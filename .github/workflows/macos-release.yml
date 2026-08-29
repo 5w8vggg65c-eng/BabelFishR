@@ -94,6 +94,7 @@ jobs:
       # the DMG. Any failure in any of those stops the job.
       # ------------------------------------------------------------------
       - name: Build, test, verify, sign and package
+        timeout-minutes: 45
         env:
           BABELFISHR_REPORT_DIR: build-reports
           BABELFISHR_MAKE_DMG: "1"

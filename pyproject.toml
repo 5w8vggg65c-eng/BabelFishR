@@ -35,7 +35,9 @@ translate = ["argostranslate>=1.9"]
 cloud = ["anthropic>=0.40"]
 # pyyaml lets the tests read the release workflow and check its
 # shape, rather than grepping YAML with regular expressions.
-dev = ["pytest>=7", "pyyaml>=6"]
+# pytest-timeout turns a hung test into a failure with a stack
+# trace naming it. A silent hang in CI tells you nothing.
+dev = ["pytest>=7", "pyyaml>=6", "pytest-timeout>=2"]
 packaging = ["pyinstaller>=6.0"]
 all = [
   "sounddevice>=0.4.6",

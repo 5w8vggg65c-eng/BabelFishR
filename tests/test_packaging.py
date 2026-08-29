@@ -149,9 +149,11 @@ def test_build_script_is_valid_shell():
 #: the very summary line these tests read.
 _VERBOSITY_FLAGS = {"-q", "--quiet", "-v", "--verbose", "-s", "-rs", "-ra"}
 
-#: Arguments that decide where a report is written, not which tests run. They
-#: contain unexpanded shell variables, so they cannot be replayed here.
-_REPORTING_PREFIXES = ("--junitxml", "--junit-xml", "--html", "--result-log")
+#: Arguments that decide how the run is reported or bounded, not which tests
+#: run. Some contain unexpanded shell variables, so they cannot be replayed
+#: here; none of them changes the selection these tests are checking.
+_REPORTING_PREFIXES = ("--junitxml", "--junit-xml", "--html", "--result-log",
+                       "--timeout", "--durations")
 
 
 def _build_pytest_invocation(strip_verbosity: bool = True) -> list:
