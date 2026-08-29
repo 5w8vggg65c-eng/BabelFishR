@@ -17,14 +17,23 @@ properties that break conversational VAD:
 
 The detector therefore tracks the channel noise floor, opens on a margin above
 it, holds through the pauses inside speech, trims the squelch tail off the end,
-and reports a *confidence* plus content flags so downstream stages can decide
-whether transcription is even worth attempting.
+and reports a *confidence* plus a content classification.
+
+Capture first, classify second
+------------------------------
+Classification NEVER decides whether an event is preserved.  The detector emits
+every event that crosses the activity threshold and lasts long enough to be
+real; the classification rides along as advice about whether *automatic* speech
+recognition is worth attempting.  A misclassified digital burst or a burst of
+static that turned out to matter must still be on disk afterwards, because the
+operator cannot re-receive it.
 """
 
 from __future__ import annotations
 
 import abc
 import dataclasses
+import enum
 import datetime as _dt
 from collections import deque
 from typing import Deque, List, Optional
@@ -34,6 +43,39 @@ import numpy as np
 from .audio.source import AudioBlock
 from .dsp.filters import dbfs, rms
 from .models import utcnow
+
+
+class ContentClass(str, enum.Enum):
+    """What the detector thinks an event contains.
+
+    Advice for downstream stages, never a reason to discard the recording.
+    """
+
+    SPEECH = "speech"
+    NOISE = "noise"
+    """Broadband and stationary: static, a fade, an open squelch."""
+
+    TONE = "tone"
+    """A steady tone: courtesy beep, roger beep, carrier with no modulation."""
+
+    DIGITAL_SUSPECTED = "digital-suspected"
+    """Broadband but strongly structured - possibly a digital burst.
+
+    Deliberately conservative and deliberately *not* authoritative: it routes a
+    recording toward optional digital analysis. Ordinary accessory audio is
+    often too filtered for this to be reliable, so a negative here means
+    nothing, and a positive is a hint, not an identification.
+    """
+
+    UNKNOWN = "unknown"
+
+    @property
+    def auto_transcribe_by_default(self) -> bool:
+        return self is ContentClass.SPEECH or self is ContentClass.UNKNOWN
+
+    @property
+    def worth_digital_analysis(self) -> bool:
+        return self in (ContentClass.DIGITAL_SUSPECTED, ContentClass.NOISE)
 
 
 @dataclasses.dataclass
@@ -76,8 +118,21 @@ class DetectorSettings:
     max_tail_trim: float = 0.60
     """Never trim more than this - a tail-trimmer must not eat a transmission."""
 
-    reject_noise: bool = True
-    """Discard events classified as pure static rather than logging them."""
+    # -- two distinct thresholds, deliberately separated -----------------
+    #
+    # `min_duration` and the open threshold decide whether something is an
+    # EVENT AT ALL, and therefore whether it is recorded. Nothing below is
+    # allowed to veto recording.
+    #
+    # `auto_process_*` decide only whether the ASR engine is invoked
+    # automatically. The operator can always override per transmission.
+
+    auto_process_speech: bool = True
+    auto_process_unknown: bool = True
+    auto_process_noise: bool = False
+    auto_process_tone: bool = False
+    auto_process_digital: bool = False
+    """Automatic ASR on a suspected digital burst is usually pointless."""
 
     noise_flatness: float = 0.25
     """In-band flatness above which an event *may* be static (see modulation)."""
@@ -91,6 +146,18 @@ class DetectorSettings:
 
     tone_flatness: float = 0.008
     """Below this, with no modulation, the event is a steady signalling tone."""
+
+    digital_kurtosis_max: float = 2.5
+    """Below this kurtosis a stationary event looks like discrete symbols.
+
+    Gaussian static sits at ~3.0 and synthetic 2/4-FSK at 1.4-2.0, so 2.5 is
+    roughly midway. Conservative on purpose: a false "digital" only routes a
+    recording toward optional analysis, and a false "noise" only sends it to a
+    different queue. Neither ever affects whether it is recorded.
+    """
+
+    digital_crest_max: float = 2.8
+    """Corroborating peak-to-RMS ceiling; static measures ~3.8."""
 
     def validate(self) -> "DetectorSettings":
         if self.open_margin_db <= self.close_margin_db:
@@ -117,17 +184,29 @@ class DetectedTransmission:
     active_ratio: float
     confidence: float
     clipped: bool = False
+    content_class: "ContentClass" = None  # type: ignore[assignment]
+    """What the detector thinks this is. Advice only - see module docstring."""
+
     likely_noise: bool = False
     """Broadband and structureless: probably static, not a voice."""
 
     likely_tone: bool = False
     """Dominated by a steady tone: a beep or signalling, not speech."""
 
+    likely_digital: bool = False
+    """Broadband but strongly structured: a candidate for digital analysis."""
+
     modulation_db: float = 0.0
     """Spread of frame levels in dB - the syllabic signature of speech."""
 
     flatness: float = 0.0
     """Median in-band spectral flatness: ~0 tonal, ~0.5 broadband noise."""
+
+    kurtosis: float = 3.0
+    """Sample-distribution kurtosis: ~3 static, <2 discrete symbols, >4 speech."""
+
+    crest: float = 0.0
+    """Peak-to-RMS ratio, corroborating the kurtosis reading."""
 
     truncated: bool = False
     trimmed_tail: float = 0.0
@@ -141,17 +220,53 @@ class DetectedTransmission:
     def ended_at(self) -> _dt.datetime:
         return self.started_at + _dt.timedelta(seconds=self.duration)
 
+    def should_auto_transcribe(self, settings: "DetectorSettings") -> bool:
+        """Whether to spend an ASR call automatically.
+
+        This gates *processing*, never persistence: the recording exists on
+        disk and in the database regardless of what this returns, and the
+        operator can always force transcription from the timeline.
+        """
+        if self.duration < 0.25:
+            return False
+        return {
+            ContentClass.SPEECH: settings.auto_process_speech,
+            ContentClass.UNKNOWN: settings.auto_process_unknown,
+            ContentClass.NOISE: settings.auto_process_noise,
+            ContentClass.TONE: settings.auto_process_tone,
+            ContentClass.DIGITAL_SUSPECTED: settings.auto_process_digital,
+        }.get(self.content_class or ContentClass.UNKNOWN, True)
+
     @property
-    def worth_transcribing(self) -> bool:
-        """Cheap gate so the ASR engine is not fed static or a courtesy beep."""
-        return (not self.likely_noise and not self.likely_tone
-                and self.duration >= 0.25)
+    def worth_digital_analysis(self) -> bool:
+        cls = self.content_class or ContentClass.UNKNOWN
+        return cls.worth_digital_analysis
+
+    def __post_init__(self) -> None:
+        if self.content_class is None:
+            self.content_class = ContentClass.UNKNOWN
 
     def to_dict(self) -> dict:
         d = {k: v for k, v in dataclasses.asdict(self).items() if k != "audio"}
         d["snr_db"] = self.snr_db
         d["samples"] = int(self.audio.size)
+        d["content_class"] = (self.content_class or ContentClass.UNKNOWN).value
         return d
+
+
+@dataclasses.dataclass
+class Verdict:
+    """The detector's read on one event's content."""
+
+    content_class: ContentClass
+    confidence: float
+    likely_noise: bool = False
+    likely_tone: bool = False
+    likely_digital: bool = False
+    modulation_db: float = 0.0
+    flatness: float = 0.0
+    kurtosis: float = 3.0
+    crest: float = 0.0
 
 
 class TransmissionDetector(abc.ABC):
@@ -224,6 +339,38 @@ def spectral_flatness(frame: np.ndarray, sample_rate: int,
         return 0.0
     selected = selected + 1e-20
     return float(np.exp(np.mean(np.log(selected))) / np.mean(selected))
+
+
+def amplitude_kurtosis(frame: np.ndarray) -> float:
+    """Kurtosis of the sample distribution - the digital/static discriminator.
+
+    Static is band-limited Gaussian noise, so its kurtosis sits at about 3.0.
+    A digitally modulated baseband signal spends its time near a small set of
+    discrete symbol levels, giving a flat-topped, sub-Gaussian distribution
+    with kurtosis well below 2. Speech, with its long quiet stretches and short
+    loud peaks, is super-Gaussian and lands above 4.
+
+    Measured on synthetic fixtures: speech 4.4, static 3.0, 4FSK 1.9, 2FSK 1.4.
+    """
+    x = np.asarray(frame, dtype=np.float64)
+    if x.size < 64:
+        return 3.0
+    x = x - float(np.mean(x))
+    deviation = float(np.std(x))
+    if deviation < 1e-12:
+        return 3.0
+    return float(np.mean((x / deviation) ** 4))
+
+
+def crest_factor(frame: np.ndarray) -> float:
+    """Peak-to-RMS ratio. Corroborates kurtosis: bounded symbols crest low."""
+    x = np.asarray(frame, dtype=np.float64)
+    if x.size == 0:
+        return 0.0
+    rms_value = float(np.sqrt(np.mean(np.square(x))))
+    if rms_value < 1e-12:
+        return 0.0
+    return float(np.max(np.abs(x)) / rms_value)
 
 
 def high_frequency_ratio(frame: np.ndarray, sample_rate: int,
@@ -348,6 +495,8 @@ class RadioActivityDetector(TransmissionDetector):
             "level": level,
             "flatness": spectral_flatness(frame, self.sample_rate),
             "hf_ratio": high_frequency_ratio(frame, self.sample_rate),
+            "kurtosis": amplitude_kurtosis(frame),
+            "crest": crest_factor(frame),
             "samples": int(sum(b.size for b in self._buffer)),
         })
         if loud:
@@ -416,12 +565,10 @@ class RadioActivityDetector(TransmissionDetector):
         if signal_duration < self.settings.min_duration:
             return None
 
-        (likely_noise, likely_tone, modulation, flatness,
-         confidence) = self._classify(stats, active, total)
-        if likely_noise and self.settings.reject_noise:
-            # Broadband static with no speech structure: a real event on the
-            # channel, but not one worth logging as a transmission by default.
-            return None
+        verdict = self._classify(stats, active, total)
+        # No classification veto: an event that crossed the activity threshold
+        # and lasted long enough is real, and the operator cannot re-receive
+        # it. Classification only advises whether to spend an ASR call.
         assert self.stream_start is not None
         return DetectedTransmission(
             audio=audio, sample_rate=self.sample_rate,
@@ -430,8 +577,12 @@ class RadioActivityDetector(TransmissionDetector):
             peak_dbfs=dbfs(peak), rms_dbfs=dbfs(rms(audio)),
             noise_floor_dbfs=floor_at_open,
             active_ratio=(active / total) if total else 0.0,
-            confidence=confidence, clipped=clipped, likely_noise=likely_noise,
-            likely_tone=likely_tone, modulation_db=modulation, flatness=flatness,
+            confidence=verdict.confidence, clipped=clipped,
+            content_class=verdict.content_class,
+            likely_noise=verdict.likely_noise, likely_tone=verdict.likely_tone,
+            likely_digital=verdict.likely_digital,
+            modulation_db=verdict.modulation_db, flatness=verdict.flatness,
+            kurtosis=verdict.kurtosis, crest=verdict.crest,
             truncated=truncated, trimmed_tail=trimmed,
         )
 
@@ -465,19 +616,25 @@ class RadioActivityDetector(TransmissionDetector):
         trimmed = (audio.size - keep) / float(self.sample_rate)
         return (audio[:keep], trimmed)
 
-    def _classify(self, stats: List[dict], active: int, total: int):
-        """Content flags plus an overall detection confidence.
+    def _classify(self, stats: List[dict], active: int, total: int) -> "Verdict":
+        """Content classification plus an overall detection confidence.
 
-        Two independent signatures are combined, because neither is sufficient
-        alone: *spectral flatness* separates tonal from broadband, and
-        *envelope modulation* separates speech (which swings in level from
-        syllable to syllable) from stationary static that happens to sit in the
-        same band.
+        Three independent signatures, because no one of them is sufficient:
+
+        * *spectral flatness* separates tonal from broadband;
+        * *envelope modulation* separates speech (which swings in level from
+          syllable to syllable) from stationary noise in the same band;
+        * *symbol structure* separates a digital burst - which is broadband and
+          stationary in level but highly regular in its zero crossings - from
+          formless static.
         """
         if not stats:
-            return (False, False, 0.0, 0.0, 0.4)
+            return Verdict(content_class=ContentClass.UNKNOWN, confidence=0.4)
+
         flatness = np.asarray([s["flatness"] for s in stats])
         levels = np.asarray([s["level"] for s in stats])
+        kurtosis = np.asarray([s.get("kurtosis", 3.0) for s in stats])
+        crest = np.asarray([s.get("crest", 0.0) for s in stats])
         threshold = self.open_threshold()
         selected = levels >= threshold
         if not selected.any():
@@ -485,22 +642,45 @@ class RadioActivityDetector(TransmissionDetector):
 
         median_flatness = float(np.median(flatness[selected]))
         modulation = float(np.std(levels[selected])) if selected.sum() > 1 else 0.0
+        median_kurtosis = float(np.median(kurtosis[selected]))
+        median_crest = float(np.median(crest[selected]))
         stationary = modulation < self.settings.min_modulation_db
 
-        likely_noise = stationary and median_flatness > self.settings.noise_flatness
         likely_tone = stationary and median_flatness < self.settings.tone_flatness
+        # A digital burst and static are both broadband and both stationary in
+        # level; what separates them is the shape of the sample distribution.
+        # Static is Gaussian; discrete symbols are flat-topped and sub-Gaussian.
+        likely_digital = (stationary and not likely_tone
+                          and median_kurtosis < self.settings.digital_kurtosis_max
+                          and median_crest < self.settings.digital_crest_max)
+        likely_noise = (stationary and not likely_tone and not likely_digital
+                        and median_flatness > self.settings.noise_flatness)
 
-        # Confidence rises with how much of the event was above threshold, how
-        # far above the floor it sat, and how speech-like the envelope was.
+        if likely_digital:
+            content_class = ContentClass.DIGITAL_SUSPECTED
+        elif likely_noise:
+            content_class = ContentClass.NOISE
+        elif likely_tone:
+            content_class = ContentClass.TONE
+        elif modulation >= self.settings.min_modulation_db:
+            content_class = ContentClass.SPEECH
+        else:
+            content_class = ContentClass.UNKNOWN
+
         activity = (active / total) if total else 0.0
         margin = float(np.clip((float(np.max(levels)) - self.floor.value) / 30.0, 0, 1))
         speechiness = float(np.clip(modulation / 8.0, 0.0, 1.0))
         confidence = float(np.clip(0.2 * activity + 0.35 * margin
                                    + 0.45 * speechiness, 0.0, 1.0))
-        if likely_noise or likely_tone:
+        if content_class is not ContentClass.SPEECH:
             confidence *= 0.4
-        return (likely_noise, likely_tone, round(modulation, 2),
-                round(median_flatness, 4), round(confidence, 3))
+        return Verdict(
+            content_class=content_class, confidence=round(confidence, 3),
+            likely_noise=likely_noise, likely_tone=likely_tone,
+            likely_digital=likely_digital, modulation_db=round(modulation, 2),
+            flatness=round(median_flatness, 4),
+            kurtosis=round(median_kurtosis, 3), crest=round(median_crest, 3),
+        )
 
 
 def detect_in_array(audio: np.ndarray, sample_rate: int,

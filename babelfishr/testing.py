@@ -15,7 +15,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .dsp.filters import bandpass, lowpass
+from .dsp.filters import bandpass, lowpass, moving_average
 
 
 def silence(seconds: float, sample_rate: int = 48_000,
@@ -89,6 +89,35 @@ def tone(seconds: float, frequency: float = 1000.0, sample_rate: int = 48_000,
     return (10 ** (level_dbfs / 20.0)) * np.sin(2 * np.pi * frequency * t)
 
 
+def digital_burst(seconds: float, sample_rate: int = 48_000, symbol_rate: float = 4800.0,
+                  levels: int = 4, level_dbfs: float = -14.0, seed: int = 4
+                  ) -> np.ndarray:
+    """A 4FSK/C4FM-shaped burst as it would appear after FM demodulation.
+
+    Digital voice (DMR, P25, NXDN) leaves a discriminator as a multi-level
+    baseband waveform clocked at a fixed symbol rate. This reproduces that
+    gross shape - broadband, level-stationary, but highly regular in its zero
+    crossings - which is exactly the combination the detector must not confuse
+    with static.
+
+    A simulation, not a real burst: it is shaped to exercise classification and
+    routing, and proves nothing about decoding a real signal.
+    """
+    rng = np.random.default_rng(seed)
+    n_symbols = max(1, int(seconds * symbol_rate))
+    deviations = (np.array([-1.0, 1.0]) if levels == 2
+                  else np.array([-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0]))
+    symbols = rng.choice(deviations, size=n_symbols)
+    samples_per_symbol = sample_rate / symbol_rate
+    index = np.minimum((np.arange(int(n_symbols * samples_per_symbol))
+                        / samples_per_symbol).astype(int), n_symbols - 1)
+    wave = symbols[index]
+    # Real modulators pulse-shape; a raw staircase is unrealistically sharp.
+    wave = moving_average(wave, max(2, int(samples_per_symbol)))
+    peak = float(np.max(np.abs(wave))) or 1.0
+    return wave / peak * (10 ** (level_dbfs / 20.0))
+
+
 @dataclasses.dataclass
 class SimulatedTransmission:
     """Ground truth for one transmission placed in a fixture."""
@@ -145,6 +174,10 @@ def build_fixture(spec: Sequence[dict], sample_rate: int = 48_000,
                                seed=counter)
         elif kind == "static":
             body = static_burst(duration, sample_rate, level, seed=counter)
+        elif kind == "digital":
+            body = digital_burst(duration, sample_rate,
+                                 entry.get("symbol_rate", 4800.0),
+                                 entry.get("levels", 4), level, seed=counter)
         elif kind == "tone":
             body = tone(duration, entry.get("frequency", 1000.0), sample_rate, level)
         elif kind == "silence":

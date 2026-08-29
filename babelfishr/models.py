@@ -62,7 +62,8 @@ class ProcessingState(str, enum.Enum):
     """Processing failed; ``error`` explains it and the audio is still intact."""
 
     SKIPPED = "skipped"
-    """Deliberately not processed (e.g. below the speech threshold)."""
+    """Not processed automatically. The audio is recorded and playable, and
+    the operator can force transcription at any time."""
 
     @property
     def is_terminal(self) -> bool:
@@ -72,6 +73,20 @@ class ProcessingState(str, enum.Enum):
     @property
     def is_pending(self) -> bool:
         return not self.is_terminal
+
+
+class ContentClass(str, enum.Enum):
+    """Detector's read on what a transmission contains.
+
+    Recorded for every transmission, and never a reason one was discarded:
+    see :mod:`babelfishr.detect` for the capture-first invariant.
+    """
+
+    SPEECH = "speech"
+    NOISE = "noise"
+    TONE = "tone"
+    DIGITAL_SUSPECTED = "digital-suspected"
+    UNKNOWN = "unknown"
 
 
 class SourceLanguageMode(str, enum.Enum):
@@ -243,6 +258,15 @@ class Transmission:
     detection_confidence: float = 0.0
     """How sure the detector is that this was a real transmission, not noise."""
 
+    content_class: ContentClass = ContentClass.UNKNOWN
+    """What the detector thought this was. Advice, not a gate on persistence."""
+
+    auto_processed: bool = True
+    """False when classification routed this away from automatic ASR."""
+
+    skip_reason: str = ""
+    """Why automatic processing was skipped, shown verbatim in the UI."""
+
     # -- operator-declared context (never inferred from audio) ---------
     profile_id: Optional[str] = None
     profile_label: str = ""
@@ -303,6 +327,16 @@ class Transmission:
         return bool(self.transcript_correction or self.translation_correction)
 
     @property
+    def can_transcribe_anyway(self) -> bool:
+        """True when the operator may force ASR on a skipped recording."""
+        return bool(self.audio_path) and not self.transcript
+
+    @property
+    def worth_digital_analysis(self) -> bool:
+        return self.content_class in (ContentClass.DIGITAL_SUSPECTED,
+                                      ContentClass.NOISE, ContentClass.UNKNOWN)
+
+    @property
     def needs_review(self) -> bool:
         """Low confidence, or a failure the operator should look at."""
         if self.state is ProcessingState.FAILED:
@@ -334,6 +368,7 @@ class Transmission:
         d["ended_at"] = iso(self.ended_at)
         d["corrected_at"] = iso(self.corrected_at)
         d["state"] = self.state.value
+        d["content_class"] = self.content_class.value
         d["source_language_mode"] = self.source_language_mode.value
         d["error"] = self.error.to_dict() if self.error else None
         d["display_transcript"] = self.display_transcript
@@ -354,6 +389,8 @@ class Transmission:
         d["corrected_at"] = parse_iso(d.get("corrected_at"))
         if d.get("state"):
             d["state"] = ProcessingState(d["state"])
+        if d.get("content_class"):
+            d["content_class"] = ContentClass(d["content_class"])
         if d.get("source_language_mode"):
             d["source_language_mode"] = SourceLanguageMode(d["source_language_mode"])
         if d.get("error"):

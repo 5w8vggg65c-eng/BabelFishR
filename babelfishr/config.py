@@ -63,7 +63,14 @@ class DetectorConfig:
     min_duration: float = 0.30
     max_duration: float = 300.0
     trim_squelch_tail: bool = True
-    reject_noise: bool = True
+
+    # Automatic-processing routing. None of these can stop a recording being
+    # made: they only decide whether an ASR call happens without being asked.
+    auto_process_speech: bool = True
+    auto_process_unknown: bool = True
+    auto_process_noise: bool = False
+    auto_process_tone: bool = False
+    auto_process_digital: bool = False
 
     def to_settings(self):
         from .detect import DetectorSettings

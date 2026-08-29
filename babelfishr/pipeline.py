@@ -13,9 +13,14 @@ Two thread pools, deliberately separated:
 * **Processing** runs a small pool that transcribes and translates.  Work is
   queued, so a backlog delays transcripts but never loses audio.
 
-Every transmission is written to disk *and* to the database before any engine
-is asked to look at it, so an engine failure, a crash or a missing model can
-never destroy captured traffic.
+Capture first, classify second
+------------------------------
+Every detected event is written to disk *and* to the database before anything
+classifies, transcribes, translates or analyses it.  Classification decides
+only whether an ASR call happens automatically; it can never decide whether the
+recording exists.  Static, tones and suspected digital bursts are all kept, and
+the operator can force transcription or digital analysis on any of them
+afterwards - which matters because a transmission cannot be received twice.
 """
 
 from __future__ import annotations
@@ -36,8 +41,8 @@ from .audio.source import AudioBlock, AudioSource
 from .audio.wavefile import write_wav
 from .config import Config
 from .detect import DetectedTransmission, RadioActivityDetector
-from .models import (ProcessingState, RadioProfile, Session, SourceLanguageMode,
-                     Transmission, utcnow)
+from .models import (ContentClass, ProcessingState, RadioProfile, Session,
+                     SourceLanguageMode, Transmission, utcnow)
 from .providers import (EngineError, EngineUnavailable, Glossary,
                         TranscriptionEngine, TranslationEngine)
 from .storage import Store
@@ -151,6 +156,21 @@ class Recorder:
             return None
 
 
+def _skip_reason(detected: DetectedTransmission) -> str:
+    """Plain-language note explaining why automatic ASR was not attempted."""
+    return {
+        "noise": "Classified as broadband noise, so speech recognition was not "
+                 "attempted automatically. The recording is kept - use "
+                 "'Transcribe anyway' to run it regardless.",
+        "tone": "Classified as a steady tone (courtesy beep or unmodulated "
+                "carrier). The recording is kept.",
+        "digital-suspected": "Possibly a digital burst rather than analogue "
+                             "voice. The recording is kept - try "
+                             "'Analyze as digital', or 'Transcribe anyway'.",
+    }.get(detected.content_class.value,
+          "Automatic speech processing was skipped. The recording is kept.")
+
+
 def _slug(text: str) -> str:
     safe = "".join(c if c.isalnum() or c in "-_." else "-" for c in text.strip())
     return safe.strip("-") or "unnamed"
@@ -230,6 +250,23 @@ class ProcessingPipeline:
         if pending:
             log.info("resuming %d unfinished transmission(s)", len(pending))
         return len(pending)
+
+    def force_transcribe(self, tx_id: str) -> bool:
+        """Operator override: transcribe a recording that was skipped.
+
+        Classification is advice; this is how the operator disagrees with it.
+        """
+        tx = self.store.get_transmission(tx_id)
+        if tx is None or not tx.audio_path:
+            return False
+        tx.clear_error()
+        tx.state = ProcessingState.CAPTURED
+        tx.auto_processed = False
+        tx.skip_reason = ""
+        self.store.save_transmission(tx)
+        self.events.publish("updated", tx)
+        self.submit(tx_id)
+        return True
 
     def retry(self, tx_id: str) -> bool:
         """Retry a failed transmission. The audio was never lost."""
@@ -488,7 +525,11 @@ class CaptureService:
 
     # -- capture ---------------------------------------------------------
     def _capture(self, detected: DetectedTransmission) -> Transmission:
-        """Persist a detected transmission before anything can go wrong."""
+        """Persist a detected event, then decide what to do with it.
+
+        The order is the invariant: WAV to disk, row to the database, and only
+        then any decision about processing.
+        """
         tx = Transmission(
             session_id=self.session.id,
             started_at=detected.started_at,
@@ -506,26 +547,29 @@ class CaptureService:
             source_language_mode=self.session.source_language_mode,
             source_language=self.session.source_language,
             target_language=self.session.target_language,
+            content_class=ContentClass(detected.content_class.value),
             state=ProcessingState.CAPTURED,
         )
         tx.ended_at = detected.ended_at
-        if detected.likely_noise:
-            tx.notes = "detector: broadband noise, not speech"
-        elif detected.likely_tone:
-            tx.notes = "detector: steady tone, not speech"
 
+        # --- persistence, before any classification-driven decision ---------
         tx.audio_path = self.recorder.write(tx, self.session, detected.audio,
                                             detected.sample_rate)
         self.store.save_transmission(tx)
         self.transmissions_captured += 1
         self.events.publish("transmission", tx)
 
-        if self.pipeline is not None and detected.worth_transcribing:
+        # --- now, and only now, decide about automatic processing -----------
+        auto = detected.should_auto_transcribe(self.detector.settings)
+        if auto and self.pipeline is not None:
             self.pipeline.submit(tx.id)
-        elif not detected.worth_transcribing:
-            tx.state = ProcessingState.SKIPPED
-            self.store.save_transmission(tx)
-            self.events.publish("updated", tx)
+            return tx
+
+        tx.auto_processed = False
+        tx.state = ProcessingState.SKIPPED
+        tx.skip_reason = _skip_reason(detected)
+        self.store.save_transmission(tx)
+        self.events.publish("updated", tx)
         return tx
 
     def _set_state(self, state: str) -> None:

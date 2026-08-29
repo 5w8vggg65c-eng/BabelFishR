@@ -18,13 +18,13 @@ import sqlite3
 import threading
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from .models import (ErrorInfo, ProcessingState, RadioProfile, Session,
-                     SourceLanguageMode, Transmission, TranscriptSegment, iso,
-                     parse_iso, utcnow)
+from .models import (ContentClass, ErrorInfo, ProcessingState, RadioProfile,
+                     Session, SourceLanguageMode, Transmission,
+                     TranscriptSegment, iso, parse_iso, utcnow)
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -77,6 +77,9 @@ CREATE TABLE IF NOT EXISTS transmissions (
     noise_floor_dbfs            REAL DEFAULT -120,
     clipped                     INTEGER DEFAULT 0,
     detection_confidence        REAL DEFAULT 0,
+    content_class               TEXT DEFAULT 'unknown',
+    auto_processed              INTEGER DEFAULT 1,
+    skip_reason                 TEXT DEFAULT '',
     profile_id                  TEXT,
     profile_label               TEXT DEFAULT '',
     channel_name                TEXT DEFAULT '',
@@ -118,7 +121,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS transmissions_fts USING fts5 (
 """
 
 _JSON_FIELDS = ("transcript_segments", "tags")
-_BOOL_FIELDS = ("clipped", "bookmarked", "reviewed")
+_BOOL_FIELDS = ("clipped", "bookmarked", "reviewed", "auto_processed")
 
 
 class Store:

@@ -262,6 +262,12 @@ class BabelFishRApp:
             return False
         return self.pipeline.retry(tx_id)
 
+    def transcribe_anyway(self, tx_id: str) -> bool:
+        """Force transcription of a recording the classifier routed away."""
+        if self.pipeline is None:
+            return False
+        return self.pipeline.force_transcribe(tx_id)
+
     def correct(self, tx_id: str, transcript: Optional[str] = None,
                 translation: Optional[str] = None,
                 notes: Optional[str] = None) -> Optional[Transmission]:

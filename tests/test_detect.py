@@ -5,8 +5,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from babelfishr.detect import (DetectorSettings, RadioActivityDetector,
-                               detect_in_array, spectral_flatness)
+from babelfishr.detect import (ContentClass, DetectorSettings,
+                               RadioActivityDetector, amplitude_kurtosis,
+                               crest_factor, detect_in_array, spectral_flatness)
 from babelfishr.testing import (build_fixture, gapped_transmission_fixture,
                                 speech_like, standard_fixture, static_burst,
                                 squelch_tail, tone)
@@ -74,26 +75,71 @@ def test_tail_trim_never_consumes_the_transmission():
     assert detected[0].duration > 2.5
 
 
-def test_static_is_classified_and_rejected():
+def test_static_is_classified_but_always_retained():
+    """The capture-first invariant: classification never discards an event."""
     fixture = build_fixture(
         [{"gap": 1.0}, {"kind": "static", "duration": 4.0, "level_dbfs": -20},
          {"gap": 1.0}], sample_rate=SR)
-    assert detect_in_array(fixture.audio, SR) == []
+    detected = detect_in_array(fixture.audio, SR)
+    assert len(detected) == 1, "static must be recorded, not discarded"
+    assert detected[0].content_class is ContentClass.NOISE
+    assert detected[0].audio.size > 0
+    # Classified out of *automatic* ASR, but still on disk and analysable.
+    assert not detected[0].should_auto_transcribe(DetectorSettings())
+    assert detected[0].worth_digital_analysis
 
-    kept = detect_in_array(fixture.audio, SR, DetectorSettings(reject_noise=False))
-    assert len(kept) == 1
-    assert kept[0].likely_noise
-    assert not kept[0].worth_transcribing
+
+def test_operator_can_opt_into_transcribing_noise():
+    fixture = build_fixture(
+        [{"gap": 1.0}, {"kind": "static", "duration": 4.0, "level_dbfs": -20},
+         {"gap": 1.0}], sample_rate=SR)
+    detected = detect_in_array(fixture.audio, SR)
+    assert detected[0].should_auto_transcribe(
+        DetectorSettings(auto_process_noise=True))
 
 
-def test_steady_tone_is_not_treated_as_speech():
+def test_steady_tone_is_classified_but_retained():
     fixture = build_fixture(
         [{"gap": 1.0}, {"kind": "tone", "duration": 1.5, "level_dbfs": -14},
          {"gap": 1.0}], sample_rate=SR)
-    detected = detect_in_array(fixture.audio, SR, DetectorSettings(reject_noise=False))
+    detected = detect_in_array(fixture.audio, SR)
     assert len(detected) == 1
-    assert detected[0].likely_tone
-    assert not detected[0].worth_transcribing
+    assert detected[0].content_class is ContentClass.TONE
+    assert not detected[0].should_auto_transcribe(DetectorSettings())
+
+
+@pytest.mark.parametrize("spec,expected", [
+    ({"kind": "voice", "duration": 3.0, "level_dbfs": -14}, ContentClass.SPEECH),
+    ({"kind": "static", "duration": 3.0, "level_dbfs": -20}, ContentClass.NOISE),
+    ({"kind": "tone", "duration": 2.0, "level_dbfs": -14}, ContentClass.TONE),
+    ({"kind": "digital", "duration": 3.0, "level_dbfs": -14},
+     ContentClass.DIGITAL_SUSPECTED),
+    ({"kind": "digital", "duration": 3.0, "levels": 2, "level_dbfs": -14},
+     ContentClass.DIGITAL_SUSPECTED),
+    ({"kind": "digital", "duration": 3.0, "symbol_rate": 2400.0,
+      "level_dbfs": -14}, ContentClass.DIGITAL_SUSPECTED),
+])
+def test_every_content_type_is_detected_and_classified(spec, expected):
+    """Speech, static, tones and digital bursts must ALL survive detection."""
+    fixture = build_fixture([{"gap": 1.0}, spec, {"gap": 1.0}], sample_rate=SR)
+    detected = detect_in_array(fixture.audio, SR)
+    assert len(detected) == 1, f"{spec['kind']} was discarded by the detector"
+    assert detected[0].content_class is expected
+    assert detected[0].audio.size > 0
+
+
+def test_digital_burst_is_separated_from_static_by_a_wide_margin():
+    """Both are broadband and level-stationary; only the statistics differ."""
+    def measure(kind, **extra):
+        fixture = build_fixture(
+            [{"gap": 1.0}, dict(kind=kind, duration=3.0, level_dbfs=-16, **extra),
+             {"gap": 1.0}], sample_rate=SR)
+        return detect_in_array(fixture.audio, SR)[0]
+
+    digital = measure("digital")
+    static = measure("static")
+    assert digital.kurtosis < static.kurtosis - 0.5
+    assert digital.crest < static.crest - 0.5
 
 
 def test_brief_crackle_is_ignored():
@@ -125,9 +171,9 @@ def test_speech_modulation_separates_it_from_static():
         [{"gap": 1.0}, {"kind": "voice", "duration": 3.0, "level_dbfs": -14},
          {"gap": 1.5}, {"kind": "static", "duration": 3.0, "level_dbfs": -20},
          {"gap": 1.0}], sample_rate=SR)
-    detected = detect_in_array(fixture.audio, SR, DetectorSettings(reject_noise=False))
-    voice = [d for d in detected if not d.likely_noise]
-    noise = [d for d in detected if d.likely_noise]
+    detected = detect_in_array(fixture.audio, SR)
+    voice = [d for d in detected if d.content_class is ContentClass.SPEECH]
+    noise = [d for d in detected if d.content_class is ContentClass.NOISE]
     assert voice and noise
     assert voice[0].modulation_db > noise[0].modulation_db + 3.0
 
