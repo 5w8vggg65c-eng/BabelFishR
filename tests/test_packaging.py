@@ -120,16 +120,129 @@ def test_macos_paths_use_application_support(monkeypatch):
     assert paths.root.name == "BabelFishR"
 
 
-def test_build_script_runs_tests_before_packaging():
-    text = (PACKAGING / "build_macos.sh").read_text()
-    assert "pytest" in text, "the build must not package an untested tree"
-    assert "set -euo pipefail" in text
+def _build_script() -> str:
+    return (PACKAGING / "build_macos.sh").read_text()
 
 
-def test_build_script_is_honest_about_signing():
-    text = (PACKAGING / "build_macos.sh").read_text()
-    assert "UNSIGNED" in text
-    assert "notarytool" in text
+def _pip_install_lines() -> list:
+    return [line.strip() for line in _build_script().splitlines()
+            if "pip install" in line and not line.strip().startswith("#")]
+
+
+def test_build_script_is_valid_shell():
+    """Catch syntax errors before someone waits ten minutes for a build."""
+    import shutil
+    import subprocess
+
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash is unavailable")
+    result = subprocess.run([bash, "-n", str(PACKAGING / "build_macos.sh")],
+                            capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+
+
+def test_clean_venv_installs_the_dependencies_the_build_uses():
+    """The defect: the script ran pytest without installing the dev extra.
+
+    Checked structurally - every tool the script invokes must appear in an
+    install line - rather than by grepping for the word "pytest".
+    """
+    import tomllib
+
+    script = _build_script()
+    installs = " ".join(_pip_install_lines())
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    extras = project["project"]["optional-dependencies"]
+
+    #: tool invoked by the script -> extra that provides it
+    tooling = {"pytest": "dev", "pyinstaller": "packaging"}
+    for tool, extra in tooling.items():
+        if tool not in script:
+            continue
+        assert extra in extras, f"pyproject has no [{extra}] extra"
+        assert extra in installs, (
+            f"the script runs {tool} but never installs the '{extra}' extra "
+            f"into the clean venv")
+
+
+def test_build_script_verifies_its_toolchain_before_using_it():
+    script = _build_script()
+    assert "import pytest" in script or "pytest --version" in script, (
+        "the script should fail fast if the toolchain is missing")
+
+
+def test_build_script_creates_a_clean_venv():
+    script = _build_script()
+    assert "python3 -m venv" in script
+    assert "rm -rf \"$VENV\"" in script or "rm -rf $VENV" in script, (
+        "a stale venv would hide missing dependencies")
+
+
+def test_build_script_fails_fast():
+    assert "set -euo pipefail" in _build_script()
+
+
+def test_build_script_does_not_touch_application_support():
+    """A rebuild must never delete a downloaded model."""
+    script = _build_script()
+    for line in script.splitlines():
+        if line.strip().startswith("rm -rf"):
+            assert "Application Support" not in line
+            assert "BABELFISHR_HOME" not in line or "mktemp" in line
+    assert "Application Support" in script, (
+        "the script should say that field assets are untouched")
+
+
+def test_build_script_points_tests_at_a_scratch_home():
+    """Tests must not write into the operator's real Application Support."""
+    script = _build_script()
+    assert "BABELFISHR_HOME" in script
+    assert "mktemp" in script
+
+
+def test_build_script_is_honest_about_signing_and_notarization():
+    script = _build_script()
+    assert "UNSIGNED" in script and "NOT notarized" in script
+    assert "notarytool" in script
+    assert "CODESIGN_IDENTITY" in script and "NOTARY_PROFILE" in script
+
+
+def test_packaged_binary_services_cli_arguments():
+    """We document the bundled binary as a CLI, so it must actually be one."""
+    import ast
+
+    module = ast.parse((PACKAGING / "app_entry.py").read_text())
+    source = (PACKAGING / "app_entry.py").read_text()
+    assert "cli_main" in source or "from babelfishr.cli import main" in source, (
+        "the entry point must dispatch to the CLI when given arguments")
+    main = next(node for node in module.body
+                if isinstance(node, ast.FunctionDef) and node.name == "main")
+    assert main.args.args, "main() must accept argv to dispatch CLI arguments"
+
+
+def test_packaged_entry_point_dispatches_to_cli(monkeypatch, tmp_path):
+    """Exercise the dispatch for real, not by reading the source."""
+    import sys
+
+    monkeypatch.setenv("BABELFISHR_HOME", str(tmp_path))
+    monkeypatch.syspath_prepend(str(PACKAGING))
+    import app_entry
+
+    assert app_entry.main(["--selftest-import"]) == 0
+
+    calls = {}
+
+    def fake_cli(argv):
+        calls["argv"] = argv
+        return 0
+
+    monkeypatch.setitem(sys.modules, "babelfishr.cli",
+                        type(sys)("babelfishr.cli"))
+    sys.modules["babelfishr.cli"].main = fake_cli
+    assert app_entry.main(["devices"]) == 0
+    assert calls["argv"] == ["devices"]
 
 
 def test_upgrade_does_not_touch_field_assets(tmp_path, monkeypatch):

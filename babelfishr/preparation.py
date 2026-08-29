@@ -57,8 +57,17 @@ class PreparationResult:
 def prepare_field(config, *, asr_model: Optional[str] = None,
                   language_pairs: Optional[List[Tuple[str, str]]] = None,
                   report: Optional[Reporter] = None,
-                  skip_download: bool = False) -> PreparationResult:
-    """Download and verify everything needed for offline operation."""
+                  skip_download: bool = False,
+                  mode: Optional[OperatingMode] = None) -> PreparationResult:
+    """Download and verify everything needed for offline operation.
+
+    Refuses to run in a mode that forbids downloads, unless the caller is only
+    verifying what is already present (``skip_download``).
+    """
+    if not skip_download:
+        guard_download(mode or OperatingMode(getattr(config, "mode",
+                                                     "online-setup")),
+                       "field preparation")
     say = report or (lambda text: None)
     result = PreparationResult()
     paths = config.paths().ensure()
@@ -251,6 +260,7 @@ def available_languages() -> List[Tuple[str, str]]:
 
 
 def install_language(source: str, target: str, mode: OperatingMode) -> bool:
+    """Install a language pack. Refused outside preparation mode."""
     guard_download(mode, f"installing the {source}->{target} language pack")
     from .providers.argos import ArgosTranslateEngine
 

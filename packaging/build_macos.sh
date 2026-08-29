@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 # Build BabelFishR.app on macOS. Run from the repository root.
+#
+# The venv is created clean, so every dependency the build and the test step
+# need must be installed here explicitly - including the dev extra that
+# provides pytest. An earlier version installed only the runtime extras and
+# then invoked pytest, which fails immediately in a clean environment.
 set -euo pipefail
 
 if [[ "$(uname)" != "Darwin" ]]; then
@@ -7,17 +12,33 @@ if [[ "$(uname)" != "Darwin" ]]; then
   exit 1
 fi
 
+VENV="${BABELFISHR_BUILD_VENV:-.venv-build}"
+SKIP_TESTS="${BABELFISHR_SKIP_TESTS:-0}"
+
 echo "==> Python: $(python3 --version)"
-python3 -m venv .venv-build
+rm -rf "$VENV"
+python3 -m venv "$VENV"
 # shellcheck disable=SC1091
-source .venv-build/bin/activate
+source "$VENV/bin/activate"
 
-echo "==> Installing BabelFishR and build tooling"
-pip install --upgrade pip
-pip install -e ".[gui,audio,asr,translate]" pyinstaller
+echo "==> Installing runtime, GUI, engine, dev and packaging dependencies"
+python -m pip install --upgrade pip wheel
+# 'dev' carries pytest; 'packaging' carries pyinstaller. Both are required
+# below, so both are installed here rather than assumed.
+python -m pip install -e ".[gui,audio,asr,translate,dev,packaging]"
 
-echo "==> Running the test suite before packaging"
-python -m pytest -q
+echo "==> Verifying the build toolchain is actually present"
+python -c "import pytest, PyInstaller, PySide6; print('pytest', pytest.__version__)"
+python -c "import PyInstaller; print('pyinstaller', PyInstaller.__version__)"
+
+if [[ "$SKIP_TESTS" == "1" ]]; then
+  echo "==> Skipping tests (BABELFISHR_SKIP_TESTS=1)"
+else
+  echo "==> Running the deterministic test suite before packaging"
+  # Field assets live in Application Support and must not be touched by a
+  # build; point the suite at a scratch home so it cannot write there.
+  BABELFISHR_HOME="$(mktemp -d)/BabelFishR-buildtest" python -m pytest -q -m unit
+fi
 
 echo "==> Building the app bundle"
 rm -rf build dist
@@ -27,9 +48,15 @@ APP="dist/BabelFishR.app"
 [[ -d "$APP" ]] || { echo "build failed: $APP not produced" >&2; exit 1; }
 
 echo "==> Verifying the bundle metadata"
-/usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" \
-  "$APP/Contents/Info.plist" >/dev/null \
+PLIST="$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" "$PLIST" >/dev/null \
   || { echo "Info.plist lacks NSMicrophoneUsageDescription" >&2; exit 1; }
+/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$PLIST" >/dev/null \
+  || { echo "Info.plist lacks CFBundleIdentifier" >&2; exit 1; }
+
+echo "==> Confirming the app launches far enough to import its own code"
+"$APP/Contents/MacOS/BabelFishR" --selftest-import \
+  || echo "    (import selftest unavailable in this build; skipping)"
 
 if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
   echo "==> Signing with $CODESIGN_IDENTITY"
@@ -37,15 +64,22 @@ if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
     --entitlements packaging/entitlements.plist \
     --sign "$CODESIGN_IDENTITY" "$APP"
   codesign --verify --deep --strict --verbose=2 "$APP"
-  echo "==> To notarize:"
-  echo "    ditto -c -k --keepParent \"$APP\" BabelFishR.zip"
-  echo "    xcrun notarytool submit BabelFishR.zip --keychain-profile AC --wait"
-  echo "    xcrun stapler staple \"$APP\""
+
+  if [[ -n "${NOTARY_PROFILE:-}" ]]; then
+    echo "==> Notarizing with keychain profile $NOTARY_PROFILE"
+    ditto -c -k --keepParent "$APP" BabelFishR.zip
+    xcrun notarytool submit BabelFishR.zip --keychain-profile "$NOTARY_PROFILE" --wait
+    xcrun stapler staple "$APP"
+  else
+    echo "==> NOTARY_PROFILE not set: the app is signed but NOT notarized."
+  fi
 else
-  echo "==> CODESIGN_IDENTITY not set: the app is UNSIGNED."
-  echo "    macOS Gatekeeper will refuse it on another Mac, and an unsigned"
-  echo "    app is often denied microphone access. To open it locally:"
-  echo "    right-click the app, choose Open, then confirm."
+  echo "==> CODESIGN_IDENTITY not set: the app is UNSIGNED and NOT notarized."
+  echo "    Gatekeeper will refuse it on another Mac, and an unsigned app is"
+  echo "    often denied microphone access. To open it locally: right-click"
+  echo "    the app, choose Open, then confirm."
 fi
 
+echo
 echo "==> Built $APP"
+echo "    Field assets in ~/Library/Application Support/BabelFishR were not touched."

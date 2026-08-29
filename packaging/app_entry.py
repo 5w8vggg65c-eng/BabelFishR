@@ -28,9 +28,31 @@ def _setup_logging():
     return paths
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    """Launch the GUI, or hand off to the CLI when arguments are supplied.
+
+    The bundled binary is the same entry point either way, so
+    ``BabelFishR.app/Contents/MacOS/BabelFishR devices`` works and the
+    documentation can honestly say so.
+    """
+    argv = list(sys.argv[1:] if argv is None else argv)
     paths = _setup_logging()
     logging.info("BabelFishR starting; assets in %s", paths.root)
+
+    if argv == ["--selftest-import"]:
+        # Used by the build script to prove the frozen bundle can import its
+        # own code before anything is signed or shipped.
+        import babelfishr
+        from babelfishr import cli  # noqa: F401
+
+        print(f"babelfishr {babelfishr.__version__} imports cleanly")
+        return 0
+
+    if argv:
+        from babelfishr.cli import main as cli_main
+
+        return cli_main(argv)
+
     try:
         from babelfishr.ui import run
 

@@ -189,22 +189,32 @@ def guard_mock(mode: OperatingMode, engine_name: str) -> None:
 
 
 def offline_environment() -> Dict[str, str]:
-    """Environment variables that force offline behaviour in ML libraries.
+    """Library switches that stop model hubs fetching anything.
 
-    Belt and braces alongside the explicit local-files-only loading options:
-    these are the switches huggingface_hub and transformers honour, and setting
-    them means a library that ignores our own flag still cannot reach out.
+    These are the documented offline flags for huggingface_hub, transformers
+    and datasets. They are a second line of defence behind the explicit
+    ``local_files_only`` loading options, not a network control.
+
+    Deliberately NOT included: ``NO_PROXY``. It only tells HTTP clients to
+    bypass a configured proxy - it blocks nothing, and listing it here as a
+    denial mechanism would be a false claim. BabelFishR's actual guarantee is
+    architectural: in Field Offline no cloud provider is constructed and no
+    download or install path is reachable, so there is nothing to make a
+    request in the first place.
     """
     return {
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
         "HF_DATASETS_OFFLINE": "1",
-        "NO_PROXY": "*",
     }
 
 
 def apply_offline_environment() -> List[str]:
-    """Set the offline variables in this process. Returns the names set."""
+    """Set the model-hub offline flags in this process.
+
+    Returns the names set. This reduces the chance of a library reaching out;
+    it is not, and must not be described as, a firewall.
+    """
     applied = []
     for key, value in offline_environment().items():
         os.environ[key] = value
