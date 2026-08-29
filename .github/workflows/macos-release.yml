@@ -69,10 +69,10 @@ jobs:
           fi
 
       - name: Check out the source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -143,7 +143,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the disk image
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: BabelFishR-macOS-arm64-dmg
           path: |
@@ -154,7 +154,7 @@ jobs:
 
       - name: Upload the test, build, verification and signing reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: BabelFishR-macOS-reports
           path: build-reports/
@@ -175,6 +175,13 @@ jobs:
           done
           echo "================ test summary ================"
           tail -n 12 build-reports/test-report.txt 2>/dev/null || echo "(none)"
+          echo ""
+          echo "================ CoreAudio, from the shipped bundle ================"
+          # Printed on its own so the ABI result is visible without reading the
+          # whole independence report. Hosted runners have no audio hardware,
+          # so zero devices here is expected and is not hardware validation.
+          sed -n '/CoreAudio probe/,/result  *:/p' \
+            build-reports/independence-report.txt 2>/dev/null || echo "(none)"
 
       # ------------------------------------------------------------------
       # Publishing. A tag push publishes automatically; a manual run publishes

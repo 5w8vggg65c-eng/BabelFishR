@@ -259,5 +259,116 @@ def input_index() -> Dict[str, CoreAudioDevice]:
     return {name: found[0] for name, found in by_name.items() if len(found) == 1}
 
 
+def probe() -> Dict[str, object]:
+    """Exercise the CoreAudio ABI and report exactly what happened.
+
+    Written to be run on a real Mac - including inside the shipped bundle, via
+    ``BabelFishR --selftest-coreaudio`` - because everything else in this
+    module is verified against a fake framework and that proves only that the
+    Python is self-consistent.
+
+    What it can establish: the frameworks load, the property selectors and the
+    AudioObjectPropertyAddress layout are right (a size query for the device
+    list returns status 0), and whatever devices the machine does have come
+    back with a coherent shape.
+
+    What it cannot establish: that audio flows. A hosted runner has no audio
+    hardware, so ``device_count`` there is expected to be 0 and that is not a
+    failure of this code. Only a Mac with an interface plugged into it can
+    show that a device is real, and only listening to the result can show that
+    the right one was opened.
+    """
+    report: Dict[str, object] = {
+        "platform": sys.platform,
+        "applicable": sys.platform == "darwin",
+        "frameworks_loaded": False,
+        "device_list_query": "not attempted",
+        "device_count": 0,
+        "devices": [],
+        "errors": [],
+        "ok": True,
+    }
+    if sys.platform != "darwin":
+        report["device_list_query"] = "skipped: not macOS"
+        return report
+
+    libraries = _libraries()
+    if libraries is None:
+        report["errors"] = ["CoreAudio/CoreFoundation could not be loaded"]
+        report["ok"] = False
+        return report
+    report["frameworks_loaded"] = True
+    core_audio, _ = libraries
+
+    try:
+        address = _address(_PROP_DEVICES)
+        size = _property_size(core_audio, _SYSTEM_OBJECT, address)
+        if size is None:
+            report["device_list_query"] = "failed: non-zero OSStatus"
+            report["errors"] = [
+                "AudioObjectGetPropertyDataSize(kAudioHardwarePropertyDevices) "
+                "returned a non-zero status; the selector or the property "
+                "address layout is wrong"]
+            report["ok"] = False
+            return report
+        report["device_list_query"] = "ok"
+        report["object_count"] = size // ctypes.sizeof(ctypes.c_uint32)
+    except Exception as exc:  # noqa: BLE001
+        report["device_list_query"] = f"raised: {exc}"
+        report["errors"] = [f"{type(exc).__name__}: {exc}"]
+        report["ok"] = False
+        return report
+
+    devices = list_input_devices()
+    report["device_count"] = len(devices)
+    report["devices"] = [
+        {"uid": d.uid, "name": d.name, "channels": d.input_channels,
+         "transport": d.transport, "builtin": d.is_builtin} for d in devices]
+
+    # Anything the machine did report has to be coherent, or the struct
+    # reading is wrong in a way that would silently corrupt identification.
+    problems = []
+    for device in devices:
+        if device.input_channels <= 0:
+            problems.append(f"{device.name!r} reported as an input with "
+                            f"{device.input_channels} channels")
+        if not device.name:
+            problems.append(f"a device with uid {device.uid!r} has no name")
+        if device.transport not in set(TRANSPORTS.values()) | {"unknown"}:
+            problems.append(f"{device.name!r} has unrecognised transport "
+                            f"{device.transport!r}")
+    if problems:
+        report["errors"] = problems
+        report["ok"] = False
+    return report
+
+
+def format_probe(report: Optional[Dict[str, object]] = None) -> str:
+    """The probe as plain text, for a build log or a diagnostic report."""
+    report = probe() if report is None else report
+    lines = [
+        "CoreAudio probe",
+        f"  platform          : {report['platform']}",
+        f"  applicable        : {report['applicable']}",
+        f"  frameworks loaded : {report['frameworks_loaded']}",
+        f"  device list query : {report['device_list_query']}",
+        f"  audio objects     : {report.get('object_count', 'n/a')}",
+        f"  input devices     : {report['device_count']}",
+    ]
+    for device in report["devices"]:  # type: ignore[union-attr]
+        lines.append(
+            f"     {device['name']!r} uid={device['uid']!r} "
+            f"{device['channels']} ch {device['transport']}"
+            f"{' (built-in)' if device['builtin'] else ''}")
+    for error in report["errors"]:  # type: ignore[union-attr]
+        lines.append(f"  ERROR: {error}")
+    if report["applicable"] and not report["device_count"]:
+        lines.append("  note: no input devices. Expected on a hosted runner, "
+                     "which has no audio hardware. This is not evidence that "
+                     "audio capture works.")
+    lines.append(f"  result            : {'ok' if report['ok'] else 'FAILED'}")
+    return "\n".join(lines)
+
+
 __all__ = ["CoreAudioDevice", "available", "list_input_devices", "input_index",
-           "TRANSPORTS", "BUILTIN_TRANSPORTS"]
+           "format_probe", "probe", "TRANSPORTS", "BUILTIN_TRANSPORTS"]

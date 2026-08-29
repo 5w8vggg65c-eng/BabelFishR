@@ -139,6 +139,32 @@ def test_every_packaging_script_is_valid_shell(script):
     assert result.returncode == 0, result.stderr
 
 
+def test_the_workflow_uses_maintained_action_versions():
+    """Deprecated Node runtimes produce a warning annotation on every run.
+
+    Pinned by major version deliberately: a floating ref would let a third
+    party change what runs in the release pipeline.
+    """
+    import re
+
+    body = _workflow()
+    used = dict(re.findall(r"uses:\s*(actions/[a-z-]+)@v(\d+)", body))
+    minimums = {"actions/checkout": 5, "actions/setup-python": 6,
+                "actions/upload-artifact": 5}
+    for action, minimum in minimums.items():
+        assert action in used, f"{action} is not used"
+        assert int(used[action]) >= minimum, (
+            f"{action}@v{used[action]} is below the maintained v{minimum}")
+
+
+def test_the_workflow_exercises_coreaudio_in_the_built_bundle():
+    body = _workflow()
+    assert "CoreAudio" in body
+    independence = (PACKAGING / "verify_independence.sh").read_text()
+    assert "--selftest-coreaudio" in independence
+    assert "does NOT prove audio capture works" in independence
+
+
 def test_the_independence_check_scrubs_the_environment():
     """Otherwise it proves nothing: the build machine would satisfy imports."""
     body = (PACKAGING / "verify_independence.sh").read_text(encoding="utf-8")
@@ -147,7 +173,8 @@ def test_the_independence_check_scrubs_the_environment():
         assert variable in body
     assert "cd /" in body, "it must run from outside the repository"
     for flag in ("--version", "--help", "--selftest-import",
-                 "--selftest-independence", "--selftest-gui"):
+                 "--selftest-independence", "--selftest-gui",
+                 "--selftest-coreaudio"):
         assert flag in body
 
 
@@ -174,9 +201,10 @@ def test_the_entry_point_supports_the_checks_the_scripts_run():
     tree = ast.parse(source)
     names = {node.name for node in ast.walk(tree)
              if isinstance(node, ast.FunctionDef)}
-    assert {"_selftest_independence", "_selftest_gui"} <= names
+    assert {"_selftest_independence", "_selftest_gui",
+            "_selftest_coreaudio"} <= names
     for flag in ("--selftest-import", "--selftest-independence",
-                 "--selftest-gui"):
+                 "--selftest-gui", "--selftest-coreaudio"):
         assert flag in source
 
 

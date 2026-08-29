@@ -176,6 +176,27 @@ def _selftest_independence(verbose: bool = True) -> int:
     return 0
 
 
+def _selftest_coreaudio() -> int:
+    """Exercise the real CoreAudio ABI from inside the shipped bundle.
+
+    This is the strongest honest check available without hardware: it proves
+    the frameworks load and the property selectors and struct layout are
+    correct on this machine, from the frozen app rather than from a source
+    checkout. It proves nothing about audio flowing - a hosted runner has no
+    audio hardware at all - and says so.
+    """
+    from babelfishr.audio import coreaudio
+
+    report = coreaudio.probe()
+    print(coreaudio.format_probe(report))
+    if not report["ok"]:
+        return 1
+    if sys.platform == "darwin" and not report["frameworks_loaded"]:
+        print("FAIL: running on macOS but CoreAudio did not load")
+        return 1
+    return 0
+
+
 def _selftest_gui() -> int:
     """Construct and show the real main window, headless."""
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -226,6 +247,9 @@ def main(argv=None) -> int:
 
     if argv == ["--selftest-independence"]:
         return _selftest_independence()
+
+    if argv == ["--selftest-coreaudio"]:
+        return _selftest_coreaudio()
 
     if argv == ["--selftest-gui"]:
         return _selftest_gui()

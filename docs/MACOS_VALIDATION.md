@@ -105,7 +105,6 @@ With the interface connected:
 Select your interface, then:
 
 - [ ] The status line reads `INPUT: <your interface> — CONNECTED`.
-- [ ] "Lock input to this device" is already ticked.
 - [ ] Speaking into the radio moves the level meter beside that line.
 
 Then, one at a time:
@@ -128,6 +127,19 @@ Then, one at a time:
       times appear in `~/Library/Application Support/BabelFishR/Logs/`.
 - [ ] Confirm from the recordings that nothing captured during the disconnected
       period came from the MacBook microphone.
+
+If you have **two of the same interface**, do this as well — it is the case
+the application most recently had wrong:
+
+- [ ] With only one connected, select it and confirm CONNECTED.
+- [ ] Connect the second one. If your Macs reports a CoreAudio UID for each
+      (check with `babelfishr input`, which prints `identified by`), they stay
+      distinguishable and the right one remains selected.
+- [ ] If it reports `composite` instead, the status line must change to
+      `CANNOT IDENTIFY`, both candidates must be named, and Start must refuse.
+      It must **not** silently switch to the other interface.
+- [ ] Put the radio on one of them, monitor, and confirm from the audio that
+      you are hearing the radio and not the other interface.
 
 Then check the command line agrees with the window:
 
@@ -259,6 +271,8 @@ glossary helps a lot with callsigns and place names.
 - [ ] `babelfishr doctor` reports no problems
 - [ ] Every box in section 3a is ticked, including the disconnect and replug
 - [ ] `babelfishr input` names the interface and says how it identified it
+- [ ] With two identical interfaces connected, BabelFishR refuses rather than
+      choosing one
 - [ ] The test recording sounds correct when played back
 - [ ] The segmentation test yields exactly three transmissions
 - [ ] Pre-roll preserves the first word

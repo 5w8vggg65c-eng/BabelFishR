@@ -50,6 +50,20 @@ else
 fi
 
 echo
+echo "== CoreAudio, from inside the bundle =="
+# The only place in this project where the real CoreAudio ABI is exercised.
+# It proves the frameworks load and the property selectors and struct layout
+# are right on this machine. It does NOT prove audio capture works: a hosted
+# runner has no audio hardware, so zero devices is the expected result there.
+if OUTPUT=$(run_isolated --selftest-coreaudio 2>&1); then
+  echo "$OUTPUT"
+  pass "CoreAudio ABI check"
+else
+  echo "$OUTPUT"
+  fail "the bundled app could not use CoreAudio"
+fi
+
+echo
 echo "== main window construction (offscreen) =="
 if OUTPUT=$(run_isolated --selftest-gui 2>&1); then
   pass "$(echo "$OUTPUT" | tail -n 1)"

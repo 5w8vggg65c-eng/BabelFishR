@@ -139,3 +139,82 @@ def test_a_coreaudio_row_is_ignored_when_the_channel_count_disagrees(
     device = devices_module.list_input_devices()[0]
     assert device.uid == "uid-right" and device.transport == "usb"
     assert device.is_builtin is False
+
+
+# ---- the probe ---------------------------------------------------------
+def test_the_probe_is_honest_about_not_being_applicable_off_macos():
+    report = coreaudio.probe()
+    if coreaudio.available():
+        pytest.skip("this host has CoreAudio; covered by the macOS test below")
+    assert report["applicable"] is False
+    assert report["ok"] is True, (
+        "not being on a Mac is not a failure of this code")
+    assert report["device_count"] == 0
+    assert "not macOS" in report["device_list_query"]
+
+
+def test_the_probe_reports_a_framework_that_will_not_load(monkeypatch):
+    monkeypatch.setattr("sys.platform", "darwin")
+    monkeypatch.setattr(coreaudio, "_libraries", lambda: None)
+    report = coreaudio.probe()
+    assert report["ok"] is False
+    assert report["frameworks_loaded"] is False
+    assert "could not be loaded" in report["errors"][0]
+
+
+def test_the_probe_fails_when_the_property_selector_is_wrong(monkeypatch):
+    """A non-zero OSStatus means the selector or the struct layout is wrong."""
+    monkeypatch.setattr("sys.platform", "darwin")
+    monkeypatch.setattr(coreaudio, "_libraries", lambda: (object(), object()))
+    monkeypatch.setattr(coreaudio, "_property_size", lambda *args: None)
+    report = coreaudio.probe()
+    assert report["ok"] is False
+    assert "failed" in report["device_list_query"]
+    assert "AudioObjectGetPropertyDataSize" in report["errors"][0]
+
+
+def test_the_probe_rejects_an_incoherent_device(monkeypatch):
+    """Bad struct reading would silently corrupt device identification."""
+    monkeypatch.setattr("sys.platform", "darwin")
+    monkeypatch.setattr(coreaudio, "_libraries", lambda: (object(), object()))
+    monkeypatch.setattr(coreaudio, "_property_size", lambda *args: 8)
+    monkeypatch.setattr(coreaudio, "list_input_devices", lambda: [
+        coreaudio.CoreAudioDevice("uid", "", 2, "usb")])
+    report = coreaudio.probe()
+    assert report["ok"] is False
+    assert "has no name" in report["errors"][0]
+
+
+def test_the_formatted_probe_never_implies_hardware_was_tested(monkeypatch):
+    monkeypatch.setattr(coreaudio, "probe", lambda: {
+        "platform": "darwin", "applicable": True, "frameworks_loaded": True,
+        "device_list_query": "ok", "object_count": 0, "device_count": 0,
+        "devices": [], "errors": [], "ok": True})
+    text = coreaudio.format_probe()
+    assert "no audio hardware" in text
+    assert "not evidence that audio capture works" in text
+
+
+@pytest.mark.skipif(not coreaudio.available(),
+                    reason="needs a real macOS host with CoreAudio")
+def test_the_real_coreaudio_abi_works_on_this_machine():
+    """Runs on the macOS build runner, and on any developer's Mac.
+
+    This is the only test in the project that touches the real CoreAudio ABI.
+    It proves the frameworks load and the selectors and property-address layout
+    are right. It deliberately does NOT require any device to exist: a hosted
+    runner has no audio hardware, and asserting otherwise would turn an honest
+    'nothing is plugged in' into a red build.
+    """
+    report = coreaudio.probe()
+    assert report["applicable"] is True
+    assert report["frameworks_loaded"] is True, coreaudio.format_probe(report)
+    assert report["device_list_query"] == "ok", coreaudio.format_probe(report)
+    assert report["errors"] == [], coreaudio.format_probe(report)
+    assert report["ok"] is True
+
+    # Whatever devices do exist must be coherent enough to identify.
+    for device in coreaudio.list_input_devices():
+        assert device.name
+        assert device.input_channels > 0
+        assert device.transport

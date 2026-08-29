@@ -107,8 +107,14 @@ radio traffic while it is actually recording the surrounding room.*
   `RADIO INPUT DISCONNECTED`. Recording of transmissions already captured is
   unaffected. BabelFishR waits for *that same device* and resumes when it
   returns. Both times are logged.
-- **"Lock input to this device"** is on by default for anything that is not the
-  MacBook's own microphone.
+- **If two connected inputs cannot be told apart**, BabelFishR refuses to
+  start and says so. Two of the same USB interface, with no unique identifier
+  between them, look identical in every property macOS exposes — but only one
+  of them may have your radio on it. The line reads `CANNOT IDENTIFY`, both
+  candidates are named, and you unplug the one you do not want. It does not
+  pick one.
+- **Every input you choose is pinned to that device.** There is no lock
+  setting to forget to switch on.
 - **A radio profile can remember its own input**, so selecting the profile
   selects the right interface — or says which one is missing.
 - **"Use the macOS system default input"** exists as its own clearly labelled
@@ -149,8 +155,10 @@ This distinction matters more than any feature list.
   an external interface; a choice that survives a restart; a device that comes
   back on a different index still being recognised; a *different* device that
   inherits the old index being refused; no fallback to the microphone or the
-  system default when the chosen device is missing; and the input controls
-  freezing for the duration of a watch. These use a simulated device list.
+  system default when the chosen device is missing; a refusal to choose
+  between two indistinguishable interfaces at start, after a restart, on
+  profile restoration and on reconnect; and the input controls freezing for
+  the duration of a watch. These use a simulated device list.
 - The Qt UI, headless, in both light and dark appearance.
 - DSD-neo integration driven against a stub binary reproducing its interface.
 
