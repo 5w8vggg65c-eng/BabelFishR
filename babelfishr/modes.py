@@ -1,0 +1,197 @@
+"""Operating modes and the application's asset locations.
+
+Three modes, because "offline" has to mean something enforceable rather than
+aspirational:
+
+* **Field Offline** - the operator has pulled the network. Cloud providers may
+  not be constructed, mock output is forbidden, and nothing may download. ASR
+  loads from a verified local directory with local-files-only semantics.
+  If transcription or translation is unavailable, recording continues and the
+  failure is displayed honestly; there is never a silent fallback.
+* **Online / Setup** - preparation. Downloads permitted, cloud engines
+  permitted when the operator explicitly selects them.
+* **Record Only** - deliberately capture-and-store, no processing at all. The
+  mode to choose when readiness fails but traffic still has to be preserved.
+
+The rule that matters: nothing leaves the Mac merely because a local engine is
+missing. A missing local model produces an honest failure, never a cloud call.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import enum
+import os
+import pathlib
+import platform
+import shutil
+from typing import Dict, List, Optional
+
+APP_NAME = "BabelFishR"
+
+
+class OperatingMode(str, enum.Enum):
+    FIELD_OFFLINE = "field-offline"
+    ONLINE_SETUP = "online-setup"
+    RECORD_ONLY = "record-only"
+
+    @property
+    def label(self) -> str:
+        return {
+            OperatingMode.FIELD_OFFLINE: "FIELD OFFLINE",
+            OperatingMode.ONLINE_SETUP: "ONLINE / SETUP",
+            OperatingMode.RECORD_ONLY: "RECORD ONLY",
+        }[self]
+
+    @property
+    def allows_cloud(self) -> bool:
+        """Only Online/Setup may even construct a cloud provider."""
+        return self is OperatingMode.ONLINE_SETUP
+
+    @property
+    def allows_mock(self) -> bool:
+        """Mock output is development scaffolding, never field output."""
+        return self is OperatingMode.ONLINE_SETUP
+
+    @property
+    def allows_downloads(self) -> bool:
+        return self is OperatingMode.ONLINE_SETUP
+
+    @property
+    def runs_processing(self) -> bool:
+        return self is not OperatingMode.RECORD_ONLY
+
+    def describe(self) -> str:
+        return {
+            OperatingMode.FIELD_OFFLINE:
+                "Local processing only. No network access, no cloud providers, "
+                "no downloads, no placeholder output.",
+            OperatingMode.ONLINE_SETUP:
+                "Preparation mode. Downloads and explicitly selected cloud "
+                "providers are permitted.",
+            OperatingMode.RECORD_ONLY:
+                "Capture and store only. No transcription or translation is "
+                "attempted; recordings are preserved for later processing.",
+        }[self]
+
+
+class OfflineViolation(RuntimeError):
+    """Raised when something would breach the guarantees of Field Offline.
+
+    Deliberately an exception rather than a silent downgrade: the operator has
+    to be able to trust that Field Offline means what it says.
+    """
+
+
+@dataclasses.dataclass
+class AppPaths:
+    """Where field assets live.
+
+    On macOS these sit under Application Support, not a cache directory: a
+    cache is something the OS may delete, and losing a 1.5 GB model in the
+    field because the disk got tight is not acceptable. Upgrades must not touch
+    any of these.
+    """
+
+    root: pathlib.Path
+    models: pathlib.Path
+    language_packs: pathlib.Path
+    recordings: pathlib.Path
+    database: pathlib.Path
+    logs: pathlib.Path
+    settings: pathlib.Path
+
+    @classmethod
+    def resolve(cls, override: Optional[str] = None) -> "AppPaths":
+        if override:
+            root = pathlib.Path(override).expanduser()
+        elif os.environ.get("BABELFISHR_HOME"):
+            root = pathlib.Path(os.environ["BABELFISHR_HOME"]).expanduser()
+        elif platform.system() == "Darwin":
+            root = pathlib.Path.home() / "Library" / "Application Support" / APP_NAME
+        else:
+            base = os.environ.get("XDG_DATA_HOME")
+            root = (pathlib.Path(base).expanduser() if base
+                    else pathlib.Path.home() / ".local" / "share") / APP_NAME
+        return cls(
+            root=root,
+            models=root / "models",
+            language_packs=root / "language-packs",
+            recordings=root / "Recordings",
+            database=root / "babelfishr.sqlite3",
+            logs=root / "Logs",
+            settings=root / "settings.toml",
+        )
+
+    def ensure(self) -> "AppPaths":
+        for directory in (self.root, self.models, self.language_packs,
+                          self.recordings, self.logs):
+            directory.mkdir(parents=True, exist_ok=True)
+        return self
+
+    def free_bytes(self) -> int:
+        target = self.root if self.root.exists() else self.root.parent
+        try:
+            return shutil.disk_usage(target).free
+        except OSError:
+            return 0
+
+    def writable(self) -> bool:
+        try:
+            self.recordings.mkdir(parents=True, exist_ok=True)
+            probe = self.recordings / ".babelfishr-write-test"
+            probe.write_bytes(b"ok")
+            probe.unlink()
+            return True
+        except OSError:
+            return False
+
+    def to_dict(self) -> Dict[str, str]:
+        return {k: str(v) for k, v in dataclasses.asdict(self).items()}
+
+
+def guard_download(mode: OperatingMode, what: str) -> None:
+    """Refuse a download unless the mode permits one."""
+    if not mode.allows_downloads:
+        raise OfflineViolation(
+            f"{mode.label} forbids downloads, and {what} would need one. "
+            f"Run 'babelfishr prepare-field' with a network connection first.")
+
+
+def guard_cloud(mode: OperatingMode, engine_name: str) -> None:
+    if not mode.allows_cloud:
+        raise OfflineViolation(
+            f"{mode.label} forbids cloud providers; {engine_name} would send "
+            f"data off this computer. Nothing leaves the machine in this mode, "
+            f"even when the local engine is missing.")
+
+
+def guard_mock(mode: OperatingMode, engine_name: str) -> None:
+    if not mode.allows_mock:
+        raise OfflineViolation(
+            f"{mode.label} forbids placeholder output, and {engine_name} "
+            f"produces placeholder text rather than a real result.")
+
+
+def offline_environment() -> Dict[str, str]:
+    """Environment variables that force offline behaviour in ML libraries.
+
+    Belt and braces alongside the explicit local-files-only loading options:
+    these are the switches huggingface_hub and transformers honour, and setting
+    them means a library that ignores our own flag still cannot reach out.
+    """
+    return {
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "HF_DATASETS_OFFLINE": "1",
+        "NO_PROXY": "*",
+    }
+
+
+def apply_offline_environment() -> List[str]:
+    """Set the offline variables in this process. Returns the names set."""
+    applied = []
+    for key, value in offline_environment().items():
+        os.environ[key] = value
+        applied.append(key)
+    return applied

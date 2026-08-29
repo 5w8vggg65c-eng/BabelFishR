@@ -89,6 +89,185 @@ class ContentClass(str, enum.Enum):
     UNKNOWN = "unknown"
 
 
+class Provenance(str, enum.Enum):
+    """Where a metadata value came from.
+
+    Recorded per field, because presenting an operator-typed frequency as a
+    measured one would be a lie the operator might later act on.
+    """
+
+    OPERATOR = "operator-entered"
+    PROFILE = "radio-profile-default"
+    RADIO = "radio-reported"
+    SDR = "sdr-measured"
+    INFERRED = "software-inferred"
+    DSD = "dsd-decoded"
+    UNKNOWN = "unknown"
+
+    @property
+    def is_measured(self) -> bool:
+        return self in (Provenance.SDR, Provenance.RADIO)
+
+    @property
+    def label(self) -> str:
+        return {
+            Provenance.OPERATOR: "entered by operator",
+            Provenance.PROFILE: "from radio profile",
+            Provenance.RADIO: "reported by radio",
+            Provenance.SDR: "measured by SDR",
+            Provenance.INFERRED: "inferred by software",
+            Provenance.DSD: "decoded by DSD-neo",
+            Provenance.UNKNOWN: "unknown origin",
+        }[self]
+
+
+class AnalysisOutcome(str, enum.Enum):
+    """Result taxonomy for a digital-analysis attempt.
+
+    Deliberately fine-grained: "we could not get a decode out of this input" is
+    a very different statement from "this is encrypted", and both are different
+    from "the analysis tool failed to run".
+    """
+
+    SUSPECTED_DIGITAL = "suspected-digital"
+    PROTOCOL_CANDIDATE = "protocol-candidate"
+    PROTOCOL_IDENTIFIED = "protocol-identified"
+    VOICE_DECODED = "voice-decoded"
+    METADATA_ONLY = "metadata-only"
+    ENCRYPTED_OR_UNSUPPORTED = "encrypted-or-unsupported"
+    INSUFFICIENT_INPUT = "insufficient-input-quality"
+    ANALYSIS_FAILED = "analysis-failed"
+    NO_RESULT = "no-result"
+
+    @property
+    def label(self) -> str:
+        return {
+            AnalysisOutcome.SUSPECTED_DIGITAL: "suspected digital",
+            AnalysisOutcome.PROTOCOL_CANDIDATE: "protocol candidate",
+            AnalysisOutcome.PROTOCOL_IDENTIFIED: "protocol identified",
+            AnalysisOutcome.VOICE_DECODED: "voice decoded",
+            AnalysisOutcome.METADATA_ONLY: "metadata only",
+            AnalysisOutcome.ENCRYPTED_OR_UNSUPPORTED: "encrypted or unsupported",
+            AnalysisOutcome.INSUFFICIENT_INPUT: "insufficient input quality",
+            AnalysisOutcome.ANALYSIS_FAILED: "analysis failed",
+            AnalysisOutcome.NO_RESULT: "no usable decode from this input",
+        }[self]
+
+    @property
+    def is_success(self) -> bool:
+        return self in (AnalysisOutcome.PROTOCOL_IDENTIFIED,
+                        AnalysisOutcome.VOICE_DECODED,
+                        AnalysisOutcome.METADATA_ONLY)
+
+
+@dataclasses.dataclass
+class MetadataField:
+    """A value plus where it came from."""
+
+    value: Any = None
+    provenance: Provenance = Provenance.UNKNOWN
+
+    @property
+    def measured(self) -> bool:
+        return self.value is not None and self.provenance.is_measured
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"value": self.value, "provenance": self.provenance.value,
+                "measured": self.measured}
+
+    @classmethod
+    def from_dict(cls, d: Any) -> "MetadataField":
+        if not isinstance(d, dict):
+            return cls(value=d, provenance=Provenance.UNKNOWN)
+        return cls(value=d.get("value"),
+                   provenance=Provenance(d.get("provenance", "unknown")))
+
+
+@dataclasses.dataclass
+class AnalysisArtifact:
+    """A file produced by an analysis run."""
+
+    kind: str
+    """``decoded-audio``, ``derived-input``, ``log`` or ``metadata``."""
+
+    path: str
+    description: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass
+class AnalysisAttempt:
+    """One run of an external analysis engine over one recording.
+
+    First class rather than free text, because reruns, protocol-specific
+    retries and honest failure reporting all need structure.
+    """
+
+    id: str = dataclasses.field(default_factory=lambda: new_id("an_"))
+    transmission_id: str = ""
+    engine: str = ""
+    engine_version: str = ""
+    started_at: _dt.datetime = dataclasses.field(default_factory=utcnow)
+    finished_at: Optional[_dt.datetime] = None
+    runtime_seconds: float = 0.0
+
+    input_path: str = ""
+    """The artifact analysed - the original, or a derived copy."""
+
+    input_is_derived: bool = False
+    command: List[str] = dataclasses.field(default_factory=list)
+    options: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    requested_protocol: str = ""
+
+    outcome: AnalysisOutcome = AnalysisOutcome.NO_RESULT
+    protocol: str = ""
+    confidence: float = 0.0
+    metadata: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    artifacts: List[AnalysisArtifact] = dataclasses.field(default_factory=list)
+
+    exit_status: Optional[int] = None
+    stdout: str = ""
+    stderr: str = ""
+    error: str = ""
+    attempt_number: int = 1
+
+    @property
+    def decoded_audio(self) -> Optional[str]:
+        for artifact in self.artifacts:
+            if artifact.kind == "decoded-audio":
+                return artifact.path
+        return None
+
+    def summary(self) -> str:
+        text = self.outcome.label
+        if self.protocol:
+            text = f"{self.protocol}: {text}"
+        return text
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = dataclasses.asdict(self)
+        d["started_at"] = iso(self.started_at)
+        d["finished_at"] = iso(self.finished_at)
+        d["outcome"] = self.outcome.value
+        d["summary"] = self.summary()
+        return d
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "AnalysisAttempt":
+        d = dict(d)
+        d.pop("summary", None)
+        d["started_at"] = parse_iso(d.get("started_at")) or utcnow()
+        d["finished_at"] = parse_iso(d.get("finished_at"))
+        if d.get("outcome"):
+            d["outcome"] = AnalysisOutcome(d["outcome"])
+        d["artifacts"] = [AnalysisArtifact(**a) if isinstance(a, dict) else a
+                          for a in d.get("artifacts") or []]
+        known = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in known})
+
+
 class SourceLanguageMode(str, enum.Enum):
     AUTOMATIC = "automatic"
     SPECIFIED = "specified"
@@ -273,6 +452,21 @@ class Transmission:
     channel_name: str = ""
     frequency_mhz: Optional[float] = None
 
+    frequency_provenance: Provenance = Provenance.UNKNOWN
+    """Where ``frequency_mhz`` came from. Never silently "measured"."""
+
+    channel_provenance: Provenance = Provenance.UNKNOWN
+    rssi_dbm: Optional[float] = None
+    """Only ever set by a source that genuinely measures it (an SDR)."""
+
+    rssi_provenance: Provenance = Provenance.UNKNOWN
+    modulation: str = ""
+    modulation_provenance: Provenance = Provenance.UNKNOWN
+
+    # -- digital analysis ----------------------------------------------
+    analysis_attempts: List[AnalysisAttempt] = dataclasses.field(
+        default_factory=list)
+
     # -- language ------------------------------------------------------
     source_language_mode: SourceLanguageMode = SourceLanguageMode.AUTOMATIC
     source_language: Optional[str] = None
@@ -327,6 +521,23 @@ class Transmission:
         return bool(self.transcript_correction or self.translation_correction)
 
     @property
+    def frequency_is_measured(self) -> bool:
+        """True only when something actually measured it. Never for typed values."""
+        return (self.frequency_mhz is not None
+                and self.frequency_provenance.is_measured)
+
+    @property
+    def latest_analysis(self) -> Optional[AnalysisAttempt]:
+        return self.analysis_attempts[-1] if self.analysis_attempts else None
+
+    @property
+    def decoded_audio_path(self) -> Optional[str]:
+        for attempt in reversed(self.analysis_attempts):
+            if attempt.decoded_audio:
+                return attempt.decoded_audio
+        return None
+
+    @property
     def can_transcribe_anyway(self) -> bool:
         """True when the operator may force ASR on a skipped recording."""
         return bool(self.audio_path) and not self.transcript
@@ -370,6 +581,11 @@ class Transmission:
         d["state"] = self.state.value
         d["content_class"] = self.content_class.value
         d["source_language_mode"] = self.source_language_mode.value
+        for field in ("frequency_provenance", "channel_provenance",
+                      "rssi_provenance", "modulation_provenance"):
+            d[field] = getattr(self, field).value
+        d["analysis_attempts"] = [a.to_dict() for a in self.analysis_attempts]
+        d["frequency_is_measured"] = self.frequency_is_measured
         d["error"] = self.error.to_dict() if self.error else None
         d["display_transcript"] = self.display_transcript
         d["display_translation"] = self.display_translation
@@ -391,6 +607,14 @@ class Transmission:
             d["state"] = ProcessingState(d["state"])
         if d.get("content_class"):
             d["content_class"] = ContentClass(d["content_class"])
+        for field in ("frequency_provenance", "channel_provenance",
+                      "rssi_provenance", "modulation_provenance"):
+            if d.get(field):
+                d[field] = Provenance(d[field])
+        d["analysis_attempts"] = [
+            AnalysisAttempt.from_dict(a) if isinstance(a, dict) else a
+            for a in d.get("analysis_attempts") or []]
+        d.pop("frequency_is_measured", None)
         if d.get("source_language_mode"):
             d["source_language_mode"] = SourceLanguageMode(d["source_language_mode"])
         if d.get("error"):

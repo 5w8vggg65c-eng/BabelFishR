@@ -29,6 +29,7 @@ log = logging.getLogger(__name__)
 class EngineSummary:
     """What the UI must show the operator before a session starts."""
 
+    mode: Any = None
     transcription: str = "none"
     translation: str = "none"
     transcription_placeholder: bool = False
@@ -77,9 +78,35 @@ class BabelFishRApp:
             pathlib.Path.home() / ".config" / "babelfishr" / "glossary.json")
         return self.glossary.save(path)
 
+    @property
+    def mode(self):
+        return self.config.operating_mode()
+
+    def set_mode(self, mode) -> None:
+        """Switch operating mode. Engines are re-resolved under the new rules."""
+        from .modes import OperatingMode
+
+        self.config.mode = OperatingMode(mode).value
+        self.transcription = None
+        self.translation = None
+
     def select_engines(self, strict: bool = False) -> EngineSummary:
         """Resolve the engines and report exactly what the operator is getting."""
+        from .modes import OperatingMode
+
         summary = EngineSummary()
+        summary.mode = self.mode
+
+        if self.mode is OperatingMode.RECORD_ONLY:
+            self.transcription = None
+            self.translation = None
+            summary.transcription = "disabled (Record Only)"
+            summary.translation = "disabled (Record Only)"
+            summary.warnings.append(
+                "Record Only mode: transmissions are recorded and stored, but "
+                "not transcribed or translated. Recordings can be processed "
+                "later once a local model is prepared.")
+            return summary
 
         try:
             self.transcription = build_transcription_engine(self.config)
@@ -267,6 +294,48 @@ class BabelFishRApp:
         if self.pipeline is None:
             return False
         return self.pipeline.force_transcribe(tx_id)
+
+    # -- digital analysis ------------------------------------------------
+    def analyser(self):
+        """The configured DSD-neo analyser, or None when unavailable."""
+        from .analysis import DsdNeoAnalyser
+
+        engine = DsdNeoAnalyser.from_config(self.config)
+        return engine if engine.available() else None
+
+    def analyze_digital(self, tx_id: str, protocol: str = "",
+                        timeout: Optional[float] = None):
+        """Run digital analysis over a recording. Returns the attempt, or None.
+
+        Never raises on a missing tool or a failed decode: the outcome is
+        recorded on the transmission and the recording is untouched.
+        """
+        from .analysis.base import AnalysisRequest
+        from .analysis.dsd import DsdNeoAnalyser
+
+        tx = self.store.get_transmission(tx_id)
+        if tx is None:
+            return None
+        engine = DsdNeoAnalyser.from_config(self.config)
+        attempt = engine.analyse(AnalysisRequest(
+            transmission=tx, protocol=protocol,
+            timeout=timeout or self.config.analysis.timeout))
+        tx.analysis_attempts.append(attempt)
+        self.store.save_transmission(tx)
+        self.events.publish("updated", tx)
+        return attempt
+
+    def signal_metadata(self):
+        """Measured RF metadata, when a signal source is supplying it."""
+        source = getattr(self, "_signal_source", None)
+        return source.metadata() if source is not None else None
+
+    def readiness(self, run_smoke_tests: bool = True):
+        """Run Field Check against the current configuration."""
+        from .readiness import field_check
+
+        return field_check(self.config, run_smoke_tests=run_smoke_tests,
+                           mode=self.mode)
 
     def correct(self, tx_id: str, transcript: Optional[str] = None,
                 translation: Optional[str] = None,

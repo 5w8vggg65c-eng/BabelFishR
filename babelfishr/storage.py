@@ -24,7 +24,7 @@ from .models import (ContentClass, ErrorInfo, ProcessingState, RadioProfile,
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -84,6 +84,13 @@ CREATE TABLE IF NOT EXISTS transmissions (
     profile_label               TEXT DEFAULT '',
     channel_name                TEXT DEFAULT '',
     frequency_mhz               REAL,
+    frequency_provenance        TEXT DEFAULT 'unknown',
+    channel_provenance          TEXT DEFAULT 'unknown',
+    rssi_dbm                    REAL,
+    rssi_provenance             TEXT DEFAULT 'unknown',
+    modulation                  TEXT DEFAULT '',
+    modulation_provenance       TEXT DEFAULT 'unknown',
+    analysis_attempts           TEXT DEFAULT '[]',
     source_language_mode        TEXT DEFAULT 'automatic',
     source_language             TEXT,
     language_confidence         REAL,
@@ -120,7 +127,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS transmissions_fts USING fts5 (
 );
 """
 
-_JSON_FIELDS = ("transcript_segments", "tags")
+_JSON_FIELDS = ("transcript_segments", "tags", "analysis_attempts")
 _BOOL_FIELDS = ("clipped", "bookmarked", "reviewed", "auto_processed")
 
 
@@ -467,11 +474,13 @@ def _fts_query(query: str) -> str:
 
 def _to_row(tx: Transmission) -> Dict[str, Any]:
     d = tx.to_dict()
-    for derived in ("display_transcript", "display_translation", "needs_review"):
+    for derived in ("display_transcript", "display_translation", "needs_review",
+                    "frequency_is_measured"):
         d.pop(derived, None)
     d["transcript_segments"] = json.dumps(
         [s if isinstance(s, dict) else s.to_dict() for s in d["transcript_segments"]])
     d["tags"] = json.dumps(d["tags"])
+    d["analysis_attempts"] = json.dumps(d.get("analysis_attempts") or [])
     d["error"] = json.dumps(d["error"]) if d["error"] else None
     for field in _BOOL_FIELDS:
         d[field] = 1 if d[field] else 0

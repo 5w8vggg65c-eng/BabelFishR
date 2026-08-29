@@ -20,6 +20,18 @@ from .glossary import protect_terms, restore_terms
 
 log = logging.getLogger(__name__)
 
+#: Short phrases used to prove a translation path really runs.
+_SMOKE_PHRASES = {
+    "es": "el equipo esta en posicion",
+    "de": "das team ist in position",
+    "fr": "l equipe est en position",
+    "en": "the team is in position",
+    "it": "la squadra e in posizione",
+    "pt": "a equipe esta em posicao",
+    "uk": "команда на позиції",
+    "ru": "команда на позиции",
+}
+
 
 class ArgosTranslateEngine(TranslationEngine):
     """Local neural MT. Requires the language pair to be installed."""
@@ -28,24 +40,71 @@ class ArgosTranslateEngine(TranslationEngine):
     name = "Argos Translate (local)"
     privacy = PrivacyProfile()  # local
 
-    def __init__(self, auto_install: bool = False):
+    def __init__(self, auto_install: bool = False,
+                 target_language: Optional[str] = None,
+                 package_dir: Optional[str] = None):
         self.auto_install = auto_install
+        #: The session's target language, so availability can mean "can
+        #: actually translate into the language the operator asked for".
+        self.target_language = target_language
+        self.package_dir = package_dir
         self.version = "argos"
         self._checked_pairs: Dict[Tuple[str, str], bool] = {}
 
-    def available(self) -> bool:
+    def library_installed(self) -> bool:
         try:
             import argostranslate.translate  # noqa: F401
         except Exception:  # noqa: BLE001
             return False
         return True
 
+    def available(self) -> bool:
+        """Installed AND holding at least one usable language pair.
+
+        Reporting availability from a successful import is what allowed a
+        field install with no language packs to look ready and then fail on
+        the first transmission.
+        """
+        if not self.library_installed():
+            return False
+        pairs = self.installed_pairs()
+        if not pairs:
+            return False
+        if self.target_language:
+            return any(target == self.target_language for _, target in pairs)
+        return True
+
     def unavailable_reason(self) -> str:
         if self.available():
             return ""
-        return ("Argos Translate is not installed. Install the translate extra:\n"
-                "    pip install 'babelfishr[translate]'\n"
-                "Then install language pairs with 'babelfishr languages --install es en'.")
+        if not self.library_installed():
+            return ("Argos Translate is not installed. Install the translate "
+                    "extra:\n    pip install 'babelfishr[translate]'")
+        pairs = self.installed_pairs()
+        if not pairs:
+            return ("Argos Translate is installed but no language packages are. "
+                    "Install one with a network connection:\n"
+                    "    babelfishr languages install es en")
+        return (f"No installed Argos package translates into "
+                f"{self.target_language!r}. Installed paths: "
+                f"{', '.join(f'{a}->{b}' for a, b in sorted(pairs))}\n"
+                f"    babelfishr languages install <source> "
+                f"{self.target_language}")
+
+    def readiness(self) -> Dict[str, object]:
+        """Structured view for Field Check."""
+        return {
+            "library_installed": self.library_installed(),
+            "pairs": sorted(self.installed_pairs()),
+            "target_language": self.target_language,
+            "available": self.available(),
+            "reason": self.unavailable_reason(),
+        }
+
+    def smoke_test(self, source: str, target: str) -> "TranslationResult":
+        """Actually translate a fixed phrase, to prove the path works."""
+        return self.translate(_SMOKE_PHRASES.get(source, "hello"), target,
+                              source_language=source)
 
     # -- pair management -------------------------------------------------
     def installed_pairs(self) -> List[Tuple[str, str]]:

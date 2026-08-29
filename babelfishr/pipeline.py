@@ -41,8 +41,8 @@ from .audio.source import AudioBlock, AudioSource
 from .audio.wavefile import write_wav
 from .config import Config
 from .detect import DetectedTransmission, RadioActivityDetector
-from .models import (ContentClass, ProcessingState, RadioProfile, Session,
-                     SourceLanguageMode, Transmission, utcnow)
+from .models import (ContentClass, ProcessingState, Provenance, RadioProfile,
+                     Session, SourceLanguageMode, Transmission, utcnow)
 from .providers import (EngineError, EngineUnavailable, Glossary,
                         TranscriptionEngine, TranslationEngine)
 from .storage import Store
@@ -544,6 +544,14 @@ class CaptureService:
             profile_label=self.session.profile_label,
             channel_name=(self.profile.channel_name if self.profile else ""),
             frequency_mhz=(self.profile.frequency_mhz if self.profile else None),
+            # Profile values are operator-declared labels. Marking them as such
+            # is what stops a typed frequency being read later as a measurement.
+            frequency_provenance=(Provenance.PROFILE if self.profile
+                                  and self.profile.frequency_mhz is not None
+                                  else Provenance.UNKNOWN),
+            channel_provenance=(Provenance.PROFILE if self.profile
+                                and self.profile.channel_name
+                                else Provenance.UNKNOWN),
             source_language_mode=self.session.source_language_mode,
             source_language=self.session.source_language,
             target_language=self.session.target_language,
@@ -551,6 +559,7 @@ class CaptureService:
             state=ProcessingState.CAPTURED,
         )
         tx.ended_at = detected.ended_at
+        self._apply_measured_metadata(tx)
 
         # --- persistence, before any classification-driven decision ---------
         tx.audio_path = self.recorder.write(tx, self.session, detected.audio,
@@ -571,6 +580,32 @@ class CaptureService:
         self.store.save_transmission(tx)
         self.events.publish("updated", tx)
         return tx
+
+    def _apply_measured_metadata(self, tx: Transmission) -> None:
+        """Overlay genuinely measured values from a signal source, if present.
+
+        Only a source that measures may set these, and it stamps SDR
+        provenance so a measured frequency is never confused with a typed one.
+        """
+        source = self.source
+        if not getattr(source, "measures_rf", False):
+            return
+        try:
+            metadata = source.metadata()
+        except Exception:  # noqa: BLE001 - metadata must never break capture
+            log.debug("signal source metadata failed", exc_info=True)
+            return
+        if metadata is None:
+            return
+        if metadata.frequency_mhz is not None:
+            tx.frequency_mhz = metadata.frequency_mhz
+            tx.frequency_provenance = Provenance.SDR
+        if metadata.rssi_dbm is not None:
+            tx.rssi_dbm = metadata.rssi_dbm
+            tx.rssi_provenance = Provenance.SDR
+        if metadata.modulation:
+            tx.modulation = metadata.modulation
+            tx.modulation_provenance = Provenance.SDR
 
     def _set_state(self, state: str) -> None:
         if state != self.state:

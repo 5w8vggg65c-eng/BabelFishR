@@ -87,6 +87,9 @@ class AsrConfig:
     device: str = "auto"
     compute_type: str = "default"
     beam_size: int = 5
+    model_path: Optional[str] = None
+    """Explicit local model directory; overrides the managed models folder."""
+
     min_confidence: float = 0.0
     """Transcripts below this are still stored, but flagged for review."""
 
@@ -117,6 +120,32 @@ class RecordingConfig:
 
 
 @dataclasses.dataclass
+class AnalysisConfig:
+    """Optional local digital post-processing. Entirely opt-in."""
+
+    dsd_path: str = ""
+    """Path to a dsd-neo executable, or a bare name to find on PATH."""
+
+    dsd_args: List[str] = dataclasses.field(default_factory=list)
+    timeout: float = 120.0
+    auto_analyse_suspected: bool = False
+    """Automatically analyse events classified as suspected digital."""
+
+
+@dataclasses.dataclass
+class SdrConfig:
+    """Optional SDR input. The ordinary audio path is the default."""
+
+    driver: str = ""
+    """``""``/``none`` (default), or ``recorded-iq``. No device drivers bundled."""
+
+    recording_path: str = ""
+    center_frequency_hz: Optional[float] = None
+    tuned_frequency_hz: Optional[float] = None
+    gain_db: Optional[float] = None
+
+
+@dataclasses.dataclass
 class SessionConfig:
     profile_id: Optional[str] = None
     source_language_mode: str = "automatic"
@@ -134,6 +163,14 @@ class Config:
     translate: TranslateConfig = dataclasses.field(default_factory=TranslateConfig)
     recording: RecordingConfig = dataclasses.field(default_factory=RecordingConfig)
     session: SessionConfig = dataclasses.field(default_factory=SessionConfig)
+    analysis: AnalysisConfig = dataclasses.field(default_factory=AnalysisConfig)
+    sdr: SdrConfig = dataclasses.field(default_factory=SdrConfig)
+    mode: str = "online-setup"
+    """``field-offline``, ``online-setup`` or ``record-only``."""
+
+    app_home: Optional[str] = None
+    """Override for the Application Support directory holding field assets."""
+
     database: str = "babelfishr.sqlite3"
     log_level: str = "INFO"
     experimental: bool = False
@@ -158,14 +195,14 @@ class Config:
         sections = {
             "audio": cfg.audio, "detector": cfg.detector, "asr": cfg.asr,
             "translate": cfg.translate, "recording": cfg.recording,
-            "session": cfg.session,
+            "session": cfg.session, "analysis": cfg.analysis, "sdr": cfg.sdr,
         }
         for name, obj in sections.items():
             values = dict(data.get(name) or {})
             if name == "audio" and "safety_recording" in values:
                 _update(cfg.audio.safety_recording, values.pop("safety_recording"))
             _update(obj, values)
-        for key in ("database", "log_level", "experimental"):
+        for key in ("database", "log_level", "experimental", "mode", "app_home"):
             if key in data:
                 setattr(cfg, key, data[key])
         return cfg
@@ -181,6 +218,8 @@ class Config:
             "BABELFISHR_RECORDINGS": (self.recording, "directory", str),
             "BABELFISHR_DB": (self, "database", str),
             "BABELFISHR_LOG_LEVEL": (self, "log_level", str),
+            "BABELFISHR_MODE": (self, "mode", str),
+            "BABELFISHR_HOME": (self, "app_home", str),
         }
         for key, (obj, attr, cast) in mapping.items():
             if env.get(key):
@@ -205,6 +244,16 @@ class Config:
 
     def dump_toml(self) -> str:
         return _to_toml(self.to_dict())
+
+    def operating_mode(self):
+        from .modes import OperatingMode
+
+        return OperatingMode(self.mode)
+
+    def paths(self):
+        from .modes import AppPaths
+
+        return AppPaths.resolve(self.app_home)
 
     def recordings_path(self) -> pathlib.Path:
         return pathlib.Path(self.recording.directory).expanduser()

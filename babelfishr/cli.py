@@ -257,6 +257,162 @@ def cmd_doctor(args) -> int:
     return 1 if problems else 0
 
 
+def cmd_field_check(args) -> int:
+    """Prove offline readiness. Downloads nothing."""
+    from .config import Config
+    from .modes import OperatingMode
+    from .readiness import field_check
+
+    config = Config.load(args.config)
+    mode = OperatingMode(args.mode) if args.mode else OperatingMode.FIELD_OFFLINE
+    report = field_check(config, run_smoke_tests=not args.no_smoke_tests, mode=mode)
+    print(report.summary())
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+    if report.field_ready:
+        return 0
+    return 0 if (args.allow_record_only and report.can_record) else 1
+
+
+def cmd_prepare_field(args) -> int:
+    """One-time online setup so the app works with the network unplugged."""
+    from .config import Config
+    from .preparation import prepare_field
+    from .readiness import field_check
+    from .modes import OperatingMode
+
+    config = Config.load(args.config)
+    pairs = []
+    for spec in args.language or []:
+        if "-" in spec or ":" in spec:
+            source, target = spec.replace(":", "-").split("-", 1)
+            pairs.append((source.strip(), target.strip()))
+        else:
+            print(f"ignoring malformed --language {spec!r} (use es-en)",
+                  file=sys.stderr)
+
+    result = prepare_field(config, asr_model=args.asr_model,
+                           language_pairs=pairs, report=print,
+                           skip_download=args.no_download)
+    print()
+    print(result.summary())
+
+    print("\nVerifying with Field Check (as if the network were unplugged)...\n")
+    report = field_check(config, mode=OperatingMode.FIELD_OFFLINE)
+    print(report.summary())
+    return 0 if (result.ok and report.field_ready) else 1
+
+
+def cmd_languages(args) -> int:
+    from .config import Config
+    from .modes import OperatingMode
+    from .preparation import (available_languages, install_language,
+                              installed_languages, remove_language,
+                              translation_paths)
+
+    config = Config.load(args.config)
+    action = args.action or "list"
+
+    if action == "list":
+        installed = installed_languages()
+        if not installed:
+            print("No translation language packs are installed.")
+            print("Install one with a network connection:")
+            print("    babelfishr languages install es en")
+            return 1
+        print(f"{len(installed)} installed language pack(s):\n")
+        for source, target in installed:
+            print(f"  {source} -> {target}")
+        target = config.translate.target_language
+        routes = translation_paths(target)
+        print(f"\nInto your target language ({target}):")
+        print(f"  direct   : {', '.join(routes['direct']) or 'none'}")
+        print(f"  via en   : {', '.join(routes['pivot_via_en']) or 'none'}")
+        if args.available:
+            print("\nAvailable to install (needs the network):")
+            try:
+                for source, dest in available_languages():
+                    print(f"  {source} -> {dest}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"  could not fetch the index: {exc}", file=sys.stderr)
+        return 0
+
+    if action == "install":
+        mode = OperatingMode(config.mode)
+        if not mode.allows_downloads:
+            mode = OperatingMode.ONLINE_SETUP  # installing is an online action
+        try:
+            ok = install_language(args.source, args.target, mode)
+        except Exception as exc:  # noqa: BLE001
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        if not ok:
+            print(f"No published package for {args.source} -> {args.target}.",
+                  file=sys.stderr)
+            return 1
+        print(f"Installed {args.source} -> {args.target}")
+        return 0
+
+    if action == "remove":
+        try:
+            ok = remove_language(args.source, args.target)
+        except Exception as exc:  # noqa: BLE001
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(f"Removed {args.source} -> {args.target}" if ok
+              else f"{args.source} -> {args.target} was not installed")
+        return 0 if ok else 1
+    return 1
+
+
+def cmd_analyze(args) -> int:
+    """Run digital post-processing over a stored recording."""
+    from .app import BabelFishRApp
+    from .config import Config
+    from .storage import Store
+
+    config = Config.load(args.config)
+    app = BabelFishRApp(config=config, store=Store(config.database))
+    attempt = app.analyze_digital(args.transmission, protocol=args.protocol or "")
+    if attempt is None:
+        print(f"No such transmission: {args.transmission}", file=sys.stderr)
+        return 1
+    print(f"engine    : {attempt.engine} {attempt.engine_version}")
+    print(f"input     : {attempt.input_path}"
+          + (" (derived copy)" if attempt.input_is_derived else " (original)"))
+    print(f"command   : {' '.join(attempt.command) or '-'}")
+    print(f"runtime   : {attempt.runtime_seconds:.2f}s  exit={attempt.exit_status}")
+    print(f"outcome   : {attempt.outcome.label}")
+    if attempt.protocol:
+        print(f"protocol  : {attempt.protocol}")
+    if attempt.metadata:
+        print(f"metadata  : {attempt.metadata}")
+    if attempt.decoded_audio:
+        print(f"decoded   : {attempt.decoded_audio}")
+    if attempt.error:
+        print(f"error     : {attempt.error}")
+    print("\nThe original recording is unchanged.")
+    return 0 if attempt.outcome.is_success else 2
+
+
+def cmd_mode(args) -> int:
+    from .config import Config
+    from .modes import OperatingMode
+
+    config = Config.load(args.config)
+    if not args.set:
+        current = config.operating_mode()
+        print(f"{current.label}\n  {current.describe()}")
+        print("\nAvailable modes:")
+        for mode in OperatingMode:
+            print(f"  {mode.value:14s} {mode.label}")
+        return 0
+    config.mode = OperatingMode(args.set).value
+    path = config.save()
+    print(f"Mode set to {config.operating_mode().label} (saved to {path})")
+    return 0
+
+
 def cmd_replay(args) -> int:
     """Run a WAV file through exactly the same pipeline as live audio."""
     from .app import BabelFishRApp
@@ -588,6 +744,45 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("engines", help="show transcription/translation engine status")
     p.set_defaults(func=cmd_engines)
+
+    p = sub.add_parser("field-check",
+                       help="prove offline readiness (downloads nothing)")
+    p.add_argument("--mode", choices=[m.value for m in __import__(
+        "babelfishr.modes", fromlist=["OperatingMode"]).OperatingMode])
+    p.add_argument("--no-smoke-tests", action="store_true",
+                   help="skip actually loading models and running fixtures")
+    p.add_argument("--allow-record-only", action="store_true",
+                   help="exit 0 when recording works even if processing does not")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_field_check)
+
+    p = sub.add_parser("prepare-field",
+                       help="one-time online setup for offline operation")
+    p.add_argument("--asr-model", help="Whisper model to download (e.g. small)")
+    p.add_argument("--language", action="append", metavar="SRC-DST",
+                   help="translation pack to install, e.g. es-en (repeatable)")
+    p.add_argument("--no-download", action="store_true",
+                   help="verify what is already present without downloading")
+    p.set_defaults(func=cmd_prepare_field)
+
+    p = sub.add_parser("languages", help="list, install or remove language packs")
+    p.add_argument("action", nargs="?", choices=("list", "install", "remove"),
+                   default="list")
+    p.add_argument("source", nargs="?", help="source language code")
+    p.add_argument("target", nargs="?", help="target language code")
+    p.add_argument("--available", action="store_true",
+                   help="also list packs available to download")
+    p.set_defaults(func=cmd_languages)
+
+    p = sub.add_parser("analyze", help="run digital post-processing on a recording")
+    p.add_argument("transmission", help="transmission id")
+    p.add_argument("--protocol", help="force a protocol, e.g. DMR")
+    p.set_defaults(func=cmd_analyze)
+
+    p = sub.add_parser("mode", help="show or set the operating mode")
+    p.add_argument("--set", choices=[m.value for m in __import__(
+        "babelfishr.modes", fromlist=["OperatingMode"]).OperatingMode])
+    p.set_defaults(func=cmd_mode)
 
     p = sub.add_parser("replay", help="run a WAV file through the pipeline")
     p.add_argument("path")

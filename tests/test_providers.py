@@ -60,9 +60,17 @@ def test_auto_selection_prefers_real_engines_but_admits_a_mock():
         assert status.is_placeholder
 
 
-def test_explicitly_requesting_a_missing_engine_fails_loudly():
+def test_explicitly_requesting_an_unusable_engine_fails_loudly(tmp_path,
+                                                               monkeypatch):
+    """An explicit request must never silently downgrade to something else."""
+    from babelfishr.modes import OperatingMode
+
+    monkeypatch.setenv("BABELFISHR_HOME", str(tmp_path))
     with pytest.raises(EngineUnavailable):
-        build_transcription_engine(requested="faster-whisper")
+        # No model is present under this empty home, and Field Offline forbids
+        # fetching one, so the request must fail rather than fall back.
+        build_transcription_engine(requested="faster-whisper",
+                                   mode=OperatingMode.FIELD_OFFLINE)
 
 
 def test_requesting_none_disables_the_stage():
