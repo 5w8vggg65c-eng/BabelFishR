@@ -9,6 +9,8 @@ from typing import Dict, List, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from ..analysis.dsd import AUTO_ROTATION_SECONDS
+from ..analysis.dsd import PRESETS as DSD_PRESETS
 from ..models import ContentClass, ProcessingState, Transmission
 from .widgets import TagEditor, WaveformWidget
 
@@ -225,16 +227,23 @@ class TransmissionBubble(QtWidgets.QFrame):
             "Transcribe anyway", lambda: self.transcribeAnywayRequested.emit(
                 self.tx.id))
         self.analyze_action = menu.addAction(
-            "Analyze as digital", lambda: self.analyzeDigitalRequested.emit(
-                self.tx.id, ""))
+            "Analyze as digital (hunt all profiles)",
+            lambda: self.analyzeDigitalRequested.emit(self.tx.id, "auto"))
+        self.analyze_action.setToolTip(
+            f"Tries every profile in turn. A full rotation takes about "
+            f"{int(AUTO_ROTATION_SECONDS)} seconds at 48 kHz, so a shorter "
+            f"recording may finish before the right profile is reached - "
+            f"pick a specific preset below if you know the mode.")
 
-        protocols = QtWidgets.QMenu("Reanalyze as...", menu)
-        for protocol in ("DMR", "P25 Phase 1", "P25 Phase 2", "D-STAR",
-                         "NXDN", "System Fusion", "dPMR"):
-            protocols.addAction(
-                protocol,
-                lambda checked=False, name=protocol:
+        protocols = QtWidgets.QMenu("Analyze as a specific mode...", menu)
+        for preset in DSD_PRESETS:
+            if preset.id == "auto":
+                continue
+            action = protocols.addAction(
+                preset.label,
+                lambda checked=False, name=preset.id:
                 self.analyzeDigitalRequested.emit(self.tx.id, name))
+            action.setToolTip(preset.describe())
         self.protocol_menu = menu.addMenu(protocols)
         menu.addSeparator()
         menu.addAction("Retry processing",
@@ -309,6 +318,9 @@ class TransmissionBubble(QtWidgets.QFrame):
             if attempt.error:
                 line += f" - {_escape(attempt.error)}"
             details.append(line)
+            warning = attempt.metadata.get("auto_hunt_warning")
+            if warning:
+                details.append(_escape(str(warning)))
         if tx.notes:
             details.append(f"Note: {_escape(tx.notes)}")
         if details:

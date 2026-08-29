@@ -48,21 +48,106 @@ log = logging.getLogger(__name__)
 #: DSD family decoders conventionally want 48 kHz mono.
 DSD_SAMPLE_RATE = 48_000
 
-#: Protocol names DSD-neo commonly reports, mapped to a canonical label.
+#: Automatic hunting rotates through the candidate profiles; upstream documents
+#: a full rotation as roughly six seconds at 48 kHz. A shorter recording can
+#: therefore finish before the right profile is tried, which is why a narrower
+#: preset is offered and why a negative auto result means very little.
+AUTO_ROTATION_SECONDS = 6.0
+
+AUTO_FLAG = "-fa"
+
+
+@dataclasses.dataclass(frozen=True)
+class Preset:
+    """One decoder profile, mapped to its documented dsd-neo flag."""
+
+    id: str
+    label: str
+    flag: str
+    note: str = ""
+
+    def describe(self) -> str:
+        return f"{self.label} ({self.flag})" + (f" - {self.note}" if self.note else "")
+
+
+#: Flags per https://github.com/arancormonk/dsd-neo/blob/main/docs/cli.md
+#: Kept faithful to upstream, including the distinctions an earlier version
+#: collapsed: DMR dual-slot (-fs) vs single-slot mono (-fr), and NXDN48 (-fi)
+#: vs NXDN96 (-fn).
+PRESETS: List[Preset] = [
+    Preset("auto", "Automatic (hunt all profiles)", AUTO_FLAG,
+           f"a full rotation takes about {AUTO_ROTATION_SECONDS:.0f}s at 48 kHz"),
+    Preset("dmr-dual", "DMR simplex, dual slot", "-fs",
+           "BS/MS dual-slot decoder"),
+    Preset("dmr-mono", "DMR simplex, single slot (mono)", "-fr",
+           "BS/MS single-slot mono decoder"),
+    Preset("p25p1", "P25 Phase 1", "-f1"),
+    Preset("p25p2", "P25 Phase 2", "-f2", "6000 sps"),
+    Preset("dstar", "D-STAR", "-fd"),
+    Preset("nxdn48", "NXDN48", "-fi", "6.25 kHz"),
+    Preset("nxdn96", "NXDN96", "-fn", "12.5 kHz"),
+    Preset("x2tdma", "X2-TDMA", "-fx"),
+    Preset("ysf", "System Fusion (YSF)", "-fy"),
+    Preset("m17", "M17", "-fz"),
+    Preset("provoice", "ProVoice", "-fp"),
+    Preset("dpmr", "dPMR", "-fm"),
+    Preset("edacs", "EDACS / ProVoice", "-fh"),
+    Preset("edacs-esk", "EDACS / ProVoice with ESK 0xA0", "-fH"),
+    Preset("edacs-ea", "EDACS EA / ProVoice", "-fe"),
+    Preset("edacs-ea-esk", "EDACS EA / ProVoice with ESK 0xA0", "-fE"),
+]
+
+PRESETS_BY_ID: Dict[str, Preset] = {preset.id: preset for preset in PRESETS}
+
+#: Accept a human label or an id, so the UI and the CLI can both be friendly.
+_PRESET_ALIASES: Dict[str, str] = {
+    "": "auto", "auto": "auto", "unknown": "auto",
+    "dmr": "dmr-dual", "dmr simplex": "dmr-dual", "dmr dual": "dmr-dual",
+    "dmr mono": "dmr-mono", "dmr single": "dmr-mono",
+    "p25": "p25p1", "p25 phase 1": "p25p1", "p25 phase 2": "p25p2",
+    "d-star": "dstar", "dstar": "dstar",
+    "nxdn": "nxdn96", "nxdn48": "nxdn48", "nxdn96": "nxdn96",
+    "x2-tdma": "x2tdma", "system fusion": "ysf", "fusion": "ysf", "ysf": "ysf",
+    "m17": "m17", "provoice": "provoice", "dpmr": "dpmr", "edacs": "edacs",
+}
+
+
+def resolve_preset(name: str) -> Preset:
+    """Map an id, label or alias onto a documented preset. Unknown -> auto."""
+    key = (name or "").strip().lower()
+    if key in PRESETS_BY_ID:
+        return PRESETS_BY_ID[key]
+    if key in _PRESET_ALIASES:
+        return PRESETS_BY_ID[_PRESET_ALIASES[key]]
+    return PRESETS_BY_ID["auto"]
+
+
+#: Protocol recognition in decoder output. ORDER MATTERS: the Phase 2 pattern
+#: must be tried before the generic P25 pattern, or "P25 Phase 2" matches the
+#: Phase 1 rule first and a Phase 2 decode is mislabelled as Phase 1.
 PROTOCOL_PATTERNS: List[Tuple[str, str]] = [
+    (r"\bP25\s*(?:Phase\s*)?2\b|\bP25p2\b", "P25 Phase 2"),
+    (r"\bP25\s*(?:Phase\s*)?1\b|\bP25p1\b|\bP25\b", "P25 Phase 1"),
+    (r"\bNXDN\s*96\b", "NXDN96"),
+    (r"\bNXDN\s*48\b", "NXDN48"),
+    (r"\bNXDN\b", "NXDN"),
     (r"\bDMR\b", "DMR"),
-    (r"\bP25(?:\s*Phase\s*1)?\b", "P25 Phase 1"),
-    (r"\bP25\s*Phase\s*2\b", "P25 Phase 2"),
     (r"\bD-?STAR\b", "D-STAR"),
-    (r"\bNXDN\s*(?:48|96)?\b", "NXDN"),
     (r"\bYSF\b|\bFusion\b", "System Fusion"),
+    (r"\bM17\b", "M17"),
     (r"\bdPMR\b", "dPMR"),
     (r"\bProVoice\b", "ProVoice"),
+    (r"\bEDACS\b", "EDACS"),
     (r"\bX2-?TDMA\b", "X2-TDMA"),
 ]
 
 _ENCRYPTED = re.compile(r"encrypt|\bENC\b|scrambl|\bKEY ID\b", re.IGNORECASE)
 _SYNC = re.compile(r"sync|frame|voice|slot", re.IGNORECASE)
+_VOICE = re.compile(r"\bvoice\b", re.IGNORECASE)
+
+#: A decoded WAV must contain this much non-silent audio to count as a decode.
+MIN_DECODED_SECONDS = 0.20
+MIN_DECODED_RMS = 1e-3
 
 
 @dataclasses.dataclass
@@ -152,7 +237,10 @@ class DsdNeoAnalyser(AnalysisEngine):
         return self._version
 
     def supported_protocols(self) -> List[str]:
-        return [label for _, label in PROTOCOL_PATTERNS]
+        return [preset.id for preset in PRESETS]
+
+    def presets(self) -> List[Preset]:
+        return list(PRESETS)
 
     # -- analysis --------------------------------------------------------
     def analyse(self, request: AnalysisRequest) -> AnalysisAttempt:
@@ -174,8 +262,12 @@ class DsdNeoAnalyser(AnalysisEngine):
             return self._finish(attempt, started, AnalysisOutcome.ANALYSIS_FAILED,
                                 error="the recording is missing from disk")
 
+        preset = resolve_preset(request.protocol)
+        attempt.options.setdefault("preset", preset.id)
+        attempt.options.setdefault("flag", preset.flag)
         try:
-            input_path, derived = self._prepare_input(tx, request.output_dir)
+            input_path, derived = self._prepare_input(tx, request.output_dir,
+                                                      attempt.id)
         except Exception as exc:  # noqa: BLE001
             return self._finish(attempt, started, AnalysisOutcome.ANALYSIS_FAILED,
                                 error=f"could not prepare input: {exc}")
@@ -193,8 +285,7 @@ class DsdNeoAnalyser(AnalysisEngine):
         output_dir.mkdir(parents=True, exist_ok=True)
         output_wav = str(output_dir / f"{source.stem}.{attempt.id}.decoded.wav")
         pathlib.Path(output_wav).unlink(missing_ok=True)
-        command = self._build_command(executable, input_path, output_wav,
-                                      request.protocol)
+        command = self._build_command(executable, input_path, output_wav, preset)
         attempt.command = command
 
         try:
@@ -212,32 +303,88 @@ class DsdNeoAnalyser(AnalysisEngine):
         attempt.stdout = (result.stdout or "")[-20_000:]
         attempt.stderr = (result.stderr or "")[-20_000:]
 
+        text_output = f"{attempt.stdout}\n{attempt.stderr}"
         outcome, protocol, metadata = self._interpret(
             attempt.stdout, attempt.stderr, result.returncode, output_wav)
         attempt.protocol = protocol
         attempt.metadata = metadata
 
         decoded = pathlib.Path(output_wav)
-        if decoded.exists() and decoded.stat().st_size > 44 and result.returncode == 0:
-            attempt.artifacts.append(AnalysisArtifact(
-                kind="decoded-audio", path=str(decoded),
-                description="Voice decoded by DSD-neo"))
-            if outcome in (AnalysisOutcome.PROTOCOL_IDENTIFIED,
-                           AnalysisOutcome.PROTOCOL_CANDIDATE,
-                           AnalysisOutcome.NO_RESULT):
-                outcome = AnalysisOutcome.VOICE_DECODED
+        if decoded.exists() and result.returncode == 0:
+            usable, detail = self._decoded_audio_is_usable(decoded)
+            attempt.metadata["decoded_audio"] = detail
+            if usable:
+                attempt.artifacts.append(AnalysisArtifact(
+                    kind="decoded-audio", path=str(decoded),
+                    description="Voice decoded by DSD-neo"))
+                # Only claim a voice decode when the audio is real AND the
+                # decoder said something corroborating. A file that merely
+                # exceeds its 44-byte header is not evidence of a decode.
+                if _VOICE.search(text_output) or outcome in (
+                        AnalysisOutcome.PROTOCOL_IDENTIFIED,
+                        AnalysisOutcome.PROTOCOL_CANDIDATE):
+                    outcome = AnalysisOutcome.VOICE_DECODED
+                elif outcome is AnalysisOutcome.NO_RESULT:
+                    outcome = AnalysisOutcome.PROTOCOL_CANDIDATE
+            else:
+                decoded.unlink(missing_ok=True)
+                if outcome is AnalysisOutcome.NO_RESULT:
+                    attempt.metadata.setdefault(
+                        "note", f"decoder wrote no usable audio ({detail})")
         elif decoded.exists():
-            decoded.unlink(missing_ok=True)  # empty stub, not a real decode
+            decoded.unlink(missing_ok=True)
+
+        if (preset.id == "auto" and not outcome.is_success
+                and self._input_duration(input_path) < AUTO_ROTATION_SECONDS):
+            attempt.metadata["auto_hunt_warning"] = (
+                f"Automatic hunting rotates through profiles in about "
+                f"{AUTO_ROTATION_SECONDS:.0f}s; this recording is shorter, so "
+                f"the correct profile may never have been tried. Try a "
+                f"specific preset.")
 
         return self._finish(attempt, started, outcome)
 
-    def _prepare_input(self, tx: Transmission,
-                       output_dir: Optional[str]) -> Tuple[str, bool]:
+    def _decoded_audio_is_usable(self, path: pathlib.Path) -> Tuple[bool, str]:
+        """Is this a real decode, or an empty file the decoder happened to open?
+
+        Requires meaningful duration and non-silent content. The previous
+        44-byte header check declared VOICE_DECODED for any file dsd-neo
+        created, including silent placeholders.
+        """
+        import numpy as np
+
+        from ..audio.wavefile import read_wav
+
+        try:
+            samples, rate = read_wav(str(path))
+        except Exception as exc:  # noqa: BLE001
+            return (False, f"unreadable: {exc}")
+        if rate <= 0 or samples.size == 0:
+            return (False, "empty")
+        duration = samples.size / float(rate)
+        if duration < MIN_DECODED_SECONDS:
+            return (False, f"only {duration:.2f}s")
+        rms = float(np.sqrt(np.mean(np.square(samples))))
+        if rms < MIN_DECODED_RMS:
+            return (False, f"silent ({duration:.2f}s, rms {rms:.2e})")
+        return (True, f"{duration:.2f}s, rms {rms:.3f}")
+
+    def _input_duration(self, path: str) -> float:
+        from ..audio.wavefile import wav_duration
+
+        try:
+            return wav_duration(path)
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    def _prepare_input(self, tx: Transmission, output_dir: Optional[str],
+                       attempt_id: str) -> Tuple[str, bool]:
         """Return a path DSD can read, deriving a copy only if necessary.
 
         The original recording is opened read-only and never rewritten: if a
-        conversion is needed the result goes to a separate file with its own
-        provenance.
+        conversion is needed the result goes to a separate file named for this
+        attempt, so a rerun or a concurrent analysis of the same recording
+        cannot read or overwrite another attempt's input.
         """
         from ..audio.wavefile import read_wav, write_wav
 
@@ -250,22 +397,22 @@ class DsdNeoAnalyser(AnalysisEngine):
 
         target_dir = pathlib.Path(output_dir) if output_dir else original.parent
         target_dir.mkdir(parents=True, exist_ok=True)
-        derived = target_dir / f"{original.stem}.dsd48k.wav"
+        derived = target_dir / f"{original.stem}.{attempt_id}.dsd48k.wav"
         write_wav(str(derived), resample(samples, rate, DSD_SAMPLE_RATE),
                   DSD_SAMPLE_RATE, bit_depth=16)
         return (str(derived), True)
 
     def _build_command(self, executable: str, input_path: str, output_path: str,
-                       protocol: str) -> List[str]:
-        command = [executable, "-i", input_path, "-w", output_path]
-        if protocol:
-            flag = {
-                "DMR": "-fr", "P25 Phase 1": "-f1", "P25 Phase 2": "-f2",
-                "D-STAR": "-fd", "NXDN": "-fn", "System Fusion": "-fy",
-                "dPMR": "-fm", "X2-TDMA": "-fx",
-            }.get(protocol)
-            if flag:
-                command.append(flag)
+                       preset: Preset) -> List[str]:
+        """Build the dsd-neo invocation.
+
+        The profile flag is always explicit - including ``-fa`` when the
+        protocol is unknown. Relying on dsd-neo's default rather than naming
+        the automatic profile leaves the behaviour dependent on a default that
+        may change.
+        """
+        command = [executable, "-i", input_path, "-w", output_path,
+                   "-s", str(DSD_SAMPLE_RATE), preset.flag]
         command.extend(self.extra_args)
         return command
 

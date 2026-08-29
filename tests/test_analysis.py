@@ -70,6 +70,7 @@ def test_version_is_captured(analyser):
 # ---- outcomes ----------------------------------------------------------
 @pytest.mark.parametrize("scenario,expected", [
     ("dmr-voice", AnalysisOutcome.VOICE_DECODED),
+    ("p25p2-voice", AnalysisOutcome.VOICE_DECODED),
     ("p25-metadata", AnalysisOutcome.PROTOCOL_IDENTIFIED),
     ("encrypted", AnalysisOutcome.ENCRYPTED_OR_UNSUPPORTED),
     ("nothing", AnalysisOutcome.NO_RESULT),
@@ -166,10 +167,11 @@ def test_rerun_does_not_inherit_a_previous_decode(analyser, recording,
     assert second.decoded_audio is None
 
 
-def test_protocol_specific_rerun_passes_the_flag(analyser, recording,
-                                                 monkeypatch):
-    attempt = _run(analyser, recording, "nothing", monkeypatch, protocol="DMR")
-    assert attempt.requested_protocol == "DMR"
+def test_protocol_specific_rerun_passes_the_documented_flag(analyser, recording,
+                                                            monkeypatch):
+    attempt = _run(analyser, recording, "nothing", monkeypatch,
+                   protocol="dmr-mono")
+    assert attempt.requested_protocol == "dmr-mono"
     assert "-fr" in attempt.command
 
 

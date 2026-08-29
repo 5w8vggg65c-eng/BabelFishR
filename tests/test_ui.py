@@ -201,9 +201,11 @@ def test_secondary_actions_live_in_an_overflow_menu(qt_app):
     bubble = TimelineView().add(Transmission(transcript="hi", audio_path="/x.wav"))
     labels = {a.text() for a in bubble.menu_button.menu().actions() if a.text()}
     for expected in ("Edit transcript and translation...", "Edit tags...",
-                     "Bookmark", "Transcribe anyway", "Analyze as digital",
-                     "Export audio..."):
+                     "Bookmark", "Transcribe anyway", "Export audio..."):
         assert expected in labels, f"{expected} missing from the overflow menu"
+    # Automatic hunting and a specific-mode submenu are both offered.
+    assert any(label.startswith("Analyze as digital") for label in labels)
+    assert any("specific mode" in label for label in labels)
 
 
 def test_skipped_recording_offers_transcribe_anyway(qt_app):
