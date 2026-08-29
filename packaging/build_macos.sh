@@ -34,10 +34,18 @@ python -c "import PyInstaller; print('pyinstaller', PyInstaller.__version__)"
 if [[ "$SKIP_TESTS" == "1" ]]; then
   echo "==> Skipping tests (BABELFISHR_SKIP_TESTS=1)"
 else
-  echo "==> Running the deterministic test suite before packaging"
+  echo "==> Running the full deterministic test suite before packaging"
+  # The WHOLE suite, not a marker subset. Most of the original regression
+  # coverage (capture invariant, pipeline, storage, CLI, acceptance) predates
+  # the `unit` marker, so `-m unit` collected well under half of it and the
+  # build was verifying far less than it appeared to.
+  #
+  # Tests that genuinely need hardware, real models or a real dsd-neo binary
+  # skip themselves honestly, so a plain run is both complete and portable.
+  #
   # Field assets live in Application Support and must not be touched by a
   # build; point the suite at a scratch home so it cannot write there.
-  BABELFISHR_HOME="$(mktemp -d)/BabelFishR-buildtest" python -m pytest -q -m unit
+  BABELFISHR_HOME="$(mktemp -d)/BabelFishR-buildtest" python -m pytest -q
 fi
 
 echo "==> Building the app bundle"
@@ -47,16 +55,10 @@ pyinstaller packaging/babelfishr.spec --noconfirm
 APP="dist/BabelFishR.app"
 [[ -d "$APP" ]] || { echo "build failed: $APP not produced" >&2; exit 1; }
 
-echo "==> Verifying the bundle metadata"
-PLIST="$APP/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" "$PLIST" >/dev/null \
-  || { echo "Info.plist lacks NSMicrophoneUsageDescription" >&2; exit 1; }
-/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$PLIST" >/dev/null \
-  || { echo "Info.plist lacks CFBundleIdentifier" >&2; exit 1; }
-
-echo "==> Confirming the app launches far enough to import its own code"
-"$APP/Contents/MacOS/BabelFishR" --selftest-import \
-  || echo "    (import selftest unavailable in this build; skipping)"
+echo "==> Verifying the bundle (metadata and a real launch)"
+# Fatal: `set -e` plus a non-zero exit from verify_bundle.sh stops the build.
+# A bundle that cannot start must never reach signing or notarization.
+./packaging/verify_bundle.sh "$APP"
 
 if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
   echo "==> Signing with $CODESIGN_IDENTITY"

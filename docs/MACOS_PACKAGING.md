@@ -17,11 +17,19 @@ Treat the first build as the real test.
 
 It creates a **clean** venv, installs `[gui,audio,asr,translate,dev,packaging]`
 — the dev extra provides pytest and the packaging extra provides PyInstaller,
-both of which the script then verifies import — runs the deterministic suite
+both of which the script then verifies import — runs the **full** deterministic suite (plain `pytest`, not a marker subset —
+tests needing real models, a real dsd-neo binary or hardware skip themselves)
 with `BABELFISHR_HOME` pointed at a scratch directory, builds
-`dist/BabelFishR.app`, checks the `Info.plist` carries the microphone usage
-string and a bundle identifier, and confirms the frozen binary can import its
-own code.
+`dist/BabelFishR.app`, and runs `packaging/verify_bundle.sh`, which checks the `Info.plist` keys and
+launches the frozen binary with `--selftest-import`.
+
+**Bundle verification is fatal.** If the packaged executable cannot start, the
+build exits non-zero and nothing is signed or notarized. You can run it against
+an existing bundle directly:
+
+```bash
+./packaging/verify_bundle.sh dist/BabelFishR.app
+```
 
 Set `BABELFISHR_SKIP_TESTS=1` to skip the test step deliberately.
 

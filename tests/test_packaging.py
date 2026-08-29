@@ -9,6 +9,7 @@ directory that macOS may purge, or an entry point that does not import.
 from __future__ import annotations
 
 import ast
+import os
 import pathlib
 import plistlib
 
@@ -142,6 +143,101 @@ def test_build_script_is_valid_shell():
     assert result.returncode == 0, result.stderr
 
 
+# ---- the build must verify the WHOLE deterministic suite ---------------
+#: Flags that change output volume but not which tests are selected. They are
+#: stripped before re-running the invocation, because a second -q suppresses
+#: the very summary line these tests read.
+_VERBOSITY_FLAGS = {"-q", "--quiet", "-v", "--verbose", "-s"}
+
+
+def _build_pytest_invocation(strip_verbosity: bool = True) -> list:
+    """The pytest arguments the build script actually uses."""
+    for line in _build_script().splitlines():
+        stripped = line.strip()
+        if "python -m pytest" in stripped and not stripped.startswith("#"):
+            args = stripped.split("python -m pytest", 1)[1].split()
+            if strip_verbosity:
+                args = [a for a in args if a not in _VERBOSITY_FLAGS]
+            return args
+    raise AssertionError("the build script does not run pytest")
+
+
+def test_build_does_not_restrict_itself_to_the_unit_marker():
+    """The defect: -m unit collected well under half the suite.
+
+    Most of the original regression coverage predates the marker, so the build
+    was verifying far less than it appeared to.
+    """
+    args = _build_pytest_invocation(strip_verbosity=False)
+    assert "-m" not in args or "unit" not in args, (
+        "the build must not verify only the tests carrying the 'unit' marker")
+
+
+def test_build_test_selection_collects_the_whole_deterministic_suite():
+    """Run the build's own pytest arguments and check what they collect.
+
+    Asserted against representative ORIGINAL tests and representative NEW
+    correction tests, so neither half can be silently dropped again.
+    """
+    import subprocess
+    import sys
+
+    args = _build_pytest_invocation()
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", *args],
+        cwd=str(ROOT), capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    collected = result.stdout
+
+    # Original suite, predating the correction passes.
+    legacy = [
+        "tests/test_acceptance.py",
+        "tests/test_pipeline.py",
+        "tests/test_storage.py",
+        "tests/test_detect.py",
+        "tests/test_audio.py",
+        "tests/test_models.py",
+        "tests/test_providers.py",
+        "tests/test_export.py" if (ROOT / "tests/test_export.py").exists()
+        else "tests/test_capture_invariant.py",
+    ]
+    # Added by the correction passes.
+    added = [
+        "tests/test_model_layout.py",
+        "tests/test_model_selection.py",
+        "tests/test_runtime_paths.py",
+        "tests/test_glossary_path.py",
+        "tests/test_dsd_cli.py",
+        "tests/test_offline_integration.py",
+        "tests/test_gui_setup.py",
+    ]
+    for path in legacy + added:
+        assert path in collected, (
+            f"{path} is not collected by the build's test selection")
+
+
+def test_build_collects_substantially_more_than_the_unit_marker():
+    """Guard the ratio, not just the file list."""
+    import re
+    import subprocess
+    import sys
+
+    def count(extra):
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "--collect-only", "-q", *extra],
+            cwd=str(ROOT), capture_output=True, text=True, check=False)
+        match = re.search(r"(\d+)(?:/\d+)? tests collected", result.stdout)
+        return int(match.group(1)) if match else 0
+
+    build_total = count(_build_pytest_invocation())
+    unit_only = count(["-m", "unit"])
+    assert build_total > unit_only, (
+        f"the build collects {build_total} tests, the unit marker {unit_only}")
+    assert build_total > unit_only * 1.5, (
+        "the build's selection should cover the legacy suite too, not just "
+        f"the marked tests ({build_total} vs {unit_only})")
+
+
 def test_clean_venv_installs_the_dependencies_the_build_uses():
     """The defect: the script ran pytest without installing the dev extra.
 
@@ -165,6 +261,80 @@ def test_clean_venv_installs_the_dependencies_the_build_uses():
         assert extra in installs, (
             f"the script runs {tool} but never installs the '{extra}' extra "
             f"into the clean venv")
+
+
+# ---- bundle verification must be fatal --------------------------------
+def test_verify_bundle_script_exists_and_is_executable():
+    script = PACKAGING / "verify_bundle.sh"
+    assert script.exists()
+    assert os.access(script, os.X_OK), "verify_bundle.sh must be executable"
+
+
+def test_build_script_does_not_swallow_verification_failures():
+    """The defect: the self-test failure was absorbed by `|| echo`."""
+    script = _build_script()
+    for line in script.splitlines():
+        if "selftest-import" in line or "verify_bundle" in line:
+            assert "|| echo" not in line, (
+                "verification failure must not be downgraded to a message")
+            assert "|| true" not in line
+
+
+def _stub_bundle(root: pathlib.Path, name: str, body: str) -> pathlib.Path:
+    app = root / name
+    binary = app / "Contents" / "MacOS" / "BabelFishR"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text(body, encoding="utf-8")
+    binary.chmod(0o755)
+    return app
+
+
+def _run_verify(app: pathlib.Path):
+    import subprocess
+
+    return subprocess.run(
+        ["bash", str(PACKAGING / "verify_bundle.sh"), str(app)],
+        cwd=str(ROOT), capture_output=True, text=True, check=False)
+
+
+def test_verify_bundle_passes_a_working_executable(tmp_path):
+    app = _stub_bundle(tmp_path, "good.app",
+                       '#!/bin/sh\n'
+                       '[ "$1" = "--selftest-import" ] && '
+                       '{ echo "imports cleanly"; exit 0; }\nexit 0\n')
+    result = _run_verify(app)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "passed" in result.stdout
+
+
+def test_verify_bundle_fails_a_broken_executable(tmp_path):
+    """A bundle that cannot import its own code must fail the build."""
+    app = _stub_bundle(tmp_path, "broken.app",
+                       '#!/bin/sh\necho "ImportError" >&2\nexit 1\n')
+    result = _run_verify(app)
+    assert result.returncode != 0, (
+        "a failed self-test must make the build return non-zero")
+    assert "self-test failed" in result.stderr
+
+
+def test_verify_bundle_fails_a_crashing_executable(tmp_path):
+    app = _stub_bundle(tmp_path, "crash.app",
+                       '#!/bin/sh\nkill -SEGV $$\n')
+    assert _run_verify(app).returncode != 0
+
+
+def test_verify_bundle_fails_a_missing_bundle(tmp_path):
+    result = _run_verify(tmp_path / "absent.app")
+    assert result.returncode != 0
+    assert "no bundle" in result.stderr
+
+
+def test_verify_bundle_fails_a_bundle_without_an_executable(tmp_path):
+    app = tmp_path / "empty.app"
+    (app / "Contents" / "MacOS").mkdir(parents=True)
+    result = _run_verify(app)
+    assert result.returncode != 0
+    assert "no executable" in result.stderr
 
 
 def test_build_script_verifies_its_toolchain_before_using_it():
