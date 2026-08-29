@@ -10,10 +10,10 @@ not.
 |---|---|
 | Audited base commit | `bc2c72d` (released as `v0.3.0-alpha.1`) |
 | Branch | `claude/radio-decoder-translator-0oslya` |
-| Final branch commit | `fda9e5a` |
+| Final branch commit | `4048943` |
 | Release tag | **NOT PUBLISHED** — see *Release status* below |
 | Release URL | none yet |
-| Last publish attempt | https://github.com/5w8vggg65c-eng/BabelFishR/actions/runs/33276322107 |
+| Publish attempts | run 11 (failed, real defect) · run 12 (dispatched, outcome unconfirmed) |
 | DMG | not produced for alpha 2 |
 | DMG size | n/a |
 | DMG SHA-256 | n/a |
@@ -132,15 +132,17 @@ on device enumeration is a real exposure regardless.
 
 ## Tests
 
-**535 passed, 9 skipped, 0 failed** on the Linux development host, at
-commit `fda9e5a`.
+**540 passed, 9 skipped, 0 failed** on the Linux development host, at
+commit `4048943`.
 
-No macOS figure for this branch: the last four runs on the Apple Silicon
-runner were either cancelled by me or could not be observed to completion (see
-*Release status*). The most recent confirmed macOS arm64 result is from
-`v0.3.0-alpha.1`: **473 passed, 7 skipped**. Everything added since then is
-platform-independent Python plus the CoreAudio probe, but that is an argument,
-not a measurement, and it should not be treated as one.
+On the macOS arm64 runner, run 11 gave **534 passed, 1 failed, 9 skipped** -
+the enum defect above, now fixed. Run 12 carries the fix; its figure is
+unconfirmed. The last fully green macOS result remains `v0.3.0-alpha.1`'s
+**473 passed, 7 skipped**.
+
+Note the runner's skip list differs from Linux: two CoreAudio tests skip
+*because the host has CoreAudio* (`test_coreaudio.py:76` and `:148` cover the
+non-macOS fallback), and the real-ABI test runs there instead.
 
 Skips, all with reasons:
 
@@ -196,16 +198,41 @@ CoreAudio self-test, then `actions/checkout@v5`. Both were retracted in commit
 Run 10 I cancelled deliberately and correctly: it was queued ahead of the
 publish run and built from the commit whose premise I had just retracted.
 
-Run 11 is the alpha 2 publish attempt, dispatched with
-`publish_prerelease=true` and `release_tag=v0.3.0-alpha.2` at `fda9e5a`. It
-reached the build step and, from this session, its status never advanced past
-that point in the API. I did not cancel it. It carries `timeout-minutes: 40`,
-so it has terminated one way or the other by now; I could not observe which.
+Run 11 was the first alpha 2 publish attempt, at `fda9e5a`. It **failed on a
+real defect**, and finding it justified the whole exercise:
 
-**To finish the release**, check that run, and if it did not publish, dispatch
-the workflow again on the branch with those same two inputs. Nothing in the
-tree needs changing first. Do not judge a run's health by how long it feels
-like it has been going - read `created_at` against `updated_at` from the API.
+    babelfishr/models.py: AttributeError: 'NoneType' object has no attribute 'value'
+    1 failed, 534 passed, 9 skipped
+
+`Transmission.to_dict()` called `.value` on a `content_class` that was `None`.
+The cause was in `from_dict`: every enum field used
+`if d.get(field): d[field] = Enum(...)`, so a falsy stored value fell straight
+through into the constructor and overrode the dataclass default with something
+that is not a member of the enum at all. The next `to_dict()` on that object
+raised.
+
+This sits directly on capture-first. Every event is written to disk and the
+database *before* anything classifies it, so a row with no content class yet is
+not corruption - it is the normal intermediate state. Reading one back and
+being unable to serialise it means that transmission cannot be exported or
+displayed, and a transmission cannot be received twice. It reproduces in one
+line on any platform; the Linux suite simply never happened to construct the
+object. Fixed in `4048943` with `_coerce_enum` / `_enum_value` and three
+regression tests, including one asserting that a value which *was* recorded
+still round-trips exactly.
+
+Run 12 is the second publish attempt, at `4048943`, dispatched with
+`publish_prerelease=true` and `release_tag=v0.3.0-alpha.2`. I could not observe
+it to completion from this session and did not cancel it.
+
+**To finish the release**: check run 12. If it published, alpha 2 is done and
+this document's identifier table needs its DMG size and SHA-256 filled in from
+the run summary. If it did not, dispatch the workflow again on the branch with
+those same two inputs; nothing in the tree needs changing first.
+
+Do not judge a run's health by how long it feels like it has been going - read
+`created_at` against `updated_at` from the API. A healthy run on this pipeline
+is three to six minutes by that clock.
 
 ## Unresolved risks
 
@@ -224,17 +251,17 @@ like it has been going - read `created_at` against `updated_at` from the API.
    disproved. Candidates not yet ruled out: runner or CDN variance, the
    per-file signing loop over ~3,500 items, or the action version bump. Worth
    timing the sub-steps before assuming it is benign.
-4. **Ad-hoc signature, no notarization.** No Apple Developer ID exists.
+5. **Ad-hoc signature, no notarization.** No Apple Developer ID exists.
    Gatekeeper requires right-click ▸ Open on first launch. Nothing in the
    repository claims otherwise.
-5. **`--selftest-gui` has no wall-clock watchdog**, unlike the CoreAudio check.
+6. **`--selftest-gui` has no wall-clock watchdog**, unlike the CoreAudio check.
    It constructs a real QApplication and reaches device enumeration, which is
    now internally bounded, but the Qt side is not.
-6. **The build-phase timings have never been read.** They were added in
+7. **The build-phase timings have never been read.** They were added in
    `8f72751` to answer a question that turned out not to exist. They are
    harmless and will be useful the first time a build really is slow, but
    nobody has yet seen their output.
-7. **The CoreAudio ctypes layer has still never returned a real device.** The
+8. **The CoreAudio ctypes layer has still never returned a real device.** The
    probe proves the ABI is callable; it has never parsed an actual
    `AudioBufferList` from real hardware, and that is where a struct-layout
    error would show up.
