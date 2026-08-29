@@ -16,3 +16,7 @@ babelfishr.toml
 models/
 *.wav
 !tests/data/*.wav
+
+# Never commit real credentials
+.env
+!.env.example
