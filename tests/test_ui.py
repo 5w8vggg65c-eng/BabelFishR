@@ -19,6 +19,19 @@ def qt_app():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
+def _pump(qt_app, predicate, timeout: float = 5.0) -> bool:
+    """Spin the event loop until *predicate* holds. Readiness is asynchronous."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        qt_app.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
 def test_timeline_renders_a_bubble(qt_app):
     from babelfishr.ui.timeline import TimelineView
 
@@ -167,7 +180,8 @@ def test_readiness_indicator_reflects_capability(qt_app, config, store):
     from babelfishr.ui.main_window import MainWindow
 
     window = MainWindow(BabelFishRApp(config=config, store=store))
-    assert window.ready_badge.text()
+    # The badge is filled in by a worker so the window opens instantly.
+    assert _pump(qt_app, lambda: window.ready_badge.text().strip() != "")
     assert window.ready_badge.accessibleDescription()
     window.close()
 
@@ -264,7 +278,7 @@ def test_readiness_dialog_builds(qt_app, config, store):
     from babelfishr.ui.readiness_dialog import ReadinessDialog
 
     dialog = ReadinessDialog(BabelFishRApp(config=config, store=store))
-    assert dialog.tree.topLevelItemCount() > 0
+    assert _pump(qt_app, lambda: dialog.tree.topLevelItemCount() > 0)
     assert dialog.headline.text()
     assert not dialog.grab().isNull()
 
@@ -275,7 +289,9 @@ def test_setup_assistant_builds_and_parses_pairs(qt_app, config, store):
 
     assistant = SetupAssistant(BabelFishRApp(config=config, store=store))
     assert ("es", "en") in assistant.language_pairs()
-    assert "prepare-field" in assistant.command_label.text()
+    # The terminal command remains available as an advanced fallback.
+    assert "prepare-field" in assistant.advanced.text()
+    assert assistant.prepare_button.isEnabled()
     assert not assistant.grab().isNull()
 
 
