@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from ..models import DecodeResult
+from ..results import DecodeResult
 from .afsk import demodulate, recover_bits
 from .base import BaseDecoder, register
 

@@ -11,8 +11,8 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from ..dsp.filters import bandpass, moving_average
-from ..models import DecodeResult
+from ...dsp.filters import bandpass, moving_average
+from ..results import DecodeResult
 from . import hdlc
 from .base import BaseDecoder, register
 

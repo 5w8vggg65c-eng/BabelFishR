@@ -11,9 +11,9 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from ..dsp.filters import moving_average
-from ..dsp.goertzel import peak_frequency
-from ..models import DecodeResult
+from ...dsp.filters import moving_average
+from ..goertzel import peak_frequency
+from ..results import DecodeResult
 from .afsk import correlate_tone
 from .base import BaseDecoder, register
 

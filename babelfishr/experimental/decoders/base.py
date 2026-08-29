@@ -13,7 +13,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Protocol
 
 import numpy as np
 
-from ..models import DecodeResult
+from ..results import DecodeResult
 
 log = logging.getLogger(__name__)
 
@@ -79,7 +79,7 @@ def run_decoders(audio: np.ndarray, sample_rate: int,
                  on_error: Optional[Callable[[str, Exception], None]] = None,
                  ) -> List[DecodeResult]:
     """Run the enabled decoders over one transmission, newest-first by confidence."""
-    from ..dsp.resample import resample
+    from ...dsp.resample import resample
 
     decoders = available()
     ids = list(enabled) if enabled is not None else list(decoders)

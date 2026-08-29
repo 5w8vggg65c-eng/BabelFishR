@@ -26,8 +26,8 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from ..dsp.filters import hilbert_envelope, lowpass, moving_average
-from ..models import DecodeResult
+from ...dsp.filters import hilbert_envelope, lowpass, moving_average
+from ..results import DecodeResult
 from .base import BaseDecoder, register
 
 

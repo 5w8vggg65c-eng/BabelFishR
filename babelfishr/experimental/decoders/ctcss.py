@@ -11,9 +11,9 @@ from typing import List, Optional
 
 import numpy as np
 
-from ..dsp.filters import lowpass, rms
-from ..dsp.goertzel import goertzel_bank
-from ..models import DecodeResult
+from ...dsp.filters import lowpass, rms
+from ..goertzel import goertzel_bank
+from ..results import DecodeResult
 from .base import BaseDecoder, register
 
 #: The 50 standard CTCSS tones in Hz (EIA 38 plus the common extensions).

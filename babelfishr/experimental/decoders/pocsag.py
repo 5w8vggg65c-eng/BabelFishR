@@ -17,8 +17,8 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
-from ..dsp.filters import moving_average
-from ..models import DecodeResult
+from ...dsp.filters import moving_average
+from ..results import DecodeResult
 from .base import BaseDecoder, register
 
 SYNC_WORD = 0x7CD215D8

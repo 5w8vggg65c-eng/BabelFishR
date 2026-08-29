@@ -10,9 +10,9 @@ from typing import List, Optional
 
 import numpy as np
 
-from ..dsp.filters import rms
-from ..dsp.goertzel import goertzel_bank
-from ..models import DecodeResult
+from ...dsp.filters import rms
+from ..goertzel import goertzel_bank
+from ..results import DecodeResult
 from .base import BaseDecoder, register
 
 LOW_TONES = [697.0, 770.0, 852.0, 941.0]

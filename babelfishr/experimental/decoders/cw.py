@@ -6,9 +6,9 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from ..dsp.filters import bandpass, hilbert_envelope, moving_average
-from ..dsp.goertzel import peak_frequency
-from ..models import DecodeResult
+from ...dsp.filters import bandpass, hilbert_envelope, moving_average
+from ..goertzel import peak_frequency
+from ..results import DecodeResult
 from .base import BaseDecoder, register
 
 MORSE: Dict[str, str] = {

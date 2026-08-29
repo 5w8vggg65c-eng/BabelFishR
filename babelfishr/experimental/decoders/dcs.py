@@ -15,8 +15,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from ..dsp.filters import lowpass
-from ..models import DecodeResult
+from ...dsp.filters import lowpass
+from ..results import DecodeResult
 from .base import BaseDecoder, register
 
 BIT_RATE = 134.4
@@ -174,3 +174,6 @@ def synthesize(code: str, duration: float, sample_rate: int = 8000,
     shaped = lowpass(nrz, 250.0, sample_rate, numtaps=127)
     peak = float(np.max(np.abs(shaped))) or 1.0
     return amplitude * shaped / peak
+
+
+register(DcsDecoder())
