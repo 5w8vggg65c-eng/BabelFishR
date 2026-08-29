@@ -52,6 +52,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._state = PipelineState.IDLE
         self._readiness = None
         self._theming = False
+        self._readiness_worker = None
+        self._analysis_worker = None
         self._build_ui()
         self._refresh_devices()
         self._refresh_profiles()
@@ -532,9 +534,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_mode_badge()
 
     def _refresh_readiness(self, run_smoke_tests: bool = False) -> None:
+        """Refresh the toolbar badge without blocking the interface."""
+        from .workers import readiness_job, run_in_background
+
+        self._readiness_worker = run_in_background(
+            readiness_job, self.app, run_smoke_tests,
+            on_finished=self._render_readiness,
+            on_failed=lambda message: self.ready_badge.setText("\u26a0 Unknown"))
+
+    def _render_readiness(self, report) -> None:
         from . import theme
 
-        report = self.app.readiness(run_smoke_tests=run_smoke_tests)
         self._readiness = report
         if report.field_ready:
             text, tone = "\u2713 Field ready", "ok"
@@ -580,17 +590,28 @@ class MainWindow(QtWidgets.QMainWindow):
 
             show_dsd_missing(self, self.app)
             return
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-        try:
-            attempt = self.app.analyze_digital(tx_id, protocol=protocol)
-        finally:
-            QtWidgets.QApplication.restoreOverrideCursor()
+        # dsd-neo can run for seconds - automatic hunting alone rotates for
+        # about six - so it must not block the interface.
+        from .workers import analysis_job, run_in_background
+
+        self.status.showMessage("Running digital analysis...", 0)
+        self._analysis_worker = run_in_background(
+            analysis_job, self.app, tx_id, protocol,
+            on_finished=self._analysis_finished,
+            on_failed=lambda message: self.status.showMessage(
+                f"Digital analysis failed: {message}", 12000))
+
+    def _analysis_finished(self, attempt) -> None:
         if attempt is None:
+            self.status.showMessage("Digital analysis produced no attempt", 8000)
             return
-        self.status.showMessage(
-            f"Digital analysis: {attempt.summary()} "
-            f"({attempt.runtime_seconds:.1f}s) - the recording is unchanged",
-            12000)
+        message = (f"Digital analysis: {attempt.summary()} "
+                   f"({attempt.runtime_seconds:.1f}s) - the recording is "
+                   f"unchanged")
+        warning = attempt.metadata.get("auto_hunt_warning")
+        if warning:
+            message += "  |  " + str(warning)
+        self.status.showMessage(message, 15000)
 
     def _on_retry(self, tx_id: str) -> None:
         if not self.app.retry(tx_id):
@@ -636,6 +657,7 @@ class MainWindow(QtWidgets.QMainWindow):
         from .setup_assistant import SetupAssistant
 
         SetupAssistant(self.app, self).exec()
+        self._refresh_devices()
         self._report_engines()
         self._refresh_mode_badge()
         self._refresh_readiness()

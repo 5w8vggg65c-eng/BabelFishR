@@ -1,27 +1,51 @@
-"""First-run assistant: get an operator from install to field-ready.
+"""First-run setup, performed in the GUI rather than described in prose.
 
-Deliberately honest about the one-time online step: offline operation is only
-real once a model and language packs are on disk, and pretending otherwise
-would strand someone in the field.
+The previous version told the operator to open Terminal and run a command,
+which is not a setup workflow for an application whose entire point is being
+double-clicked. This one does the work: choose a model and language pairs,
+press a button, watch progress, and end with a real Field Check.
+
+Everything slow runs on a worker thread. The terminal command is still shown,
+as an advanced fallback for someone who prefers it or is scripting a fleet.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+import logging
+from typing import List, Optional, Tuple
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..modes import OperatingMode
+from .workers import prepare_field_job, run_in_background
+
+log = logging.getLogger(__name__)
+
+MODELS = [
+    ("tiny", "fastest, least accurate", 75),
+    ("base", "", 145),
+    ("small", "recommended balance", 480),
+    ("medium", "slower, more accurate", 1500),
+    ("large-v3", "slowest, most accurate", 3100),
+]
+
+LANGUAGES = [
+    ("es", "Spanish"), ("de", "German"), ("fr", "French"), ("uk", "Ukrainian"),
+    ("ru", "Russian"), ("pl", "Polish"), ("it", "Italian"), ("pt", "Portuguese"),
+    ("ar", "Arabic"), ("tr", "Turkish"), ("nl", "Dutch"), ("zh", "Chinese"),
+]
 
 
 class SetupAssistant(QtWidgets.QDialog):
-    """Explains the path to offline readiness and offers to run preparation."""
+    """Choose assets, prepare them here, and verify offline readiness."""
 
     def __init__(self, app, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
         self.app = app
-        self.setWindowTitle("Welcome to BabelFishR")
-        self.resize(640, 520)
+        self.setWindowTitle("Set up BabelFishR")
+        self.resize(680, 640)
+        self._worker = None
+        self._readiness = None
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setSpacing(14)
@@ -34,89 +58,230 @@ class SetupAssistant(QtWidgets.QDialog):
         layout.addWidget(title)
 
         layout.addWidget(_paragraph(
-            "BabelFishR listens to the audio your radio sends to its accessory "
-            "connector, records every transmission, and transcribes and "
-            "translates the speech.\n\n"
-            "It is receive-only: it never transmits, and it cannot tell what "
-            "frequency you are on. You supply that with a radio profile."))
+            "BabelFishR records every transmission your radio receives, then "
+            "transcribes and translates the speech. It is receive-only and "
+            "never transmits.\n\n"
+            "Preparation needs the internet once. Afterwards everything runs "
+            "on this Mac with the network switched off."))
 
-        steps = QtWidgets.QGroupBox("What has to happen once, with internet")
-        steps_layout = QtWidgets.QVBoxLayout(steps)
-        steps_layout.addWidget(_paragraph(
-            "1.  Download a local speech model.\n"
-            "2.  Install the translation language packs you need.\n"
-            "3.  Verify both actually run with downloads disabled.\n\n"
-            "After that the app works with the network switched off. Until "
-            "then, transcription and translation are unavailable - but "
-            "recording already works, so nothing received is lost."))
-        layout.addWidget(steps)
+        self.stack = QtWidgets.QStackedWidget()
+        self.stack.addWidget(self._build_choices())
+        self.stack.addWidget(self._build_progress())
+        layout.addWidget(self.stack, 1)
 
-        options = QtWidgets.QGroupBox("Preparation")
-        form = QtWidgets.QFormLayout(options)
+        self.advanced = QtWidgets.QLabel()
+        self.advanced.setObjectName("sectionLabel")
+        self.advanced.setWordWrap(True)
+        self.advanced.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        layout.addWidget(self.advanced)
+
+        self.buttons = QtWidgets.QDialogButtonBox()
+        self.prepare_button = self.buttons.addButton(
+            "Prepare now", QtWidgets.QDialogButtonBox.AcceptRole)
+        self.prepare_button.setObjectName("primaryButton")
+        self.prepare_button.clicked.connect(self._start)
+
+        self.record_only_button = self.buttons.addButton(
+            "Record only for now", QtWidgets.QDialogButtonBox.DestructiveRole)
+        self.record_only_button.setToolTip(
+            "Skip preparation. Transmissions are still recorded and kept, and "
+            "can be transcribed later.")
+        self.record_only_button.clicked.connect(self._record_only)
+
+        self.cancel_button = self.buttons.addButton(
+            QtWidgets.QDialogButtonBox.Cancel)
+        self.cancel_button.clicked.connect(self._cancel)
+        layout.addWidget(self.buttons)
+
+        self._update_advanced()
+
+    # -- pages -----------------------------------------------------------
+    def _build_choices(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        model_box = QtWidgets.QGroupBox("Speech model")
+        model_layout = QtWidgets.QVBoxLayout(model_box)
         self.model_box = QtWidgets.QComboBox()
-        for name, note in (("tiny", "fastest, least accurate"),
-                           ("base", ""), ("small", "recommended"),
-                           ("medium", "slower, more accurate"),
-                           ("large-v3", "slowest, most accurate")):
-            self.model_box.addItem(f"{name}  {note}".strip(), name)
+        for name, note, size in MODELS:
+            label = f"{name} - about {size} MB" + (f", {note}" if note else "")
+            self.model_box.addItem(label, name)
         self.model_box.setCurrentIndex(2)
-        form.addRow("Speech model", self.model_box)
+        self.model_box.currentIndexChanged.connect(self._update_advanced)
+        model_layout.addWidget(self.model_box)
+        self.size_label = QtWidgets.QLabel()
+        self.size_label.setObjectName("sectionLabel")
+        model_layout.addWidget(self.size_label)
+        layout.addWidget(model_box)
 
-        self.languages_field = QtWidgets.QLineEdit("es-en, de-en, fr-en")
-        self.languages_field.setToolTip(
-            "Comma-separated source-target pairs, e.g. es-en")
-        form.addRow("Language packs", self.languages_field)
-        layout.addWidget(options)
+        language_box = QtWidgets.QGroupBox(
+            "Languages to translate from (into your target language)")
+        language_layout = QtWidgets.QGridLayout(language_box)
+        self.language_checks = {}
+        for index, (code, name) in enumerate(LANGUAGES):
+            check = QtWidgets.QCheckBox(f"{name} ({code})")
+            check.setChecked(code in ("es", "de", "fr"))
+            check.stateChanged.connect(self._update_advanced)
+            self.language_checks[code] = check
+            language_layout.addWidget(check, index // 3, index % 3)
+        layout.addWidget(language_box)
 
-        self.command_label = QtWidgets.QLabel()
-        self.command_label.setObjectName("sectionLabel")
-        self.command_label.setTextInteractionFlags(
-            QtCore.Qt.TextSelectableByMouse)
-        self.command_label.setWordWrap(True)
-        layout.addWidget(self.command_label)
-        self.model_box.currentIndexChanged.connect(self._update_command)
-        self.languages_field.textChanged.connect(self._update_command)
-        self._update_command()
-
+        layout.addWidget(_paragraph(
+            "Only the pairs you install can be translated offline. Traffic in "
+            "any other language is still recorded, and still transcribed when "
+            "the speech model recognises it."))
         layout.addStretch(1)
+        return page
 
-        buttons = QtWidgets.QDialogButtonBox()
-        skip = buttons.addButton("Skip - record only for now",
-                                 QtWidgets.QDialogButtonBox.RejectRole)
-        skip.clicked.connect(self._record_only)
-        check = buttons.addButton("Check readiness",
-                                  QtWidgets.QDialogButtonBox.ActionRole)
-        check.clicked.connect(self._check)
-        buttons.addButton(QtWidgets.QDialogButtonBox.Close)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+    def _build_progress(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-    def language_pairs(self):
-        pairs = []
-        for chunk in self.languages_field.text().split(","):
-            chunk = chunk.strip()
-            if "-" in chunk:
-                source, target = chunk.split("-", 1)
-                pairs.append((source.strip(), target.strip()))
-        return pairs
+        self.status_label = QtWidgets.QLabel("Preparing...")
+        font = self.status_label.font()
+        font.setBold(True)
+        self.status_label.setFont(font)
+        layout.addWidget(self.status_label)
 
-    def _update_command(self) -> None:
-        model = self.model_box.currentData()
-        languages = " ".join(f"--language {a}-{b}" for a, b in self.language_pairs())
-        self.command_label.setText(
-            "Run this in a terminal with internet access:\n\n"
-            f"    babelfishr prepare-field --asr-model {model} {languages}\n\n"
-            "It downloads the model and packs into the application's own "
-            "folder, then verifies they load with downloads disabled.")
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setRange(0, 0)  # indeterminate: sizes are not knowable
+        layout.addWidget(self.progress)
+
+        self.log_view = QtWidgets.QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        layout.addWidget(self.log_view, 1)
+        return page
+
+    # -- choices ---------------------------------------------------------
+    def language_pairs(self) -> List[Tuple[str, str]]:
+        target = self.app.config.translate.target_language
+        return [(code, target) for code, check in self.language_checks.items()
+                if check.isChecked() and code != target]
+
+    def selected_model(self) -> str:
+        return self.model_box.currentData()
+
+    def _update_advanced(self) -> None:
+        model = self.selected_model()
+        size = next((s for n, _, s in MODELS if n == model), 0)
+        pairs = self.language_pairs()
+        estimate = size + 120 * len(pairs)
+        self.size_label.setText(
+            f"About {estimate} MB will be downloaded into "
+            f"{self.app.config.paths().models.parent}")
+        languages = " ".join(f"--language {a}-{b}" for a, b in pairs)
+        self.advanced.setText(
+            "Advanced: the same preparation from a terminal —\n"
+            f"    babelfishr prepare-field --asr-model {model} {languages}")
+
+    # -- running ---------------------------------------------------------
+    def _start(self) -> None:
+        pairs = self.language_pairs()
+        model = self.selected_model()
+        self.stack.setCurrentIndex(1)
+        self.prepare_button.setEnabled(False)
+        self.record_only_button.setEnabled(False)
+        self.cancel_button.setText("Cancel")
+        self.status_label.setText(f"Preparing {model}...")
+        self.log_view.clear()
+        self._append("Starting preparation. This needs the internet.")
+
+        # Off the GUI thread: a 500 MB download on the UI thread looks like a
+        # crash, and a force-quit mid-download leaves a broken model.
+        self._worker = run_in_background(
+            prepare_field_job, self.app.config, model, pairs,
+            on_message=self._append,
+            on_finished=self._finished,
+            on_failed=self._failed,
+            on_cancelled=self._cancelled)
+
+    def _append(self, text: str) -> None:
+        self.log_view.appendPlainText(text)
+        self.log_view.verticalScrollBar().setValue(
+            self.log_view.verticalScrollBar().maximum())
+
+    def _finished(self, payload) -> None:
+        self.progress.setRange(0, 1)
+        self.progress.setValue(1)
+        self._worker = None
+        result = payload["preparation"]
+        readiness = payload["readiness"]
+        self._readiness = readiness
+
+        self._append("")
+        self._append(result.summary())
+        self._append("")
+        self._append(readiness.summary())
+
+        # Readiness is only claimed when the model and the requested routes
+        # actually loaded with downloads disabled.
+        if readiness.field_ready:
+            self.status_label.setText("Ready for offline field use")
+            self.app.config.record_setup(
+                asr_model=self.selected_model(),
+                language_pairs=self.language_pairs())
+            self.app.set_mode(OperatingMode.FIELD_OFFLINE.value)
+        elif readiness.can_record:
+            self.status_label.setText(
+                "Partly ready - recording works, processing does not")
+        else:
+            self.status_label.setText("Not ready")
+        self.cancel_button.setText("Close")
+        self.prepare_button.setEnabled(True)
+        self.prepare_button.setText("Prepare again")
+        self.record_only_button.setEnabled(True)
+
+    def _failed(self, message: str) -> None:
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self._worker = None
+        self.status_label.setText("Preparation failed")
+        self._append("")
+        self._append(f"ERROR: {message}")
+        self._append(
+            "Nothing was lost. Recording works without a model - choose "
+            "'Record only for now' and prepare later.")
+        self.prepare_button.setEnabled(True)
+        self.record_only_button.setEnabled(True)
+        self.cancel_button.setText("Close")
+
+    def _cancelled(self) -> None:
+        self._worker = None
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.status_label.setText("Preparation cancelled")
+        self._append(
+            "Cancelled. A partly downloaded model is detected as incomplete "
+            "and repaired the next time you prepare.")
+        self.prepare_button.setEnabled(True)
+        self.record_only_button.setEnabled(True)
+        self.cancel_button.setText("Close")
+        self.stack.setCurrentIndex(1)
+
+    def _cancel(self) -> None:
+        if self._worker is not None:
+            self._append("Cancelling after the current step...")
+            self._worker.cancel()
+            self.cancel_button.setEnabled(False)
+            return
+        self.reject()
 
     def _record_only(self) -> None:
+        """A deliberate, remembered choice - not a silent fallback."""
         self.app.set_mode(OperatingMode.RECORD_ONLY.value)
+        self.app.config.record_setup(record_only=True)
         self.accept()
 
-    def _check(self) -> None:
-        from .readiness_dialog import ReadinessDialog
+    @property
+    def readiness(self):
+        return self._readiness
 
-        ReadinessDialog(self.app, self).exec()
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
+        if self._worker is not None:
+            self._worker.cancel()
+        super().closeEvent(event)
 
 
 def _paragraph(text: str) -> QtWidgets.QLabel:

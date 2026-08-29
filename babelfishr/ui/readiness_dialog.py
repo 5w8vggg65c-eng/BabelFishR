@@ -59,15 +59,36 @@ class ReadinessDialog(QtWidgets.QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+        self._worker = None
         self.refresh(False)
 
     def refresh(self, run_smoke_tests: bool) -> None:
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-        try:
-            report = self.app.readiness(run_smoke_tests=run_smoke_tests)
-        finally:
-            QtWidgets.QApplication.restoreOverrideCursor()
+        """Run Field Check on a worker thread.
 
+        With smoke tests enabled this loads a Whisper model and transcribes a
+        fixture, which takes seconds; on the GUI thread that is a frozen
+        window.
+        """
+        from .workers import readiness_job, run_in_background
+
+        self.recheck_button.setEnabled(False)
+        self.headline.setText("Checking...")
+        self.subtitle.setText(
+            "Loading models and running real smoke tests."
+            if run_smoke_tests else "Checking audio, storage and engines.")
+        self._worker = run_in_background(
+            readiness_job, self.app, run_smoke_tests,
+            on_message=self.subtitle.setText,
+            on_finished=self._render,
+            on_failed=self._failed)
+
+    def _failed(self, message: str) -> None:
+        self.recheck_button.setEnabled(True)
+        self.headline.setText("Field check could not complete")
+        self.subtitle.setText(message)
+
+    def _render(self, report) -> None:
+        self.recheck_button.setEnabled(True)
         self.tree.clear()
         for check in report.checks:
             item = QtWidgets.QTreeWidgetItem(
