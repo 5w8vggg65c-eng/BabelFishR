@@ -36,14 +36,33 @@ def run(config_path: Optional[str] = None, argv: Optional[list] = None) -> int:
     window = MainWindow(app)
     window.show()
 
-    # First launch: no completed setup, so guide the operator rather than
-    # leaving them at an app that cannot transcribe and will not say why.
-    if config.needs_first_run_setup:
+    # Guide the operator rather than leaving them at an app that cannot
+    # transcribe and will not say why. Not only on a genuine first launch: a
+    # model that was deleted, moved or left half-downloaded is the same
+    # situation from the operator's side, and the flag alone would miss it.
+    if config.needs_first_run_setup or not _has_usable_assets(config):
         from .setup_assistant import SetupAssistant
 
         QtCore.QTimer.singleShot(
             200, lambda: SetupAssistant(app, window).exec())
     return qt_app.exec()
+
+
+def _has_usable_assets(config) -> bool:
+    """Is there a complete speech model AND at least one translation route?"""
+    try:
+        from ..preparation import installed_routes
+        from ..providers.whisper_local import (ModelState,
+                                               inspect_model_directory,
+                                               model_directory_for)
+
+        directory = model_directory_for(config.paths().models, config.asr.model)
+        state, _ = inspect_model_directory(directory)
+        if state is not ModelState.COMPLETE:
+            return False
+        return bool(installed_routes(config))
+    except Exception:  # noqa: BLE001 - never block startup on this check
+        return False
 
 
 __all__ = ["run"]

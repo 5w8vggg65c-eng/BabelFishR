@@ -321,3 +321,18 @@ def test_main_window_readiness_badge_updates_asynchronously(qt_app, app):
     window = MainWindow(app)
     assert _pump(qt_app, lambda: window.ready_badge.text().strip() != "")
     window.close()
+
+
+def test_the_assistant_opens_when_the_model_is_gone_not_only_on_first_run(
+        tmp_path, monkeypatch):
+    """A deleted or half-downloaded model is a first run from where the
+    operator is standing, even though setup was once marked complete."""
+    from babelfishr.config import Config
+    from babelfishr.ui import _has_usable_assets
+
+    config = Config()
+    config.app_home = str(tmp_path)
+    config.setup.completed = True
+    assert config.needs_first_run_setup is False
+    # Nothing is prepared under this home, so the assistant must still appear.
+    assert _has_usable_assets(config) is False
