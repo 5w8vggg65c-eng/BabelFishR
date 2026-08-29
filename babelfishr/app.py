@@ -66,17 +66,21 @@ class BabelFishRApp:
         self.pipeline: Optional[ProcessingPipeline] = None
 
     # -- setup -----------------------------------------------------------
+    def glossary_path(self) -> pathlib.Path:
+        """The one location the glossary is read from and written to.
+
+        Resolved by the configuration, so it lands under Application Support
+        with everything else rather than in a legacy ~/.config directory the
+        rest of the application does not know about.
+        """
+        return self.config.glossary_file()
+
     def _load_glossary(self) -> Glossary:
-        path = self.config.translate.glossary_path
-        if path:
-            return Glossary.load(path)
-        default = pathlib.Path.home() / ".config" / "babelfishr" / "glossary.json"
-        return Glossary.load(str(default)) if default.exists() else Glossary()
+        path = self.glossary_path()
+        return Glossary.load(str(path)) if path.exists() else Glossary()
 
     def save_glossary(self) -> str:
-        path = self.config.translate.glossary_path or str(
-            pathlib.Path.home() / ".config" / "babelfishr" / "glossary.json")
-        return self.glossary.save(path)
+        return self.glossary.save(str(self.glossary_path()))
 
     @property
     def mode(self):
