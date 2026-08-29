@@ -27,7 +27,7 @@ def _configure_logging(level: str) -> None:
 
 # ---- commands ---------------------------------------------------------
 def cmd_devices(args) -> int:
-    from .audio.devices import backend_status, list_input_devices
+    from .audio.devices import backend_status, list_input_devices, unique_labels
 
     print(backend_status())
     devices = list_input_devices()
@@ -36,11 +36,109 @@ def cmd_devices(args) -> int:
         print("On macOS, check System Settings > Privacy & Security > Microphone")
         print("and make sure your terminal (or BabelFishR) is allowed.")
         return 1
+    labels = unique_labels(devices)
     print(f"\n{len(devices)} input device(s):\n")
     for device in devices:
+        kind = "built-in microphone" if device.is_builtin else "external input"
         print("  " + device.describe())
-    print("\nUse the index or a name fragment with --device.")
+        print(f"        {labels[device.index]}  -  {kind}")
+    print("\nThe index is only valid until something is plugged in or removed.")
+    print("To remember one across restarts:  babelfishr input --select INDEX")
     return 0
+
+
+def cmd_input(args) -> int:
+    """Show, choose or clear the remembered audio input.
+
+    The remembered input is stored as a stable identity, not an index, so it
+    still means the same physical device after a reboot or a replug.
+    """
+    from .app import BabelFishRApp
+    from .audio.devices import (backend_status, list_input_devices,
+                                unique_labels)
+    from .config import Config
+
+    config = Config.load(args.config)
+    app = BabelFishRApp(config=config)
+    try:
+        if args.clear:
+            config.clear_input_selection()
+            print("Cleared. Nothing will be monitored until an input is chosen.")
+            return 0
+
+        if args.system_default:
+            config.record_system_default_input()
+            print("Recorded a deliberate choice to follow the macOS system "
+                  "default input.")
+            print("This changes when you change the system setting. For radio "
+                  "work, select the interface itself instead.")
+            return 0
+
+        if args.select is not None:
+            devices = list_input_devices()
+            chosen = [d for d in devices if str(d.index) == str(args.select)
+                      or d.name == args.select]
+            if not chosen:
+                fragments = [d for d in devices
+                             if str(args.select).lower() in d.name.lower()]
+                chosen = fragments
+            if not chosen:
+                print(f"No input matching {args.select!r}. "
+                      f"Run 'babelfishr devices'.", file=sys.stderr)
+                return 1
+            if len(chosen) > 1:
+                print(f"{args.select!r} matches more than one input:",
+                      file=sys.stderr)
+                labels = unique_labels(chosen)
+                for device in chosen:
+                    print(f"  [{device.index}] {labels[device.index]}",
+                          file=sys.stderr)
+                return 1
+            device = chosen[0]
+            config.record_input_selection(
+                device, locked=None if args.lock is None else args.lock,
+                profile_id=args.profile)
+            print(f"Remembered: {device.name}")
+            print(f"  identity : {device.identity.describe()}")
+            print(f"  locked   : {config.audio.input.locked}")
+            if device.is_builtin:
+                print("  This is the microphone built into this Mac. It is the "
+                      "right choice for a bench test and the wrong one for "
+                      "monitoring a radio.")
+            if args.profile:
+                print(f"  profile  : {args.profile} will select this input")
+            return 0
+
+        # No action: report.
+        print(backend_status())
+        status = app.input_status()
+        state = status["state"]
+        if state == "none":
+            print("\nNo input has been chosen.")
+            print("Run 'babelfishr devices', then "
+                  "'babelfishr input --select INDEX'.")
+            return 1
+        if state == "system-default":
+            print("\nINPUT: macOS system default (chosen deliberately)")
+            print("  This follows the system setting and can change without "
+                  "warning. For radio work, select the interface itself.")
+            return 0
+        identity = status["identity"]
+        print(f"\nExpected input: {identity.describe()}")
+        print(f"  identified by : {identity.basis}")
+        print(f"  locked        : {status['locked']}")
+        if state == "connected":
+            device = status["device"]
+            print(f"  STATUS        : CONNECTED as input {device.index}")
+            if status.get("ambiguous"):
+                print("  WARNING: more than one connected input is "
+                      "indistinguishable from this one.")
+            return 0
+        print("  STATUS        : NOT CONNECTED")
+        print("  BabelFishR will not substitute another input for it.")
+        return 1
+    finally:
+        app.close()
 
 
 def cmd_level(args) -> int:
@@ -840,6 +938,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--name")
     p.add_argument("--target-language")
     p.set_defaults(func=cmd_listen)
+
+    p = sub.add_parser("input", help="show, choose or clear the saved audio input")
+    p.add_argument("--select", metavar="INDEX_OR_NAME",
+                   help="remember this input by stable identity")
+    p.add_argument("--system-default", action="store_true",
+                   help="deliberately follow the macOS default input")
+    p.add_argument("--clear", action="store_true", help="forget the saved input")
+    p.add_argument("--profile", help="also associate the input with this profile")
+    lock = p.add_mutually_exclusive_group()
+    lock.add_argument("--lock", dest="lock", action="store_true", default=None,
+                      help="refuse to capture from anything else (default for "
+                           "external inputs)")
+    lock.add_argument("--no-lock", dest="lock", action="store_false",
+                      help="allow choosing a different input later without "
+                           "unlocking first")
+    p.add_argument("--config")
+    p.set_defaults(func=cmd_input)
 
     p = sub.add_parser("search", help="search transcripts and translations")
     p.add_argument("query", nargs="?", default="")

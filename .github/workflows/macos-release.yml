@@ -161,6 +161,21 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      # Echoed into the job log, after the uploads, so the outcome can be read
+      # without downloading an artifact.
+      - name: Print the verification and signing reports
+        if: always()
+        run: |
+          set -euo pipefail
+          for report in signing-status independence-report bundle-verification; do
+            file="build-reports/$report.txt"
+            echo "================ $file ================"
+            [[ -f "$file" ]] && cat "$file" || echo "(not produced)"
+            echo ""
+          done
+          echo "================ test summary ================"
+          tail -n 12 build-reports/test-report.txt 2>/dev/null || echo "(none)"
+
       # ------------------------------------------------------------------
       # Publishing. A tag push publishes automatically; a manual run publishes
       # only when explicitly asked to, so probing the pipeline never creates a

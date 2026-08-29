@@ -9,11 +9,13 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..app import BabelFishRApp
 from ..audio.devices import backend_available, backend_status
+from ..audio.devices import InputDeviceMissing, InputNotSelected
 from ..config import Config
 from ..models import (ProcessingState, RadioProfile, SourceLanguageMode,
                       Transmission)
 from ..modes import OperatingMode
 from ..pipeline import PipelineState
+from .input_panel import InputPanel
 from .timeline import TimelineView
 from .widgets import LevelMeterWidget
 
@@ -100,6 +102,18 @@ class MainWindow(QtWidgets.QMainWindow):
         root.setSpacing(10)
 
         root.addLayout(self._build_header())
+
+        # Deliberately outside the collapsible panel below: the operator must
+        # be able to see which input is live at every moment of a watch,
+        # without expanding anything to find out.
+        self.input_box = QtWidgets.QGroupBox("Audio input")
+        self.input_box.setObjectName("inputPanel")
+        self.input_panel = InputPanel(self.app)
+        self.input_panel.selectionChanged.connect(self._on_input_selection)
+        input_layout = QtWidgets.QVBoxLayout(self.input_box)
+        input_layout.setContentsMargins(10, 6, 10, 8)
+        input_layout.addWidget(self.input_panel)
+        root.addWidget(self.input_box)
 
         self.setup_box = QtWidgets.QGroupBox("Session setup")
         self.setup_box.setObjectName("setupPanel")
@@ -190,17 +204,6 @@ class MainWindow(QtWidgets.QMainWindow):
         grid = QtWidgets.QGridLayout()
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(6)
-
-        grid.addWidget(QtWidgets.QLabel("Input"), 0, 0)
-        self.device_box = QtWidgets.QComboBox()
-        self.device_box.setMinimumWidth(230)
-        grid.addWidget(self.device_box, 0, 1)
-
-        self.refresh_button = QtWidgets.QToolButton()
-        self.refresh_button.setText("↻")
-        self.refresh_button.setToolTip("Rescan audio devices")
-        self.refresh_button.clicked.connect(self._refresh_devices)
-        grid.addWidget(self.refresh_button, 0, 2)
 
         grid.addWidget(QtWidgets.QLabel("Radio profile"), 0, 3)
         self.profile_box = QtWidgets.QComboBox()
@@ -327,21 +330,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # -- population ------------------------------------------------------
     def _refresh_devices(self) -> None:
-        self.device_box.clear()
-        devices = self.app.devices()
-        if not devices:
-            self.device_box.addItem("No audio input devices found", None)
-            self.device_box.setEnabled(False)
-            if not backend_available():
-                self._warn("No audio backend. Install the audio extra "
-                           "(pip install 'babelfishr[audio]') to capture live "
-                           "audio. Replaying a WAV file still works.")
-        else:
-            self.device_box.setEnabled(True)
-            for device in devices:
-                self.device_box.addItem(device.describe(), device.index)
-                if device.is_default:
-                    self.device_box.setCurrentIndex(self.device_box.count() - 1)
+        """Rescan inputs. Selection is the input panel's business, not ours."""
+        self.input_panel.refresh_devices()
+        if not backend_available():
+            self._warn("No audio backend. Install the audio extra "
+                       "(pip install 'babelfishr[audio]') to capture live "
+                       "audio. Replaying a WAV file still works.")
+
+    def _on_input_selection(self) -> None:
+        self.status.showMessage(self.input_panel.status_label.text(), 6000)
 
     def _refresh_sdr_label(self) -> None:
         from ..sources import sdr_status
@@ -392,11 +389,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self._start_monitoring()
 
     def _start_monitoring(self, replay_path: Optional[str] = None) -> None:
-        device = self.device_box.currentData()
+        identity = None
+        if not replay_path:
+            ok, message = self.input_panel.ready_to_monitor()
+            if not ok:
+                self._resolve_input_problem(message)
+                return
+            identity = self.input_panel.selected_identity()
+
         mode = self.source_mode_box.currentData()
         try:
             self.app.start_session(
-                device=None if device is None else str(device),
+                identity=identity,
                 replay_path=replay_path, realtime_replay=bool(replay_path),
                 profile_id=self.profile_box.currentData(),
                 target_language=self.target_language_box.currentData(),
@@ -405,6 +409,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 source_language_mode=mode,
             )
             self.app.begin_capture()
+        except (InputDeviceMissing, InputNotSelected) as exc:
+            self.app.stop_session()
+            self._resolve_input_problem(str(exc))
+            return
         except Exception as exc:  # noqa: BLE001 - surface, never crash
             QtWidgets.QMessageBox.critical(self, "Could not start monitoring", str(exc))
             self.app.stop_session()
@@ -413,18 +421,55 @@ class MainWindow(QtWidgets.QMainWindow):
         self.meter.reset()
         self.start_button.setText("Stop monitoring")
         self._set_controls_enabled(False)
+        self.input_panel.set_monitoring(True)
+
+    def _resolve_input_problem(self, message: str) -> None:
+        """Refuse to start, say exactly why, and offer the real options.
+
+        Deliberately three named actions rather than a bare OK: the operator
+        needs to be able to act on this without being tempted to press start
+        again and hope.
+        """
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle("BabelFishR is not receiving anything yet")
+        box.setText("Monitoring was not started.")
+        box.setInformativeText(message)
+        rescan = box.addButton("Rescan", QtWidgets.QMessageBox.ActionRole)
+        choose = box.addButton("Choose Different Input",
+                               QtWidgets.QMessageBox.ActionRole)
+        later = box.addButton("Record Later", QtWidgets.QMessageBox.RejectRole)
+        box.setDefaultButton(rescan)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is rescan:
+            self.input_panel.refresh_devices()
+            ok, _ = self.input_panel.ready_to_monitor()
+            if ok:
+                self._start_monitoring()
+        elif clicked is choose:
+            self.input_box.setVisible(True)
+            self.input_panel.refresh_devices()
+            self.input_panel.device_box.setFocus()
+            self.input_panel.device_box.showPopup()
+        elif clicked is later:
+            self.status.showMessage(
+                "Not monitoring. Nothing is being recorded.", 8000)
 
     def _stop_monitoring(self) -> None:
         self.app.stop_session()
         self.start_button.setText("Start monitoring")
         self._set_controls_enabled(True)
+        # Inputs can be changed again, but only once the watch has stopped.
+        self.input_panel.set_monitoring(False)
         self._set_state(PipelineState.IDLE)
         self.meter.reset()
 
     def _set_controls_enabled(self, enabled: bool) -> None:
-        for widget in (self.device_box, self.profile_box, self.profile_button,
+        for widget in (self.profile_box, self.profile_button,
                        self.source_mode_box, self.target_language_box,
-                       self.refresh_button, self.calibrate_button):
+                       self.calibrate_button):
             widget.setEnabled(enabled)
         self.source_language_box.setEnabled(
             enabled and self.source_mode_box.currentData() == "specified")
@@ -478,6 +523,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 reading = event.payload
                 self.meter.set_reading(reading.rms_fraction, reading.peak_fraction,
                                        reading.clipped, reading.clip_count)
+                self.input_panel.set_reading(
+                    reading.rms_fraction, reading.peak_fraction,
+                    reading.clipped, reading.clip_count)
                 self.clip_label.setText(
                     f"⚠ clipping ({reading.clip_count})" if reading.clip_count else "")
             elif event.kind == "state":
@@ -488,10 +536,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.timeline.update(event.payload)
             elif event.kind == "audio-status":
                 payload = event.payload or {}
-                self.status.showMessage(
-                    f"Audio: {payload.get('kind')} - {payload.get('message')}", 8000)
-                if payload.get("kind") in ("disconnected", "reconnect-failed"):
-                    self._warn(f"Audio device problem: {payload.get('message')}")
+                kind = payload.get("kind", "")
+                message = payload.get("message", "")
+                self.status.showMessage(f"Audio: {kind} - {message}", 8000)
+                self.input_panel.report_audio_status(kind, message)
+                if kind in ("disconnected", "reconnect-failed"):
+                    self._warn(
+                        "The selected audio input stopped responding. "
+                        "BabelFishR is waiting for that same device and will "
+                        "not record from anything else. Transmissions already "
+                        "captured are safe.")
             elif event.kind == "error":
                 payload = event.payload or {}
                 self.status.showMessage(
@@ -696,6 +750,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_profile_changed(self) -> None:
         profile_id = self.profile_box.currentData()
         profile = self.app.use_profile(profile_id) if profile_id else None
+        # A profile can remember which interface it is wired to. Selecting it
+        # selects that input when it is present - and says so plainly when it
+        # is not, rather than leaving the previous device in place.
+        if getattr(self, "input_panel", None) is not None:
+            self.input_panel.set_profile(profile_id)
         if profile is None:
             self.channel_label.setText(
                 "No profile selected - transmissions will have no channel or "

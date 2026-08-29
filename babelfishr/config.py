@@ -34,9 +34,42 @@ class SafetyRecordingConfig:
 
 
 @dataclasses.dataclass
+class InputSelection:
+    """Which audio input the operator chose, and how firmly.
+
+    Stored as a :class:`babelfishr.audio.devices.DeviceIdentity` token rather
+    than an index or a name, so it still means the same physical device after
+    the interface has been unplugged, replugged, or the machine rebooted.
+    """
+
+    identity: str = ""
+    """Serialised DeviceIdentity. Empty means nothing has been chosen yet."""
+
+    label: str = ""
+    """What the operator saw when they chose it. Used when it goes missing."""
+
+    confirmed: bool = False
+    """The operator selected this deliberately. Nothing else may set it."""
+
+    locked: bool = True
+    """Refuse to capture from anything but this exact device."""
+
+    use_system_default: bool = False
+    """A deliberate, visibly labelled choice to follow the macOS setting.
+
+    Never a fallback. When this is true the operator has said, in as many
+    words, that they want whatever macOS currently calls the default input.
+    """
+
+
+@dataclasses.dataclass
 class AudioConfig:
     device: Optional[str] = None
-    """Device index, name fragment, or ``None`` for the system default."""
+    """Device index, name fragment, or ``None`` for the system default.
+
+    A *selector*, for the command line and for one-off use. It is not how a
+    saved selection is restored - see ``input``.
+    """
 
     sample_rate: int = 48_000
     block_size: int = 2048
@@ -47,6 +80,17 @@ class AudioConfig:
     reconnect: bool = True
     safety_recording: SafetyRecordingConfig = dataclasses.field(
         default_factory=SafetyRecordingConfig)
+
+    input: InputSelection = dataclasses.field(default_factory=InputSelection)
+    """The persisted, operator-confirmed input."""
+
+    profile_inputs: Dict[str, str] = dataclasses.field(default_factory=dict)
+    """profile id -> DeviceIdentity token.
+
+    A radio profile can remember which interface it is wired to, so selecting
+    the profile selects the right input - and says so loudly when that input is
+    not connected, instead of quietly using something else.
+    """
 
 
 @dataclasses.dataclass
@@ -257,8 +301,14 @@ class Config:
         }
         for name, obj in sections.items():
             values = dict(data.get(name) or {})
-            if name == "audio" and "safety_recording" in values:
-                _update(cfg.audio.safety_recording, values.pop("safety_recording"))
+            if name == "audio":
+                # Nested dataclasses have to be updated in place; assigning the
+                # raw dict would leave a dict where the code expects an object.
+                if "safety_recording" in values:
+                    _update(cfg.audio.safety_recording,
+                            values.pop("safety_recording"))
+                if "input" in values:
+                    _update(cfg.audio.input, dict(values.pop("input") or {}))
             _update(obj, values)
         for key in ("database", "log_level", "experimental", "mode", "app_home"):
             if key in data:
@@ -336,6 +386,79 @@ class Config:
             self.setup.completed_at = _dt.datetime.now(
                 _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         return self.save()
+
+    # ---- audio input selection ----------------------------------------
+    def selected_input(self):
+        """The saved input identity, or an empty one when nothing is chosen."""
+        from .audio.devices import DeviceIdentity
+
+        return DeviceIdentity.parse(self.audio.input.identity)
+
+    def has_confirmed_input(self) -> bool:
+        """True only when the operator explicitly chose something.
+
+        Monitoring is not allowed to start without this. A remembered device is
+        not the same as a chosen one, and an unchosen device is how a laptop
+        microphone ends up standing in for a radio.
+        """
+        selection = self.audio.input
+        if not selection.confirmed:
+            return False
+        return bool(selection.use_system_default or selection.identity)
+
+    def record_input_selection(self, device, *, locked: Optional[bool] = None,
+                               profile_id: Optional[str] = None,
+                               save: bool = True) -> str:
+        """Persist a device the operator chose, by stable identity.
+
+        ``locked`` defaults to True for anything that is not the machine's own
+        microphone: an external interface is chosen because of what is wired to
+        it, so substituting another device is never the right answer. The
+        built-in microphone is a deliberate bench-test choice and is left
+        unlocked so the operator can move on quickly.
+        """
+        identity = device.identity
+        self.audio.input = InputSelection(
+            identity=identity.token(),
+            label=getattr(device, "name", "") or identity.describe(),
+            confirmed=True,
+            locked=(not device.is_builtin) if locked is None else bool(locked),
+            use_system_default=False,
+        )
+        # Keep the CLI selector pointing at the same device, so `babelfishr
+        # monitor` with no arguments agrees with the window.
+        self.audio.device = identity.token()
+        if profile_id:
+            self.audio.profile_inputs[profile_id] = identity.token()
+        return self.save() if save else ""
+
+    def record_system_default_input(self, save: bool = True) -> str:
+        """Record a deliberate choice to follow the macOS system default."""
+        self.audio.input = InputSelection(
+            identity="", label="macOS system default input", confirmed=True,
+            locked=False, use_system_default=True)
+        self.audio.device = None
+        return self.save() if save else ""
+
+    def clear_input_selection(self, save: bool = True) -> str:
+        self.audio.input = InputSelection()
+        self.audio.device = None
+        return self.save() if save else ""
+
+    def preferred_input_for_profile(self, profile_id: Optional[str]):
+        """The input this radio profile is wired to, if it has one."""
+        from .audio.devices import DeviceIdentity
+
+        if not profile_id:
+            return DeviceIdentity()
+        return DeviceIdentity.parse(self.audio.profile_inputs.get(profile_id, ""))
+
+    def associate_profile_input(self, profile_id: str, device,
+                                save: bool = True) -> str:
+        if not profile_id:
+            return ""
+        self.audio.profile_inputs[profile_id] = device.identity.token()
+        return self.save() if save else ""
 
     @property
     def needs_first_run_setup(self) -> bool:

@@ -61,6 +61,15 @@ class InputDeviceMissing(AudioBackendUnavailable):
             f"the selected audio input is not connected: {identity.describe()}"))
 
 
+class InputNotSelected(RuntimeError):
+    """Monitoring was requested before an input was deliberately chosen.
+
+    A remembered device is not the same as a chosen one. Starting a watch on
+    "whatever the system default happens to be" is exactly how an operator ends
+    up recording the room, so it is refused outright rather than defaulted.
+    """
+
+
 @dataclasses.dataclass(frozen=True)
 class DeviceIdentity:
     """A way to name one audio input that survives replugging and rebooting.
@@ -416,7 +425,8 @@ def default_input_device() -> Optional[AudioDevice]:
 
 __all__ = [
     "AudioBackendUnavailable", "AudioDevice", "DeviceIdentity", "DeviceMatch",
-    "InputDeviceMissing", "backend_available", "backend_status",
+    "InputDeviceMissing", "InputNotSelected", "backend_available",
+    "backend_status",
     "default_input_device", "find_device", "list_input_devices",
     "resolve_identity", "unique_labels",
 ]

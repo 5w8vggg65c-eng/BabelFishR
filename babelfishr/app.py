@@ -11,7 +11,9 @@ import logging
 import pathlib
 from typing import Any, Dict, List, Optional
 
-from .audio.devices import AudioDevice, backend_status, find_device, list_input_devices
+from .audio.devices import (AudioDevice, DeviceIdentity, DeviceMatch,
+                            InputNotSelected, backend_status, find_device,
+                            list_input_devices, resolve_identity)
 from .audio.source import AudioSource, LiveAudioSource, ReplayAudioSource
 from .config import Config
 from .models import (ProcessingState, RadioProfile, Session, SourceLanguageMode,
@@ -177,6 +179,44 @@ class BabelFishRApp:
     def audio_backend_status(self) -> str:
         return backend_status()
 
+    def selected_input_identity(self) -> DeviceIdentity:
+        """The input the operator chose, as a stable identity."""
+        return self.config.selected_input()
+
+    def resolve_selected_input(self) -> Optional[DeviceMatch]:
+        """Is the chosen input connected right now?
+
+        ``None`` means it is not. It never means "here is a different device
+        that happens to be available".
+        """
+        return resolve_identity(self.selected_input_identity())
+
+    def input_status(self) -> dict:
+        """Everything the window needs to say what it is listening to.
+
+        ``state`` is one of ``none`` (nothing chosen yet), ``system-default``
+        (chosen deliberately), ``connected`` or ``missing``.
+        """
+        selection = self.config.audio.input
+        identity = self.selected_input_identity()
+        if selection.use_system_default and selection.confirmed:
+            return {"state": "system-default", "identity": identity,
+                    "device": None, "label": "macOS system default input",
+                    "locked": False, "expected": "macOS system default input"}
+        if not self.config.has_confirmed_input():
+            return {"state": "none", "identity": identity, "device": None,
+                    "label": "", "locked": False, "expected": ""}
+        match = resolve_identity(identity)
+        expected = selection.label or identity.describe()
+        if match is None:
+            return {"state": "missing", "identity": identity, "device": None,
+                    "label": expected, "locked": selection.locked,
+                    "expected": expected}
+        return {"state": "connected", "identity": identity,
+                "device": match.device, "label": match.device.name,
+                "locked": selection.locked, "expected": expected,
+                "basis": match.basis, "ambiguous": match.ambiguous}
+
     # -- session ---------------------------------------------------------
     def start_session(self, source: Optional[AudioSource] = None, *,
                       device: Optional[str] = None,
@@ -186,13 +226,15 @@ class BabelFishRApp:
                       target_language: Optional[str] = None,
                       source_language: Optional[str] = None,
                       source_language_mode: Optional[str] = None,
+                      identity: Optional[DeviceIdentity] = None,
                       workers: int = 1) -> Session:
         """Open a session and begin capturing."""
         if self.capture is not None:
             raise RuntimeError("a session is already running")
 
         if source is None:
-            source = self._build_source(device, replay_path, realtime_replay)
+            source = self._build_source(device, replay_path, realtime_replay,
+                                        identity)
 
         if self.transcription is None and self.translation is None:
             self.select_engines()
@@ -231,12 +273,33 @@ class BabelFishRApp:
         return session
 
     def _build_source(self, device: Optional[str], replay_path: Optional[str],
-                      realtime: bool) -> AudioSource:
+                      realtime: bool,
+                      identity: Optional[DeviceIdentity] = None) -> AudioSource:
         if replay_path:
             return ReplayAudioSource(replay_path, realtime=realtime,
                                      block_size=self.config.audio.block_size)
+
+        selection = self.config.audio.input
+        if identity is None or identity.empty:
+            if device is not None:
+                # An explicit selector from this call or the command line: the
+                # operator is naming a device now and can see the result.
+                identity = None
+            elif selection.use_system_default and selection.confirmed:
+                # A deliberate, visibly labelled choice. Not a fallback.
+                identity = None
+            elif selection.identity:
+                identity = self.config.selected_input()
+            else:
+                raise InputNotSelected(
+                    "No audio input has been chosen. Choose the input you want "
+                    "to monitor - the built-in microphone for a bench test, or "
+                    "your radio interface - before starting. BabelFishR will "
+                    "not pick one for you.")
+
         return LiveAudioSource(
             device=device if device is not None else self.config.audio.device,
+            identity=identity,
             sample_rate=self.config.audio.sample_rate,
             block_size=self.config.audio.block_size,
             channels=self.config.audio.channels,

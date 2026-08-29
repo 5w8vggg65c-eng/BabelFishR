@@ -79,9 +79,22 @@ class FunctionWorker(QtCore.QRunnable):
     def cancel(self) -> None:
         self.token.cancel()
 
+    def _emit(self, signal, *args) -> None:
+        """Deliver a result, unless the receiver has already gone away.
+
+        A window can be closed while a readiness check is still running. The
+        C++ side of its signals object is destroyed, and emitting into it
+        raises out of the pool thread - noisy, and one day fatal. The result
+        is simply not wanted any more, so it is dropped.
+        """
+        try:
+            signal.emit(*args)
+        except RuntimeError as exc:  # pragma: no cover - teardown race
+            log.debug("dropping a background result: %s", exc)
+
     @QtCore.Slot()
     def run(self) -> None:  # pragma: no cover - exercised via the thread pool
-        self.signals.started.emit()
+        self._emit(self.signals.started)
         try:
             import inspect
 
@@ -93,16 +106,16 @@ class FunctionWorker(QtCore.QRunnable):
                 kwargs["token"] = self.token
             result = self._function(*self._args, **kwargs)
         except Cancelled:
-            self.signals.cancelled.emit()
+            self._emit(self.signals.cancelled)
             return
         except Exception as exc:  # noqa: BLE001 - a worker must never crash the UI
             log.exception("background worker failed")
-            self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
+            self._emit(self.signals.failed, f"{type(exc).__name__}: {exc}")
             return
         if self.token.cancelled:
-            self.signals.cancelled.emit()
+            self._emit(self.signals.cancelled)
             return
-        self.signals.finished.emit(result)
+        self._emit(self.signals.finished, result)
 
 
 #: Workers currently in flight. Without a strong reference the Python wrapper
