@@ -27,6 +27,24 @@ MODEL_SIZES_MB = {
 }
 
 
+def working_config(config, asr_model: str):
+    """A copy of *config* carrying the model actually being prepared.
+
+    Preparation took an ``asr_model`` override while the following Field Check
+    read ``config.asr.model``, so choosing ``tiny`` downloaded tiny and then
+    failed readiness looking for ``small``. Both steps now run against one
+    working copy, and the caller's configuration is left untouched until the
+    whole operation succeeds - a failed or cancelled preparation must not
+    rewrite a setting that was previously working.
+    """
+    import copy
+
+    working = copy.deepcopy(config)
+    if asr_model:
+        working.asr.model = asr_model
+    return working
+
+
 @dataclasses.dataclass
 class PreparationResult:
     steps: List[Tuple[str, bool, str]] = dataclasses.field(default_factory=list)

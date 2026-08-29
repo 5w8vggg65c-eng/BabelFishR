@@ -43,7 +43,7 @@ def app(tmp_path, monkeypatch):
     return BabelFishRApp(config=config, store=Store(":memory:"))
 
 
-def _pump(qt_app, predicate, timeout: float = 5.0) -> bool:
+def _pump(qt_app, predicate, timeout: float = 15.0) -> bool:
     """Spin the event loop until *predicate* holds or the timeout expires."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

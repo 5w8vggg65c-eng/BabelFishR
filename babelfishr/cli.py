@@ -308,16 +308,29 @@ def cmd_prepare_field(args) -> int:
             print(f"ignoring malformed --language {spec!r} (use es-en)",
                   file=sys.stderr)
 
-    result = prepare_field(config, asr_model=args.asr_model,
+    # One config for preparation and verification, so a non-default model is
+    # not prepared and then checked for under the default name.
+    from .preparation import working_config
+
+    working = working_config(config, args.asr_model or config.asr.model)
+    result = prepare_field(working, asr_model=working.asr.model,
                            language_pairs=pairs, report=print,
                            skip_download=args.no_download)
     print()
     print(result.summary())
 
-    print("\nVerifying with Field Check (as if the network were unplugged)...\n")
-    report = field_check(config, mode=OperatingMode.FIELD_OFFLINE)
+    print(f"\nVerifying {working.asr.model!r} with Field Check (as if the "
+          f"network were unplugged)...\n")
+    report = field_check(working, mode=OperatingMode.FIELD_OFFLINE)
     print(report.summary())
-    return 0 if (result.ok and report.field_ready) else 1
+
+    ok = result.ok and report.field_ready
+    if ok:
+        # Persist only what actually verified.
+        config.record_setup(asr_model=working.asr.model, language_pairs=pairs)
+        print(f"\nSaved: model {working.asr.model!r}, "
+              f"{len(pairs)} language pair(s).")
+    return 0 if ok else 1
 
 
 def cmd_languages(args) -> int:

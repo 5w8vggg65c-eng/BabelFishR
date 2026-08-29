@@ -219,9 +219,13 @@ class SetupAssistant(QtWidgets.QDialog):
         # actually loaded with downloads disabled.
         if readiness.field_ready:
             self.status_label.setText("Ready for offline field use")
+            # Persist the model that was actually prepared AND verified, and
+            # only now - a failed or cancelled run must leave the previous
+            # setting intact.
             self.app.config.record_setup(
-                asr_model=self.selected_model(),
-                language_pairs=self.language_pairs())
+                asr_model=payload.get("asr_model") or self.selected_model(),
+                language_pairs=payload.get("language_pairs")
+                or self.language_pairs())
             self.app.set_mode(OperatingMode.FIELD_OFFLINE.value)
         elif readiness.can_record:
             self.status_label.setText(

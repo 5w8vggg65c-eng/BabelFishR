@@ -19,7 +19,13 @@ from typing import Any, Callable, List, Optional, Tuple
 
 from PySide6 import QtCore
 
+from ..preparation import working_config
+
 log = logging.getLogger(__name__)
+
+__all__ = ["CancellationToken", "Cancelled", "FunctionWorker", "WorkerSignals",
+           "active_worker_count", "analysis_job", "prepare_field_job",
+           "readiness_job", "run_in_background", "working_config"]
 
 
 class WorkerSignals(QtCore.QObject):
@@ -143,7 +149,7 @@ def prepare_field_job(config, asr_model: str,
                       report: Callable[[str], None] = lambda text: None,
                       token: Optional[CancellationToken] = None) -> dict:
     """Download and verify field assets. Runs entirely off the GUI thread."""
-    from ..preparation import prepare_field
+    from ..preparation import prepare_field, working_config
 
     token = token or CancellationToken()
     token.raise_if_cancelled()
@@ -152,17 +158,23 @@ def prepare_field_job(config, asr_model: str,
         token.raise_if_cancelled()
         report(text)
 
-    result = prepare_field(config, asr_model=asr_model,
+    # One config for both steps, so preparation and verification can never
+    # disagree about which model they are talking about.
+    working = working_config(config, asr_model)
+    result = prepare_field(working, asr_model=asr_model,
                            language_pairs=language_pairs, report=relay)
     token.raise_if_cancelled()
 
-    report("Running Field Check with downloads disabled...")
+    report(f"Running Field Check on {working.asr.model!r} with downloads "
+           f"disabled...")
     from ..modes import OperatingMode
     from ..readiness import field_check
 
-    readiness = field_check(config, run_smoke_tests=True,
+    readiness = field_check(working, run_smoke_tests=True,
                             mode=OperatingMode.FIELD_OFFLINE)
-    return {"preparation": result, "readiness": readiness}
+    return {"preparation": result, "readiness": readiness,
+            "asr_model": working.asr.model,
+            "language_pairs": list(language_pairs or [])}
 
 
 def readiness_job(app, run_smoke_tests: bool = True,

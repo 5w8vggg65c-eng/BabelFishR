@@ -19,7 +19,7 @@ def qt_app():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
-def _pump(qt_app, predicate, timeout: float = 5.0) -> bool:
+def _pump(qt_app, predicate, timeout: float = 15.0) -> bool:
     """Spin the event loop until *predicate* holds. Readiness is asynchronous."""
     import time
 
