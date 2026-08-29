@@ -215,9 +215,17 @@ class SetupAssistant(QtWidgets.QDialog):
         self._append("")
         self._append(readiness.summary())
 
-        # Readiness is only claimed when the model and the requested routes
-        # actually loaded with downloads disabled.
-        if readiness.field_ready:
+        # Success needs BOTH halves, exactly as the CLI defines it:
+        # everything asked for was prepared, AND it verifies offline.
+        #
+        # Field Check alone is not sufficient. It smoke-tests one usable route,
+        # so an operator who already had es->en installed and then asked for
+        # de->en and uk->en would see field_ready stay true even if both new
+        # packages failed to install - and the old code would have recorded all
+        # three pairs as ready and switched to Field Offline.
+        prepared_ok = getattr(result, "ok", True)
+
+        if readiness.field_ready and prepared_ok:
             self.status_label.setText("Ready for offline field use")
             # Persist the model that was actually prepared AND verified, and
             # only now - a failed or cancelled run must leave the previous
@@ -227,6 +235,8 @@ class SetupAssistant(QtWidgets.QDialog):
                 language_pairs=payload.get("language_pairs")
                 or self.language_pairs())
             self.app.set_mode(OperatingMode.FIELD_OFFLINE.value)
+        elif readiness.field_ready:
+            self._report_incomplete_preparation(result)
         elif readiness.can_record:
             self.status_label.setText(
                 "Partly ready - recording works, processing does not")
@@ -236,6 +246,30 @@ class SetupAssistant(QtWidgets.QDialog):
         self.prepare_button.setEnabled(True)
         self.prepare_button.setText("Prepare again")
         self.record_only_button.setEnabled(True)
+
+    def _report_incomplete_preparation(self, result) -> None:
+        """Field Check passed, but not everything the operator asked for.
+
+        Nothing is persisted and the mode is unchanged: claiming readiness here
+        would tell an operator their new languages are available offline when
+        the check only proved an already-installed route still works.
+        """
+        failed = [(name, detail) for name, ok, detail in
+                  getattr(result, "steps", []) if not ok]
+        self.status_label.setText("Preparation incomplete - not marked ready")
+        self._append("")
+        self._append(
+            "Field Check passed, but part of what you selected did not "
+            "install:")
+        for name, detail in failed:
+            self._append(f"  - {name}" + (f": {detail}" if detail else ""))
+        self._append(
+            "\nField Check verifies one working route, so it can still pass "
+            "using a language you had installed already. Your new selection "
+            "has NOT been saved and the operating mode is unchanged.")
+        self._append(
+            "Fix the problem above and prepare again, or choose "
+            "'Record only for now' - recording works either way.")
 
     def _failed(self, message: str) -> None:
         self.progress.setRange(0, 1)

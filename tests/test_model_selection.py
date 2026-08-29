@@ -292,3 +292,171 @@ def test_cli_prepare_field_also_checks_the_selected_model(tmp_path, monkeypatch,
     main(["prepare-field", "--asr-model", NON_DEFAULT, "--no-download"])
     assert checked.get("model") == NON_DEFAULT, (
         "the CLI ran Field Check against a different model than it prepared")
+
+
+# ---- success needs BOTH halves, as the CLI already required -------------
+def _partial_preparation() -> PreparationResult:
+    """One requested language package failed; everything else succeeded."""
+    result = PreparationResult()
+    result.add("Free storage", True, "31 GB free")
+    result.add("Recording directory writable", True, "/tmp/Recordings")
+    result.add("Local ASR model", True, f"prepared {NON_DEFAULT}")
+    result.add("Language pack es->en", True, "already installed")
+    result.add("Language pack de->en", False, "no such package is published")
+    assert not result.ok, "the fixture must represent an incomplete preparation"
+    return result
+
+
+def _field_ready_report() -> ReadinessReport:
+    """Field Check passes on the previously installed es->en route."""
+    report = ReadinessReport()
+    report.add(Check("Audio backend", CheckStatus.PASS))
+    report.add(Check("Recording directory writable", CheckStatus.PASS))
+    report.add(Check("Local ASR model present", CheckStatus.PASS))
+    report.add(Check("Local transcription smoke test", CheckStatus.PASS))
+    report.add(Check("Installed translation paths", CheckStatus.PASS, "es->en"))
+    report.add(Check("Local translation smoke test", CheckStatus.PASS,
+                     "es->en produced 'the team is in position'"))
+    assert report.field_ready, "the fixture must represent a passing check"
+    return report
+
+
+def _run_assistant(qt_app, app, monkeypatch, result, readiness,
+                   model=NON_DEFAULT, pairs=(("es", "en"), ("de", "en"))):
+    import babelfishr.ui.setup_assistant as module
+
+    def job(config, chosen_model, chosen_pairs, report=None, token=None):
+        return {"preparation": result, "readiness": readiness,
+                "asr_model": chosen_model, "language_pairs": list(chosen_pairs)}
+
+    monkeypatch.setattr(module, "prepare_field_job", job)
+    assistant = _assistant_with_model(app, model)
+    for code, check in assistant.language_checks.items():
+        check.setChecked(code in {source for source, _ in pairs})
+    assistant._start()
+    assert _pump(qt_app, lambda: assistant.readiness is not None)
+    return assistant
+
+
+def test_partial_preparation_does_not_claim_readiness(qt_app, app, monkeypatch):
+    """Field Check can pass on an already-installed route while a newly
+    requested package failed. That is not 'ready for offline field use'."""
+    assistant = _run_assistant(qt_app, app, monkeypatch,
+                               _partial_preparation(), _field_ready_report())
+
+    assert "Ready for offline field use" not in assistant.status_label.text()
+    assert "incomplete" in assistant.status_label.text().lower()
+
+
+def test_partial_preparation_names_what_failed(qt_app, app, monkeypatch):
+    assistant = _run_assistant(qt_app, app, monkeypatch,
+                               _partial_preparation(), _field_ready_report())
+    log = assistant.log_view.toPlainText()
+
+    assert "Language pack de->en" in log
+    assert "no such package is published" in log
+    # And explains why Field Check passed anyway, so the operator is not left
+    # thinking the two statements contradict each other.
+    assert "already" in log.lower()
+    assert "NOT been saved" in log or "not been saved" in log.lower()
+
+
+def test_partial_preparation_persists_nothing(qt_app, app, monkeypatch):
+    """The previous configuration must survive an incomplete preparation."""
+    app.config.record_setup(asr_model=DEFAULT,
+                            language_pairs=[("es", "en")])
+    before = Config.load()
+    assert before.asr.model == DEFAULT
+    assert before.setup.language_pairs == ["es-en"]
+
+    _run_assistant(qt_app, app, monkeypatch,
+                   _partial_preparation(), _field_ready_report())
+
+    after = Config.load()
+    assert after.asr.model == DEFAULT, "the model selection was persisted"
+    assert after.setup.asr_model == DEFAULT
+    assert after.setup.language_pairs == ["es-en"], (
+        "the failed language-pair selection was persisted")
+
+
+def test_partial_preparation_does_not_switch_to_field_offline(qt_app, app,
+                                                              monkeypatch):
+    app.set_mode(OperatingMode.ONLINE_SETUP.value)
+    assert Config.load().operating_mode() is OperatingMode.ONLINE_SETUP
+
+    _run_assistant(qt_app, app, monkeypatch,
+                   _partial_preparation(), _field_ready_report())
+
+    assert app.config.operating_mode() is OperatingMode.ONLINE_SETUP
+    assert Config.load().operating_mode() is OperatingMode.ONLINE_SETUP
+
+
+def test_partial_preparation_preserves_a_record_only_mode(qt_app, app,
+                                                          monkeypatch):
+    """Whatever the operator had, they keep."""
+    app.set_mode(OperatingMode.RECORD_ONLY.value)
+
+    _run_assistant(qt_app, app, monkeypatch,
+                   _partial_preparation(), _field_ready_report())
+
+    assert Config.load().operating_mode() is OperatingMode.RECORD_ONLY
+
+
+def test_complete_preparation_still_persists_normally(qt_app, app, monkeypatch):
+    """The fix must not break the success path."""
+    result = PreparationResult()
+    result.add("Local ASR model", True, f"prepared {NON_DEFAULT}")
+    result.add("Language pack es->en", True, "installed")
+    result.add("Language pack de->en", True, "installed")
+    assert result.ok
+
+    assistant = _run_assistant(qt_app, app, monkeypatch, result,
+                               _field_ready_report())
+
+    assert "Ready for offline field use" in assistant.status_label.text()
+    reloaded = Config.load()
+    assert reloaded.asr.model == NON_DEFAULT
+    assert set(reloaded.setup.language_pairs) == {"es-en", "de-en"}
+    assert reloaded.operating_mode() is OperatingMode.FIELD_OFFLINE
+
+
+def test_gui_success_condition_matches_the_cli(qt_app, app, monkeypatch):
+    """Both front ends must agree on what 'ready' means.
+
+    The CLI has always required result.ok AND report.field_ready; the GUI
+    checked only the second half.
+    """
+    cases = [
+        (True, True, True),    # prepared and verified
+        (False, True, False),  # the defect: verified, but not fully prepared
+        (True, False, False),  # prepared, but does not verify offline
+        (False, False, False),
+    ]
+    for preparation_ok, field_ready, expected in cases:
+        result = PreparationResult()
+        result.add("Local ASR model", preparation_ok,
+                   "prepared" if preparation_ok else "failed")
+        readiness = (_field_ready_report() if field_ready
+                     else ReadinessReport())
+        assert result.ok is preparation_ok
+        assert readiness.field_ready is field_ready
+
+        # The CLI's rule, stated once.
+        assert (result.ok and readiness.field_ready) is expected
+
+        app.set_mode(OperatingMode.ONLINE_SETUP.value)
+        assistant = _run_assistant(qt_app, app, monkeypatch, result, readiness)
+        claimed = "Ready for offline field use" in assistant.status_label.text()
+        assert claimed is expected, (
+            f"GUI claimed readiness={claimed} for preparation_ok="
+            f"{preparation_ok}, field_ready={field_ready}")
+
+
+def test_cli_success_condition_is_unchanged():
+    """The CLI already required both; this pass must not have touched it."""
+    import inspect
+
+    from babelfishr.cli import cmd_prepare_field
+
+    source = inspect.getsource(cmd_prepare_field)
+    assert "result.ok and report.field_ready" in source
