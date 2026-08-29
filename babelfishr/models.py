@@ -21,8 +21,11 @@ import dataclasses
 import datetime as _dt
 import enum
 import json
+import logging
 import uuid
 from typing import Any, Dict, List, Optional
+
+log = logging.getLogger(__name__)
 
 
 def utcnow() -> _dt.datetime:
@@ -402,10 +405,46 @@ class Session:
         d.pop("duration", None)
         d["started_at"] = parse_iso(d.get("started_at")) or utcnow()
         d["ended_at"] = parse_iso(d.get("ended_at"))
-        if d.get("source_language_mode"):
-            d["source_language_mode"] = SourceLanguageMode(d["source_language_mode"])
+        _coerce_enum(d, "source_language_mode", SourceLanguageMode)
         known = {f.name for f in dataclasses.fields(cls)}
         return cls(**{k: v for k, v in d.items() if k in known})
+
+
+def _enum_value(value: Any, default: Any) -> str:
+    """The stored form of an enum field, tolerating a field that lost its type.
+
+    Used on the way out. Capture-first means an event is written to disk before
+    anything classifies it, so a half-populated row is a normal thing to read
+    back; it must not be a thing that cannot be written out again.
+    """
+    if isinstance(value, enum.Enum):
+        return value.value
+    if value:
+        return str(value)
+    return default.value
+
+
+def _coerce_enum(data: Dict[str, Any], key: str, enum_type) -> None:
+    """Turn a stored value into its enum member, in place.
+
+    A falsy value means nothing was recorded, so the key is removed and the
+    dataclass default applies. An unrecognised value is also dropped rather
+    than raising: a transmission that survived being received should not be
+    unreadable because one column holds a string from a future version.
+    """
+    if key not in data:
+        return
+    value = data[key]
+    if isinstance(value, enum_type):
+        return
+    if not value:
+        data.pop(key)
+        return
+    try:
+        data[key] = enum_type(value)
+    except ValueError:
+        log.warning("unrecognised %s %r; using the default", key, value)
+        data.pop(key)
 
 
 @dataclasses.dataclass
@@ -578,12 +617,18 @@ class Transmission:
         d["started_at"] = iso(self.started_at)
         d["ended_at"] = iso(self.ended_at)
         d["corrected_at"] = iso(self.corrected_at)
-        d["state"] = self.state.value
-        d["content_class"] = self.content_class.value
-        d["source_language_mode"] = self.source_language_mode.value
+        # _enum_value rather than .value: serialisation must not be the thing
+        # that loses a transmission. A field that somehow holds None or a bare
+        # string still exports, as its default, instead of raising and taking
+        # the whole export with it.
+        d["state"] = _enum_value(self.state, ProcessingState.CAPTURED)
+        d["content_class"] = _enum_value(self.content_class,
+                                         ContentClass.UNKNOWN)
+        d["source_language_mode"] = _enum_value(
+            self.source_language_mode, SourceLanguageMode.AUTOMATIC)
         for field in ("frequency_provenance", "channel_provenance",
                       "rssi_provenance", "modulation_provenance"):
-            d[field] = getattr(self, field).value
+            d[field] = _enum_value(getattr(self, field), Provenance.UNKNOWN)
         d["analysis_attempts"] = [a.to_dict() for a in self.analysis_attempts]
         d["frequency_is_measured"] = self.frequency_is_measured
         d["error"] = self.error.to_dict() if self.error else None
@@ -603,20 +648,22 @@ class Transmission:
         d["started_at"] = parse_iso(d.get("started_at")) or utcnow()
         d["ended_at"] = parse_iso(d.get("ended_at"))
         d["corrected_at"] = parse_iso(d.get("corrected_at"))
-        if d.get("state"):
-            d["state"] = ProcessingState(d["state"])
-        if d.get("content_class"):
-            d["content_class"] = ContentClass(d["content_class"])
+        # A falsy stored value means "nothing was recorded", which must fall
+        # back to the field's declared default. Leaving it in place passed the
+        # raw None or "" straight into the constructor, overriding the default
+        # with something that is not a member of the enum at all - and the
+        # next to_dict() on that object raised AttributeError, so an event
+        # stored before classification could not be exported or shown.
+        _coerce_enum(d, "state", ProcessingState)
+        _coerce_enum(d, "content_class", ContentClass)
         for field in ("frequency_provenance", "channel_provenance",
                       "rssi_provenance", "modulation_provenance"):
-            if d.get(field):
-                d[field] = Provenance(d[field])
+            _coerce_enum(d, field, Provenance)
         d["analysis_attempts"] = [
             AnalysisAttempt.from_dict(a) if isinstance(a, dict) else a
             for a in d.get("analysis_attempts") or []]
         d.pop("frequency_is_measured", None)
-        if d.get("source_language_mode"):
-            d["source_language_mode"] = SourceLanguageMode(d["source_language_mode"])
+        _coerce_enum(d, "source_language_mode", SourceLanguageMode)
         if d.get("error"):
             d["error"] = ErrorInfo.from_dict(d["error"])
         d["transcript_segments"] = [

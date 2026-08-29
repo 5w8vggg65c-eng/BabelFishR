@@ -105,3 +105,70 @@ def test_metadata_defaults_are_empty_not_invented():
     assert tx.frequency_mhz is None
     assert tx.channel_name == ""
     assert tx.profile_id is None
+
+
+# ---- a half-populated row must survive the round trip ------------------
+#
+# Found by the macOS build runner, not here: to_dict() raised AttributeError on
+# a transmission whose content_class was None. from_dict() was the cause - a
+# falsy stored value was passed straight into the constructor, overriding the
+# dataclass default with something that is not a member of the enum.
+#
+# This matters because of capture-first. Every event is written to disk and the
+# database *before* anything classifies it, so a row with no content class yet
+# is not a corruption, it is the normal intermediate state. Reading one back
+# and being unable to serialise it means it cannot be exported or shown.
+
+@pytest.mark.unit
+@pytest.mark.parametrize("stored", [None, "", "a-value-from-a-later-version"])
+def test_an_unset_enum_column_falls_back_to_the_default(stored):
+    from babelfishr.models import ContentClass, ProcessingState, Provenance
+
+    tx = Transmission.from_dict({
+        "id": "tx_half", "content_class": stored, "state": stored,
+        "frequency_provenance": stored, "source_language_mode": stored,
+    })
+
+    assert tx.content_class is ContentClass.UNKNOWN
+    assert tx.state is ProcessingState.CAPTURED
+    assert tx.frequency_provenance is Provenance.UNKNOWN
+
+    # And it serialises, which is the part that was broken.
+    d = tx.to_dict()
+    assert d["content_class"] == "unknown"
+    assert d["state"] == "captured"
+    assert d["frequency_provenance"] == "unknown"
+    assert tx.to_json()
+
+
+@pytest.mark.unit
+def test_serialisation_never_raises_on_a_field_that_lost_its_type():
+    """Losing an export because one column is None is not an acceptable trade.
+
+    A transmission cannot be received twice, so writing it out must not be the
+    step that fails.
+    """
+    tx = Transmission(id="tx_direct")
+    tx.content_class = None
+    tx.state = None
+    tx.frequency_provenance = None
+
+    d = tx.to_dict()
+    assert d["content_class"] == "unknown"
+    assert d["state"] == "captured"
+    assert d["frequency_provenance"] == "unknown"
+
+
+@pytest.mark.unit
+def test_a_real_value_still_round_trips_exactly():
+    """The fallback must not quietly flatten information that was recorded."""
+    from babelfishr.models import ContentClass, ProcessingState, Provenance
+
+    tx = Transmission(id="tx_full", content_class=ContentClass.SPEECH,
+                      state=ProcessingState.COMPLETE,
+                      frequency_provenance=Provenance.OPERATOR)
+    back = Transmission.from_dict(tx.to_dict())
+
+    assert back.content_class is ContentClass.SPEECH
+    assert back.state is ProcessingState.COMPLETE
+    assert back.frequency_provenance is Provenance.OPERATOR
