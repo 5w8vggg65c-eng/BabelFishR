@@ -95,12 +95,9 @@ def cmd_input(args) -> int:
                           file=sys.stderr)
                 return 1
             device = chosen[0]
-            config.record_input_selection(
-                device, locked=None if args.lock is None else args.lock,
-                profile_id=args.profile)
+            config.record_input_selection(device, profile_id=args.profile)
             print(f"Remembered: {device.name}")
             print(f"  identity : {device.identity.describe()}")
-            print(f"  locked   : {config.audio.input.locked}")
             if device.is_builtin:
                 print("  This is the microphone built into this Mac. It is the "
                       "right choice for a bench test and the wrong one for "
@@ -126,14 +123,20 @@ def cmd_input(args) -> int:
         identity = status["identity"]
         print(f"\nExpected input: {identity.describe()}")
         print(f"  identified by : {identity.basis}")
-        print(f"  locked        : {status['locked']}")
         if state == "connected":
             device = status["device"]
             print(f"  STATUS        : CONNECTED as input {device.index}")
-            if status.get("ambiguous"):
-                print("  WARNING: more than one connected input is "
-                      "indistinguishable from this one.")
             return 0
+        if state == "ambiguous":
+            print("  STATUS        : CANNOT IDENTIFY")
+            print(f"  {len(status['candidates'])} connected inputs are "
+                  f"indistinguishable from it:")
+            for name in status["candidates"]:
+                print(f"    - {name}")
+            print("  BabelFishR cannot safely determine which interface is "
+                  "carrying the radio, and will not guess.")
+            print("  Disconnect the one you do not want to monitor.")
+            return 1
         print("  STATUS        : NOT CONNECTED")
         print("  BabelFishR will not substitute another input for it.")
         return 1
@@ -946,13 +949,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="deliberately follow the macOS default input")
     p.add_argument("--clear", action="store_true", help="forget the saved input")
     p.add_argument("--profile", help="also associate the input with this profile")
-    lock = p.add_mutually_exclusive_group()
-    lock.add_argument("--lock", dest="lock", action="store_true", default=None,
-                      help="refuse to capture from anything else (default for "
-                           "external inputs)")
-    lock.add_argument("--no-lock", dest="lock", action="store_false",
-                      help="allow choosing a different input later without "
-                           "unlocking first")
     p.add_argument("--config")
     p.set_defaults(func=cmd_input)
 

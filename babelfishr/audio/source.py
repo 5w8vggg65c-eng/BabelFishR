@@ -21,8 +21,9 @@ import numpy as np
 
 from ..dsp.filters import dbfs, rms
 from ..models import utcnow
-from .devices import (AudioBackendUnavailable, AudioDevice, DeviceIdentity,
-                      InputDeviceMissing, find_device, resolve_identity)
+from .devices import (AmbiguousInputDevice, AudioBackendUnavailable,
+                      AudioDevice, DeviceIdentity, InputDeviceMissing,
+                      find_device, resolve_input)
 from .wavefile import read_wav
 
 log = logging.getLogger(__name__)
@@ -263,15 +264,20 @@ class LiveAudioSource(AudioSource):
         inherits the old index is not mistaken for it.
         """
         if self.identity is not None and not self.identity.empty:
-            match = resolve_identity(self.identity)
-            if match is None:
+            resolution = resolve_input(self.identity)
+            if resolution.ambiguous:
+                # Fail closed. An earlier version opened the first candidate
+                # and logged a warning, which meant an operator who selected
+                # the second of two identical interfaces was recorded from the
+                # first and never told in a way that stopped them.
+                self._notify("ambiguous-device", (
+                    f"{len(resolution.candidates)} connected inputs are "
+                    f"indistinguishable from {self.identity.describe()}; "
+                    f"refusing to guess"))
+                raise AmbiguousInputDevice(self.identity, resolution.candidates)
+            if resolution.device is None:
                 raise InputDeviceMissing(self.identity)
-            if match.ambiguous:
-                self._notify(
-                    "ambiguous-device",
-                    f"more than one connected input is indistinguishable from "
-                    f"{self.identity.describe()}; using the first")
-            return match.device
+            return resolution.device
 
         device = find_device(self.device_selector)
         if device is None:
@@ -379,9 +385,10 @@ class LiveAudioSource(AudioSource):
         log.debug("audio %s: %s", kind, message)
         # Disconnections and recoveries are recorded with times, because after
         # the fact the operator needs to know exactly which minutes of a watch
-        # were not being received.
+        # were not being received. An ambiguous device belongs in that log for
+        # the same reason: those minutes were not received either.
         if kind in ("connected", "disconnected", "reconnected",
-                    "reconnect-failed", "stopped"):
+                    "reconnect-failed", "stopped", "ambiguous-device"):
             self.connection_log.append((utcnow(), kind, message))
             log.info("audio input %s: %s", kind, message)
         if self.on_status is not None:

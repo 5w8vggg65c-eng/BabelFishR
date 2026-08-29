@@ -9,7 +9,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..app import BabelFishRApp
 from ..audio.devices import backend_available, backend_status
-from ..audio.devices import InputDeviceMissing, InputNotSelected
+from ..audio.devices import (AmbiguousInputDevice, InputDeviceMissing,
+                             InputNotSelected)
 from ..config import Config
 from ..models import (ProcessingState, RadioProfile, SourceLanguageMode,
                       Transmission)
@@ -409,7 +410,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 source_language_mode=mode,
             )
             self.app.begin_capture()
-        except (InputDeviceMissing, InputNotSelected) as exc:
+        except (AmbiguousInputDevice, InputDeviceMissing,
+                InputNotSelected) as exc:
             self.app.stop_session()
             self._resolve_input_problem(str(exc))
             return

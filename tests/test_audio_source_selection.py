@@ -19,9 +19,10 @@ import pytest
 
 from babelfishr.app import BabelFishRApp
 from babelfishr.audio import devices as devices_module
-from babelfishr.audio.devices import (AudioDevice, DeviceIdentity,
-                                      InputDeviceMissing, InputNotSelected,
-                                      resolve_identity, unique_labels)
+from babelfishr.audio.devices import (AmbiguousInputDevice, AudioDevice,
+                                      DeviceIdentity, InputDeviceMissing,
+                                      InputNotSelected, resolve_identity,
+                                      resolve_input, unique_labels)
 from babelfishr.audio.source import LiveAudioSource
 from babelfishr.config import Config
 
@@ -55,31 +56,24 @@ def second_interface(index: int = 2) -> AudioDevice:
 
 @pytest.fixture
 def connected(monkeypatch):
-    """Control what PortAudio appears to report, for the whole audio stack."""
+    """Control what PortAudio appears to report, for the whole audio stack.
+
+    Only one thing needs patching. Every resolution path funnels through
+    ``resolve_input``, which calls ``list_input_devices`` out of this module's
+    own globals when no explicit list is given - so replacing that one name
+    changes what the source, the app and the panel all see.
+    """
     state = {"devices": []}
 
     def present():
         return list(state["devices"])
 
     monkeypatch.setattr(devices_module, "list_input_devices", present)
-    # source.py and app.py imported resolve_identity/find_device by name, so
-    # the module attribute is what has to be patched for them to see this.
-    import babelfishr.audio.source as source_module
-
-    monkeypatch.setattr(
-        source_module, "resolve_identity",
-        lambda identity, devices=None: resolve_identity(identity, present()))
-    import babelfishr.app as app_module
-
-    monkeypatch.setattr(
-        app_module, "resolve_identity",
-        lambda identity, devices=None: resolve_identity(identity, present()))
 
     def set_devices(*devices):
         state["devices"] = list(devices)
         return state["devices"]
 
-    set_devices.set = set_devices
     return set_devices
 
 
@@ -127,9 +121,10 @@ def test_an_external_interface_can_be_chosen(cfg, connected):
     assert cfg.selected_input().is_builtin is False
     match = resolve_identity(cfg.selected_input())
     assert match is not None and match.device.uid == radio.uid
-    # An external input locks itself by default: it was chosen for what is
-    # wired to it, so no other device is an acceptable substitute.
-    assert cfg.audio.input.locked is True
+    # Every explicitly chosen device is pinned to its identity. There is no
+    # setting for this, because the setting that used to exist changed nothing
+    # about capture and so could only ever mislead.
+    assert not hasattr(cfg.audio.input, "locked")
 
 
 # ---- 3-4. choices survive a restart ------------------------------------
@@ -319,7 +314,7 @@ def test_input_status_reports_every_state(cfg, connected):
         status = app.input_status()
         assert status["state"] == "connected"
         assert status["device"].uid == radio.uid
-        assert status["locked"] is True
+        assert status["candidates"] == []
 
         connected(builtin_mic())
         missing = app.input_status()
@@ -430,14 +425,21 @@ def test_two_identical_interfaces_get_distinguishable_labels(connected):
     assert labels[0] == "MacBook Air Microphone"
 
 
-def test_indistinguishable_devices_are_flagged_rather_than_guessed(connected):
-    """No UID, same everything: report the ambiguity instead of hiding it."""
+def test_indistinguishable_devices_resolve_to_nothing(connected):
+    """No UID, same everything: refuse, rather than pick one."""
     make = lambda index: AudioDevice(  # noqa: E731
         index=index, name="USB Audio CODEC", max_input_channels=2,
         default_sample_rate=48_000.0, host_api="Core Audio")
     identity = make(1).identity
-    match = resolve_identity(identity, [make(1), make(2)])
-    assert match is not None and match.ambiguous is True
+
+    resolution = resolve_input(identity, [make(1), make(2)])
+    assert resolution.ambiguous is True
+    assert resolution.device is None
+    assert [d.index for d in resolution.candidates] == [1, 2]
+
+    # The safe wrapper hands back nothing at all, so a caller that only knows
+    # how to check for None cannot be given the wrong device.
+    assert resolve_identity(identity, [make(1), make(2)]) is None
 
     labels = unique_labels([make(1), make(2)])
     assert "currently input 1" in labels[1] and "currently input 2" in labels[2]
@@ -513,3 +515,174 @@ def test_a_missing_input_does_not_by_itself_make_the_app_unready(cfg,
     report.add(Check("Recording directory writable", CheckStatus.PASS, ""))
     report.add(Check("Selected audio input", CheckStatus.FAIL, "not connected"))
     assert report.can_record is True
+
+
+# ---- P0: two identical interfaces, and the second one is the radio -----
+#
+# The failure being reproduced, exactly: an operator has two of the same USB
+# interface. macOS reports no unique identifier for either, so their identities
+# are byte-for-byte identical. The operator selects the second one - the one
+# with the radio on it. The previous implementation returned composite[0] and
+# LiveAudioSource logged "using the first", so capture opened the *first*
+# interface, which was carrying nothing, and the operator was never stopped.
+#
+# There is no property in this situation that distinguishes the two devices.
+# That is the point: because nothing can tell them apart, nothing may choose
+# between them.
+
+def identical_interface(index: int) -> AudioDevice:
+    """One of a matched pair. No CoreAudio UID, so nothing separates them."""
+    return AudioDevice(
+        index=index, name="USB Audio CODEC", max_input_channels=2,
+        default_sample_rate=48_000.0, host_api="Core Audio", is_default=False)
+
+
+def test_selecting_the_second_of_two_identical_interfaces_never_opens_the_first(
+        cfg, connected):
+    """The precise case from the audit, at the point capture starts."""
+    first, second = identical_interface(1), identical_interface(2)
+    connected(builtin_mic(), first, second)
+
+    # The operator selects the second one, which is the one with the radio.
+    cfg.record_input_selection(second, save=False)
+
+    source = LiveAudioSource(identity=cfg.selected_input())
+    with pytest.raises(AmbiguousInputDevice) as raised:
+        source._resolve_device()
+
+    # Not "opened the first". Not opened at all.
+    assert source.device is None
+    assert len(raised.value.candidates) == 2
+    assert "cannot safely determine which interface" in str(raised.value)
+
+
+def test_an_ambiguous_identity_refuses_at_session_start(cfg, connected):
+    """Through the real start path, not just the resolver."""
+    first, second = identical_interface(1), identical_interface(2)
+    connected(builtin_mic(), first, second)
+    cfg.record_input_selection(second, save=False)
+
+    app = BabelFishRApp(config=cfg)
+    try:
+        with pytest.raises(AmbiguousInputDevice):
+            app.start_session()
+        assert app.session is None
+        assert app.capture is None
+    finally:
+        app.close()
+
+
+def test_an_ambiguous_identity_refuses_after_a_restart(cfg, connected):
+    """Restored from a settings file, as a relaunch would."""
+    first, second = identical_interface(1), identical_interface(2)
+    connected(builtin_mic(), first, second)
+    cfg.record_input_selection(second)
+
+    restored = reload_settings(cfg)
+    resolution = resolve_input(restored.selected_input())
+    assert resolution.ambiguous and resolution.device is None
+    assert resolve_identity(restored.selected_input()) is None
+
+    source = LiveAudioSource(identity=restored.selected_input())
+    with pytest.raises(AmbiguousInputDevice):
+        source._resolve_device()
+
+
+def test_an_ambiguous_identity_refuses_on_profile_restoration(cfg, connected):
+    """A radio profile pointing at one of a matched pair selects neither."""
+    first, second = identical_interface(1), identical_interface(2)
+    connected(builtin_mic(), first, second)
+    cfg.record_input_selection(second, profile_id="prof_gmrs16")
+
+    restored = reload_settings(cfg)
+    preferred = restored.preferred_input_for_profile("prof_gmrs16")
+    assert not preferred.empty
+
+    resolution = resolve_input(preferred)
+    assert resolution.ambiguous
+    assert resolution.device is None
+    assert resolve_identity(preferred) is None
+
+
+def test_an_ambiguous_identity_refuses_on_reconnect(cfg, connected):
+    """A duplicate appearing mid-watch stops capture rather than switching.
+
+    The dangerous shape: the operator starts on the only interface present,
+    then a second identical one is connected - a hub coming back, a colleague
+    plugging in the spare - and the original briefly drops. Reconnection must
+    not pick one.
+    """
+    radio = identical_interface(1)
+    connected(builtin_mic(), radio)
+    cfg.record_input_selection(radio, save=False)
+
+    source = LiveAudioSource(identity=cfg.selected_input())
+    assert source._resolve_device().index == 1
+
+    connected(builtin_mic(), identical_interface(1), identical_interface(4))
+    with pytest.raises(AmbiguousInputDevice):
+        source._resolve_device()
+
+    # The duplicate is removed; the original is unambiguous again and resumes.
+    connected(builtin_mic(), identical_interface(4))
+    assert source._resolve_device().index == 4
+
+
+def test_the_ambiguous_refusal_is_recorded_in_the_connection_log(cfg,
+                                                                connected):
+    """Those minutes were not received, and the log has to say so."""
+    connected(builtin_mic(), identical_interface(1), identical_interface(2))
+    cfg.record_input_selection(identical_interface(2), save=False)
+
+    source = LiveAudioSource(identity=cfg.selected_input())
+    with pytest.raises(AmbiguousInputDevice):
+        source._resolve_device()
+
+    kinds = [entry[1] for entry in source.connection_log]
+    assert "ambiguous-device" in kinds
+    detail = next(e[2] for e in source.connection_log
+                  if e[1] == "ambiguous-device")
+    assert "refusing to guess" in detail
+
+
+def test_a_uid_pair_is_not_ambiguous_and_still_selects_the_right_one(cfg,
+                                                                     connected):
+    """Two of the same model *with* UIDs are distinguishable, so they work.
+
+    The refusal is about being unable to tell devices apart, not about having
+    two of something.
+    """
+    first = dataclasses_replace(identical_interface(1), uid="usb-a")
+    second = dataclasses_replace(identical_interface(2), uid="usb-b")
+    connected(builtin_mic(), first, second)
+    cfg.record_input_selection(second, save=False)
+
+    source = LiveAudioSource(identity=cfg.selected_input())
+    device = source._resolve_device()
+    assert device.uid == "usb-b"
+
+    # And it follows that device when the pair swaps indices.
+    connected(builtin_mic(),
+              dataclasses_replace(identical_interface(7), uid="usb-b"),
+              dataclasses_replace(identical_interface(8), uid="usb-a"))
+    assert source._resolve_device().index == 7
+
+
+def dataclasses_replace(device, **changes):
+    import dataclasses as _dc
+
+    return _dc.replace(device, **changes)
+
+
+def test_readiness_fails_rather_than_warns_on_an_ambiguous_input(cfg,
+                                                                 connected):
+    import babelfishr.readiness as readiness_module
+
+    connected(builtin_mic(), identical_interface(1), identical_interface(2))
+    cfg.record_input_selection(identical_interface(2), save=False)
+
+    check = readiness_module._selected_input_check(cfg)
+    assert check.status.name == "FAIL"
+    assert "indistinguishable" in check.detail
+    assert "will not guess" in check.remedy
+    assert len(check.data["candidates"]) == 2

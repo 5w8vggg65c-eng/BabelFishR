@@ -75,14 +75,13 @@ def diagnostic_report(config, *, extra: str = "",
     lines += [
         f"  chosen         : {selection.label or '(nothing chosen yet)'}",
         f"  confirmed      : {selection.confirmed}",
-        f"  locked         : {selection.locked}",
         f"  system default : {selection.use_system_default}",
         f"  identity       : {config.selected_input().describe()}",
         f"  identified by  : {config.selected_input().basis}",
     ]
     try:
         from .audio.devices import (backend_status, list_input_devices,
-                                    resolve_identity)
+                                    resolve_input)
 
         lines.append(f"  backend        : {backend_status()}")
         connected = list_input_devices()
@@ -92,9 +91,16 @@ def diagnostic_report(config, *, extra: str = "",
             lines.append(f"     [{device.index}] {device.name} "
                          f"({device.max_input_channels} ch, {kind}"
                          f"{', uid ' + device.uid if device.uid else ''})")
-        match = resolve_identity(config.selected_input())
-        lines.append(f"  chosen present : "
-                     f"{'yes' if match else 'NO - it is not connected'}")
+        resolution = resolve_input(config.selected_input())
+        if resolution.resolved:
+            lines.append(f"  chosen present : yes, as input "
+                         f"{resolution.device.index}")
+        elif resolution.ambiguous:
+            lines.append(f"  chosen present : AMBIGUOUS - "
+                         f"{len(resolution.candidates)} connected inputs are "
+                         f"indistinguishable from it, so none was selected")
+        else:
+            lines.append("  chosen present : NO - it is not connected")
     except Exception as exc:  # noqa: BLE001
         lines.append(f"  could not enumerate inputs: {exc}")
 

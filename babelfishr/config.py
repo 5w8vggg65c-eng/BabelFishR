@@ -51,9 +51,6 @@ class InputSelection:
     confirmed: bool = False
     """The operator selected this deliberately. Nothing else may set it."""
 
-    locked: bool = True
-    """Refuse to capture from anything but this exact device."""
-
     use_system_default: bool = False
     """A deliberate, visibly labelled choice to follow the macOS setting.
 
@@ -406,23 +403,21 @@ class Config:
             return False
         return bool(selection.use_system_default or selection.identity)
 
-    def record_input_selection(self, device, *, locked: Optional[bool] = None,
+    def record_input_selection(self, device, *,
                                profile_id: Optional[str] = None,
                                save: bool = True) -> str:
         """Persist a device the operator chose, by stable identity.
 
-        ``locked`` defaults to True for anything that is not the machine's own
-        microphone: an external interface is chosen because of what is wired to
-        it, so substituting another device is never the right answer. The
-        built-in microphone is a deliberate bench-test choice and is left
-        unlocked so the operator can move on quickly.
+        Every explicitly chosen device is pinned to its identity: capture opens
+        that device or nothing. There is no setting to relax it, because the
+        setting that used to exist did not actually relax or tighten anything,
+        which is a worse state of affairs than either.
         """
         identity = device.identity
         self.audio.input = InputSelection(
             identity=identity.token(),
             label=getattr(device, "name", "") or identity.describe(),
             confirmed=True,
-            locked=(not device.is_builtin) if locked is None else bool(locked),
             use_system_default=False,
         )
         # Keep the CLI selector pointing at the same device, so `babelfishr
@@ -436,7 +431,7 @@ class Config:
         """Record a deliberate choice to follow the macOS system default."""
         self.audio.input = InputSelection(
             identity="", label="macOS system default input", confirmed=True,
-            locked=False, use_system_default=True)
+            use_system_default=True)
         self.audio.device = None
         return self.save() if save else ""
 
@@ -525,9 +520,25 @@ def _read_file(path: pathlib.Path) -> Dict[str, Any]:
     return _toml.loads(text.decode("utf-8"))
 
 
+#: Settings that used to exist and are now ignored, per dataclass. They are
+#: accepted and dropped so a settings file written by an older version still
+#: loads; rejecting them would leave an operator with an application that
+#: refuses to start after an upgrade.
+RETIRED_OPTIONS: Dict[str, set] = {
+    # "Lock input to this device" was a checkbox that changed nothing: capture
+    # resolved the saved identity whether it was ticked or not. Every
+    # explicitly chosen device is now pinned to its identity unconditionally,
+    # so there is no longer a setting for it to be wrong about.
+    "InputSelection": {"locked"},
+}
+
+
 def _update(obj: Any, values: Dict[str, Any]) -> None:
     known = {f.name for f in dataclasses.fields(obj)}
+    retired = RETIRED_OPTIONS.get(type(obj).__name__, set())
     for key, value in values.items():
+        if key in retired:
+            continue
         if key not in known:
             raise ValueError(f"unknown option {key!r} in [{type(obj).__name__}]")
         setattr(obj, key, value)

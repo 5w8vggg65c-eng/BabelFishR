@@ -11,9 +11,10 @@ import logging
 import pathlib
 from typing import Any, Dict, List, Optional
 
-from .audio.devices import (AudioDevice, DeviceIdentity, DeviceMatch,
-                            InputNotSelected, backend_status, find_device,
-                            list_input_devices, resolve_identity)
+from .audio.devices import (AmbiguousInputDevice, AudioDevice, DeviceIdentity,
+                            DeviceMatch, InputDeviceMissing, InputNotSelected,
+                            backend_status, find_device, list_input_devices,
+                            resolve_identity, resolve_input, unique_labels)
 from .audio.source import AudioSource, LiveAudioSource, ReplayAudioSource
 from .config import Config
 from .models import (ProcessingState, RadioProfile, Session, SourceLanguageMode,
@@ -195,27 +196,37 @@ class BabelFishRApp:
         """Everything the window needs to say what it is listening to.
 
         ``state`` is one of ``none`` (nothing chosen yet), ``system-default``
-        (chosen deliberately), ``connected`` or ``missing``.
+        (chosen deliberately), ``connected``, ``missing``, or ``ambiguous``.
+
+        ``ambiguous`` is its own state rather than a flag on ``connected``,
+        because a flag alongside a device is something a caller can forget to
+        read, and the device is right there to be used.
         """
         selection = self.config.audio.input
         identity = self.selected_input_identity()
         if selection.use_system_default and selection.confirmed:
             return {"state": "system-default", "identity": identity,
                     "device": None, "label": "macOS system default input",
-                    "locked": False, "expected": "macOS system default input"}
+                    "expected": "macOS system default input", "candidates": []}
         if not self.config.has_confirmed_input():
             return {"state": "none", "identity": identity, "device": None,
-                    "label": "", "locked": False, "expected": ""}
-        match = resolve_identity(identity)
+                    "label": "", "expected": "", "candidates": []}
+
+        resolution = resolve_input(identity)
         expected = selection.label or identity.describe()
-        if match is None:
+        if resolution.ambiguous:
+            labels = unique_labels(list(resolution.candidates))
+            return {"state": "ambiguous", "identity": identity, "device": None,
+                    "label": expected, "expected": expected,
+                    "candidates": [labels[device.index]
+                                   for device in resolution.candidates]}
+        if resolution.device is None:
             return {"state": "missing", "identity": identity, "device": None,
-                    "label": expected, "locked": selection.locked,
-                    "expected": expected}
+                    "label": expected, "expected": expected, "candidates": []}
         return {"state": "connected", "identity": identity,
-                "device": match.device, "label": match.device.name,
-                "locked": selection.locked, "expected": expected,
-                "basis": match.basis, "ambiguous": match.ambiguous}
+                "device": resolution.device, "label": resolution.device.name,
+                "expected": expected, "basis": resolution.basis,
+                "candidates": []}
 
     # -- session ---------------------------------------------------------
     def start_session(self, source: Optional[AudioSource] = None, *,
@@ -296,6 +307,17 @@ class BabelFishRApp:
                     "to monitor - the built-in microphone for a bench test, or "
                     "your radio interface - before starting. BabelFishR will "
                     "not pick one for you.")
+
+        if identity is not None and not identity.empty:
+            # Resolve before a Session row and a pipeline exist. LiveAudioSource
+            # would refuse on start() anyway, but by then a session has been
+            # opened and has to be unwound; and "monitoring never began" is a
+            # clearer thing to tell an operator than "monitoring stopped".
+            resolution = resolve_input(identity)
+            if resolution.ambiguous:
+                raise AmbiguousInputDevice(identity, resolution.candidates)
+            if resolution.device is None:
+                raise InputDeviceMissing(identity)
 
         return LiveAudioSource(
             device=device if device is not None else self.config.audio.device,

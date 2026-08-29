@@ -222,7 +222,7 @@ def _selected_input_check(config) -> Check:
     before an interface is wired up. The hard refusal lives where it belongs -
     monitoring will not start on a missing or unchosen input.
     """
-    from .audio.devices import resolve_identity
+    from .audio.devices import resolve_input
 
     selection = config.audio.input
     if selection.use_system_default and selection.confirmed:
@@ -239,8 +239,18 @@ def _selected_input_check(config) -> Check:
                    "start until one is chosen.")
 
     identity = config.selected_input()
-    match = resolve_identity(identity)
-    if match is None:
+    resolution = resolve_input(identity)
+    if resolution.ambiguous:
+        return Check(
+            "Selected audio input", CheckStatus.FAIL,
+            f"{len(resolution.candidates)} connected inputs are "
+            f"indistinguishable from {selection.label or identity.describe()}",
+            data={"identity": identity.token(),
+                  "candidates": [d.to_dict() for d in resolution.candidates]},
+            remedy="BabelFishR cannot safely determine which interface is "
+                   "carrying the radio, and will not guess. Disconnect the "
+                   "one you do not want to monitor.")
+    if resolution.device is None:
         return Check(
             "Selected audio input", CheckStatus.FAIL,
             f"{selection.label or identity.describe()} is NOT connected",
@@ -248,18 +258,14 @@ def _selected_input_check(config) -> Check:
             remedy="Reconnect that device. BabelFishR will not substitute "
                    "another input for it - not the built-in microphone, not "
                    "the system default, and not another interface.")
-    kind = "built-in microphone" if match.device.is_builtin else "external input"
-    status = CheckStatus.WARN if match.device.is_builtin else CheckStatus.PASS
-    detail = (f"{match.device.name} ({kind}, matched by {match.basis}"
-              f"{', AMBIGUOUS' if match.ambiguous else ''})")
+    device = resolution.device
+    kind = "built-in microphone" if device.is_builtin else "external input"
+    status = CheckStatus.WARN if device.is_builtin else CheckStatus.PASS
+    detail = f"{device.name} ({kind}, matched by {resolution.basis})"
     remedy = ""
-    if match.device.is_builtin:
+    if device.is_builtin:
         remedy = ("This is the microphone built into this Mac. It records the "
                   "room, not a radio. Correct for a bench test only.")
-    elif match.ambiguous:
-        remedy = ("More than one connected input is indistinguishable from "
-                  "this one. Disconnect the duplicate to be certain which is "
-                  "being recorded.")
     return Check("Selected audio input", status, detail, remedy=remedy)
 
 

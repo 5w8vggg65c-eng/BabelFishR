@@ -17,7 +17,6 @@ from PySide6 import QtWidgets  # noqa: E402
 
 from babelfishr.app import BabelFishRApp  # noqa: E402
 from babelfishr.audio import devices as devices_module  # noqa: E402
-from babelfishr.audio.devices import resolve_identity  # noqa: E402
 from babelfishr.config import Config  # noqa: E402
 from babelfishr.ui import input_panel as panel_module  # noqa: E402
 
@@ -42,14 +41,6 @@ def wired(monkeypatch):
 
     for module in (devices_module, panel_module):
         monkeypatch.setattr(module, "list_input_devices", present)
-    monkeypatch.setattr(panel_module, "resolve_identity",
-                        lambda identity, devices=None:
-                        resolve_identity(identity, present()))
-    import babelfishr.app as app_module
-
-    monkeypatch.setattr(app_module, "resolve_identity",
-                        lambda identity, devices=None:
-                        resolve_identity(identity, present()))
     monkeypatch.setattr(panel_module, "backend_available", lambda: True)
 
     def set_devices(*devices):
@@ -132,20 +123,17 @@ def test_choosing_an_interface_persists_it_and_shows_it(qt_app, app, wired):
 
     assert app.config.selected_input().uid == radio.uid
     assert app.config.audio.input.confirmed is True
-    assert app.config.audio.input.locked is True
     assert panel.status_label.text() == "INPUT: USB Audio CODEC — CONNECTED"
     assert panel.ready_to_monitor()[0] is True
 
 
-def test_choosing_the_builtin_microphone_is_allowed_and_unlocked(qt_app, app,
-                                                                 wired):
+def test_choosing_the_builtin_microphone_is_allowed(qt_app, app, wired):
     mic = builtin_mic()
     wired(mic, radio_interface())
     panel = _panel(app)
     _select(panel, mic)
 
     assert app.config.selected_input().is_builtin
-    assert app.config.audio.input.locked is False
     assert panel.ready_to_monitor()[0] is True
 
 
@@ -198,15 +186,24 @@ def test_a_disconnect_during_a_watch_is_shown_in_red(qt_app, app, wired):
 
 
 # ---- locking and radio profiles ---------------------------------------
-def test_the_lock_can_be_turned_off_deliberately(qt_app, app, wired):
+def test_there_is_no_lock_control_to_be_misled_by(qt_app, app, wired):
+    """The checkbox is gone, and so is the setting behind it.
+
+    It was ticked by default and it changed nothing: capture resolved the
+    saved identity either way. A control that looks like a safety interlock
+    and is not one is worse than no control.
+    """
     radio = radio_interface()
     wired(builtin_mic(), radio)
     panel = _panel(app)
     _select(panel, radio)
 
-    assert panel.lock_check.isChecked() is True
-    panel.lock_check.setChecked(False)
-    assert app.config.audio.input.locked is False
+    assert not hasattr(panel, "lock_check")
+    assert not hasattr(app.config.audio.input, "locked")
+    # And the behaviour it claimed to provide is now unconditional.
+    wired(builtin_mic())
+    panel.refresh_devices()
+    assert panel.ready_to_monitor()[0] is False
 
 
 def test_a_profile_selects_its_own_input_when_it_is_present(qt_app, app, wired):
@@ -256,7 +253,7 @@ def test_input_controls_are_disabled_while_monitoring(qt_app, app, wired):
     _select(panel, radio)
 
     panel.set_monitoring(True)
-    for widget in (panel.device_box, panel.rescan_button, panel.lock_check,
+    for widget in (panel.device_box, panel.rescan_button,
                    panel.profile_check):
         assert widget.isEnabled() is False
 
@@ -349,3 +346,111 @@ def test_calibration_uses_the_selected_input_not_a_stale_widget(qt_app, app,
     window._calibrate()
 
     assert opened["identity"].uid == radio.uid
+
+
+# ---- P0: the window when two interfaces cannot be told apart -----------
+def _identical(index):
+    from babelfishr.audio.devices import AudioDevice
+
+    return AudioDevice(index=index, name="USB Audio CODEC",
+                       max_input_channels=2, default_sample_rate=48_000.0,
+                       host_api="Core Audio")
+
+
+def test_selecting_one_of_two_identical_interfaces_refuses_to_monitor(
+        qt_app, app, wired):
+    """The operator picks the second; nothing is opened, and they are told why."""
+    first, second = _identical(1), _identical(2)
+    wired(builtin_mic(), first, second)
+    panel = _panel(app)
+
+    # The two rows are still distinguishable to a human, so the operator can
+    # see there are two of them.
+    texts = [panel.device_box.itemText(i)
+             for i in range(panel.device_box.count())]
+    assert sum("USB Audio CODEC" in text for text in texts) == 2
+    assert any("currently input 1" in text for text in texts)
+    assert any("currently input 2" in text for text in texts)
+
+    _select(panel, second)
+
+    ok, message = panel.ready_to_monitor()
+    assert ok is False
+    assert "cannot safely determine which interface is carrying the radio" \
+        in message
+    assert "will not guess" in message
+    assert "CANNOT IDENTIFY" in panel.status_label.text()
+    assert panel.alert_label.isVisibleTo(panel)
+    assert "indistinguishable" in panel.alert_label.text()
+    # Both candidates are named, so the operator knows what to unplug.
+    assert panel.alert_label.text().count("USB Audio CODEC") >= 2
+
+
+def test_an_ambiguous_input_offers_rescan_choose_and_record_later(
+        qt_app, app, wired, monkeypatch):
+    from babelfishr.ui.main_window import MainWindow
+
+    wired(builtin_mic(), _identical(1), _identical(2))
+    window = MainWindow(app)
+    _select(window.input_panel, _identical(2))
+
+    seen = {}
+    monkeypatch.setattr(window, "_resolve_input_problem",
+                        lambda message: seen.setdefault("message", message))
+    window._start_monitoring()
+
+    assert app.session is None, "no watch may begin on an unidentifiable input"
+    assert "cannot safely determine" in seen["message"]
+
+    import inspect
+
+    source = inspect.getsource(MainWindow._resolve_input_problem)
+    for option in ("Rescan", "Choose Different Input", "Record Later"):
+        assert option in source
+
+
+def test_removing_the_duplicate_makes_the_input_usable_again(qt_app, app,
+                                                             wired):
+    wired(builtin_mic(), _identical(1), _identical(2))
+    panel = _panel(app)
+    _select(panel, _identical(2))
+    assert panel.ready_to_monitor()[0] is False
+
+    # One is unplugged. The remaining one now matches the saved identity
+    # uniquely, so it is recognised and monitoring is allowed.
+    wired(builtin_mic(), _identical(2))
+    panel.refresh_devices()
+    assert panel.status_label.text() == "INPUT: USB Audio CODEC — CONNECTED"
+    assert panel.ready_to_monitor()[0] is True
+
+
+def test_a_profile_pointing_at_one_of_a_pair_selects_neither(qt_app, app,
+                                                             wired):
+    wired(builtin_mic(), _identical(2))
+    panel = _panel(app)
+    _select(panel, _identical(2))
+    app.config.associate_profile_input("prof_gmrs16", _identical(2))
+
+    # The duplicate is connected. The profile can no longer identify its input.
+    wired(builtin_mic(), _identical(1), _identical(2))
+    panel.refresh_devices()
+    panel.set_profile("prof_gmrs16")
+
+    assert app.config.has_confirmed_input() is False
+    assert panel.device_box.currentIndex() == 0
+    assert "indistinguishable" in panel.alert_label.text()
+    assert panel.ready_to_monitor()[0] is False
+
+
+def test_an_ambiguous_device_mid_watch_is_shown_in_red(qt_app, app, wired):
+    wired(builtin_mic(), _identical(2))
+    panel = _panel(app)
+    _select(panel, _identical(2))
+
+    panel.report_audio_status(
+        "ambiguous-device",
+        "2 connected inputs are indistinguishable; refusing to guess")
+    assert "CANNOT IDENTIFY" in panel.status_label.text()
+    assert "cannot safely determine" in panel.alert_label.text()
+    assert "Recordings already captured are unaffected" in \
+        panel.alert_label.text()

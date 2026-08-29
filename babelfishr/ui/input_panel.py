@@ -27,8 +27,7 @@ from typing import Optional
 from PySide6 import QtCore, QtWidgets
 
 from ..audio.devices import (AudioDevice, DeviceIdentity, backend_available,
-                             list_input_devices, resolve_identity,
-                             unique_labels)
+                             list_input_devices, resolve_input, unique_labels)
 from .widgets import LevelMeterWidget
 
 #: Combo box entry kinds, stored as item data.
@@ -89,15 +88,12 @@ class InputPanel(QtWidgets.QWidget):
 
         options = QtWidgets.QHBoxLayout()
         options.setSpacing(14)
-        self.lock_check = QtWidgets.QCheckBox("Lock input to this device")
-        self.lock_check.setToolTip(
-            "Never capture from any other device. If this one is not "
-            "connected, BabelFishR refuses to start rather than recording "
-            "something else.\n\nOn by default for anything that is not the "
-            "microphone built into this Mac.")
-        self.lock_check.toggled.connect(self._on_lock)
-        options.addWidget(self.lock_check)
-
+        # There is deliberately no "lock input" checkbox. It used to be here,
+        # ticked by default, and it changed nothing: capture resolved the saved
+        # identity either way. A control that appears to protect the operator
+        # and does not is worse than no control, so every explicitly chosen
+        # device is now pinned to its identity, always, and the only way to
+        # follow the system default is to choose that option by name.
         self.profile_check = QtWidgets.QCheckBox(
             "Remember this input for the selected radio profile")
         self.profile_check.setToolTip(
@@ -174,16 +170,17 @@ class InputPanel(QtWidgets.QWidget):
             index = self.device_box.findData({"kind": SYSTEM_DEFAULT})
             self.device_box.setCurrentIndex(max(index, 0))
             return
-        match = resolve_identity(DeviceIdentity.parse(selection.identity),
-                                 self._devices)
-        if match is None:
-            # The chosen device is not here. Leave the box on "Choose an audio
-            # input" so nothing can be started by accident, and let
-            # refresh_status say which device is missing.
+        resolution = resolve_input(DeviceIdentity.parse(selection.identity),
+                                   self._devices)
+        if resolution.device is None:
+            # Either the chosen device is not here, or several here are
+            # indistinguishable from it. Both leave the box on "Choose an audio
+            # input" so nothing can be started by accident; refresh_status says
+            # which of the two situations it is.
             self.device_box.setCurrentIndex(0)
             return
         index = self.device_box.findData({"kind": DEVICE,
-                                          "index": match.device.index})
+                                          "index": resolution.device.index})
         self.device_box.setCurrentIndex(max(index, 0))
 
     # -- operator actions ------------------------------------------------
@@ -206,15 +203,6 @@ class InputPanel(QtWidgets.QWidget):
                                     if self.profile_check.isChecked() else None))
         self.refresh_status()
         self.selectionChanged.emit()
-
-    def _on_lock(self, checked: bool) -> None:
-        if self._loading:
-            return
-        selection = self.app.config.audio.input
-        if selection.locked != bool(checked):
-            selection.locked = bool(checked)
-            self.app.config.save()
-        self.refresh_status()
 
     def _on_profile_link(self, checked: bool) -> None:
         if self._loading or not self._profile_id:
@@ -252,8 +240,8 @@ class InputPanel(QtWidgets.QWidget):
             self.refresh_status()
             return
 
-        match = resolve_identity(preferred, self._devices)
-        if match is None:
+        resolution = resolve_input(preferred, self._devices)
+        if resolution.device is None:
             self._loading = True
             try:
                 self.device_box.setCurrentIndex(0)
@@ -264,18 +252,26 @@ class InputPanel(QtWidgets.QWidget):
             # previous alert, so the message about *this* profile has to be
             # written after it, not before.
             self.refresh_status()
-            self._show_alert(
-                f"This radio profile expects <b>{preferred.describe()}</b>, "
-                f"which is not connected. No other input has been selected in "
-                f"its place. Connect it and press Rescan, or choose a "
-                f"different input deliberately.")
+            if resolution.ambiguous:
+                self._show_alert(
+                    f"This radio profile expects <b>{preferred.describe()}</b>, "
+                    f"and {len(resolution.candidates)} connected inputs are "
+                    f"indistinguishable from it. BabelFishR cannot safely "
+                    f"determine which one is carrying the radio, so it has "
+                    f"selected none of them.")
+            else:
+                self._show_alert(
+                    f"This radio profile expects <b>{preferred.describe()}</b>, "
+                    f"which is not connected. No other input has been selected "
+                    f"in its place. Connect it and press Rescan, or choose a "
+                    f"different input deliberately.")
             return
-        self.app.config.record_input_selection(match.device,
+        self.app.config.record_input_selection(resolution.device,
                                                profile_id=profile_id)
         self._loading = True
         try:
             index = self.device_box.findData({"kind": DEVICE,
-                                              "index": match.device.index})
+                                              "index": resolution.device.index})
             self.device_box.setCurrentIndex(max(index, 0))
         finally:
             self._loading = False
@@ -316,6 +312,20 @@ class InputPanel(QtWidgets.QWidget):
                 f"BabelFishR will not substitute another input for it - not "
                 f"the MacBook microphone, not the system default, and not "
                 f"another interface that happens to be plugged in.")
+        if state == "ambiguous":
+            listed = "\n".join(f"    {name}" for name in status["candidates"])
+            return False, (
+                f"BabelFishR cannot safely determine which interface is "
+                f"carrying the radio.\n\n"
+                f"{len(status['candidates'])} connected inputs are "
+                f"indistinguishable from the one you selected "
+                f"({status['expected']}):\n\n{listed}\n\n"
+                f"They report the same name, the same connection and the same "
+                f"channel count, and macOS gives no unique identifier for "
+                f"them, so nothing here can tell them apart - but only one of "
+                f"them may have your radio plugged into it. BabelFishR will "
+                f"not guess.\n\n"
+                f"Disconnect the one you do not want and press Rescan.")
         return True, ""
 
     def refresh_status(self) -> None:
@@ -324,14 +334,6 @@ class InputPanel(QtWidgets.QWidget):
 
         status = self.app.input_status()
         state = status["state"]
-        self._loading = True
-        try:
-            selection = self.app.config.audio.input
-            self.lock_check.setChecked(bool(selection.locked))
-            self.lock_check.setEnabled(
-                state in ("connected", "missing") and not self._monitoring)
-        finally:
-            self._loading = False
 
         if state == "none":
             self._set_status("INPUT: none selected", "idle")
@@ -351,15 +353,26 @@ class InputPanel(QtWidgets.QWidget):
                 f"connected. Nothing else has been selected in its place. "
                 f"Reconnect it and press Rescan.")
             self.meter.reset()
+        elif state == "ambiguous":
+            self._set_status(
+                f"INPUT: {status['expected']} — CANNOT IDENTIFY", "error")
+            listed = "<br>".join(f"&nbsp;&nbsp;• {name}"
+                                 for name in status["candidates"])
+            self._show_alert(
+                f"<b>BabelFishR cannot safely determine which interface is "
+                f"carrying the radio.</b><br><br>"
+                f"{len(status['candidates'])} connected inputs are "
+                f"indistinguishable from the one you selected:<br>{listed}"
+                f"<br><br>Only one of them may have your radio plugged into "
+                f"it, and nothing macOS reports tells them apart. Nothing has "
+                f"been selected and monitoring will not start. Disconnect the "
+                f"one you do not want, then press Rescan.")
+            self.meter.reset()
         else:
             device = status["device"]
             self._set_status(f"INPUT: {device.name} — CONNECTED", "listening")
             note = ""
-            if status.get("ambiguous"):
-                note = ("More than one connected input is indistinguishable "
-                        "from the one you chose. Disconnect the duplicate to "
-                        "be certain which one is being recorded.")
-            elif device.is_builtin and self._monitoring:
+            if device.is_builtin and self._monitoring:
                 note = ("This is the microphone built into this Mac. It is "
                         "recording the room, not a radio.")
             self._show_alert(note)
@@ -386,7 +399,7 @@ class InputPanel(QtWidgets.QWidget):
     def set_monitoring(self, monitoring: bool) -> None:
         """Freeze the input controls for the duration of a watch."""
         self._monitoring = bool(monitoring)
-        for widget in (self.device_box, self.rescan_button, self.lock_check,
+        for widget in (self.device_box, self.rescan_button,
                        self.profile_check):
             widget.setEnabled(not self._monitoring)
         if not self._monitoring:
@@ -402,7 +415,15 @@ class InputPanel(QtWidgets.QWidget):
         """React to the capture thread losing or regaining the device."""
         from . import theme
 
-        if kind in ("disconnected", "reconnect-failed"):
+        if kind == "ambiguous-device":
+            self._set_status("INPUT: CANNOT IDENTIFY", "error")
+            self._show_alert(
+                f"<b>BabelFishR cannot safely determine which interface is "
+                f"carrying the radio.</b> {message}<br><br>Nothing is being "
+                f"recorded. Recordings already captured are unaffected. "
+                f"Disconnect the duplicate interface and press Rescan.")
+            self.meter.reset()
+        elif kind in ("disconnected", "reconnect-failed"):
             expected = (self.app.config.audio.input.label
                         or self.app.selected_input_identity().describe()
                         or "the selected input")

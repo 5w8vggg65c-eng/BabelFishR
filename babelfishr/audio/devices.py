@@ -61,6 +61,29 @@ class InputDeviceMissing(AudioBackendUnavailable):
             f"the selected audio input is not connected: {identity.describe()}"))
 
 
+class AmbiguousInputDevice(AudioBackendUnavailable):
+    """More than one connected device is indistinguishable from the saved one.
+
+    Two identical USB interfaces with no CoreAudio UID between them produce
+    byte-for-byte identical identities. There is no observable property that
+    tells them apart, so there is no way to know which one the operator meant -
+    and one of them may be carrying the radio while the other carries nothing.
+
+    Picking either would be a coin flip presented to the operator as a fact.
+    So this is raised instead, and capture does not start.
+    """
+
+    def __init__(self, identity: "DeviceIdentity", candidates=(),
+                 message: str = ""):
+        self.identity = identity
+        self.candidates = list(candidates)
+        super().__init__(message or (
+            f"{len(self.candidates)} connected inputs are indistinguishable "
+            f"from the one you selected ({identity.describe()}). BabelFishR "
+            f"cannot safely determine which interface is carrying the radio, "
+            f"so it will not start."))
+
+
 class InputNotSelected(RuntimeError):
     """Monitoring was requested before an input was deliberately chosen.
 
@@ -177,14 +200,53 @@ class DeviceIdentity:
 
 @dataclasses.dataclass(frozen=True)
 class DeviceMatch:
-    """The result of restoring a persisted selection."""
+    """One device, positively identified.
+
+    A DeviceMatch only ever exists when exactly one connected device matches.
+    There is deliberately no "ambiguous" flag on it: a flag can be ignored, and
+    the previous version of this code proved that by attaching one to the first
+    of several candidates and handing it out anyway.
+    """
 
     device: "AudioDevice"
     basis: str
     """``"uid"`` or ``"composite"``."""
 
-    ambiguous: bool = False
-    """More than one connected device is indistinguishable from the identity."""
+
+@dataclasses.dataclass(frozen=True)
+class InputResolution:
+    """What a saved identity resolves to right now.
+
+    ``state`` is one of:
+
+    ``resolved``   exactly one connected device matches; ``device`` is it.
+    ``missing``    nothing matches. Not "use something else" - nothing.
+    ``ambiguous``  several match and nothing distinguishes them. ``candidates``
+                   lists them so the operator can be shown what the choice is.
+    """
+
+    state: str
+    device: Optional["AudioDevice"] = None
+    basis: str = ""
+    candidates: tuple = ()
+
+    @property
+    def resolved(self) -> bool:
+        return self.state == "resolved"
+
+    @property
+    def ambiguous(self) -> bool:
+        return self.state == "ambiguous"
+
+    @property
+    def missing(self) -> bool:
+        return self.state == "missing"
+
+    def match(self) -> Optional[DeviceMatch]:
+        """The device, but only when it is unambiguously the right one."""
+        if not self.resolved or self.device is None:
+            return None
+        return DeviceMatch(self.device, self.basis)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -324,35 +386,50 @@ def list_input_devices() -> List[AudioDevice]:
     return devices
 
 
-def resolve_identity(identity: Optional[DeviceIdentity],
-                     devices: Optional[List[AudioDevice]] = None
-                     ) -> Optional[DeviceMatch]:
-    """Find the device the operator actually chose, or nothing.
+def resolve_input(identity: Optional[DeviceIdentity],
+                  devices: Optional[List[AudioDevice]] = None
+                  ) -> InputResolution:
+    """What the operator's saved selection resolves to, including "cannot tell".
 
-    This is the only function that may be used to restore a persisted
-    selection. It never falls back to the system default, never falls back to
-    the built-in microphone, and never matches on the PortAudio index - so a
-    device that comes back on a different index is still found, and a
-    *different* device that inherits the old index is not.
+    The only function permitted to restore a persisted selection. It never
+    falls back to the system default, never falls back to the built-in
+    microphone, and never matches on the PortAudio index - so a device that
+    comes back on a different index is still found, and a *different* device
+    that inherits the old index is not.
+
+    When several connected devices are indistinguishable it reports
+    ``ambiguous`` and names them. It does not pick one. An operator who
+    selected the second of two identical interfaces would otherwise be given
+    the first, and would have no way of knowing: the two look the same in every
+    property the operating system exposes, but only one of them has the radio
+    plugged into it.
     """
     if identity is None or identity.empty:
-        return None
+        return InputResolution("missing")
     if devices is None:
         devices = list_input_devices()
 
-    exact = [device for device in devices if identity.matches(device) == "uid"]
-    if exact:
-        return DeviceMatch(exact[0], "uid", ambiguous=len(exact) > 1)
+    for basis in ("uid", "composite"):
+        found = [device for device in devices
+                 if identity.matches(device) == basis]
+        if len(found) == 1:
+            return InputResolution("resolved", found[0], basis)
+        if len(found) > 1:
+            return InputResolution("ambiguous", None, basis, tuple(found))
+    return InputResolution("missing")
 
-    composite = [device for device in devices
-                 if identity.matches(device) == "composite"]
-    if not composite:
-        return None
-    # Several connected devices are genuinely indistinguishable from the
-    # recorded identity (two identical USB interfaces, say). They are
-    # interchangeable as far as anything we can observe goes, but the operator
-    # is told, because they may not be interchangeable in the rack.
-    return DeviceMatch(composite[0], "composite", ambiguous=len(composite) > 1)
+
+def resolve_identity(identity: Optional[DeviceIdentity],
+                     devices: Optional[List[AudioDevice]] = None
+                     ) -> Optional[DeviceMatch]:
+    """The chosen device, and only when it is unambiguously the chosen device.
+
+    Returns ``None`` for both "not connected" and "cannot tell which one", so
+    a caller that only knows how to check for ``None`` is fail-closed by
+    construction. Callers that need to tell the two apart - and to say which
+    is which to the operator - use :func:`resolve_input`.
+    """
+    return resolve_input(identity, devices).match()
 
 
 def unique_labels(devices: List[AudioDevice]) -> Dict[int, str]:
@@ -400,6 +477,8 @@ def find_device(selector: Optional[str]) -> Optional[AudioDevice]:
 
     selector = str(selector).strip()
     if selector.startswith(f"{_IDENTITY_SCHEME}:"):
+        # Deliberately the safe wrapper: an identity selector that matches two
+        # devices resolves to nothing, not to the first of them.
         match = resolve_identity(DeviceIdentity.parse(selector), devices)
         return match.device if match else None
     if selector.isdigit():
@@ -424,9 +503,9 @@ def default_input_device() -> Optional[AudioDevice]:
 
 
 __all__ = [
-    "AudioBackendUnavailable", "AudioDevice", "DeviceIdentity", "DeviceMatch",
-    "InputDeviceMissing", "InputNotSelected", "backend_available",
-    "backend_status",
+    "AmbiguousInputDevice", "AudioBackendUnavailable", "AudioDevice",
+    "DeviceIdentity", "DeviceMatch", "InputDeviceMissing", "InputNotSelected",
+    "InputResolution", "backend_available", "backend_status",
     "default_input_device", "find_device", "list_input_devices",
-    "resolve_identity", "unique_labels",
+    "resolve_identity", "resolve_input", "unique_labels",
 ]
