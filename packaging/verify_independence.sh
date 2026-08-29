@@ -30,6 +30,25 @@ run_isolated() {
       "$BINARY" "$@")
 }
 
+# The same, with a hard wall-clock limit. macOS has no GNU `timeout`, so this
+# is done by hand. Used for the checks that talk to system daemons: a build
+# must fail in a minute, not sit on a runner for two hours because coreaudiod
+# never answered.
+run_isolated_limited() {
+  local limit="$1"; shift
+  local output_file status
+  output_file="$(mktemp)"
+  ( run_isolated "$@" >"$output_file" 2>&1 ) &
+  local pid=$!
+  ( sleep "$limit"; kill -9 "$pid" 2>/dev/null ) 2>/dev/null &
+  local watcher=$!
+  wait "$pid"; status=$?
+  kill "$watcher" 2>/dev/null || true
+  cat "$output_file"
+  rm -f "$output_file"
+  return "$status"
+}
+
 echo "== running the frozen app from / with a scrubbed environment =="
 for flag in --version --help --selftest-import; do
   if OUTPUT=$(run_isolated "$flag" 2>&1); then
@@ -55,12 +74,17 @@ echo "== CoreAudio, from inside the bundle =="
 # It proves the frameworks load and the property selectors and struct layout
 # are right on this machine. It does NOT prove audio capture works: a hosted
 # runner has no audio hardware, so zero devices is the expected result there.
-if OUTPUT=$(run_isolated --selftest-coreaudio 2>&1); then
+if OUTPUT=$(run_isolated_limited 90 --selftest-coreaudio); then
   echo "$OUTPUT"
   pass "CoreAudio ABI check"
 else
+  STATUS=$?
   echo "$OUTPUT"
-  fail "the bundled app could not use CoreAudio"
+  if [[ "$STATUS" -eq 137 ]]; then
+    fail "the CoreAudio check did not finish within 90s and was killed"
+  else
+    fail "the bundled app could not use CoreAudio (exit $STATUS)"
+  fi
 fi
 
 echo

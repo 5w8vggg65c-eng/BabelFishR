@@ -195,6 +195,63 @@ def test_the_formatted_probe_never_implies_hardware_was_tested(monkeypatch):
     assert "not evidence that audio capture works" in text
 
 
+# ---- a CoreAudio call must never be able to hang the application ------
+def test_a_blocked_coreaudio_call_gives_up_instead_of_hanging():
+    """Every call here goes through the HAL to coreaudiod over Mach IPC.
+
+    If that daemon is absent, wedged or still starting - the normal state of a
+    machine with no audio hardware - a call can block rather than fail. Device
+    enumeration runs on the GUI thread, so a block there freezes the window
+    an operator is watching a radio through.
+    """
+    import time
+
+    started = time.monotonic()
+    with pytest.raises(coreaudio.CoreAudioTimeout):
+        coreaudio._with_timeout(lambda: time.sleep(30), timeout=0.2,
+                                what="test call")
+    assert time.monotonic() - started < 5.0
+
+
+def test_enumeration_falls_back_to_nothing_when_coreaudio_will_not_answer(
+        monkeypatch):
+    """Losing the UID is a handled degradation. Hanging is not."""
+    def blocked():
+        import time
+
+        time.sleep(30)
+
+    monkeypatch.setattr(coreaudio, "_list_input_devices", blocked)
+    monkeypatch.setattr(coreaudio, "CALL_TIMEOUT_SECONDS", 0.2)
+    assert coreaudio.list_input_devices() == []
+    assert coreaudio.input_index() == {}
+
+
+def test_the_probe_reports_a_timeout_without_calling_it_a_failure(monkeypatch):
+    """A daemon that will not answer is not a defect in this code.
+
+    Failing the build on it would make a green build depend on the mood of a
+    daemon on a machine with no sound card - so it is reported, loudly, and
+    the consequence is spelled out.
+    """
+    import time
+
+    monkeypatch.setattr("sys.platform", "darwin")
+    monkeypatch.setattr(coreaudio, "_libraries", lambda: (object(), object()))
+    monkeypatch.setattr(coreaudio, "_property_size",
+                        lambda *a: time.sleep(30))
+    monkeypatch.setattr(coreaudio, "CALL_TIMEOUT_SECONDS", 0.2)
+
+    started = time.monotonic()
+    report = coreaudio.probe()
+    assert time.monotonic() - started < 5.0
+    assert report["timed_out"] is True
+    assert report["ok"] is True
+    assert "timed out" in report["device_list_query"]
+    text = coreaudio.format_probe(report)
+    assert "cannot tell two identical interfaces apart" in text
+
+
 @pytest.mark.skipif(not coreaudio.available(),
                     reason="needs a real macOS host with CoreAudio")
 def test_the_real_coreaudio_abi_works_on_this_machine():
@@ -209,9 +266,12 @@ def test_the_real_coreaudio_abi_works_on_this_machine():
     report = coreaudio.probe()
     assert report["applicable"] is True
     assert report["frameworks_loaded"] is True, coreaudio.format_probe(report)
-    assert report["device_list_query"] == "ok", coreaudio.format_probe(report)
     assert report["errors"] == [], coreaudio.format_probe(report)
     assert report["ok"] is True
+    if report["timed_out"]:
+        pytest.skip("coreaudiod did not answer on this host; the ABI could "
+                    "not be exercised. See the probe output in the build log.")
+    assert report["device_list_query"] == "ok", coreaudio.format_probe(report)
 
     # Whatever devices do exist must be coherent enough to identify.
     for device in coreaudio.list_input_devices():

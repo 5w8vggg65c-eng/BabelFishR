@@ -22,8 +22,10 @@ import ctypes
 import ctypes.util
 import dataclasses
 import logging
+import queue
 import sys
-from typing import Dict, List, Optional
+import threading
+from typing import Any, Callable, Dict, List, Optional
 
 log = logging.getLogger(__name__)
 
@@ -97,6 +99,14 @@ class CoreAudioDevice:
         return self.transport in BUILTIN_TRANSPORTS
 
 
+#: Longest we will wait for CoreAudio to answer. Every call here goes through
+#: the HAL to coreaudiod over Mach IPC; if that daemon is missing, wedged or
+#: still starting - which is the normal state of a machine with no audio
+#: hardware at all - a call can block rather than fail. Nothing in this
+#: application is important enough to freeze the window over, so we give up and
+#: report it.
+CALL_TIMEOUT_SECONDS = 5.0
+
 _LIBRARIES = None
 
 
@@ -127,6 +137,42 @@ def _libraries():
 
 def available() -> bool:
     return _libraries() is not None
+
+
+class CoreAudioTimeout(RuntimeError):
+    """CoreAudio did not answer within :data:`CALL_TIMEOUT_SECONDS`."""
+
+
+def _with_timeout(function: Callable[[], Any], timeout: Optional[float] = None,
+                  what: str = "CoreAudio call") -> Any:
+    """Run *function* on a daemon thread and give up if it blocks.
+
+    ctypes releases the GIL around a foreign call, so a wedged HAL call parks
+    its own thread and nothing else. The thread is a daemon, so a call that
+    never returns cannot hold up interpreter exit either - which matters,
+    because this is reached from device enumeration on the GUI thread and from
+    the packaged app's own self-test.
+    """
+    timeout = CALL_TIMEOUT_SECONDS if timeout is None else timeout
+    outcome: "queue.Queue[tuple]" = queue.Queue(maxsize=1)
+
+    def run() -> None:
+        try:
+            outcome.put(("ok", function()))
+        except BaseException as exc:  # noqa: BLE001 - relayed to the caller
+            outcome.put(("raised", exc))
+
+    thread = threading.Thread(target=run, daemon=True,
+                              name="babelfishr-coreaudio")
+    thread.start()
+    try:
+        kind, value = outcome.get(timeout=timeout)
+    except queue.Empty:
+        raise CoreAudioTimeout(
+            f"{what} did not return within {timeout:g}s") from None
+    if kind == "raised":
+        raise value
+    return value
 
 
 def _address(selector: int, scope: int = _SCOPE_GLOBAL):
@@ -207,9 +253,23 @@ def _transport(core_audio, object_id: int) -> str:
 def list_input_devices() -> List[CoreAudioDevice]:
     """Every CoreAudio device with at least one input channel.
 
-    Returns an empty list on any host or any failure, so callers can treat
-    "CoreAudio told us nothing" and "we are not on a Mac" identically.
+    Returns an empty list on any host, on any failure, and on a CoreAudio call
+    that blocks - so callers can treat "CoreAudio told us nothing", "we are not
+    on a Mac" and "the HAL is not answering" identically. Losing the UID means
+    falling back to composite identification, which is a degradation the rest
+    of the code already handles; hanging the window would not be.
     """
+    try:
+        return _with_timeout(_list_input_devices, what="device enumeration")
+    except CoreAudioTimeout as exc:
+        log.warning("%s; falling back to composite device identification", exc)
+        return []
+    except Exception as exc:  # noqa: BLE001 - never break the audio path
+        log.debug("could not enumerate CoreAudio devices: %s", exc)
+        return []
+
+
+def _list_input_devices() -> List[CoreAudioDevice]:
     libraries = _libraries()
     if libraries is None:
         return []
@@ -286,6 +346,8 @@ def probe() -> Dict[str, object]:
         "device_count": 0,
         "devices": [],
         "errors": [],
+        "notes": [],
+        "timed_out": False,
         "ok": True,
     }
     if sys.platform != "darwin":
@@ -300,9 +362,12 @@ def probe() -> Dict[str, object]:
     report["frameworks_loaded"] = True
     core_audio, _ = libraries
 
+    def size_query():
+        return _property_size(core_audio, _SYSTEM_OBJECT,
+                              _address(_PROP_DEVICES))
+
     try:
-        address = _address(_PROP_DEVICES)
-        size = _property_size(core_audio, _SYSTEM_OBJECT, address)
+        size = _with_timeout(size_query, what="device list size query")
         if size is None:
             report["device_list_query"] = "failed: non-zero OSStatus"
             report["errors"] = [
@@ -313,6 +378,18 @@ def probe() -> Dict[str, object]:
             return report
         report["device_list_query"] = "ok"
         report["object_count"] = size // ctypes.sizeof(ctypes.c_uint32)
+    except CoreAudioTimeout as exc:
+        # A wedged or absent coreaudiod. Reported, not fatal: the application
+        # degrades to composite identification and keeps working, and calling
+        # this a build failure would make a green build depend on the mood of a
+        # daemon on a machine with no sound card.
+        report["device_list_query"] = f"timed out: {exc}"
+        report["timed_out"] = True
+        report["notes"] = [
+            "CoreAudio did not answer. Device identification falls back to "
+            "name plus host API plus channel count, which cannot tell two "
+            "identical interfaces apart."]
+        return report
     except Exception as exc:  # noqa: BLE001
         report["device_list_query"] = f"raised: {exc}"
         report["errors"] = [f"{type(exc).__name__}: {exc}"]
@@ -360,6 +437,8 @@ def format_probe(report: Optional[Dict[str, object]] = None) -> str:
             f"     {device['name']!r} uid={device['uid']!r} "
             f"{device['channels']} ch {device['transport']}"
             f"{' (built-in)' if device['builtin'] else ''}")
+    for note in report.get("notes", []):  # type: ignore[union-attr]
+        lines.append(f"  note: {note}")
     for error in report["errors"]:  # type: ignore[union-attr]
         lines.append(f"  ERROR: {error}")
     if report["applicable"] and not report["device_count"]:

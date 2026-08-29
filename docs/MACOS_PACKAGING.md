@@ -72,8 +72,18 @@ minimal `PATH`. It fails if:
 - any bundled `.dylib` or `.so` still references an absolute path that is not
   an OS library under `/usr/lib` or `/System`.
 
+It also runs `--selftest-coreaudio`, which is the only place in this project
+where the real CoreAudio ABI is exercised: the frameworks are loaded, a size
+query is issued for the device list, and a non-zero OSStatus - what a wrong
+selector or a wrong `AudioObjectPropertyAddress` layout produces - fails the
+build. Any devices the machine reports must be coherent enough to identify.
+
+It deliberately does **not** require a device to exist. A hosted runner has no
+audio hardware, so zero devices is the expected result there, and the report
+says so rather than letting a green tick imply that audio capture was tested.
+
 The checks that have to run inside the frozen process are the entry point's
-`--selftest-independence` and `--selftest-gui` flags.
+`--selftest-independence`, `--selftest-coreaudio` and `--selftest-gui` flags.
 
 Result from the first successful Apple Silicon run: every required module
 loaded from `BabelFishR.app/Contents/Frameworks`, `libqcocoa.dylib` and the
