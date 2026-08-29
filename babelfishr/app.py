@@ -82,13 +82,23 @@ class BabelFishRApp:
     def mode(self):
         return self.config.operating_mode()
 
-    def set_mode(self, mode) -> None:
-        """Switch operating mode. Engines are re-resolved under the new rules."""
+    def set_mode(self, mode, persist: bool = True) -> None:
+        """Switch operating mode, persisting it so it survives a restart.
+
+        An in-memory-only switch meant an operator who selected Field Offline
+        was silently back in Online/Setup after relaunching - exactly the
+        situation where a cloud engine could become selectable again.
+        """
         from .modes import OperatingMode
 
         self.config.mode = OperatingMode(mode).value
         self.transcription = None
         self.translation = None
+        if persist:
+            try:
+                self.config.save()
+            except OSError as exc:  # noqa: BLE001 - never fatal
+                log.warning("could not persist the operating mode: %s", exc)
 
     def select_engines(self, strict: bool = False) -> EngineSummary:
         """Resolve the engines and report exactly what the operator is getting."""

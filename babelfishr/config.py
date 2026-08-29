@@ -109,7 +109,9 @@ class TranslateConfig:
 
 @dataclasses.dataclass
 class RecordingConfig:
-    directory: str = "recordings"
+    directory: str = ""
+    """Empty means the managed location (AppPaths.recordings). See resolve()."""
+
     enabled: bool = True
     layout: str = "{date}/{session}"
     """Placeholders: date, session, profile, channel."""
@@ -146,6 +148,21 @@ class SdrConfig:
 
 
 @dataclasses.dataclass
+class SetupState:
+    """What the operator has already chosen. Persisted across restarts."""
+
+    completed: bool = False
+    """True once preparation finished or Record Only was chosen deliberately."""
+
+    completed_at: str = ""
+    asr_model: str = ""
+    language_pairs: List[str] = dataclasses.field(default_factory=list)
+    audio_device: str = ""
+    record_only_acknowledged: bool = False
+    """The operator chose to proceed without processing, knowingly."""
+
+
+@dataclasses.dataclass
 class SessionConfig:
     profile_id: Optional[str] = None
     source_language_mode: str = "automatic"
@@ -165,13 +182,16 @@ class Config:
     session: SessionConfig = dataclasses.field(default_factory=SessionConfig)
     analysis: AnalysisConfig = dataclasses.field(default_factory=AnalysisConfig)
     sdr: SdrConfig = dataclasses.field(default_factory=SdrConfig)
+    setup: SetupState = dataclasses.field(default_factory=SetupState)
     mode: str = "online-setup"
     """``field-offline``, ``online-setup`` or ``record-only``."""
 
     app_home: Optional[str] = None
     """Override for the Application Support directory holding field assets."""
 
-    database: str = "babelfishr.sqlite3"
+    database: str = ""
+    """Empty means the managed location (AppPaths.database). See resolve()."""
+
     log_level: str = "INFO"
     experimental: bool = False
     """Enable the unvalidated signalling decoders. Off by default."""
@@ -181,13 +201,50 @@ class Config:
 
     # ---- construction -------------------------------------------------
     @classmethod
-    def load(cls, path: Optional[str] = None) -> "Config":
+    def load(cls, path: Optional[str] = None,
+             resolve_paths: bool = True) -> "Config":
+        """Load configuration and resolve every runtime path exactly once.
+
+        Search order for a config file: an explicit path, then the working
+        directory, then the managed settings file under Application Support.
+        """
         resolved = _resolve_path(path)
         data = _read_file(resolved) if resolved else {}
         cfg = cls.from_dict(data)
         cfg.source_path = str(resolved) if resolved else None
         cfg.apply_env(dict(os.environ))
+        if resolve_paths:
+            cfg.resolve_runtime_paths()
         return cfg
+
+    def resolve_runtime_paths(self) -> "Config":
+        """Make ``database`` and ``recording.directory`` absolute, once.
+
+        The rules, in order:
+
+        1. An explicit absolute path from config or environment wins outright.
+        2. An explicit *relative* path resolves against the directory holding
+           the config file that set it - never against the process working
+           directory, which for a double-clicked ``.app`` is ``/`` and would
+           scatter databases wherever Finder happened to launch from.
+        3. Anything unset uses the managed Application Support location.
+
+        Every consumer - Store, Recorder, readiness, the CLI, the GUI and the
+        packaged entry point - reads the resolved values, so they cannot
+        disagree about where data lives.
+        """
+        paths = self.paths()
+        base = (pathlib.Path(self.source_path).parent
+                if self.source_path else None)
+
+        self.database = str(_resolve_runtime_path(
+            self.database, base, paths.database))
+        self.recording.directory = str(_resolve_runtime_path(
+            self.recording.directory, base, paths.recordings))
+        if self.translate.glossary_path:
+            self.translate.glossary_path = str(_resolve_runtime_path(
+                self.translate.glossary_path, base, paths.root / "glossary.json"))
+        return self
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Config":
@@ -196,6 +253,7 @@ class Config:
             "audio": cfg.audio, "detector": cfg.detector, "asr": cfg.asr,
             "translate": cfg.translate, "recording": cfg.recording,
             "session": cfg.session, "analysis": cfg.analysis, "sdr": cfg.sdr,
+            "setup": cfg.setup,
         }
         for name, obj in sections.items():
             values = dict(data.get(name) or {})
@@ -232,15 +290,57 @@ class Config:
         d.pop("source_path", None)
         return d
 
+    def settings_path(self) -> pathlib.Path:
+        """Where *application* settings are written.
+
+        An explicitly supplied config file keeps ownership - the operator's own
+        file is never silently replaced by the managed one - otherwise settings
+        go to the managed location under Application Support.
+        """
+        if self.source_path:
+            return pathlib.Path(self.source_path)
+        return self.paths().settings
+
     def save(self, path: Optional[str] = None) -> str:
-        target = pathlib.Path(path or self.source_path or (APP_DIR / "babelfishr.toml"))
+        """Write settings atomically, so a crash cannot truncate them."""
+        target = pathlib.Path(path) if path else self.settings_path()
         target.parent.mkdir(parents=True, exist_ok=True)
-        if target.suffix == ".json":
-            target.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
-        else:
-            target.write_text(self.dump_toml(), encoding="utf-8")
+        text = (json.dumps(self.to_dict(), indent=2) if target.suffix == ".json"
+                else self.dump_toml())
+        # Write-then-rename: a settings file half-written by a crash would
+        # leave the app unable to start.
+        temporary = target.with_name(target.name + ".tmp")
+        temporary.write_text(text, encoding="utf-8")
+        os.replace(temporary, target)
         self.source_path = str(target)
         return str(target)
+
+    def record_setup(self, *, asr_model: str = "", language_pairs=None,
+                     audio_device: str = "", record_only: bool = False,
+                     completed: bool = True) -> str:
+        """Persist the operator's setup choices and save."""
+        import datetime as _dt
+
+        if asr_model:
+            self.setup.asr_model = asr_model
+            self.asr.model = asr_model
+        if language_pairs is not None:
+            self.setup.language_pairs = [f"{a}-{b}" for a, b in language_pairs]
+        if audio_device:
+            self.setup.audio_device = audio_device
+            self.audio.device = audio_device
+        if record_only:
+            self.setup.record_only_acknowledged = True
+        self.setup.completed = completed
+        if completed:
+            self.setup.completed_at = _dt.datetime.now(
+                _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return self.save()
+
+    @property
+    def needs_first_run_setup(self) -> bool:
+        """True when no completed setup exists, so the assistant should show."""
+        return not self.setup.completed
 
     def dump_toml(self) -> str:
         return _to_toml(self.to_dict())
@@ -258,6 +358,23 @@ class Config:
     def recordings_path(self) -> pathlib.Path:
         return pathlib.Path(self.recording.directory).expanduser()
 
+    def glossary_file(self) -> pathlib.Path:
+        if self.translate.glossary_path:
+            return pathlib.Path(self.translate.glossary_path).expanduser()
+        return self.paths().root / "glossary.json"
+
+
+def _resolve_runtime_path(value: str, base: Optional[pathlib.Path],
+                          managed: pathlib.Path) -> pathlib.Path:
+    """Apply the resolution rules documented on Config.resolve_runtime_paths."""
+    if not value:
+        return managed
+    candidate = pathlib.Path(value).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    # Relative to the config file that declared it, not to os.getcwd().
+    return (base / candidate).resolve() if base else (managed.parent / candidate)
+
 
 def _resolve_path(path: Optional[str]) -> Optional[pathlib.Path]:
     if path:
@@ -265,11 +382,14 @@ def _resolve_path(path: Optional[str]) -> Optional[pathlib.Path]:
         if not p.exists():
             raise FileNotFoundError(f"config file not found: {p}")
         return p
-    for name in DEFAULT_CONFIG_NAMES:
-        for base in (pathlib.Path.cwd(), APP_DIR):
-            candidate = base / name
-            if candidate.exists():
-                return candidate
+    from .modes import AppPaths
+
+    candidates = [pathlib.Path.cwd() / name for name in DEFAULT_CONFIG_NAMES]
+    candidates.append(AppPaths.resolve().settings)
+    candidates += [APP_DIR / name for name in DEFAULT_CONFIG_NAMES]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
     return None
 
 
