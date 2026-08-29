@@ -175,6 +175,7 @@ def field_check(config, *, run_smoke_tests: bool = True,
                          "no audio backend"))
 
     report.add(_microphone_permission_check())
+    report.add(_selected_input_check(config))
 
     # -- storage --------------------------------------------------------
     if paths.writable():
@@ -211,6 +212,55 @@ def field_check(config, *, run_smoke_tests: bool = True,
     report.add(_cloud_disabled_check(mode))
     report.add(_mock_disabled_check(mode))
     return report
+
+
+def _selected_input_check(config) -> Check:
+    """Is the input the operator chose actually the one that would be used?
+
+    Reported, not enforced here: readiness is about whether the models and the
+    machine can do the work offline, and preparation legitimately happens
+    before an interface is wired up. The hard refusal lives where it belongs -
+    monitoring will not start on a missing or unchosen input.
+    """
+    from .audio.devices import resolve_identity
+
+    selection = config.audio.input
+    if selection.use_system_default and selection.confirmed:
+        return Check(
+            "Selected audio input", CheckStatus.WARN,
+            "macOS system default (chosen deliberately)",
+            remedy="For a radio watch, select the interface itself: the system "
+                   "default can change without warning.")
+    if not config.has_confirmed_input():
+        return Check(
+            "Selected audio input", CheckStatus.WARN, "none chosen yet",
+            remedy="Choose an input in the Audio input panel, or run "
+                   "'babelfishr input --select INDEX'. Monitoring will not "
+                   "start until one is chosen.")
+
+    identity = config.selected_input()
+    match = resolve_identity(identity)
+    if match is None:
+        return Check(
+            "Selected audio input", CheckStatus.FAIL,
+            f"{selection.label or identity.describe()} is NOT connected",
+            data={"identity": identity.token()},
+            remedy="Reconnect that device. BabelFishR will not substitute "
+                   "another input for it - not the built-in microphone, not "
+                   "the system default, and not another interface.")
+    kind = "built-in microphone" if match.device.is_builtin else "external input"
+    status = CheckStatus.WARN if match.device.is_builtin else CheckStatus.PASS
+    detail = (f"{match.device.name} ({kind}, matched by {match.basis}"
+              f"{', AMBIGUOUS' if match.ambiguous else ''})")
+    remedy = ""
+    if match.device.is_builtin:
+        remedy = ("This is the microphone built into this Mac. It records the "
+                  "room, not a radio. Correct for a bench test only.")
+    elif match.ambiguous:
+        remedy = ("More than one connected input is indistinguishable from "
+                  "this one. Disconnect the duplicate to be certain which is "
+                  "being recorded.")
+    return Check("Selected audio input", status, detail, remedy=remedy)
 
 
 def _microphone_permission_check() -> Check:

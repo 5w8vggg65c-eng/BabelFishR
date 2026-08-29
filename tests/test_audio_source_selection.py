@@ -467,3 +467,49 @@ def test_an_identity_token_never_contains_the_index():
     parsed = DeviceIdentity.parse(token)
     assert not hasattr(parsed, "index")
     assert "index" not in token
+
+
+# ---- Field Check reports the input, without hijacking readiness --------
+def test_field_check_reports_the_selected_input(cfg, connected):
+    import babelfishr.readiness as readiness_module
+
+    radio = radio_interface()
+    connected(builtin_mic(), radio)
+
+    check = readiness_module._selected_input_check(cfg)
+    assert check.status.name == "WARN" and "none chosen" in check.detail
+
+    cfg.record_input_selection(radio, save=False)
+    check = readiness_module._selected_input_check(cfg)
+    assert check.status.name == "PASS"
+    assert "USB Audio CODEC" in check.detail and "external" in check.detail
+
+    connected(builtin_mic())
+    check = readiness_module._selected_input_check(cfg)
+    assert check.status.name == "FAIL"
+    assert "NOT connected" in check.detail
+    assert "will not substitute" in check.remedy
+
+    # The built-in mic is usable, and flagged for what it is.
+    connected(builtin_mic(), radio)
+    cfg.record_input_selection(builtin_mic(), save=False)
+    check = readiness_module._selected_input_check(cfg)
+    assert check.status.name == "WARN"
+    assert "records the room" in check.remedy
+
+
+def test_a_missing_input_does_not_by_itself_make_the_app_unready(cfg,
+                                                                 connected):
+    """Preparation legitimately happens before the interface is wired up.
+
+    Readiness is about whether this machine can do the work offline. The hard
+    refusal belongs where monitoring starts, not here - otherwise an operator
+    could never prepare models on a Mac with nothing plugged into it.
+    """
+    from babelfishr.readiness import Check, CheckStatus, ReadinessReport
+
+    report = ReadinessReport()
+    report.add(Check("Audio backend", CheckStatus.PASS, ""))
+    report.add(Check("Recording directory writable", CheckStatus.PASS, ""))
+    report.add(Check("Selected audio input", CheckStatus.FAIL, "not connected"))
+    assert report.can_record is True

@@ -34,6 +34,19 @@ outputs can be much hotter than a computer input expects.
 
 ## 1. Install and launch
 
+Normally: download `BabelFishR-macOS-arm64.dmg` from Releases, open it, drag
+BabelFishR to Applications, and launch it. While builds are unnotarized the
+first launch needs right-click ▸ Open ▸ Open.
+
+The packaged binary is also the CLI, so everything below works against the
+installed app with no Python involved:
+
+```bash
+/Applications/BabelFishR.app/Contents/MacOS/BabelFishR doctor
+```
+
+From source instead:
+
 ```bash
 cd BabelFishR
 python3 -m venv .venv && source .venv/bin/activate
@@ -72,6 +85,63 @@ If the direct 3.5 mm connection does not appear: macOS only exposes an input on
 that jack when it detects a TRRS device presenting a microphone. Many adapters
 do not. Confirm in **System Settings ▸ Sound ▸ Input** — if macOS does not list
 it there, BabelFishR cannot see it either. Use a USB interface.
+
+## 3a. Input selection, persistence and disconnection
+
+**This is the section that cannot be simulated, and it is the one that matters
+most.** Everything about device identity has been tested only against a fake
+device list. These steps are the first time any of it meets CoreAudio.
+
+With the interface connected:
+
+- [ ] The Audio input panel opens on **"Choose an audio input"**. Nothing is
+      selected — not the MacBook microphone, not the system default.
+- [ ] Your interface is listed by a name you recognise, marked as an external
+      input, with a plausible channel count.
+- [ ] The MacBook microphone is listed separately and marked *built-in
+      microphone*.
+- [ ] The system default is *labelled* as such but not selected.
+
+Select your interface, then:
+
+- [ ] The status line reads `INPUT: <your interface> — CONNECTED`.
+- [ ] "Lock input to this device" is already ticked.
+- [ ] Speaking into the radio moves the level meter beside that line.
+
+Then, one at a time:
+
+- [ ] **Quit and relaunch.** The same interface is selected again, by name.
+- [ ] **Unplug it, then relaunch.** Nothing is selected. The line reads
+      `NOT CONNECTED` and names the interface. Pressing Start refuses, offers
+      *Rescan / Choose Different Input / Record Later*, and **does not** fall
+      back to the MacBook microphone.
+- [ ] **Replug it into a different USB port** and press Rescan. It is
+      recognised and selected again, even though its position in the device
+      list has changed.
+- [ ] **Plug in a second, different USB audio device** while yours is
+      unplugged. Still nothing is selected, and the line still names the
+      missing interface.
+- [ ] **Unplug it mid-watch.** The line turns red and reads
+      `RADIO INPUT DISCONNECTED`. Nothing new is recorded. Everything already
+      recorded is still in the timeline and still plays back.
+- [ ] **Replug it mid-watch.** Monitoring resumes on the same interface. Both
+      times appear in `~/Library/Application Support/BabelFishR/Logs/`.
+- [ ] Confirm from the recordings that nothing captured during the disconnected
+      period came from the MacBook microphone.
+
+Then check the command line agrees with the window:
+
+```bash
+/Applications/BabelFishR.app/Contents/MacOS/BabelFishR input
+```
+
+- [ ] It names the same device, says how it was identified (`coreaudio-uid` on
+      a Mac), and reports CONNECTED.
+
+If your Mac reports `composite` rather than `coreaudio-uid`, the CoreAudio UID
+could not be read and identification has fallen back to name plus host API plus
+channel count. That still works, but two identical interfaces cannot be told
+apart; say so before relying on a two-radio setup.
 
 ## 4. Levels
 
@@ -187,6 +257,8 @@ glossary helps a lot with callsigns and place names.
 ## 10. Before relying on it
 
 - [ ] `babelfishr doctor` reports no problems
+- [ ] Every box in section 3a is ticked, including the disconnect and replug
+- [ ] `babelfishr input` names the interface and says how it identified it
 - [ ] The test recording sounds correct when played back
 - [ ] The segmentation test yields exactly three transmissions
 - [ ] Pre-roll preserves the first word
