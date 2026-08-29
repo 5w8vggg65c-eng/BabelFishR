@@ -12,18 +12,21 @@ from ..audio.devices import backend_available, backend_status
 from ..config import Config
 from ..models import (ProcessingState, RadioProfile, SourceLanguageMode,
                       Transmission)
+from ..modes import OperatingMode
 from ..pipeline import PipelineState
 from .timeline import TimelineView
 from .widgets import LevelMeterWidget
 
+#: State labels paired with a semantic colour NAME (resolved per appearance),
+#: plus a symbol, so state never depends on colour alone.
 STATE_TEXT = {
-    PipelineState.IDLE: ("Idle", "#8b949e"),
-    PipelineState.LISTENING: ("Listening", "#3fb950"),
-    PipelineState.RECEIVING: ("Receiving", "#58a6ff"),
-    PipelineState.TRANSCRIBING: ("Transcribing", "#d29922"),
-    PipelineState.TRANSLATING: ("Translating", "#d29922"),
-    PipelineState.COMPLETE: ("Complete", "#3fb950"),
-    PipelineState.ERROR: ("Error", "#f85149"),
+    PipelineState.IDLE: ("Idle", "idle", "\u25cb"),
+    PipelineState.LISTENING: ("Listening", "listening", "\u25c9"),
+    PipelineState.RECEIVING: ("Receiving", "receiving", "\u25cf"),
+    PipelineState.TRANSCRIBING: ("Transcribing", "working", "\u25d4"),
+    PipelineState.TRANSLATING: ("Translating", "working", "\u25d1"),
+    PipelineState.COMPLETE: ("Complete", "ok", "\u2713"),
+    PipelineState.ERROR: ("Error", "error", "\u26a0"),
 }
 
 COMMON_LANGUAGES = [
@@ -34,27 +37,6 @@ COMMON_LANGUAGES = [
     ("sv", "Swedish"), ("no", "Norwegian"), ("da", "Danish"), ("fi", "Finnish"),
 ]
 
-STYLESHEET = """
-QWidget { font-size: 13px; }
-#bubble { background: #161b22; border: 1px solid #30363d; border-radius: 10px; }
-#bubble[state="failed"] { border-color: #f85149; }
-#bubble[review="true"] { border-color: #d29922; }
-#bubbleHeader { color: #8b949e; font-size: 11px; }
-#originalText { color: #e6edf3; }
-#translatedText { color: #79c0ff; }
-#errorText { color: #f85149; font-size: 12px; }
-#noteText { color: #d29922; font-size: 12px; }
-#provisional { color: #8b949e; }
-#statusText { color: #6e7681; font-size: 11px; }
-#emptyState { color: #6e7681; padding: 40px; }
-#stateBadge { font-weight: 600; padding: 3px 10px; border-radius: 9px;
-              background: #21262d; }
-#warningBanner { background: #3b2300; color: #f0b849; border: 1px solid #7a5c00;
-                 border-radius: 6px; padding: 7px 10px; }
-#privacyBanner { background: #0d2b45; color: #79c0ff; border: 1px solid #1f6feb;
-                 border-radius: 6px; padding: 7px 10px; }
-"""
-
 
 class MainWindow(QtWidgets.QMainWindow):
     """Session header, input controls, live meter and the timeline."""
@@ -63,19 +45,49 @@ class MainWindow(QtWidgets.QMainWindow):
                  parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
         self.app = app
-        self.setWindowTitle("BabelFishR - receive, transcribe, translate")
-        self.resize(980, 780)
-        self.setStyleSheet(STYLESHEET)
+        self.setWindowTitle("BabelFishR")
+        self.resize(1040, 820)
+        self._apply_theme()
 
+        self._state = PipelineState.IDLE
+        self._readiness = None
+        self._theming = False
         self._build_ui()
         self._refresh_devices()
         self._refresh_profiles()
         self._report_engines()
+        self._refresh_mode_badge()
+        self._refresh_state_badge()
+        self._refresh_readiness()
+        self._refresh_sdr_label()
 
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(100)
         self._timer.timeout.connect(self._drain_events)
         self._timer.start()
+
+    def _apply_theme(self) -> None:
+        """Restyle from the live system palette (light/dark)."""
+        from . import theme
+
+        # setStyleSheet itself posts a palette/style change, so without this
+        # guard changeEvent re-enters _apply_theme until the stack overflows.
+        if getattr(self, "_theming", False):
+            return
+        self._theming = True
+        try:
+            self.setStyleSheet(theme.stylesheet(self))
+        finally:
+            self._theming = False
+
+    def changeEvent(self, event: QtCore.QEvent) -> None:  # noqa: N802
+        """Follow the operator's system appearance when it changes."""
+        if (event.type() in (QtCore.QEvent.PaletteChange,
+                             QtCore.QEvent.ApplicationPaletteChange)
+                and not getattr(self, "_theming", False)):
+            self._apply_theme()
+            self._refresh_state_badge()
+        super().changeEvent(event)
 
     # -- construction ----------------------------------------------------
     def _build_ui(self) -> None:
@@ -86,7 +98,15 @@ class MainWindow(QtWidgets.QMainWindow):
         root.setSpacing(10)
 
         root.addLayout(self._build_header())
-        root.addLayout(self._build_controls())
+
+        self.setup_box = QtWidgets.QGroupBox("Session setup")
+        self.setup_box.setObjectName("setupPanel")
+        self.setup_box.setCheckable(True)
+        self.setup_box.setChecked(True)
+        self.setup_box.setToolTip("Collapse to give the timeline more room")
+        self.setup_box.setLayout(self._build_controls())
+        self.setup_box.toggled.connect(self._toggle_setup_panel)
+        root.addWidget(self.setup_box)
 
         self.warning_banner = QtWidgets.QLabel()
         self.warning_banner.setObjectName("warningBanner")
@@ -107,6 +127,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timeline.retryRequested.connect(self._on_retry)
         self.timeline.exportRequested.connect(self._on_export_clip)
         self.timeline.noteChanged.connect(self._on_note)
+        self.timeline.transcribeAnywayRequested.connect(self._on_transcribe_anyway)
+        self.timeline.analyzeDigitalRequested.connect(self._on_analyze_digital)
         root.addWidget(self.timeline, 1)
 
         self.status = self.statusBar()
@@ -118,13 +140,35 @@ class MainWindow(QtWidgets.QMainWindow):
         row.setSpacing(10)
 
         self.start_button = QtWidgets.QPushButton("Start monitoring")
-        self.start_button.setMinimumWidth(150)
+        self.start_button.setObjectName("primaryButton")
+        self.start_button.setMinimumWidth(170)
+        self.start_button.setDefault(True)
+        self.start_button.setShortcut("Ctrl+R")
+        self.start_button.setToolTip("Start or stop monitoring (Ctrl+R)")
+        self.start_button.setAccessibleName("Start or stop monitoring")
         self.start_button.clicked.connect(self._toggle_monitoring)
         row.addWidget(self.start_button)
 
-        self.state_badge = QtWidgets.QLabel("Idle")
+        self.state_badge = QtWidgets.QLabel("\u25cb Idle")
         self.state_badge.setObjectName("stateBadge")
+        self.state_badge.setAccessibleName("Current state")
         row.addWidget(self.state_badge)
+
+        self.mode_badge = QtWidgets.QLabel()
+        self.mode_badge.setObjectName("modeBadge")
+        self.mode_badge.setAccessibleName("Operating mode")
+        self.mode_badge.setCursor(QtCore.Qt.PointingHandCursor)
+        self.mode_badge.setToolTip("Operating mode - click to change")
+        self.mode_badge.mousePressEvent = lambda event: self._choose_mode()
+        row.addWidget(self.mode_badge)
+
+        self.ready_badge = QtWidgets.QLabel()
+        self.ready_badge.setObjectName("chip")
+        self.ready_badge.setCursor(QtCore.Qt.PointingHandCursor)
+        self.ready_badge.setToolTip("Field readiness - click for the full report")
+        self.ready_badge.setAccessibleName("Field readiness")
+        self.ready_badge.mousePressEvent = lambda event: self._show_readiness()
+        row.addWidget(self.ready_badge)
 
         self.meter = LevelMeterWidget()
         row.addWidget(self.meter, 1)
@@ -191,10 +235,36 @@ class MainWindow(QtWidgets.QMainWindow):
             self.target_language_box.setCurrentIndex(index)
         grid.addWidget(self.target_language_box, 1, 5)
 
+        grid.addWidget(QtWidgets.QLabel("Processing"), 2, 0)
+        self.mode_box = QtWidgets.QComboBox()
+        for mode in OperatingMode:
+            self.mode_box.addItem(mode.label, mode.value)
+        index = self.mode_box.findData(self.app.config.mode)
+        if index >= 0:
+            self.mode_box.setCurrentIndex(index)
+        self.mode_box.currentIndexChanged.connect(self._on_mode_box)
+        grid.addWidget(self.mode_box, 2, 1)
+
+        self.sdr_label = QtWidgets.QLabel()
+        self.sdr_label.setObjectName("sectionLabel")
+        grid.addWidget(self.sdr_label, 2, 2, 1, 4)
+
         self.channel_label = QtWidgets.QLabel("No profile selected")
-        self.channel_label.setObjectName("bubbleHeader")
-        grid.addWidget(self.channel_label, 2, 0, 1, 6)
+        self.channel_label.setObjectName("sectionLabel")
+        self.channel_label.setWordWrap(True)
+        grid.addWidget(self.channel_label, 3, 0, 1, 6)
         return grid
+
+    def _toggle_setup_panel(self, expanded: bool) -> None:
+        for child in self.setup_box.findChildren(QtWidgets.QWidget):
+            child.setVisible(expanded)
+
+    def _on_mode_box(self) -> None:
+        value = self.mode_box.currentData()
+        if value and value != self.app.config.mode:
+            self.app.set_mode(value)
+            self._report_engines()
+            self._refresh_mode_badge()
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
@@ -234,6 +304,16 @@ class MainWindow(QtWidgets.QMainWindow):
         show_all.triggered.connect(self._reload_timeline)
         view_menu.addAction(show_all)
 
+        tools_menu = self.menuBar().addMenu("&Tools")
+        readiness = QtGui.QAction("Field readiness...", self)
+        readiness.setShortcut("Ctrl+Shift+R")
+        readiness.triggered.connect(self._show_readiness)
+        tools_menu.addAction(readiness)
+
+        assistant = QtGui.QAction("Setup assistant...", self)
+        assistant.triggered.connect(self._show_assistant)
+        tools_menu.addAction(assistant)
+
         help_menu = self.menuBar().addMenu("&Help")
         where = QtGui.QAction("Where are my recordings?", self)
         where.triggered.connect(self._show_storage_location)
@@ -260,6 +340,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.device_box.addItem(device.describe(), device.index)
                 if device.is_default:
                     self.device_box.setCurrentIndex(self.device_box.count() - 1)
+
+    def _refresh_sdr_label(self) -> None:
+        from ..sources import sdr_status
+
+        status = sdr_status(self.app.config)
+        if not status["configured"]:
+            self.sdr_label.setText("SDR: not configured (optional)")
+        elif status["available"]:
+            self.sdr_label.setText(f"SDR: {status['detail']}")
+        else:
+            self.sdr_label.setText(f"SDR: unavailable - {status['reason'][:60]}")
 
     def _refresh_profiles(self) -> None:
         self.profile_box.blockSignals(True)
@@ -406,9 +497,60 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"{payload.get('message', '')}", 12000)
 
     def _set_state(self, state: str) -> None:
-        text, colour = STATE_TEXT.get(state, (str(state).title(), "#8b949e"))
-        self.state_badge.setText(text)
-        self.state_badge.setStyleSheet(f"color: {colour};")
+        self._state = state
+        self._refresh_state_badge()
+
+    def _refresh_state_badge(self) -> None:
+        from . import theme
+
+        state = getattr(self, "_state", PipelineState.IDLE)
+        text, tone, symbol = STATE_TEXT.get(
+            state, (str(state).title(), "idle", "\u25cb"))
+        # Symbol plus word, so the state is never carried by colour alone.
+        self.state_badge.setText(f"{symbol} {text}")
+        self.state_badge.setStyleSheet(f"color: {theme.status_color(tone, self)};")
+        self.state_badge.setAccessibleDescription(text)
+
+    def _refresh_mode_badge(self) -> None:
+        mode = self.app.mode
+        self.mode_badge.setText(mode.label)
+        self.mode_badge.setToolTip(mode.describe() + "\n\nClick to change.")
+        index = self.mode_box.findData(mode.value)
+        if index >= 0 and self.mode_box.currentIndex() != index:
+            self.mode_box.blockSignals(True)
+            self.mode_box.setCurrentIndex(index)
+            self.mode_box.blockSignals(False)
+
+    def _choose_mode(self) -> None:
+        modes = [m.label for m in OperatingMode]
+        current = list(OperatingMode).index(self.app.mode)
+        choice, ok = QtWidgets.QInputDialog.getItem(
+            self, "Operating mode", "Mode:", modes, current, False)
+        if ok:
+            self.app.set_mode(list(OperatingMode)[modes.index(choice)].value)
+            self._report_engines()
+            self._refresh_mode_badge()
+
+    def _refresh_readiness(self, run_smoke_tests: bool = False) -> None:
+        from . import theme
+
+        report = self.app.readiness(run_smoke_tests=run_smoke_tests)
+        self._readiness = report
+        if report.field_ready:
+            text, tone = "\u2713 Field ready", "ok"
+        elif report.can_record:
+            text, tone = "\u25d1 Record only", "working"
+        else:
+            text, tone = "\u26a0 Not ready", "error"
+        self.ready_badge.setText(text)
+        self.ready_badge.setStyleSheet(f"color: {theme.status_color(tone, self)};")
+        self.ready_badge.setAccessibleDescription(text)
+
+    def _show_readiness(self) -> None:
+        from .readiness_dialog import ReadinessDialog
+
+        ReadinessDialog(self.app, self).exec()
+        self._refresh_readiness()
 
     # -- transmission actions --------------------------------------------
     def _on_correction(self, tx_id: str, transcript: str, translation: str) -> None:
@@ -422,6 +564,33 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_note(self, tx_id: str, note: str) -> None:
         self.app.correct(tx_id, notes=note)
+
+    def _on_transcribe_anyway(self, tx_id: str) -> None:
+        if not self.app.transcribe_anyway(tx_id):
+            QtWidgets.QMessageBox.information(
+                self, "Transcribe anyway",
+                "Forcing transcription needs a running session with a "
+                "transcription engine available.\n\n"
+                "The recording is safe either way.")
+
+    def _on_analyze_digital(self, tx_id: str, protocol: str) -> None:
+        analyser = self.app.analyser()
+        if analyser is None:
+            from .analysis_dialog import show_dsd_missing
+
+            show_dsd_missing(self, self.app)
+            return
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            attempt = self.app.analyze_digital(tx_id, protocol=protocol)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        if attempt is None:
+            return
+        self.status.showMessage(
+            f"Digital analysis: {attempt.summary()} "
+            f"({attempt.runtime_seconds:.1f}s) - the recording is unchanged",
+            12000)
 
     def _on_retry(self, tx_id: str) -> None:
         if not self.app.retry(tx_id):
@@ -462,6 +631,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timeline.set_transmissions(results)
         self.status.showMessage(
             f"{len(results)} transmission(s) need review", 10000)
+
+    def _show_assistant(self) -> None:
+        from .setup_assistant import SetupAssistant
+
+        SetupAssistant(self.app, self).exec()
+        self._report_engines()
+        self._refresh_mode_badge()
+        self._refresh_readiness()
 
     def _show_storage_location(self) -> None:
         stats = self.app.store.stats()

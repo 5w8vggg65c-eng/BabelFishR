@@ -9,8 +9,16 @@ from typing import Dict, List, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..models import ProcessingState, Transmission
+from ..models import ContentClass, ProcessingState, Transmission
 from .widgets import TagEditor, WaveformWidget
+
+CONTENT_LABELS = {
+    "speech": "speech",
+    "noise": "noise / static",
+    "tone": "tone only",
+    "digital-suspected": "possibly digital",
+    "unknown": "unclassified",
+}
 
 STATE_LABELS = {
     ProcessingState.CAPTURED: "queued",
@@ -91,6 +99,8 @@ class TransmissionBubble(QtWidgets.QFrame):
     retryRequested = QtCore.Signal(str)
     exportRequested = QtCore.Signal(str)
     noteChanged = QtCore.Signal(str, str)
+    transcribeAnywayRequested = QtCore.Signal(str)
+    analyzeDigitalRequested = QtCore.Signal(str, str)   # tx_id, protocol
 
     def __init__(self, tx: Transmission, player: _Player,
                  parent: Optional[QtWidgets.QWidget] = None):
@@ -143,40 +153,94 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.waveform = WaveformWidget()
         outer.addWidget(self.waveform)
 
+        # Metadata chips: compact, scannable, and readable without colour.
+        self.chip_row = QtWidgets.QHBoxLayout()
+        self.chip_row.setSpacing(5)
+        self.chip_row.addStretch(1)
+        outer.addLayout(self.chip_row)
+
         controls = QtWidgets.QHBoxLayout()
-        controls.setSpacing(6)
+        controls.setSpacing(8)
+
         self.play_button = QtWidgets.QToolButton()
         self.play_button.setText("Play")
+        self.play_button.setToolTip("Play the original recording")
+        self.play_button.setAccessibleName("Play original recording")
         self.play_button.clicked.connect(self._toggle_play)
         controls.addWidget(self.play_button)
 
-        for text, slot in (("Edit", self._edit), ("Tag", self._edit_tags),
-                           ("Note", self._edit_note), ("Export", self._export)):
-            button = QtWidgets.QToolButton()
-            button.setText(text)
-            button.clicked.connect(slot)
-            controls.addWidget(button)
+        self.decoded_button = QtWidgets.QToolButton()
+        self.decoded_button.setText("Play decoded")
+        self.decoded_button.setToolTip("Play the audio decoded by DSD-neo")
+        self.decoded_button.setAccessibleName("Play decoded audio")
+        self.decoded_button.clicked.connect(self._play_decoded)
+        self.decoded_button.hide()
+        controls.addWidget(self.decoded_button)
 
-        self.bookmark_button = QtWidgets.QToolButton()
-        self.bookmark_button.setCheckable(True)
-        self.bookmark_button.setText("Bookmark")
-        self.bookmark_button.clicked.connect(self._toggle_bookmark)
-        controls.addWidget(self.bookmark_button)
+        # Primary recovery action stays visible; everything else is in the menu.
+        self.action_button = QtWidgets.QToolButton()
+        self.action_button.setText("Transcribe anyway")
+        self.action_button.setAccessibleName("Transcribe this recording anyway")
+        self.action_button.clicked.connect(
+            lambda: self.transcribeAnywayRequested.emit(self.tx.id))
+        self.action_button.hide()
+        controls.addWidget(self.action_button)
 
         self.retry_button = QtWidgets.QToolButton()
         self.retry_button.setText("Retry")
+        self.retry_button.setAccessibleName("Retry processing")
         self.retry_button.clicked.connect(
             lambda: self.retryRequested.emit(self.tx.id))
         self.retry_button.hide()
         controls.addWidget(self.retry_button)
 
         controls.addStretch(1)
+
         self.status_label = QtWidgets.QLabel()
         self.status_label.setObjectName("statusText")
         controls.addWidget(self.status_label)
+
+        self.menu_button = QtWidgets.QToolButton()
+        self.menu_button.setText("\u22ef")
+        self.menu_button.setToolTip("More actions")
+        self.menu_button.setAccessibleName("More actions")
+        self.menu_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self.menu_button.setMenu(self._build_menu())
+        controls.addWidget(self.menu_button)
         outer.addLayout(controls)
 
         self.update_from(tx)
+
+    def _build_menu(self) -> QtWidgets.QMenu:
+        """Secondary actions, out of the way but one click deep."""
+        menu = QtWidgets.QMenu(self)
+        menu.addAction("Edit transcript and translation...", self._edit)
+        menu.addAction("Add or edit note...", self._edit_note)
+        menu.addAction("Edit tags...", self._edit_tags)
+        self.bookmark_action = menu.addAction("Bookmark")
+        self.bookmark_action.setCheckable(True)
+        self.bookmark_action.triggered.connect(self._toggle_bookmark)
+        menu.addSeparator()
+        self.transcribe_action = menu.addAction(
+            "Transcribe anyway", lambda: self.transcribeAnywayRequested.emit(
+                self.tx.id))
+        self.analyze_action = menu.addAction(
+            "Analyze as digital", lambda: self.analyzeDigitalRequested.emit(
+                self.tx.id, ""))
+
+        protocols = QtWidgets.QMenu("Reanalyze as...", menu)
+        for protocol in ("DMR", "P25 Phase 1", "P25 Phase 2", "D-STAR",
+                         "NXDN", "System Fusion", "dPMR"):
+            protocols.addAction(
+                protocol,
+                lambda checked=False, name=protocol:
+                self.analyzeDigitalRequested.emit(self.tx.id, name))
+        self.protocol_menu = menu.addMenu(protocols)
+        menu.addSeparator()
+        menu.addAction("Retry processing",
+                       lambda: self.retryRequested.emit(self.tx.id))
+        menu.addAction("Export audio...", self._export)
+        return menu
 
     # -- rendering -------------------------------------------------------
     def update_from(self, tx: Transmission) -> None:
@@ -186,7 +250,9 @@ class TransmissionBubble(QtWidgets.QFrame):
         if tx.channel_name:
             meta.append(tx.channel_name)
         if tx.frequency_mhz is not None:
-            meta.append(f"{tx.frequency_mhz:.4f} MHz")
+            # Never let a typed value read as a measurement.
+            suffix = "" if tx.frequency_is_measured else " (entered)"
+            meta.append(f"{tx.frequency_mhz:.4f} MHz{suffix}")
         if tx.source_language:
             language = tx.source_language
             if tx.language_confidence is not None:
@@ -229,33 +295,92 @@ class TransmissionBubble(QtWidgets.QFrame):
             self.error_label.hide()
             self.retry_button.hide()
 
+        details: List[str] = []
+        if tx.skip_reason:
+            details.append(_escape(tx.skip_reason))
+        attempt = tx.latest_analysis
+        if attempt is not None:
+            line = (f"Digital analysis ({attempt.engine} "
+                    f"{attempt.engine_version}): {_escape(attempt.summary())}")
+            if attempt.metadata:
+                line += " - " + _escape(", ".join(
+                    f"{k}={v}" for k, v in attempt.metadata.items()
+                    if k != "protocols_mentioned"))
+            if attempt.error:
+                line += f" - {_escape(attempt.error)}"
+            details.append(line)
         if tx.notes:
-            self.notes_label.setText(f"📝 {_escape(tx.notes)}")
+            details.append(f"Note: {_escape(tx.notes)}")
+        if details:
+            self.notes_label.setText("<br>".join(details))
             self.notes_label.show()
         else:
             self.notes_label.hide()
+
+        self._rebuild_chips(tx)
 
         status_bits: List[str] = []
         pending = STATE_LABELS.get(tx.state, "")
         if pending:
             status_bits.append(pending)
-        if tx.tags:
-            status_bits.append(" ".join(f"#{t}" for t in tx.tags))
         if tx.needs_review and tx.state is not ProcessingState.FAILED:
             status_bits.append("needs review")
-        if tx.transcript_confidence is not None and tx.transcript:
-            status_bits.append(f"conf {tx.transcript_confidence:.0%}")
         self.status_label.setText("  ·  ".join(status_bits))
 
-        self.bookmark_button.setChecked(tx.bookmarked)
+        self.bookmark_action.setChecked(tx.bookmarked)
         self.setProperty("state", tx.state.value)
         self.setProperty("review", bool(tx.needs_review))
+        self.setProperty("skipped", tx.state is ProcessingState.SKIPPED)
         self.style().unpolish(self)
         self.style().polish(self)
+
+        # Recovery actions, shown only where they apply.
+        can_force = tx.can_transcribe_anyway and tx.state in (
+            ProcessingState.SKIPPED, ProcessingState.COMPLETE)
+        self.action_button.setVisible(can_force)
+        self.transcribe_action.setEnabled(bool(tx.audio_path))
+        self.analyze_action.setEnabled(bool(tx.audio_path))
+        self.protocol_menu.setEnabled(bool(tx.audio_path))
+
+        decoded = tx.decoded_audio_path
+        self.decoded_button.setVisible(bool(decoded))
 
         self.play_button.setEnabled(bool(tx.audio_path))
         if tx.audio_path and self.waveform._peaks is None:
             self.waveform.load_file(tx.audio_path)
+
+    def _rebuild_chips(self, tx: Transmission) -> None:
+        """Compact metadata chips: class, confidence, tags, digital result."""
+        while self.chip_row.count() > 1:
+            item = self.chip_row.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        chips: List[tuple] = []
+        label = CONTENT_LABELS.get(tx.content_class.value, tx.content_class.value)
+        if tx.content_class is not ContentClass.SPEECH:
+            chips.append((label, "warning"))
+        if tx.transcript_confidence is not None and tx.transcript:
+            tone = "warning" if tx.transcript_confidence < 0.6 else "plain"
+            chips.append((f"confidence {tx.transcript_confidence:.0%}", tone))
+        if tx.clipped:
+            chips.append(("clipped", "error"))
+        for tag in tx.tags:
+            chips.append((f"#{tag}", "accent"))
+        if tx.bookmarked:
+            chips.append(("bookmarked", "accent"))
+
+        attempt = tx.latest_analysis
+        if attempt is not None:
+            tone = "accent" if attempt.outcome.is_success else "warning"
+            chips.append((f"DSD: {attempt.summary()}", tone))
+
+        for index, (text, tone) in enumerate(chips):
+            chip = QtWidgets.QLabel(text)
+            chip.setObjectName("chip")
+            chip.setProperty("tone", tone)
+            chip.setAccessibleName(text)
+            self.chip_row.insertWidget(index, chip)
 
     def set_provisional(self, text: str) -> None:
         """Show live partial text, visually marked as not final."""
@@ -313,7 +438,12 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.exportRequested.emit(self.tx.id)
 
     def _toggle_bookmark(self) -> None:
-        self.bookmarkToggled.emit(self.tx.id, self.bookmark_button.isChecked())
+        self.bookmarkToggled.emit(self.tx.id, self.bookmark_action.isChecked())
+
+    def _play_decoded(self) -> None:
+        decoded = self.tx.decoded_audio_path
+        if decoded:
+            self._player.play(decoded)
 
 
 def _escape(text: str) -> str:
@@ -329,6 +459,8 @@ class TimelineView(QtWidgets.QScrollArea):
     retryRequested = QtCore.Signal(str)
     exportRequested = QtCore.Signal(str)
     noteChanged = QtCore.Signal(str, str)
+    transcribeAnywayRequested = QtCore.Signal(str)
+    analyzeDigitalRequested = QtCore.Signal(str, str)
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
@@ -347,7 +479,11 @@ class TimelineView(QtWidgets.QScrollArea):
         self.playback_backend = self._player.backend
 
         self.empty_label = QtWidgets.QLabel(
-            "No transmissions yet.\nStart monitoring, or replay a WAV file.")
+            "No transmissions yet.\n\n"
+            "Press Start monitoring to listen to the selected input, or use\n"
+            "File \u25b8 Replay WAV file to run a recording through the pipeline.\n\n"
+            "Every detected transmission is recorded before it is processed,\n"
+            "so nothing is lost if transcription is unavailable.")
         self.empty_label.setAlignment(QtCore.Qt.AlignCenter)
         self.empty_label.setObjectName("emptyState")
         self._layout.insertWidget(0, self.empty_label)
@@ -374,6 +510,8 @@ class TimelineView(QtWidgets.QScrollArea):
         bubble.retryRequested.connect(self.retryRequested)
         bubble.exportRequested.connect(self.exportRequested)
         bubble.noteChanged.connect(self.noteChanged)
+        bubble.transcribeAnywayRequested.connect(self.transcribeAnywayRequested)
+        bubble.analyzeDigitalRequested.connect(self.analyzeDigitalRequested)
         # Keep the stretch last so bubbles stack from the top.
         self._layout.insertWidget(self._layout.count() - 1, bubble)
         self._bubbles[tx.id] = bubble
