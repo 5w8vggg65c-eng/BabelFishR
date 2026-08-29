@@ -1,0 +1,235 @@
+name: macOS release (Apple Silicon)
+
+# Produces the thing a non-developer actually needs: a signed .app inside a
+# BabelFishR-macOS-arm64.dmg, with a checksum and honest reports about what was
+# and was not verified.
+#
+# Triggered by hand (workflow_dispatch) or by pushing a v* tag. A tag also
+# publishes a GitHub prerelease.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: "Apple Silicon runner label"
+        required: false
+        default: "macos-26"
+      publish_prerelease:
+        description: "Publish a prerelease from this run (needs release_tag)"
+        required: false
+        default: "false"
+      release_tag:
+        description: "Tag to create/publish, e.g. v0.1.0-alpha.1"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macos-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build, test and package on Apple Silicon
+    runs-on: ${{ inputs.runner_label || 'macos-26' }}
+    timeout-minutes: 120
+
+    steps:
+      # ------------------------------------------------------------------
+      # Architecture gate. This runs before anything else, and it is fatal.
+      # An Intel build labelled arm64 would be worse than no build at all:
+      # it would launch under Rosetta on the target Mac and nobody would know
+      # why it was slow, or it would not launch at all.
+      # ------------------------------------------------------------------
+      - name: Verify this is an Apple Silicon runner
+        run: |
+          set -euo pipefail
+          ARCH="$(uname -m)"
+          echo "uname -m      : $ARCH"
+          echo "uname -a      : $(uname -a)"
+          echo "sw_vers       : $(sw_vers -productName) $(sw_vers -productVersion)"
+          echo "runner label  : ${{ inputs.runner_label || 'macos-26' }}"
+          {
+            echo "### Runner architecture"
+            echo ""
+            echo '```'
+            echo "uname -m   : $ARCH"
+            echo "macOS      : $(sw_vers -productName) $(sw_vers -productVersion)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$ARCH" != "arm64" ]]; then
+            echo "::error::This runner reports '$ARCH', not arm64. Refusing to" \
+                 "build an Apple Silicon release on a non-Apple-Silicon machine."
+            exit 1
+          fi
+
+      - name: Check out the source
+        uses: actions/checkout@v4
+
+      - name: Install Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Record the toolchain
+        run: |
+          set -euo pipefail
+          echo "python3       : $(python3 --version)"
+          echo "python3 path  : $(command -v python3)"
+          echo "python3 arch  : $(python3 -c 'import platform;print(platform.machine())')"
+          echo "xcode         : $(xcodebuild -version 2>/dev/null | head -n 1 || echo 'n/a')"
+          python3 -c "import platform,sys; assert platform.machine()=='arm64', \
+            f'python3 is {platform.machine()}, not arm64'; \
+            assert sys.version_info[:2]==(3,12), f'python is {sys.version}'"
+
+      # ------------------------------------------------------------------
+      # build_macos.sh creates its own clean venv, runs the WHOLE test suite,
+      # builds the bundle, verifies it, signs it (Developer ID when the
+      # secrets exist, ad-hoc otherwise), proves it is standalone, and builds
+      # the DMG. Any failure in any of those stops the job.
+      # ------------------------------------------------------------------
+      - name: Build, test, verify, sign and package
+        env:
+          BABELFISHR_REPORT_DIR: build-reports
+          BABELFISHR_MAKE_DMG: "1"
+          CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
+          NOTARY_PROFILE: ${{ secrets.NOTARY_PROFILE }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p build-reports
+          ./packaging/build_macos.sh 2>&1 | tee build-reports/build-log.txt
+
+      - name: Re-verify the bundle independently of the build script
+        run: |
+          set -euo pipefail
+          ./packaging/verify_bundle.sh dist/BabelFishR.app \
+            2>&1 | tee -a build-reports/bundle-verification.txt
+
+      - name: Collect the disk image and its checksum
+        id: dmg
+        run: |
+          set -euo pipefail
+          DMG="dist/BabelFishR-macOS-arm64.dmg"
+          [[ -f "$DMG" ]] || { echo "::error::$DMG was not produced"; exit 1; }
+          [[ -f "$DMG.sha256" ]] || { echo "::error::$DMG.sha256 missing"; exit 1; }
+          SHA="$(awk '{print $1}' "$DMG.sha256")"
+          SIZE="$(du -h "$DMG" | awk '{print $1}')"
+          echo "dmg=$DMG"   >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA"   >> "$GITHUB_OUTPUT"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          {
+            echo ""
+            echo "### Disk image"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| file | \`BabelFishR-macOS-arm64.dmg\` |"
+            echo "| size | $SIZE |"
+            echo "| sha256 | \`$SHA\` |"
+            echo ""
+            echo "### Signing"
+            echo ""
+            echo '```'
+            sed -n '1,12p' build-reports/signing-status.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the disk image
+        uses: actions/upload-artifact@v4
+        with:
+          name: BabelFishR-macOS-arm64-dmg
+          path: |
+            dist/BabelFishR-macOS-arm64.dmg
+            dist/BabelFishR-macOS-arm64.dmg.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload the test, build, verification and signing reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BabelFishR-macOS-reports
+          path: build-reports/
+          if-no-files-found: warn
+          retention-days: 30
+
+      # ------------------------------------------------------------------
+      # Publishing. A tag push publishes automatically; a manual run publishes
+      # only when explicitly asked to, so probing the pipeline never creates a
+      # release by accident. Everything below the 0.x line is a prerelease.
+      # ------------------------------------------------------------------
+      - name: Publish the prerelease
+        if: >-
+          startsWith(github.ref, 'refs/tags/v') ||
+          (github.event_name == 'workflow_dispatch' &&
+           inputs.publish_prerelease == 'true' && inputs.release_tag != '')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.release_tag }}
+          SHA256: ${{ steps.dmg.outputs.sha }}
+        run: |
+          set -euo pipefail
+          NOTARIZED="$(grep -E '^notarized *:' build-reports/signing-status.txt \
+                       | awk -F': *' '{print $2}' || echo unknown)"
+          MODE="$(grep -E '^signing mode *:' build-reports/signing-status.txt \
+                  | awk -F': *' '{print $2}' || echo unknown)"
+
+          if [[ "$NOTARIZED" == "yes" ]]; then
+            GATEKEEPER="This build is signed with a Developer ID certificate and notarized by Apple. It opens normally."
+          else
+            GATEKEEPER=$'**UNNOTARIZED ALPHA.** This build is '"$MODE"$' signed and has *not* been notarized by Apple.\nmacOS will refuse it on first launch. To open it: right-click (Control-click) **BabelFishR** in\nApplications, choose **Open**, then click **Open** in the dialog. You only have to do this once.'
+          fi
+
+          cat > release-notes.md <<NOTES
+          ## BabelFishR $TAG — macOS (Apple Silicon)
+
+          Download **BabelFishR-macOS-arm64.dmg**, open it, and drag BabelFishR to Applications.
+          You do not need Python, Terminal, or this repository to run it.
+
+          $GATEKEEPER
+
+          ### First launch
+          1. Open BabelFishR from Applications.
+          2. Approve the macOS audio-input permission request.
+          3. Choose your input: the MacBook microphone for a bench test, or your USB
+             audio interface for radio audio. **BabelFishR never picks one for you.**
+          4. Complete first-run preparation in the setup window (this is the one step
+             that needs internet — it downloads the speech model and language packages).
+          5. Run Field Check, then disconnect from the network and work offline.
+
+          ### Verify your download
+          \`\`\`
+          shasum -a 256 BabelFishR-macOS-arm64.dmg
+          $SHA256
+          \`\`\`
+
+          ### Not yet validated on physical hardware
+          This build was produced and tested on a GitHub Apple Silicon runner. It has
+          **not** been exercised against a real radio, a FalconClaw PTT interface, a USB
+          audio interface, an SDR, or dsd-neo. Treat those paths as unvalidated until
+          you have tested them yourself on your own Mac.
+          NOTES
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              "dist/BabelFishR-macOS-arm64.dmg" \
+              "dist/BabelFishR-macOS-arm64.dmg.sha256" --clobber
+            gh release edit "$TAG" --prerelease --notes-file release-notes.md
+          else
+            gh release create "$TAG" \
+              "dist/BabelFishR-macOS-arm64.dmg" \
+              "dist/BabelFishR-macOS-arm64.dmg.sha256" \
+              --title "BabelFishR $TAG (macOS Apple Silicon)" \
+              --notes-file release-notes.md \
+              --prerelease \
+              --target "$GITHUB_SHA"
+          fi
+          echo "Release: $(gh release view "$TAG" --json url -q .url)" >> "$GITHUB_STEP_SUMMARY"

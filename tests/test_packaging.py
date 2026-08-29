@@ -147,18 +147,39 @@ def test_build_script_is_valid_shell():
 #: Flags that change output volume but not which tests are selected. They are
 #: stripped before re-running the invocation, because a second -q suppresses
 #: the very summary line these tests read.
-_VERBOSITY_FLAGS = {"-q", "--quiet", "-v", "--verbose", "-s"}
+_VERBOSITY_FLAGS = {"-q", "--quiet", "-v", "--verbose", "-s", "-rs", "-ra"}
+
+#: Arguments that decide where a report is written, not which tests run. They
+#: contain unexpanded shell variables, so they cannot be replayed here.
+_REPORTING_PREFIXES = ("--junitxml", "--junit-xml", "--html", "--result-log")
 
 
 def _build_pytest_invocation(strip_verbosity: bool = True) -> list:
-    """The pytest arguments the build script actually uses."""
-    for line in _build_script().splitlines():
+    """The pytest arguments the build script actually uses.
+
+    The build line is real shell: it spans a backslash continuation and pipes
+    into ``tee`` so the run is also captured as a report artifact. Everything
+    from the first redirection or pipe onwards is plumbing, not test
+    selection, and is dropped - otherwise these tests would replay ``2>&1``
+    and ``|`` as if they were pytest arguments and collect nothing.
+    """
+    # Re-join backslash continuations before looking for the invocation.
+    joined = _build_script().replace("\\\n", " ")
+    for line in joined.splitlines():
         stripped = line.strip()
-        if "python -m pytest" in stripped and not stripped.startswith("#"):
-            args = stripped.split("python -m pytest", 1)[1].split()
-            if strip_verbosity:
-                args = [a for a in args if a not in _VERBOSITY_FLAGS]
-            return args
+        if "python -m pytest" not in stripped or stripped.startswith("#"):
+            continue
+        tail = stripped.split("python -m pytest", 1)[1]
+        # Cut the shell plumbing off the end.
+        for token in ("2>&1", "|", ">>", ">", "&&", ";"):
+            index = tail.find(token)
+            if index != -1:
+                tail = tail[:index]
+        args = tail.split()
+        args = [a for a in args if not a.startswith(_REPORTING_PREFIXES)]
+        if strip_verbosity:
+            args = [a for a in args if a not in _VERBOSITY_FLAGS]
+        return args
     raise AssertionError("the build script does not run pytest")
 
 
@@ -372,11 +393,43 @@ def test_build_script_points_tests_at_a_scratch_home():
     assert "mktemp" in script
 
 
-def test_build_script_is_honest_about_signing_and_notarization():
+def _signing_script() -> str:
+    return (PACKAGING / "sign_macos.sh").read_text()
+
+
+def test_build_script_delegates_to_the_signing_script():
     script = _build_script()
-    assert "UNSIGNED" in script and "NOT notarized" in script
-    assert "notarytool" in script
+    assert "sign_macos.sh" in script, (
+        "the build must sign the bundle; an unsigned app has no stable code "
+        "identity, so macOS cannot remember a microphone permission grant")
+
+
+def test_signing_script_is_honest_about_notarization():
+    """Ad-hoc must never be described as notarized.
+
+    Both supported paths have to be present and clearly distinguished: a real
+    Developer ID signature that can be notarized, and an ad-hoc signature that
+    cannot be.
+    """
+    script = _signing_script()
     assert "CODESIGN_IDENTITY" in script and "NOTARY_PROFILE" in script
+    assert "notarytool" in script and "stapler" in script
+    assert "ad-hoc" in script
+    assert "UNNOTARIZED ALPHA" in script, (
+        "an ad-hoc build must be labelled unnotarized, prominently")
+    assert "right-click" in script or "Control-click" in script, (
+        "the operator has to be told how to open an unnotarized app")
+
+    # The dangerous failure mode is claiming Apple blessed a build it never saw.
+    lowered = script.lower()
+    for phrase in ("ad-hoc signed and notarized", "adhoc notarized",
+                   "notarized by apple" ):
+        assert phrase not in lowered, f"misleading claim in the script: {phrase}"
+
+
+def test_signing_script_reports_a_notarized_flag_the_release_step_can_read():
+    """The workflow greps this line to decide what the release notes say."""
+    assert 'notarized       : $NOTARIZED' in _signing_script()
 
 
 def test_packaged_binary_services_cli_arguments():
