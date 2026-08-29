@@ -19,14 +19,25 @@ This distinction matters more than any feature list, so it comes first.
 
 ### Verified in automated tests (simulated audio, no hardware)
 
+- **The capture-first invariant**: speech, static, tones and digital-shaped
+  events are all recorded and logged before anything classifies them.
 - Detection, segmentation, pre-roll, hang time and squelch-tail trimming
   against synthetic radio fixtures with known ground truth.
-- Recording, storage, search, review queue, retention and export.
+- Recording, storage, search, review queue, retention, provenance and export.
 - The full pipeline end to end, using deterministic mock engines.
-- The Qt UI, headless: a replay session drives the real UI code path and
-  populates the timeline.
+- **Field Offline enforcement**: no cloud provider is constructed, no mock
+  output is produced, and a missing local engine fails honestly.
+- The Qt UI, headless, in both light and dark appearance.
+- DSD-neo integration driven against a stub binary reproducing its interface.
+
+### Verified against the real libraries (not mocks)
+
+- **faster-whisper 1.2.1**: `local_files_only` loading with a missing model
+  fails in 0.22 s with no download attempt — the field guarantee.
+- **argostranslate**: availability correctly reports *unavailable* when the
+  library is installed but no language pack is.
 - The Claude translation engine's request shape against the real Anthropic SDK
-  (request rejected only at authentication, with no API key present).
+  (rejected only at authentication, with no API key present).
 
 ### NOT tested — no hardware was available
 
@@ -35,11 +46,19 @@ This distinction matters more than any feature list, so it comes first.
   app packaging. Development and testing ran on Linux.
 - **Live audio capture through PortAudio.** The capture path is written and
   unit-tested through a fake source, but no real input device was opened.
-- **Real transcription.** `faster-whisper` was not installed or run; the engine
-  wrapper is written and its failure paths tested, but no audio has been
-  transcribed by it.
-- **Real translation.** Neither Argos nor a live Claude API call has produced a
-  translation here. Only the mock engine has run end to end.
+- **Real transcription output.** faster-whisper is installed and its loading
+  and failure paths are exercised, but no model weights could be downloaded
+  here (Hugging Face is blocked by this environment's network policy), so **no
+  audio has actually been transcribed**.
+- **Real translation output.** argostranslate is installed, but no language
+  pack could be downloaded, so **no text has actually been translated**.
+- **DSD-neo itself.** The integration is tested against a stub that reproduces
+  its interface. The real binary has never run, and no real digital traffic
+  has been decoded.
+- **Any SDR.** The `SignalSource` interface and a recorded-file reference
+  implementation are tested; no device driver is bundled or claimed.
+- **The macOS .app.** Spec, entitlements and build script are written and
+  metadata-tested; no bundle has been built, signed or notarized.
 
 Everything above is written and reviewable, but "written" is not "working".
 Treat the first run on your Mac as the real integration test, and use the
@@ -108,9 +127,59 @@ the pipeline with mock engines, which is how the test suite works.
 
 ```bash
 babelfishr doctor          # check the install, devices, engines, credentials
+babelfishr field-check     # prove offline readiness (downloads nothing)
 babelfishr devices         # list audio inputs
 babelfishr gui             # launch the desktop app
 ```
+
+## Offline field operation
+
+BabelFishR is built to work with the network switched off, after a one-time
+online preparation:
+
+```bash
+babelfishr prepare-field --asr-model small --language es-en --language de-en
+babelfishr mode --set field-offline
+babelfishr field-check     # must still pass with the network unplugged
+```
+
+Three modes, enforced in code rather than by convention:
+
+| Mode | Cloud | Placeholder output | Downloads | Processing |
+|---|---|---|---|---|
+| Field Offline | never constructed | refused | refused | local only |
+| Online / Setup | if explicitly selected | allowed | allowed | yes |
+| Record Only | never constructed | refused | refused | none |
+
+**Nothing leaves the Mac because a local engine is missing.** A missing model
+produces an honest failure, never a silent cloud call, and recording continues
+regardless. See [docs/FIELD_OPERATION.md](docs/FIELD_OPERATION.md) for the
+zero-connectivity validation procedure.
+
+## Capture first, classify second
+
+Every event crossing the activity threshold is written to disk and the database
+**before** anything classifies, transcribes or analyses it. Static, tones and
+suspected digital bursts are all kept; classification only decides whether an
+ASR call happens automatically, and every bubble offers *Transcribe anyway* and
+*Analyze as digital*.
+
+A transmission cannot be received twice, so a misclassification must never be
+the reason one is gone.
+
+## Digital post-processing (optional)
+
+If a local `dsd-neo` is installed, a recording can be analysed after the fact:
+
+```bash
+babelfishr analyze <transmission-id> --protocol DMR
+```
+
+The original WAV is opened read-only; conversions go to derived files. A failure
+means *no usable decode from this input*, not *the recording was lost* — and
+ordinary accessory audio is often the wrong input for a digital decoder anyway,
+so a negative result says very little. BabelFishR does not attempt to defeat
+encryption.
 
 ### Diagnostics before you trust it with real traffic
 
@@ -189,7 +258,9 @@ criterion.
 
 ## Documentation
 
+- [Field operation and zero-connectivity validation](docs/FIELD_OPERATION.md)
 - [macOS + FalconClaw validation procedure](docs/MACOS_VALIDATION.md)
+- [macOS packaging](docs/MACOS_PACKAGING.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Experimental decoders](docs/EXPERIMENTAL.md)
 

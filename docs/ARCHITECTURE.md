@@ -32,10 +32,33 @@ The Qt front-end owns no worker threads: it polls `EventBus.drain()` on a
 If the processing pool falls behind, the queue grows and transcripts arrive
 late. Audio is never dropped for that reason — capture only writes files.
 
+## Capture first, classify second
+
+The Priority-0 invariant. A transmission is written to disk **and** inserted
+into the database before anything classifies, transcribes, translates or
+analyses it.
+
+Classification (`ContentClass`: speech / noise / tone / digital-suspected /
+unknown) is *advice about processing*, never a gate on persistence. The
+settings reflect that split explicitly:
+
+- `min_duration` and the open threshold decide whether something is an **event
+  at all**, and therefore whether it is recorded;
+- `auto_process_*` decide only whether an **ASR call happens automatically**.
+
+The operator can always overrule the classifier per transmission (*Transcribe
+anyway*, *Analyze as digital*). An earlier build discarded events classified as
+broadband noise before the recorder ever saw them, which meant a misclassified
+digital burst was simply gone.
+
+Digital-vs-static uses amplitude-distribution statistics: static is Gaussian
+(kurtosis ~3.0, crest ~3.8) while discrete symbols are sub-Gaussian (kurtosis
+1.4-2.0, crest 1.2-1.7). This is a routing hint validated on synthetic
+fixtures only, and it is deliberately incapable of affecting persistence.
+
 ## Durability
 
-A transmission is written to disk **and** inserted into the database before any
-engine sees it. Consequences:
+Consequences of writing before processing:
 
 - An engine failure, a missing model or a crash cannot lose captured audio.
 - A failure sets `state=failed` with an `ErrorInfo`, leaving the audio and any
@@ -59,6 +82,12 @@ engine sees it. Consequences:
 | `ui/` | PySide6 window, timeline, bubbles, widgets |
 | `cli` | diagnostics, replay, headless monitoring, search, export |
 | `testing` | synthetic radio fixtures with ground truth |
+| `modes` | operating modes, offline guards, Application Support paths |
+| `readiness` | Field Check: real smoke tests, no downloads |
+| `preparation` | the only code permitted to download anything |
+| `analysis/` | DSD-neo as an optional local post-processing provider |
+| `sources` | optional SDR `SignalSource` extension point |
+| `ui/theme` | appearance-adaptive semantic styling |
 | `experimental/` | quarantined signalling decoders (see EXPERIMENTAL.md) |
 
 ## Detection

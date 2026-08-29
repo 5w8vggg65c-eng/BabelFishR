@@ -6,6 +6,6 @@ translates it into the operator's language.  It never transmits, and it never
 claims to know anything the audio cannot tell it.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = ["__version__"]

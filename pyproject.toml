@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "babelfishr"
-version = "0.2.0"
+version = "0.3.0"
 description = "Receive-only desktop app that records, transcribes and translates radio transmissions"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -34,6 +34,7 @@ asr = ["faster-whisper>=1.0"]
 translate = ["argostranslate>=1.9"]
 cloud = ["anthropic>=0.40"]
 dev = ["pytest>=7"]
+packaging = ["pyinstaller>=6.0"]
 all = [
   "sounddevice>=0.4.6",
   "PySide6>=6.5",
