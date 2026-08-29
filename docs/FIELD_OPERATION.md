@@ -31,16 +31,42 @@ service.
 
 ## One-time preparation (needs internet)
 
+### In the app (the normal path)
+
+On first launch the setup assistant appears by itself. Choose a speech model
+and the languages you need, press **Prepare now**, and it downloads, verifies
+and runs a real Field Check — on a background thread, with a live log and a
+cancel button. Cancelling is safe: a partly downloaded model is detected as
+*incomplete* and repaired next time, never mistaken for a good one.
+
+Field readiness is only claimed, and the mode only switched to Field Offline,
+once the model and the requested routes actually load with downloads disabled.
+
+If you would rather not prepare yet, choose **Record only for now**. That
+choice is remembered.
+
+### From a terminal (the same work)
+
 ```bash
 babelfishr prepare-field --asr-model small \
   --language es-en --language de-en --language uk-en
 ```
 
+The bundled binary is the same program, so this works from an installed app:
+
+```bash
+/Applications/BabelFishR.app/Contents/MacOS/BabelFishR prepare-field --asr-model small
+```
+
 This:
 
 1. checks free space against the model's size;
-2. downloads the Whisper model into the app's own folder — **not** a cache
-   directory, so the OS cannot purge it and an app upgrade cannot delete it;
+2. downloads the Whisper model with
+   `faster_whisper.utils.download_model(name, output_dir=<models>/<name>)`
+   into the app's own folder — **not** a Hugging Face cache, so loading never
+   depends on a cache surviving, the OS cannot purge it, and an app upgrade
+   cannot delete it. The directory is verified to contain `model.bin`,
+   `config.json` and a tokenizer asset before it counts as prepared;
 3. installs the Argos language packs you named;
 4. **re-opens the model with downloads disabled** and transcribes a fixture,
    which is the only way to know that offline loading actually works;
@@ -51,11 +77,17 @@ This:
 Language packs are managed separately too:
 
 ```bash
-babelfishr languages list                # installed packs, direct and via-en routes
+babelfishr languages list                # usable routes, direct and pivoted
 babelfishr languages list --available    # what could be installed (needs internet)
 babelfishr languages install es en
 babelfishr languages remove es en
 ```
+
+Packs install into `~/Library/Application Support/BabelFishR/language-packs/`
+(`ARGOS_PACKAGES_DIR`, set before Argos is imported — it resolves that
+directory once, at import time). `languages list` prints the directory it is
+reading and marks routes that work by pivoting through another language, since
+Argos composes those and they are genuinely usable offline.
 
 ### Do not expect "any language"
 
@@ -124,8 +156,11 @@ know offline operation is real rather than assumed.
    Confirm you get a real transcript, not placeholder text. Field Offline
    refuses mock engines, so if you see output at all it is genuine.
 
-5. **Prove nothing tries to reach out.** Watch for network attempts while
-   monitoring:
+5. **Prove nothing tries to reach out.** The guarantee is architectural — in
+   Field Offline no cloud provider is constructed and no download path is
+   reachable — and the test suite proves it with sockets refusing
+   (`pytest tests/test_offline_integration.py`). To confirm on your own
+   machine, watch for network attempts while monitoring:
    ```bash
    # in one terminal
    sudo tcpdump -n -i any 'not host 127.0.0.1' -c 20

@@ -33,11 +33,17 @@ This distinction matters more than any feature list, so it comes first.
 ### Verified against the real libraries (not mocks)
 
 - **faster-whisper 1.2.1**: `local_files_only` loading with a missing model
-  fails in 0.22 s with no download attempt — the field guarantee.
+  fails in 0.22 s with no download attempt — the field guarantee. Model
+  preparation uses `faster_whisper.utils.download_model(..., output_dir=)`,
+  whose signature and asset list were read from the installed package.
 - **argostranslate**: availability correctly reports *unavailable* when the
-  library is installed but no language pack is.
+  library is installed but no language pack is; routes come from Argos's own
+  resolved translation graph, including composite (pivot) routes.
 - The Claude translation engine's request shape against the real Anthropic SDK
   (rejected only at authentication, with no API key present).
+- **The Field Offline pipeline with outbound sockets refused** — capture,
+  processing, search and export all complete with `socket.connect`,
+  `create_connection`, `getaddrinfo` and `http.client` raising.
 
 ### NOT tested — no hardware was available
 
@@ -135,13 +141,24 @@ babelfishr gui             # launch the desktop app
 ## Offline field operation
 
 BabelFishR is built to work with the network switched off, after a one-time
-online preparation:
+online preparation. **In the app**, that is the first-run setup assistant:
+choose a model and language pairs, press *Prepare now*, and watch it download,
+verify and run a real Field Check — all on a background thread, with a cancel
+button.
+
+The same thing from a terminal:
 
 ```bash
 babelfishr prepare-field --asr-model small --language es-en --language de-en
 babelfishr mode --set field-offline
 babelfishr field-check     # must still pass with the network unplugged
 ```
+
+Models are prepared into `~/Library/Application Support/BabelFishR/models/<name>/`
+and loaded from that directory explicitly — never from a Hugging Face cache
+that an upgrade or a disk-cleanup could remove. An interrupted download is
+reported as *incomplete*, with the missing files named, and repaired on the
+next preparation.
 
 Three modes, enforced in code rather than by convention:
 
@@ -153,7 +170,14 @@ Three modes, enforced in code rather than by convention:
 
 **Nothing leaves the Mac because a local engine is missing.** A missing model
 produces an honest failure, never a silent cloud call, and recording continues
-regardless. See [docs/FIELD_OPERATION.md](docs/FIELD_OPERATION.md) for the
+regardless. Field Offline also refuses preparation and language-pack installs
+outright.
+
+The offline guarantee is architectural — no cloud provider is constructed, and
+no download path is reachable — not an environment variable. `NO_PROXY` is
+deliberately *not* used: it bypasses proxies rather than blocking anything.
+
+See [docs/FIELD_OPERATION.md](docs/FIELD_OPERATION.md) for the
 zero-connectivity validation procedure.
 
 ## Capture first, classify second
@@ -172,7 +196,8 @@ the reason one is gone.
 If a local `dsd-neo` is installed, a recording can be analysed after the fact:
 
 ```bash
-babelfishr analyze <transmission-id> --protocol DMR
+babelfishr analyze <transmission-id>                   # -fa, hunts all profiles
+babelfishr analyze <transmission-id> --protocol dmr-dual
 ```
 
 The original WAV is opened read-only; conversions go to derived files. A failure
@@ -220,10 +245,22 @@ No key is ever written to the config file, and `.env` is gitignored.
 
 ## Where your data lives
 
-- Recordings: `recordings/` (configurable), original WAV, never modified.
-- Database: `babelfishr.sqlite3`, holding metadata, transcripts, translations
-  and corrections.
-- Help ▸ "Where are my recordings?" shows both paths in the app.
+Everything writable resolves under one place:
+
+```
+~/Library/Application Support/BabelFishR/
+├── settings.toml       operating mode and setup choices
+├── babelfishr.sqlite3  metadata, transcripts, translations, corrections
+├── Recordings/         original WAVs, never modified
+├── models/             prepared Whisper models
+├── language-packs/     Argos packages (ARGOS_PACKAGES_DIR)
+└── Logs/
+```
+
+An explicit absolute path in the config or environment still wins; an explicit
+*relative* path resolves against the config file that declared it, never the
+process working directory — a Finder-launched `.app` has a working directory of
+`/`. Help ▸ "Where are my recordings?" shows the resolved paths in the app.
 
 Original audio and original transcript are never overwritten. Corrections are
 stored alongside them, and exports carry both.
@@ -259,6 +296,7 @@ criterion.
 ## Documentation
 
 - [Field operation and zero-connectivity validation](docs/FIELD_OPERATION.md)
+- [Digital post-processing with DSD-neo](docs/DIGITAL_ANALYSIS.md)
 - [macOS + FalconClaw validation procedure](docs/MACOS_VALIDATION.md)
 - [macOS packaging](docs/MACOS_PACKAGING.md)
 - [Architecture](docs/ARCHITECTURE.md)

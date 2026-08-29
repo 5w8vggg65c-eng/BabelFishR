@@ -15,9 +15,15 @@ Treat the first build as the real test.
 ./packaging/build_macos.sh
 ```
 
-It creates a venv, installs the GUI/audio/ASR/translate extras plus PyInstaller,
-**runs the test suite**, builds `dist/BabelFishR.app`, and verifies the
-`Info.plist` carries the microphone usage string.
+It creates a **clean** venv, installs `[gui,audio,asr,translate,dev,packaging]`
+— the dev extra provides pytest and the packaging extra provides PyInstaller,
+both of which the script then verifies import — runs the deterministic suite
+with `BABELFISHR_HOME` pointed at a scratch directory, builds
+`dist/BabelFishR.app`, checks the `Info.plist` carries the microphone usage
+string and a bundle identifier, and confirms the frozen binary can import its
+own code.
+
+Set `BABELFISHR_SKIP_TESTS=1` to skip the test step deliberately.
 
 ## Signing and notarization
 
@@ -34,7 +40,16 @@ export CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
 ./packaging/build_macos.sh
 ```
 
-To notarize (needs an Apple Developer account and a stored keychain profile):
+To notarize (needs an Apple Developer account and a stored keychain profile),
+set `NOTARY_PROFILE` and the build script does it:
+
+```bash
+export CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+export NOTARY_PROFILE=AC
+./packaging/build_macos.sh
+```
+
+Equivalently, by hand:
 
 ```bash
 ditto -c -k --keepParent dist/BabelFishR.app BabelFishR.zip
@@ -63,7 +78,9 @@ in the field because the disk got tight is not acceptable, so nothing required
 lives there.
 
 **Upgrades replace the app bundle only.** Everything above is outside the
-bundle and survives. Override the location with `BABELFISHR_HOME` if you want
+bundle and survives; the build script never removes anything under Application
+Support, and runs its tests against a scratch home so a build cannot touch a
+prepared model. Override the location with `BABELFISHR_HOME` if you want
 assets on an external volume.
 
 ## Fresh-machine installation
@@ -76,10 +93,12 @@ assets on an external volume.
 4. The setup assistant explains the one-time online preparation.
 5. Prepare (see `docs/FIELD_OPERATION.md`), then validate offline.
 
-The CLI is available inside the bundle if you want it:
+The CLI is available inside the bundle: the packaged binary launches the GUI
+when given no arguments and dispatches to the CLI when given any.
 
 ```bash
 /Applications/BabelFishR.app/Contents/MacOS/BabelFishR --help
+/Applications/BabelFishR.app/Contents/MacOS/BabelFishR field-check
 ```
 
 ## Entitlements

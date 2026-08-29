@@ -261,3 +261,56 @@ def test_upgrade_does_not_touch_field_assets(tmp_path, monkeypatch):
     # Nothing in the packaging config points a build output at this directory.
     spec = (PACKAGING / "babelfishr.spec").read_text()
     assert "Application Support" not in spec.split('"""')[2] if '"""' in spec else True
+
+
+# ---- documentation must not contradict the code -----------------------
+def test_every_documented_command_exists():
+    """Docs previously referenced 'babelfishr languages --install', which
+    never existed. Keep documentation and the parser in sync automatically."""
+    import re
+
+    from babelfishr.cli import build_parser
+
+    parser = build_parser()
+    subparsers = [a for a in parser._actions if hasattr(a, "choices") and a.choices]
+    commands = set(subparsers[0].choices)
+
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    for doc in (ROOT / "docs").glob("*.md"):
+        text += doc.read_text(encoding="utf-8")
+
+    referenced = set(re.findall(r"babelfishr ([a-z][a-z-]+)", text))
+    # Words that follow the binary name but are not subcommands.
+    referenced -= {"prepare"}
+    unknown = referenced - commands
+    assert not unknown, f"documentation references missing commands: {unknown}"
+
+
+def test_docs_do_not_claim_a_hugging_face_cache_layout():
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    for doc in (ROOT / "docs").glob("*.md"):
+        text += doc.read_text(encoding="utf-8")
+    assert "download_root" not in text, (
+        "the docs must describe the output_dir layout actually used")
+
+
+def test_docs_do_not_claim_no_proxy_blocks_networking():
+    text = ""
+    for doc in list((ROOT / "docs").glob("*.md")) + [ROOT / "README.md"]:
+        text += doc.read_text(encoding="utf-8")
+    if "NO_PROXY" in text:
+        # Only permissible as an explicit disclaimer.
+        assert "not" in text.split("NO_PROXY")[1][:200].lower()
+
+
+def test_docs_describe_application_support_as_authoritative():
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "Application Support/BabelFishR" in text
+    assert "settings.toml" in text
+
+
+def test_docs_describe_the_gui_setup_workflow():
+    """The docs must not tell a GUI user to open Terminal as the only path."""
+    text = (ROOT / "docs" / "FIELD_OPERATION.md").read_text(encoding="utf-8")
+    assert "setup assistant" in text.lower()
+    assert "In the app" in text
