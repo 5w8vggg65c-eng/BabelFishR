@@ -301,12 +301,29 @@ def test_build_script_does_not_swallow_verification_failures():
             assert "|| true" not in line
 
 
-def _stub_bundle(root: pathlib.Path, name: str, body: str) -> pathlib.Path:
+def _stub_bundle(root: pathlib.Path, name: str, body: str,
+                 info_plist: bool = True) -> pathlib.Path:
+    """A minimal .app for exercising verify_bundle.sh.
+
+    The Info.plist matters: on macOS the verifier reads it with PlistBuddy, and
+    a stub without one fails checks that have nothing to do with what the test
+    is about. (Off macOS PlistBuddy is absent and those checks are skipped,
+    which is exactly how this went unnoticed until the first real Apple Silicon
+    run.)
+    """
     app = root / name
     binary = app / "Contents" / "MacOS" / "BabelFishR"
     binary.parent.mkdir(parents=True, exist_ok=True)
     binary.write_text(body, encoding="utf-8")
     binary.chmod(0o755)
+    if info_plist:
+        (app / "Contents" / "Info.plist").write_bytes(plistlib.dumps({
+            "CFBundleIdentifier": "org.babelfishr.app.test",
+            "CFBundleName": "BabelFishR",
+            "CFBundleExecutable": "BabelFishR",
+            "CFBundleShortVersionString": "0.0.0",
+            "NSMicrophoneUsageDescription": "test stub",
+        }))
     return app
 
 
@@ -342,6 +359,21 @@ def test_verify_bundle_fails_a_crashing_executable(tmp_path):
     app = _stub_bundle(tmp_path, "crash.app",
                        '#!/bin/sh\nkill -SEGV $$\n')
     assert _run_verify(app).returncode != 0
+
+
+def test_verify_bundle_fails_a_bundle_without_a_microphone_string(tmp_path):
+    """macOS silently denies audio input when the usage string is absent.
+
+    Only meaningful where PlistBuddy exists; elsewhere verify_bundle.sh says so
+    and skips the Info.plist checks rather than pretending to have made them.
+    """
+    if not os.path.exists("/usr/libexec/PlistBuddy"):
+        pytest.skip("PlistBuddy is only available on macOS")
+    app = _stub_bundle(tmp_path, "noplist.app",
+                       '#!/bin/sh\nexit 0\n', info_plist=False)
+    result = _run_verify(app)
+    assert result.returncode != 0
+    assert "NSMicrophoneUsageDescription" in result.stderr
 
 
 def test_verify_bundle_fails_a_missing_bundle(tmp_path):

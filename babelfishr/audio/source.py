@@ -21,7 +21,8 @@ import numpy as np
 
 from ..dsp.filters import dbfs, rms
 from ..models import utcnow
-from .devices import AudioBackendUnavailable, AudioDevice, find_device
+from .devices import (AudioBackendUnavailable, AudioDevice, DeviceIdentity,
+                      InputDeviceMissing, find_device, resolve_identity)
 from .wavefile import read_wav
 
 log = logging.getLogger(__name__)
@@ -194,14 +195,26 @@ class LiveAudioSource(AudioSource):
     def __init__(self, device: Optional[str] = None, sample_rate: int = 48_000,
                  block_size: int = 2048, channels: int = 1,
                  on_status: Optional[Callable[[str, str], None]] = None,
-                 reconnect: bool = True, max_queue_blocks: int = 512):
+                 reconnect: bool = True, max_queue_blocks: int = 512,
+                 identity: Optional[DeviceIdentity] = None):
         self.device_selector = device
+        self.identity = identity
+        """The device the operator actually chose.
+
+        Once capture has started this is always set, even when the caller only
+        supplied a selector string, so reconnection can never wander onto a
+        different device that happens to have inherited the old index.
+        """
+
         self.sample_rate = int(sample_rate)
         self.block_size = int(block_size)
         self.channels = int(channels)
         self.on_status = on_status
         self.reconnect = reconnect
         self.device: Optional[AudioDevice] = None
+        self.connection_log: List[tuple] = []
+        """(utc timestamp, event, detail) for every connect and disconnect."""
+
         self.name = f"live:{device or 'default'}"
 
         self._queue: "queue.Queue[AudioBlock]" = queue.Queue(maxsize=max_queue_blocks)
@@ -224,11 +237,11 @@ class LiveAudioSource(AudioSource):
                 "(pip install 'babelfishr[audio]'), or use replay mode."
             ) from exc
 
-        self.device = find_device(self.device_selector)
-        if self.device is None:
-            raise AudioBackendUnavailable(
-                f"no usable input device matching {self.device_selector!r}. "
-                "Run 'babelfishr devices' to see what is available.")
+        self.device = self._resolve_device()
+        # Pin the identity of whatever we actually opened. From here on the
+        # only thing that can be reconnected to is this exact device.
+        if self.identity is None or self.identity.empty:
+            self.identity = self.device.identity
         self.name = f"live:{self.device.name}"
         self._stop_event.clear()
         self._start_time = utcnow()
@@ -239,6 +252,33 @@ class LiveAudioSource(AudioSource):
             self._watchdog = threading.Thread(target=self._watch, daemon=True,
                                               name="babelfishr-audio-watchdog")
             self._watchdog.start()
+
+    def _resolve_device(self) -> AudioDevice:
+        """The one device this source is allowed to open.
+
+        Once an identity is pinned this goes through :func:`resolve_identity`,
+        which matches on the CoreAudio UID or on the full composite identity
+        and never on the PortAudio index - so the device is still found after
+        it comes back on a different index, and a different device that
+        inherits the old index is not mistaken for it.
+        """
+        if self.identity is not None and not self.identity.empty:
+            match = resolve_identity(self.identity)
+            if match is None:
+                raise InputDeviceMissing(self.identity)
+            if match.ambiguous:
+                self._notify(
+                    "ambiguous-device",
+                    f"more than one connected input is indistinguishable from "
+                    f"{self.identity.describe()}; using the first")
+            return match.device
+
+        device = find_device(self.device_selector)
+        if device is None:
+            raise AudioBackendUnavailable(
+                f"no usable input device matching {self.device_selector!r}. "
+                "Run 'babelfishr devices' to see what is available.")
+        return device
 
     def _open_stream(self) -> None:
         import sounddevice as sd  # type: ignore
@@ -293,9 +333,11 @@ class LiveAudioSource(AudioSource):
                          "input device stopped; attempting to reconnect")
             try:
                 self._close_stream()
-                self.device = find_device(self.device_selector)
-                if self.device is None:
-                    raise AudioBackendUnavailable("device not present")
+                # Only ever the same device. resolve_identity returns nothing
+                # rather than something else, so a missing radio interface
+                # keeps the session silent instead of quietly switching to the
+                # laptop microphone.
+                self.device = self._resolve_device()
                 self._open_stream()
                 self._notify("reconnected", f"resumed on {self.device.name}")
                 backoff = 1.0
@@ -335,6 +377,13 @@ class LiveAudioSource(AudioSource):
 
     def _notify(self, kind: str, message: str) -> None:
         log.debug("audio %s: %s", kind, message)
+        # Disconnections and recoveries are recorded with times, because after
+        # the fact the operator needs to know exactly which minutes of a watch
+        # were not being received.
+        if kind in ("connected", "disconnected", "reconnected",
+                    "reconnect-failed", "stopped"):
+            self.connection_log.append((utcnow(), kind, message))
+            log.info("audio input %s: %s", kind, message)
         if self.on_status is not None:
             try:
                 self.on_status(kind, message)
