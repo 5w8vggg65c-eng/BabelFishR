@@ -17,6 +17,7 @@ from typing import List, Optional, Tuple
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..modes import OperatingMode
+from .input_panel import PERMISSION_TEXT
 from .workers import prepare_field_job, run_in_background
 
 log = logging.getLogger(__name__)
@@ -62,7 +63,8 @@ class SetupAssistant(QtWidgets.QDialog):
             "transcribes and translates the speech. It is receive-only and "
             "never transmits.\n\n"
             "Preparation needs the internet once. Afterwards everything runs "
-            "on this Mac with the network switched off."))
+            "on this Mac with the network switched off.\n\n"
+            + PERMISSION_TEXT))
 
         self.stack = QtWidgets.QStackedWidget()
         self.stack.addWidget(self._build_choices())
@@ -87,6 +89,15 @@ class SetupAssistant(QtWidgets.QDialog):
             "Skip preparation. Transmissions are still recorded and kept, and "
             "can be transcribed later.")
         self.record_only_button.clicked.connect(self._record_only)
+
+        self.diagnostics_button = self.buttons.addButton(
+            "Copy Diagnostic Report", QtWidgets.QDialogButtonBox.HelpRole)
+        self.diagnostics_button.setToolTip(
+            "Copy a complete description of this installation - paths, "
+            "models, language packs, audio inputs and the log - to the "
+            "clipboard, so it can be pasted into a message. Nothing is sent "
+            "anywhere.")
+        self.diagnostics_button.clicked.connect(self._copy_diagnostics)
 
         self.cancel_button = self.buttons.addButton(
             QtWidgets.QDialogButtonBox.Cancel)
@@ -131,8 +142,39 @@ class SetupAssistant(QtWidgets.QDialog):
             "Only the pairs you install can be translated offline. Traffic in "
             "any other language is still recorded, and still transcribed when "
             "the speech model recognises it."))
+
+        # What is genuinely installed, named. "Any language" would be a claim
+        # this application cannot make.
+        self.installed_label = QtWidgets.QLabel()
+        self.installed_label.setObjectName("sectionLabel")
+        self.installed_label.setWordWrap(True)
+        self.installed_label.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse)
+        layout.addWidget(self.installed_label)
+        self._refresh_installed()
+
         layout.addStretch(1)
         return page
+
+    def _refresh_installed(self) -> None:
+        """List the translation routes that actually work on this machine."""
+        try:
+            from ..preparation import installed_routes
+
+            routes = installed_routes(self.app.config)
+        except Exception as exc:  # noqa: BLE001
+            self.installed_label.setText(
+                f"Installed translation routes could not be read: {exc}")
+            return
+        if not routes:
+            self.installed_label.setText(
+                "Installed now: none. Nothing can be translated offline yet.")
+            return
+        described = ", ".join(
+            f"{source}→{target}" + (" (via a pivot language)"
+                                    if kind != "direct" else "")
+            for source, target, kind in routes)
+        self.installed_label.setText(f"Installed now: {described}")
 
     def _build_progress(self) -> QtWidgets.QWidget:
         page = QtWidgets.QWidget()
@@ -271,6 +313,33 @@ class SetupAssistant(QtWidgets.QDialog):
             "Fix the problem above and prepare again, or choose "
             "'Record only for now' - recording works either way.")
 
+    def diagnostic_text(self) -> str:
+        """Everything a stranger would need, without opening a terminal."""
+        from ..diagnostics import diagnostic_report
+
+        return diagnostic_report(self.app.config,
+                                 extra=self.log_view.toPlainText(),
+                                 readiness=self._readiness)
+
+    def _copy_diagnostics(self) -> None:
+        text = self.diagnostic_text()
+        clipboard = QtWidgets.QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(text)
+        # Also written next to the log, so it survives the clipboard.
+        saved = ""
+        try:
+            path = self.app.config.paths().logs / "diagnostic-report.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+            saved = f"\n\nAlso saved to:\n{path}"
+        except Exception as exc:  # noqa: BLE001
+            saved = f"\n\n(It could not be saved to a file: {exc})"
+        QtWidgets.QMessageBox.information(
+            self, "Diagnostic report copied",
+            "The report is on the clipboard. Paste it into a message to "
+            "whoever is helping you." + saved)
+
     def _failed(self, message: str) -> None:
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
@@ -281,6 +350,10 @@ class SetupAssistant(QtWidgets.QDialog):
         self._append(
             "Nothing was lost. Recording works without a model - choose "
             "'Record only for now' and prepare later.")
+        self._append(
+            "If you need help with this, press 'Copy Diagnostic Report' below "
+            "and paste the result into a message. You do not need to open "
+            "Terminal or find any files.")
         self.prepare_button.setEnabled(True)
         self.record_only_button.setEnabled(True)
         self.cancel_button.setText("Close")

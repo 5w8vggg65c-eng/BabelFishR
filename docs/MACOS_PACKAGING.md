@@ -1,73 +1,124 @@
-# macOS packaging
+# macOS packaging and releases
 
-Goal: the operator double-clicks an app. No Python, no pip, no terminal during
-normal field use.
+Goal: the operator downloads a disk image, drags one icon onto another, and
+never sees Python, pip or a terminal.
 
-**Status: unbuilt and unsigned.** The spec, entry point, entitlements and build
-script are written and their metadata is unit-tested, but no `.app` has been
-produced — building requires macOS, which this development environment is not.
-Treat the first build as the real test.
+**Status.** The bundle is built, verified, ad-hoc signed and packaged into
+`BabelFishR-macOS-arm64.dmg` by
+[`.github/workflows/macos-release.yml`](../.github/workflows/macos-release.yml)
+on a GitHub-hosted Apple Silicon runner. It has **not** been notarized (that
+needs a paid Apple Developer ID), and it has **not** been run against real
+hardware: no radio, no FalconClaw, no USB interface, no real audio device.
+
+## The release pipeline
+
+Triggered by hand (`workflow_dispatch`) or by pushing a `v*` tag, which also
+publishes a GitHub **prerelease**.
+
+1. **Architecture gate, first and fatal.** `uname -m` must report `arm64`. An
+   Intel build published under an Apple Silicon name would be worse than no
+   build: it would run under Rosetta, or not at all, and nobody would know why.
+2. Python 3.12, installed inside the runner only.
+3. `packaging/build_macos.sh` — clean venv, the whole deterministic suite,
+   the bundle, verification, signing, the independence check, the disk image.
+4. `packaging/verify_bundle.sh` again, independently of the build script.
+5. Artifacts: the DMG, its `.sha256`, the test report and JUnit XML, the build
+   log, the build environment (`pip freeze`), the bundle-verification output,
+   the independence report and the signing report.
 
 ## Build
 
 ```bash
 # on macOS, from the repository root
-./packaging/build_macos.sh
+./packaging/build_macos.sh                        # bundle only
+BABELFISHR_MAKE_DMG=1 ./packaging/build_macos.sh  # and the disk image
 ```
 
 It creates a **clean** venv, installs `[gui,audio,asr,translate,dev,packaging]`
 — the dev extra provides pytest and the packaging extra provides PyInstaller,
-both of which the script then verifies import — runs the **full** deterministic suite (plain `pytest`, not a marker subset —
-tests needing real models, a real dsd-neo binary or hardware skip themselves)
-with `BABELFISHR_HOME` pointed at a scratch directory, builds
-`dist/BabelFishR.app`, and runs `packaging/verify_bundle.sh`, which checks the `Info.plist` keys and
-launches the frozen binary with `--selftest-import`.
+both of which the script then verifies import — runs the **full** deterministic
+suite (plain `pytest`, not a marker subset; tests needing real models, a real
+dsd-neo binary or hardware skip themselves) with `BABELFISHR_HOME` pointed at a
+scratch directory, builds `dist/BabelFishR.app`, then verifies, signs and
+proves it standalone.
 
-**Bundle verification is fatal.** If the packaged executable cannot start, the
-build exits non-zero and nothing is signed or notarized. You can run it against
-an existing bundle directly:
+`BABELFISHR_SKIP_TESTS=1` skips the test step. Never set it for a release.
+`BABELFISHR_REPORT_DIR` chooses where the reports are written.
+
+Each step can be run on its own against an existing bundle:
 
 ```bash
 ./packaging/verify_bundle.sh dist/BabelFishR.app
+./packaging/sign_macos.sh dist/BabelFishR.app
+./packaging/verify_independence.sh dist/BabelFishR.app
+./packaging/make_dmg.sh dist/BabelFishR.app dist/BabelFishR-macOS-arm64.dmg
 ```
 
-Set `BABELFISHR_SKIP_TESTS=1` to skip the test step deliberately.
+**Every check is fatal.** A bundle that cannot start is never signed, and a
+bundle that is not standalone is never packaged.
+
+## Proving the app is standalone
+
+`packaging/verify_independence.sh` runs the frozen binary from `/`, under
+`env -i` with `PYTHONPATH`, `PYTHONHOME` and `VIRTUAL_ENV` removed and a
+minimal `PATH`. It fails if:
+
+- `--version`, `--help` or `--selftest-import` do not work;
+- any required module — `babelfishr`, NumPy, PySide6 (Core/Gui/Widgets),
+  `sounddevice`, `faster_whisper`, `ctranslate2`, `argostranslate` — resolves
+  to a file outside the bundle;
+- Qt's plugin path is outside the bundle, or `libqcocoa.dylib` is missing;
+- the main window will not construct offscreen;
+- any bundled `.dylib` or `.so` still references an absolute path that is not
+  an OS library under `/usr/lib` or `/System`.
+
+The checks that have to run inside the frozen process are the entry point's
+`--selftest-independence` and `--selftest-gui` flags.
+
+Result from the first successful Apple Silicon run: every required module
+loaded from `BabelFishR.app/Contents/Frameworks`, `libqcocoa.dylib` and the
+Qt multimedia plugins were present inside the bundle, the main window opened,
+and no native library referenced a build-machine path.
 
 ## Signing and notarization
 
-Currently **neither signed nor notarized**. Consequences:
+`packaging/sign_macos.sh` supports exactly two honest outcomes, and never
+describes one as the other.
 
-- Gatekeeper blocks the app on any Mac other than the one that built it.
-- An unsigned app is frequently denied microphone access, which for this
-  application means silence.
-
-To sign, set an identity and rebuild:
-
-```bash
-export CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
-./packaging/build_macos.sh
-```
-
-To notarize (needs an Apple Developer account and a stored keychain profile),
-set `NOTARY_PROFILE` and the build script does it:
+**Developer ID.** Set `CODESIGN_IDENTITY` to the certificate's common name.
+Nested frameworks and native libraries are signed first, then the bundle, with
+the hardened runtime and `packaging/entitlements.plist`. If notarization
+credentials are also present — `NOTARY_PROFILE`, or `APPLE_ID` +
+`APPLE_TEAM_ID` + `APPLE_APP_PASSWORD` — the image is submitted, the ticket is
+stapled, and the result is validated. A failed notarization fails the build.
 
 ```bash
 export CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
 export NOTARY_PROFILE=AC
-./packaging/build_macos.sh
+BABELFISHR_MAKE_DMG=1 ./packaging/build_macos.sh
 ```
 
-Equivalently, by hand:
+In the release workflow these come from repository secrets of the same names.
+No credential is echoed; the notarytool output is filtered before it is logged.
 
-```bash
-ditto -c -k --keepParent dist/BabelFishR.app BabelFishR.zip
-xcrun notarytool submit BabelFishR.zip --keychain-profile AC --wait
-xcrun stapler staple dist/BabelFishR.app
-```
+**Ad-hoc.** With no certificate the bundle is still signed, with `-`. This is
+not cosmetic: an *unsigned* bundle has no stable code identity, so macOS cannot
+attach a microphone permission grant to it. The report and the release notes
+say **UNNOTARIZED ALPHA**, and explain that the operator must right-click ▸
+Open once. It is never called notarized.
 
-Until then, opening it locally means right-click ▸ Open ▸ Open.
+The absence of a paid Apple Developer ID does not block a testable DMG. It only
+changes what the DMG is honestly called.
+
+## The disk image
+
+`packaging/make_dmg.sh` stages the app beside a symlink to `/Applications`,
+builds a compressed UDZO image, verifies it, mounts it once to confirm it
+really contains a launchable app and the drop target, then writes
+`BabelFishR-macOS-arm64.dmg.sha256` beside it.
 
 ## Where things live
+
 
 Field assets are under **Application Support**, deliberately not a cache:
 
@@ -93,8 +144,8 @@ assets on an external volume.
 
 ## Fresh-machine installation
 
-1. Copy `BabelFishR.app` to `/Applications`.
-2. Right-click ▸ Open (until the app is signed).
+1. Open `BabelFishR-macOS-arm64.dmg` and drag BabelFishR to Applications.
+2. Right-click ▸ Open ▸ Open (needed once, while builds are unnotarized).
 3. Approve the microphone prompt. If none appears:
    System Settings ▸ Privacy & Security ▸ Microphone ▸ enable BabelFishR,
    then quit and relaunch.

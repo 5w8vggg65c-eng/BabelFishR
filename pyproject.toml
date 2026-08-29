@@ -33,7 +33,9 @@ gui = ["PySide6>=6.5"]
 asr = ["faster-whisper>=1.0"]
 translate = ["argostranslate>=1.9"]
 cloud = ["anthropic>=0.40"]
-dev = ["pytest>=7"]
+# pyyaml lets the tests read the release workflow and check its
+# shape, rather than grepping YAML with regular expressions.
+dev = ["pytest>=7", "pyyaml>=6"]
 packaging = ["pyinstaller>=6.0"]
 all = [
   "sounddevice>=0.4.6",
