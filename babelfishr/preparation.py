@@ -109,6 +109,16 @@ def prepare_field(config, *, asr_model: Optional[str] = None,
                        "field preparation")
     say = report or (lambda text: None)
     result = PreparationResult()
+
+    # Once per run, here and nowhere else. The cached index outcome is what
+    # stops five requested language pairs making five identical network
+    # attempts; clearing it between pairs would undo that. But an operator who
+    # fixed their network and pressed "Prepare again" is starting a new run,
+    # and must get a new attempt rather than the remembered failure.
+    from .providers.argos import reset_package_index_state
+
+    reset_package_index_state()
+
     paths = config.paths().ensure()
     # Argos must see the managed directory before it is imported anywhere.
     from .modes import bootstrap_environment

@@ -116,19 +116,103 @@ def _index_is_readable(path: Optional[pathlib.Path]) -> bool:
         return False
 
 
+#: Where the Argos catalogue lives, when argostranslate does not tell us.
+DEFAULT_INDEX_URL = ("https://raw.githubusercontent.com/argosopentech/"
+                     "argospm-index/main/index.json")
+
+
+def package_index_url() -> str:
+    """The catalogue URL, preferring whatever argostranslate is configured for."""
+    try:
+        import argostranslate.settings as settings
+    except Exception:  # noqa: BLE001
+        return DEFAULT_INDEX_URL
+    for attribute in ("remote_package_index", "package_index_url",
+                      "remote_index_url"):
+        value = getattr(settings, attribute, None)
+        if value:
+            return str(value)
+    return DEFAULT_INDEX_URL
+
+
+def fetch_package_index(url: Optional[str] = None,
+                        destination: Optional[pathlib.Path] = None,
+                        timeout: float = 30.0) -> pathlib.Path:
+    """Fetch the catalogue ourselves, verified, and write it atomically.
+
+    We do this rather than relying on ``update_package_index()`` because that
+    function *swallows* its own errors: on the operator's Mac it caught the
+    certificate failure, logged it somewhere we never saw, and returned
+    normally without writing an index. All BabelFishR could then say was "the
+    index was not written", which tells nobody anything.
+
+    Doing the request here means the exception is ours to keep, so the operator
+    is shown the actual cause. TLS verification is never relaxed: the request
+    goes through the default HTTPS context, which
+    :mod:`babelfishr.certificates` has already pointed at a real CA bundle.
+    """
+    import os
+    import tempfile
+    import urllib.request
+
+    url = url or package_index_url()
+    destination = destination or package_index_path()
+    if destination is None:
+        raise PackageIndexUnavailable(
+            "could not determine where the Argos package index should be "
+            "written")
+
+    from ..certificates import configure_certificates
+
+    configure_certificates()
+
+    log.info("fetching the Argos package index from %s", url)
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        payload = response.read()
+
+    # Parse before writing: a truncated or non-JSON body must not land on disk
+    # looking like a usable catalogue.
+    import json
+
+    parsed = json.loads(payload.decode("utf-8"))
+    if not parsed:
+        raise PackageIndexUnavailable(
+            f"the package index at {url} is empty")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=str(destination.parent),
+                                         prefix=".index-", suffix=".json")
+    try:
+        with os.fdopen(handle, "wb") as out:
+            out.write(payload)
+        os.replace(temporary, destination)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    log.info("wrote %d bytes of package index to %s", len(payload), destination)
+    return destination
+
+
 def refresh_package_index(force: bool = False):
     """One bounded attempt to fetch the package index. Never recurses.
 
-    argostranslate's ``get_available_packages()`` calls ``update_package_index()``
-    when the index file is missing, and that path can come straight back into
-    ``get_available_packages()``. With HTTPS failing, that loop ran until the
-    interpreter raised ``RecursionError: maximum recursion depth exceeded`` -
-    which buried the real error, a certificate verification failure, under
-    hundreds of identical log lines.
+    Two upstream behaviours make this necessary.
 
-    So: one update attempt, then check the file on disk ourselves, and only
-    call upstream once we know the index is actually there. If it is not, raise
-    :class:`PackageIndexUnavailable` carrying the original cause.
+    ``get_available_packages()`` calls ``update_package_index()`` when the
+    index file is missing, and that path can come straight back into
+    ``get_available_packages()``. With HTTPS failing, that loop ran until the
+    interpreter raised ``RecursionError: maximum recursion depth exceeded``.
+
+    And ``update_package_index()`` catches its own network errors and returns
+    without writing anything, so the real cause never reaches us at all.
+
+    So the fetch is ours: one verified HTTPS request, parsed and written
+    atomically, with the exception kept. Upstream is consulted only as a
+    fallback, and ``get_available_packages()`` is never called until the index
+    is known to be on disk.
     """
     global _INDEX_ATTEMPT
     if force:
@@ -151,15 +235,29 @@ def refresh_package_index(force: bool = False):
 
     path = package_index_path()
     original: Optional[BaseException] = None
+
+    # 1. Our own request, so a failure keeps its exception.
     try:
-        package.update_package_index()
-    except RecursionError as exc:  # pragma: no cover - upstream guard
-        original = exc
-        log.error("argostranslate recursed while refreshing its package index; "
-                  "treating the index as unavailable")
+        path = fetch_package_index(destination=path)
+    except PackageIndexUnavailable:
+        raise
     except Exception as exc:  # noqa: BLE001
         original = exc
-        log.warning("could not refresh the Argos package index: %s", exc)
+        log.warning("could not fetch the Argos package index: %s: %s",
+                    type(exc).__name__, exc)
+
+    # 2. Upstream as a fallback, in case it can reach somewhere we cannot.
+    #    Its errors are swallowed internally, so nothing is learned from it -
+    #    which is exactly why it is second.
+    if original is not None and not _index_is_readable(path):
+        try:
+            package.update_package_index()
+        except RecursionError as exc:  # pragma: no cover - upstream guard
+            log.error("argostranslate recursed while refreshing its package "
+                      "index; treating the index as unavailable")
+            original = original or exc
+        except Exception as exc:  # noqa: BLE001
+            original = original or exc
 
     if not _index_is_readable(path):
         failure = PackageIndexUnavailable(_index_failure_message(original, path))

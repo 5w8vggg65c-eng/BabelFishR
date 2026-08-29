@@ -2,7 +2,14 @@
 # Sign (and, when possible, notarize) BabelFishR.app - and say honestly which
 # of the two happened.
 #
-#   packaging/sign_macos.sh dist/BabelFishR.app [report-file]
+#   packaging/sign_macos.sh dist/BabelFishR.app [report-file] [entitlements]
+#
+# The uninstaller is signed the same way but with its own entitlements,
+# which deliberately omit the microphone:
+#
+#   packaging/sign_macos.sh "dist/Uninstall BabelFishR.app" \
+#       build-reports/signing-status-uninstaller.txt \
+#       packaging/uninstaller_entitlements.plist
 #
 # Two supported paths:
 #
@@ -24,7 +31,8 @@ set -euo pipefail
 
 APP="${1:-dist/BabelFishR.app}"
 REPORT="${2:-dist/signing-status.txt}"
-ENTITLEMENTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/entitlements.plist"
+PACKAGING_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENTITLEMENTS="${3:-$PACKAGING_DIR/entitlements.plist}"
 
 [[ -d "$APP" ]] || { echo "FAIL: no bundle at $APP" >&2; exit 1; }
 [[ -f "$ENTITLEMENTS" ]] || { echo "FAIL: no entitlements at $ENTITLEMENTS" >&2; exit 1; }
@@ -84,9 +92,25 @@ codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | tee -a "$REPORT"
   codesign -d --entitlements - --xml "$APP" 2>/dev/null || true
 } >> "$REPORT"
 
-if ! codesign -d --entitlements - --xml "$APP" 2>/dev/null \
-     | grep -q "com.apple.security.device.audio-input"; then
-  log "WARNING: the audio-input entitlement is not present in the sealed signature"
+SEALED="$(codesign -d --entitlements - --xml "$APP" 2>/dev/null || true)"
+# PlistBuddy, not grep: a comment mentioning the key in the entitlements file
+# would otherwise be read as the app requesting it.
+if /usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.audio-input' \
+     "$ENTITLEMENTS" >/dev/null 2>&1; then
+  if ! grep -q "com.apple.security.device.audio-input" <<<"$SEALED"; then
+    log "WARNING: the audio-input entitlement is not present in the sealed signature"
+  fi
+else
+  # The uninstaller must never be able to ask for the microphone. If the
+  # entitlements file does not request it, the sealed signature must not
+  # carry it either - a mix-up between the two plists would be invisible
+  # otherwise, and is a hard failure rather than a warning.
+  log "entitlements    : $ENTITLEMENTS (no microphone requested)"
+  if grep -q "com.apple.security.device.audio-input" <<<"$SEALED"; then
+    log "FAIL: $APP was signed with the microphone entitlement, which it must"
+    log "      not have. The wrong entitlements file was used."
+    exit 1
+  fi
 fi
 
 NOTARIZED="no"

@@ -63,6 +63,31 @@ Drag the new BabelFishR over the old one. Your models, language packs,
 recordings, database, corrections, tags, bookmarks and settings live in
 `~/Library/Application Support/BabelFishR/` and are not touched by an upgrade.
 
+### Removing BabelFishR
+
+Open **BabelFishR-macOS-arm64.dmg** again and double-click **Uninstall
+BabelFishR**. It runs from the disk image — there is nothing to install for it,
+and it needs neither Python nor Terminal. It shows you the exact list of paths
+first and deletes nothing until you tick the acknowledgement box *and* type
+`DELETE`. Cancel changes nothing.
+
+Complete removal permanently deletes:
+
+- BabelFishR.app
+- Whisper speech-recognition models
+- Argos language packs
+- **every recording — these cannot be recovered; nothing goes to the Trash**
+- the transmission database, with all transcripts and translations
+- your settings
+- diagnostic reports and logs
+- BabelFishR's caches, preferences and saved application state
+
+It also asks macOS to forget BabelFishR's microphone permission. Copy anything
+you want to keep somewhere else first. If something cannot be removed, the
+uninstaller names it rather than claiming it finished.
+
+There is deliberately no uninstall command inside BabelFishR itself.
+
 ---
 
 ## Choosing your audio input

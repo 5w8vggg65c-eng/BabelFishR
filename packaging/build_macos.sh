@@ -87,18 +87,52 @@ rm -rf build dist
 pyinstaller packaging/babelfishr.spec --noconfirm
 
 APP="dist/BabelFishR.app"
+UNINSTALLER="dist/Uninstall BabelFishR.app"
 [[ -d "$APP" ]] || { echo "build failed: $APP not produced" >&2; exit 1; }
+# The spec builds both bundles. A release without the uninstaller would leave
+# operators no supported way to remove models and recordings.
+[[ -d "$UNINSTALLER" ]] || {
+  echo "build failed: $UNINSTALLER not produced" >&2; exit 1; }
 
 phase "Verifying the bundle (metadata and a real launch)"
 # Fatal: `set -e` plus a non-zero exit from verify_bundle.sh stops the build.
 # A bundle that cannot start must never reach signing or notarization.
 ./packaging/verify_bundle.sh "$APP" 2>&1 | tee "$REPORT_DIR/bundle-verification.txt"
 
+phase "Verifying the uninstaller bundle"
+UNINSTALLER_BIN="$UNINSTALLER/Contents/MacOS/UninstallBabelFishR"
+[[ -x "$UNINSTALLER_BIN" ]] || {
+  echo "FAIL: $UNINSTALLER has no executable" >&2; exit 1; }
+if /usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' \
+     "$UNINSTALLER/Contents/Info.plist" >/dev/null 2>&1; then
+  echo "FAIL: the uninstaller declares a microphone usage string; it must not" >&2
+  exit 1
+fi
+/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+  "$UNINSTALLER/Contents/Info.plist" | grep -qx 'org.babelfishr.uninstaller' || {
+  echo "FAIL: the uninstaller has the wrong bundle identifier" >&2; exit 1; }
+
+# A real, non-destructive exercise of the packaged uninstaller: it computes
+# the removal plan and proves a dry run changes nothing. Pointed at a scratch
+# home so it cannot see - let alone touch - the build machine's own data.
+UNINSTALL_PROBE="$(mktemp -d)/probe-home"
+mkdir -p "$UNINSTALL_PROBE/Library/Application Support/BabelFishR/Recordings"
+"$UNINSTALLER_BIN" --selftest-dry-run "$UNINSTALL_PROBE" 2>&1 \
+  | tee "$REPORT_DIR/uninstaller-dry-run.txt"
+[[ -d "$UNINSTALL_PROBE/Library/Application Support/BabelFishR/Recordings" ]] || {
+  echo "FAIL: the uninstaller dry run deleted something" >&2; exit 1; }
+rm -rf "$UNINSTALL_PROBE"
+
 phase "Signing"
 # Always signed: with a Developer ID when one is configured, ad-hoc otherwise.
 # An unsigned bundle has no stable code identity, so macOS cannot remember a
 # microphone permission grant for it.
 ./packaging/sign_macos.sh "$APP" "$REPORT_DIR/signing-status.txt"
+# The uninstaller is signed with its own entitlements, which omit the
+# microphone. sign_macos.sh fails outright if the sealed signature carries it.
+./packaging/sign_macos.sh "$UNINSTALLER" \
+  "$REPORT_DIR/signing-status-uninstaller.txt" \
+  packaging/uninstaller_entitlements.plist
 
 phase "Proving the signed bundle is standalone"
 # After signing, because signing is the last thing that can break a bundle.
@@ -107,10 +141,10 @@ phase "Proving the signed bundle is standalone"
 
 if [[ "${BABELFISHR_MAKE_DMG:-0}" == "1" ]]; then
   phase "Building the disk image"
-  ./packaging/make_dmg.sh "$APP" "dist/BabelFishR-macOS-${ARCH}.dmg"
+  ./packaging/make_dmg.sh "$APP" "dist/BabelFishR-macOS-${ARCH}.dmg" "$UNINSTALLER"
 fi
 
 echo
-phase "Built $APP"
+phase "Built $APP and $UNINSTALLER"
 echo "    Reports in $REPORT_DIR"
 echo "    Field assets in ~/Library/Application Support/BabelFishR were not touched."

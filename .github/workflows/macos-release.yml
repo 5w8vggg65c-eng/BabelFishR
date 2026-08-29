@@ -116,6 +116,37 @@ jobs:
           ./packaging/verify_bundle.sh dist/BabelFishR.app \
             2>&1 | tee -a build-reports/bundle-verification.txt
 
+      # The uninstaller is the only thing in the release that can delete an
+      # operator's recordings, so the pipeline exercises it - non-destructively
+      # - rather than merely checking that a bundle exists. The dry run is
+      # pointed at a scratch home; nothing on the runner is touched.
+      - name: Re-verify the uninstaller bundle and run its dry run
+        run: |
+          set -euo pipefail
+          UNINSTALLER="dist/Uninstall BabelFishR.app"
+          BIN="$UNINSTALLER/Contents/MacOS/UninstallBabelFishR"
+          [[ -x "$BIN" ]] || { echo "::error::$BIN missing"; exit 1; }
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+            "$UNINSTALLER/Contents/Info.plist" | grep -qx 'org.babelfishr.uninstaller'
+          if /usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' \
+               "$UNINSTALLER/Contents/Info.plist" >/dev/null 2>&1; then
+            echo "::error::the uninstaller declares a microphone usage string"
+            exit 1
+          fi
+          if codesign -d --entitlements - --xml "$UNINSTALLER" 2>/dev/null \
+               | grep -q 'com.apple.security.device.audio-input'; then
+            echo "::error::the uninstaller was signed with the microphone entitlement"
+            exit 1
+          fi
+          PROBE="$(mktemp -d)/probe-home"
+          mkdir -p "$PROBE/Library/Application Support/BabelFishR/Recordings"
+          echo keep > "$PROBE/Library/Application Support/BabelFishR/Recordings/keep.wav"
+          "$BIN" --selftest-dry-run "$PROBE" \
+            2>&1 | tee build-reports/uninstaller-dry-run.txt
+          [[ -f "$PROBE/Library/Application Support/BabelFishR/Recordings/keep.wav" ]] \
+            || { echo "::error::the dry run deleted a file"; exit 1; }
+          rm -rf "$PROBE"
+
       - name: Collect the disk image and its checksum
         id: dmg
         run: |
@@ -170,7 +201,9 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          for report in signing-status independence-report bundle-verification; do
+          for report in signing-status signing-status-uninstaller \
+                        independence-report bundle-verification \
+                        uninstaller-dry-run; do
             file="build-reports/$report.txt"
             echo "================ $file ================"
             [[ -f "$file" ]] && cat "$file" || echo "(not produced)"
@@ -219,6 +252,8 @@ jobs:
           Download **BabelFishR-macOS-arm64.dmg**, open it, and drag BabelFishR to Applications.
           You do not need Python, Terminal, or this repository to run it.
 
+          The disk image also contains **Uninstall BabelFishR.app** — see *Removing BabelFishR* below.
+
           $GATEKEEPER
 
           ### First launch
@@ -235,6 +270,19 @@ jobs:
           shasum -a 256 BabelFishR-macOS-arm64.dmg
           $SHA256
           \`\`\`
+
+          ### Removing BabelFishR
+          Open **BabelFishR-macOS-arm64.dmg** again and double-click **Uninstall BabelFishR**.
+          It runs from the disk image; there is nothing to install for it, and it needs
+          neither Python nor Terminal. It shows you the exact list of paths first, and
+          deletes nothing until you tick the acknowledgement box *and* type `DELETE`.
+
+          **Complete removal permanently deletes every recording BabelFishR has made,
+          along with the transmission database, all transcripts and translations.
+          Recordings cannot be recovered — nothing goes to the Trash.** It also removes
+          the app itself, the Whisper models, the Argos language packs, your settings,
+          the logs and diagnostic reports, and BabelFishR's caches, preferences and saved
+          application state. Copy anything you want to keep somewhere else first.
 
           ### Not yet validated on physical hardware
           This build was produced and tested on a GitHub Apple Silicon runner. It has

@@ -316,3 +316,108 @@ def test_the_readme_does_not_require_a_terminal_for_normal_use():
     section = text[:text.index("# Developer setup")]
     assert "You do not need Python, Terminal, this repository" in section
     assert "You never need a terminal for any of it." in section
+
+
+# ---- the uninstaller in the release ------------------------------------
+def _spec() -> str:
+    return (PACKAGING / "babelfishr.spec").read_text(encoding="utf-8")
+
+
+def test_the_spec_builds_a_separate_uninstaller_bundle():
+    spec = _spec()
+    assert 'name="Uninstall BabelFishR.app"' in spec, (
+        "the spec does not build a double-clickable uninstaller")
+    assert 'bundle_identifier="org.babelfishr.uninstaller"' in spec
+    assert 'bundle_identifier="org.babelfishr.app"' in spec, (
+        "the two bundles must keep separate identifiers")
+
+
+def test_the_uninstaller_bundle_asks_for_no_microphone():
+    """A program whose only job is deleting files must not reach the mic."""
+    spec = _spec()
+    uninstaller = spec[spec.index("uninstaller_app = BUNDLE("):]
+    assert '"NSMicrophoneUsageDescription":' not in uninstaller, (
+        "the uninstaller bundle declares a microphone usage string")
+    entitlements = (PACKAGING / "uninstaller_entitlements.plist").read_text(
+        encoding="utf-8")
+    assert "com.apple.security.device.audio-input" not in entitlements
+    # And the app's own entitlements still request it, so this is a real
+    # difference between the two and not a change to both.
+    assert "com.apple.security.device.audio-input" in (
+        PACKAGING / "entitlements.plist").read_text(encoding="utf-8")
+
+
+def test_the_uninstaller_uses_its_own_entitlements_file():
+    spec = _spec()
+    assert "uninstaller_entitlements.plist" in spec
+    assert (PACKAGING / "uninstaller_entitlements.plist").exists()
+
+
+def test_the_signing_script_refuses_a_microphone_on_the_uninstaller():
+    body = (PACKAGING / "sign_macos.sh").read_text(encoding="utf-8")
+    assert "The wrong entitlements file was used" in body, (
+        "signing does not detect the app and uninstaller entitlements "
+        "being swapped")
+    assert "${3:-" in body, "the entitlements file is not selectable"
+
+
+def test_the_build_signs_and_verifies_both_bundles():
+    body = (PACKAGING / "build_macos.sh").read_text(encoding="utf-8")
+    assert 'UNINSTALLER="dist/Uninstall BabelFishR.app"' in body
+    assert "uninstaller_entitlements.plist" in body, (
+        "the uninstaller is not signed with its own entitlements")
+    assert "--selftest-dry-run" in body, (
+        "the build never exercises the uninstaller it ships")
+    assert "org.babelfishr.uninstaller" in body
+
+
+def test_the_build_dry_run_cannot_touch_the_build_machines_own_data():
+    body = (PACKAGING / "build_macos.sh").read_text(encoding="utf-8")
+    probe = body[body.index("UNINSTALL_PROBE="):]
+    assert "mktemp -d" in probe.split("\n")[0], (
+        "the uninstaller self-test is not pointed at a scratch home")
+
+
+def test_the_dmg_carries_both_apps_and_fails_without_either():
+    body = (PACKAGING / "make_dmg.sh").read_text(encoding="utf-8")
+    assert 'UNINSTALLER=' in body
+    assert "no uninstaller bundle at" in body, (
+        "a DMG built without the uninstaller would succeed silently")
+    assert "Contents/MacOS/UninstallBabelFishR" in body, (
+        "the mounted image is not checked for a launchable uninstaller")
+    assert "does not contain a launchable uninstaller" in body
+    # All three checks share one status flag, so any one of them fails the run.
+    assert body.count("STATUS=1") >= 3
+
+
+def test_the_workflow_verifies_the_uninstaller_independently():
+    body = _workflow()
+    assert "--selftest-dry-run" in body
+    assert "org.babelfishr.uninstaller" in body
+    assert "the uninstaller was signed with the microphone entitlement" in body
+    assert "the dry run deleted a file" in body
+
+
+def test_the_release_notes_explain_how_to_uninstall_and_what_it_deletes():
+    body = _workflow()
+    notes = body[body.index("cat > release-notes.md"):]
+    assert "Uninstall BabelFishR" in notes, (
+        "the release notes never mention the uninstaller")
+    assert "double-click" in notes.lower()
+    assert "Recordings cannot be recovered" in notes, (
+        "the notes do not warn that recordings are destroyed")
+    assert "DELETE" in notes, "the notes do not describe the confirmation"
+
+
+def test_the_uninstaller_entry_point_is_self_contained():
+    import ast
+
+    source = (PACKAGING / "uninstaller_entry.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    names = {node.name for node in ast.walk(tree)
+             if isinstance(node, ast.FunctionDef)}
+    assert {"_selftest_dry_run", "main"} <= names
+    # No Terminal, no Python, no shelling out to a script the operator has to
+    # find: the bundle's own binary does the whole job.
+    assert "os.system" not in source
+    assert "Terminal" not in source

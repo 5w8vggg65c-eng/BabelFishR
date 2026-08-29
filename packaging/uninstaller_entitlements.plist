@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Deliberately no audio-input entitlement. The uninstaller never records
+       anything, so it must never be able to ask for the microphone. No
+       network entitlement either: removal is entirely local. The key is
+       absent rather than false, and packaging/sign_macos.sh reads this file
+       with PlistBuddy to decide what the sealed signature must contain. -->
+
+  <!-- PyInstaller bundles need these for their native extensions to load
+       under the hardened runtime. -->
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+</dict>
+</plist>

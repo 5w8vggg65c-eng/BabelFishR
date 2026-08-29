@@ -494,3 +494,231 @@ Do these in order. Stop at the first one that misbehaves.
     passes and a transmission is still transcribed and translated.
 
 Items 5, 7 and 13 are the ones no test in this repository can stand in for.
+
+---
+
+# Follow-up pass: Argos failure fidelity, "Prepare again", and a real uninstaller
+
+Branch `claude/radio-decoder-translator-0oslya`, starting from
+`7cd2297beb79dd8cbd1ad95edc19ea06968bc562`. Alpha 1 and Alpha 2 were not
+touched. Alpha 3 was **not** published.
+
+## What the previous CI run actually proved about HTTPS
+
+Run [33280131395] (`macos-26`, arm64) finished **success**: 570 passed, 9
+skipped. The relevant line is that `--selftest-https`, run from inside the
+frozen bundle, performed **the real verified fetch** — not the "Certificate
+verification was NOT exercised" path:
+
+```
+CA bundle: .../dist/BabelFishR.app/Contents/Frameworks/certifi/cacert.pem (applied)
+fetching https://raw.githubusercontent.com/argosopentech/argospm-index/main/index.json
+ok: verified HTTPS fetch, 34612 bytes, 100 packages in the index
+```
+
+So the certifi fix is proven end-to-end on Apple Silicon, in the shipped
+bundle, against the real Argos index host, with verification on. The same run
+also showed the CoreAudio probe returning real devices for the first time
+(`Apple Virtual Sound Device`, `Null Audio Device`), which confirms the ctypes
+probe works against a real CoreAudio, though not against real hardware.
+
+## Argos correction 1 — match how upstream really fails
+
+The earlier regression test made `update_package_index()` *raise* the SSL
+error. Real `argostranslate` does not: it catches its own network error, logs
+it, and returns having written no index. Every caller then sees "no packages"
+with the cause already swallowed, which is exactly how a certificate problem
+turned into a `RecursionError` on the operator's Mac with the real reason
+nowhere in the UI.
+
+The fix is not a better message; a generic "the index was not written" would
+still lose the cause. BabelFishR now **owns the request**:
+
+- `fetch_package_index()` in `babelfishr/providers/argos.py` makes its own
+  `urllib` request over HTTPS after `configure_certificates()`, parses the
+  JSON body **before** writing anything, then writes atomically
+  (`tempfile.mkstemp` in the destination's own directory, then `os.replace`),
+  removing the temporary file if anything goes wrong. TLS verification is
+  never relaxed — there is no `ssl._create_unverified_context`, no
+  `CERT_NONE`, and a test asserts this against the module source.
+- `refresh_package_index()` tries our fetch first precisely *because* it keeps
+  the exception, and falls back to upstream `update_package_index()` second.
+  Whatever fails, the raised `PackageIndexUnavailable` carries the original
+  exception as `__cause__` and names it in the message.
+
+New tests in `tests/test_argos_index_failure.py`:
+`test_a_silently_swallowed_error_still_surfaces_the_real_cause` (upstream
+returns quietly and BabelFishR still reports the real `SSLCertVerificationError`),
+`test_our_own_fetch_is_tried_before_upstream`,
+`test_upstream_is_still_used_as_a_fallback`,
+`test_the_fetch_writes_atomically_and_rejects_a_bad_body`,
+`test_the_fetch_never_relaxes_tls_verification`.
+
+## Argos correction 2 — "Prepare again" now really retries
+
+The cached index outcome is what stops five requested language pairs making
+five identical network attempts. It was also what made "Prepare again" replay
+the remembered failure after the operator fixed their network.
+
+`prepare_field()` now calls `reset_package_index_state()` **once, at the top of
+each run, and nowhere else** — not between language pairs. An operator who
+fixed their Wi-Fi and pressed Prepare again gets a genuinely new request; five
+pairs in one run still share one attempt.
+
+Tests: `test_prepare_again_makes_a_new_index_request` (first run fails, second
+run makes one new request and can succeed) and
+`test_the_reset_happens_once_per_run_not_per_pair`.
+
+## The uninstaller
+
+A separate double-clickable **`Uninstall BabelFishR.app`**, shipped inside the
+DMG beside `BabelFishR.app` and the `Applications` shortcut. Bundle identifier
+`org.babelfishr.uninstaller`. It is self-contained: no Python, no Terminal, no
+script to find. There is deliberately **no in-app self-destruct command** —
+`tests/test_uninstaller.py::test_the_uninstaller_is_not_reachable_from_inside_the_app`
+asserts the main window, setup assistant, CLI and app object never reference
+it.
+
+New files: `babelfishr/uninstall.py` (all the logic, no Qt),
+`babelfishr/ui/uninstall_window.py` (the one window),
+`packaging/uninstaller_entry.py`, `packaging/uninstaller_entitlements.plist`.
+
+### Exact removal scope
+
+Fifteen allowlisted paths, joined from constants to one home directory:
+
+```
+~/Library/Application Support/BabelFishR/Recordings          ← cannot be recovered
+~/Library/Application Support/BabelFishR/babelfishr.sqlite3  ← transcripts, translations
+~/Library/Application Support/BabelFishR/models              ← Whisper models
+~/Library/Application Support/BabelFishR/language-packs      ← Argos packs
+~/Library/Application Support/BabelFishR/Logs                ← logs, diagnostic reports
+~/Library/Application Support/BabelFishR/settings.toml
+~/Library/Application Support/BabelFishR                     ← the folder itself
+~/.config/babelfishr
+~/Library/Caches/org.babelfishr.app
+~/Library/Caches/BabelFishR
+~/Library/HTTPStorages/org.babelfishr.app
+~/Library/Preferences/org.babelfishr.app.plist
+~/Library/Saved Application State/org.babelfishr.app.savedState
+/Applications/BabelFishR.app
+~/Applications/BabelFishR.app
+```
+
+Plus a best-effort `tccutil reset Microphone org.babelfishr.app`, whose
+success or failure is reported either way.
+
+### Safety properties, and where each is enforced
+
+| Property | Where |
+|---|---|
+| Exact paths shown before anything is deleted | `describe_plan()`, shown verbatim in the window |
+| Recordings warned as unrecoverable | the red banner, `describe_plan()`'s `← CANNOT BE RECOVERED` |
+| Both an acknowledgement box **and** typing `DELETE` | `confirmation_ready()`, re-checked inside `perform()` |
+| Cancel changes nothing | Cancel is `close()`; removal only ever runs from `perform()` |
+| Refuses while BabelFishR is running | `uninstall()` raises unless the check returns exactly `False`; "could not tell" counts as running. The window offers a graceful quit, then verifies it stopped |
+| Allowlist only | `_assert_allowlisted()`, checked at plan time *and* again per item |
+| Never reads untrusted configuration | `build_plan()` joins constants to a home; settings.toml is never opened |
+| Never follows symlinks | a symlinked item has its **link** unlinked and its target left alone, reported separately; trees go through `shutil.rmtree`, which unlinks nested symlinks rather than descending them |
+| No unsafe shell interpolation when escalating | `_authorization_command()` validates every path against a strict pattern and refuses rather than escaping cleverly; the command is a fixed `/bin/rm -rf --` with quoted, validated arguments, run through the standard macOS authorization prompt |
+| Honest report | `UninstallReport.complete` is false whenever anything failed; the summary says "was NOT completely removed" and names each leftover |
+
+The uninstaller may stay on the mounted disk image; it never needs installing.
+
+### Packaging
+
+- `packaging/babelfishr.spec` builds both bundles. The uninstaller's `Analysis`
+  excludes `faster_whisper`, `ctranslate2`, `argostranslate` and `sounddevice`.
+- Its `Info.plist` has **no** `NSMicrophoneUsageDescription` and its
+  entitlements have no audio-input key. `sign_macos.sh` takes the entitlements
+  file as its third argument and **fails the build** if a bundle signed without
+  the microphone request ends up with that entitlement sealed in — a swap of
+  the two plists would otherwise be invisible. It reads the entitlements with
+  PlistBuddy, not grep, so a comment cannot be mistaken for a request.
+- `build_macos.sh` verifies the uninstaller's identifier and plist, runs
+  `--selftest-dry-run` against a scratch home (a non-destructive exercise of
+  the packaged binary), and signs both bundles.
+- `make_dmg.sh` stages both apps and the `Applications` symlink, and **fails**
+  unless the mounted image contains both executables and the shortcut.
+- The workflow re-verifies the uninstaller independently of the build script,
+  including that the sealed signature has no microphone entitlement, and runs
+  the dry run against a probe home containing a file it asserts still exists
+  afterwards. The release notes explain how to run it and state that it
+  permanently deletes recordings.
+
+## Tests and results
+
+`tests/test_uninstaller.py` — 34 tests, all against temporary fake homes:
+cancellation deletes nothing (both the dry run and closing the window with
+both confirmations already given); every allowlisted item is removed;
+neighbouring files (`SomeOtherApp`, `com.apple.finder.plist`, `~/Music`,
+`~/.config/otherapp`, `~/Applications/Other.app`) survive; a symlinked
+`Recordings` loses only the link while its target keeps its contents; a symlink
+nested inside a removed tree is not followed; removal refuses while the app
+runs *and* when the running state cannot be determined; a leftover is reported
+and never called complete; a failed `tccutil` is reported, not hidden; a
+hostile path is refused by the authorization command rather than escaped; an
+item smuggled onto a plan is refused. `test_no_test_in_this_file_can_reach_the_real_home`
+parses this test file's own syntax tree and fails if any test calls
+`build_plan` with no argument, calls `Path.home()` or `expanduser`, or writes a
+real Application Support path as a literal — so no test can touch the
+operator's real data.
+
+`tests/test_release_pipeline.py` — 11 new tests covering the second bundle, its
+identifier, its missing microphone entitlement (and that the app still has
+one), the signing swap-detection, the build's dry run against a scratch home,
+the DMG failing without either app, the workflow's independent verification,
+and the release notes' uninstall instructions and recording warning.
+
+Focused runs: `tests/test_uninstaller.py` 34 passed;
+`tests/test_argos_index_failure.py` 15 passed;
+`tests/test_release_pipeline.py` 41 passed.
+
+Full suite: **621 passed, 9 skipped** in 77s (skips: CoreAudio needs a real
+macOS host, PlistBuddy is macOS-only, and the real-engine tests need a
+prepared model and language pack).
+
+## Files changed in this pass
+
+```
+babelfishr/providers/argos.py            our own verified fetch, atomic write
+babelfishr/preparation.py                one index-state reset per run
+babelfishr/uninstall.py                  NEW  removal logic
+babelfishr/ui/uninstall_window.py        NEW  the uninstaller window
+packaging/uninstaller_entry.py           NEW  uninstaller entry point
+packaging/uninstaller_entitlements.plist NEW  no microphone
+packaging/babelfishr.spec                second bundle
+packaging/sign_macos.sh                  selectable entitlements + swap check
+packaging/build_macos.sh                 build, verify, dry-run and sign both
+packaging/make_dmg.sh                    stage and verify both apps
+.github/workflows/macos-release.yml      uninstaller verification, release notes
+README.md                                "Removing BabelFishR"
+tests/test_uninstaller.py                NEW  34 tests
+tests/test_argos_index_failure.py        swallowed-failure and retry coverage
+tests/test_release_pipeline.py           uninstaller packaging coverage
+```
+
+## Still requiring a real Mac
+
+Nothing here has been run on physical hardware. Specifically unproven:
+
+1. That `Uninstall BabelFishR.app` opens by double-click from a mounted DMG on
+   a machine with Gatekeeper active (unnotarized alpha: right-click ▸ Open).
+2. That the running-app check finds a real launched BabelFishR — `pgrep -f
+   BabelFishR.app/Contents/MacOS` is matched against the real process
+   command line, and the graceful-quit path via `osascript` has only been
+   tested with a fake runner.
+3. That `tccutil reset Microphone org.babelfishr.app` actually clears the
+   grant; recent macOS versions sometimes require the app to have been
+   launched at least once for the entry to exist.
+4. That the administrator authorization prompt appears and completes for a
+   genuinely permission-blocked path. The suite never runs it for real.
+5. That a real, prepared installation — several gigabytes of models — is
+   removed completely, and that Field Offline is reported honestly afterwards.
+6. Whether Argos preparation now succeeds against the real index from the
+   frozen app on a real network, and that a first failure followed by
+   "Prepare again" really retries.
+
+Item 5 is the one that matters most: run it on a Mac that has a full prepared
+installation, and read the itemized report rather than trusting the absence of
+an error.

@@ -3,10 +3,19 @@
 #
 #   packaging/make_dmg.sh dist/BabelFishR.app dist/BabelFishR-macOS-arm64.dmg
 #
-# The image contains the application and a shortcut to /Applications, so the
-# whole installation is "open the DMG, drag one icon onto the other". A
-# .sha256 file is written beside it, and the image is mounted once to prove it
-# really contains a launchable app before anybody downloads it.
+# The image contains three things:
+#
+#   BabelFishR.app            drag this onto Applications to install
+#   Uninstall BabelFishR.app  double-click this to remove everything
+#   Applications              the drop target
+#
+# so the whole installation is "open the DMG, drag one icon onto the other",
+# and removal is "open the DMG again and double-click the other app". The
+# uninstaller stays on the image; there is nothing to install for it.
+#
+# A .sha256 file is written beside the image, and the image is mounted once to
+# prove it really contains BOTH launchable apps and the shortcut before
+# anybody downloads it. A DMG missing any of the three fails this script.
 set -euo pipefail
 
 if [[ "$(uname)" != "Darwin" ]]; then
@@ -16,9 +25,17 @@ fi
 
 APP="${1:-dist/BabelFishR.app}"
 DMG="${2:-dist/BabelFishR-macOS-arm64.dmg}"
+UNINSTALLER="${3:-$(dirname "$APP")/Uninstall BabelFishR.app}"
 VOLNAME="${DMG_VOLUME_NAME:-BabelFishR}"
 
 [[ -d "$APP" ]] || { echo "FAIL: no bundle at $APP" >&2; exit 1; }
+# Not optional: an image without the uninstaller leaves operators with no
+# supported way to remove several gigabytes of models and their recordings.
+[[ -d "$UNINSTALLER" ]] || {
+  echo "FAIL: no uninstaller bundle at $UNINSTALLER" >&2
+  echo "      Build it with: pyinstaller packaging/babelfishr.spec" >&2
+  exit 1
+}
 mkdir -p "$(dirname "$DMG")"
 
 STAGE="$(mktemp -d)"
@@ -26,6 +43,8 @@ trap 'rm -rf "$STAGE"' EXIT
 
 echo "==> Staging $APP"
 cp -R "$APP" "$STAGE/"
+echo "==> Staging $UNINSTALLER"
+cp -R "$UNINSTALLER" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 
 echo "==> Creating $DMG"
@@ -43,12 +62,19 @@ hdiutil verify "$DMG"
 
 MOUNT="$(mktemp -d)"
 hdiutil attach "$DMG" -readonly -nobrowse -mountpoint "$MOUNT" >/dev/null
-MOUNTED_APP="$MOUNT/$(basename "$APP")"
 STATUS=0
+MOUNTED_APP="$MOUNT/$(basename "$APP")"
 if [[ -x "$MOUNTED_APP/Contents/MacOS/BabelFishR" ]]; then
   echo "ok:   the image contains $(basename "$APP") with an executable inside"
 else
   echo "FAIL: the image does not contain a launchable app" >&2
+  STATUS=1
+fi
+MOUNTED_UNINSTALLER="$MOUNT/$(basename "$UNINSTALLER")"
+if [[ -x "$MOUNTED_UNINSTALLER/Contents/MacOS/UninstallBabelFishR" ]]; then
+  echo "ok:   the image contains $(basename "$UNINSTALLER") with an executable inside"
+else
+  echo "FAIL: the image does not contain a launchable uninstaller" >&2
   STATUS=1
 fi
 if [[ -L "$MOUNT/Applications" ]]; then
