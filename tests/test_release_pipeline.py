@@ -223,10 +223,11 @@ def test_the_entry_point_supports_the_checks_the_scripts_run():
     names = {node.name for node in ast.walk(tree)
              if isinstance(node, ast.FunctionDef)}
     assert {"_selftest_independence", "_selftest_gui",
-            "_selftest_coreaudio", "_selftest_https"} <= names
+            "_selftest_coreaudio", "_selftest_https",
+            "_selftest_argos_paths"} <= names
     for flag in ("--selftest-import", "--selftest-independence",
                  "--selftest-gui", "--selftest-coreaudio",
-                 "--selftest-https"):
+                 "--selftest-https", "--selftest-argos-paths"):
         assert flag in source
 
 
@@ -421,3 +422,34 @@ def test_the_uninstaller_entry_point_is_self_contained():
     # find: the bundle's own binary does the whole job.
     assert "os.system" not in source
     assert "Terminal" not in source
+
+
+def test_the_build_proves_argos_writes_inside_application_support():
+    """The packaged bundle, not the source tree, is what has to be checked.
+
+    Argos resolves its data, config and cache roots at import time. A bundle
+    that imports it before those roots are set leaves an index and a download
+    cache in three folders in the operator's home that BabelFishR neither
+    manages nor removes - which is what alpha 2 did.
+    """
+    body = (PACKAGING / "verify_independence.sh").read_text(encoding="utf-8")
+    assert "--selftest-argos-paths" in body
+    assert "Argos writes outside the managed Application Support root" in body, (
+        "a stray Argos directory does not fail the build")
+
+
+def test_the_independence_check_bootstraps_before_importing_argos():
+    """Import order is the whole mechanism; a test holds it in place."""
+    import ast
+
+    source = (PACKAGING / "app_entry.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    function = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name == "_selftest_independence")
+    calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
+    names = [node.func.attr if isinstance(node.func, ast.Attribute)
+             else getattr(node.func, "id", "") for node in calls]
+    assert "bootstrap_environment" in names, (
+        "the independence self-test imports argostranslate without first "
+        "pointing its directories at Application Support")

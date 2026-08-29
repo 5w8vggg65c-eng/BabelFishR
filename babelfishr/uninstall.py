@@ -33,9 +33,17 @@ import subprocess
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 APP_BUNDLE_NAME = "BabelFishR.app"
+#: The application's executable, exactly as it appears in the process table.
+#: Compared with ``==``, never with ``in``: ``UninstallBabelFishR`` contains
+#: this string, and an earlier substring match made the uninstaller refuse to
+#: run because it kept finding itself.
+MAIN_EXECUTABLE_NAME = "BabelFishR"
+UNINSTALLER_EXECUTABLE_NAME = "UninstallBabelFishR"
 APP_BUNDLE_ID = "org.babelfishr.app"
 UNINSTALLER_BUNDLE_ID = "org.babelfishr.uninstaller"
 APP_SUPPORT = "Library/Application Support/BabelFishR"
+#: The machine's own applications folder. Used only by a real runtime plan.
+SYSTEM_APPLICATIONS = pathlib.Path("/Applications")
 
 #: Everything BabelFishR creates inside a user's home directory, as fixed
 #: relative paths. Order matters only for display: the operator reads this
@@ -47,6 +55,8 @@ _MANAGED: Tuple[Tuple[str, str, bool], ...] = (
     (f"{APP_SUPPORT}/models", "Whisper speech-recognition models", False),
     (f"{APP_SUPPORT}/language-packs", "Argos language packs", False),
     (f"{APP_SUPPORT}/Logs", "Logs and diagnostic reports", False),
+    (f"{APP_SUPPORT}/argos",
+     "Argos package index, downloads cache and configuration", False),
     (f"{APP_SUPPORT}/settings.toml", "Settings", False),
     (APP_SUPPORT, "Application Support folder (anything else left in it)", False),
     (".config/babelfishr", "Command-line configuration folder", False),
@@ -111,6 +121,20 @@ class UninstallPlan:
 
     home: pathlib.Path
     items: Tuple[RemovalItem, ...]
+    system_applications: Optional[pathlib.Path] = None
+    """``/Applications`` for a real run; ``None`` for any injected root."""
+
+    def roots(self) -> List[pathlib.Path]:
+        """Every directory this plan is allowed to reach into."""
+        roots = [self.home]
+        if self.system_applications is not None:
+            roots.append(self.system_applications)
+        return roots
+
+    def contains_only_paths_within_its_roots(self) -> bool:
+        roots = self.roots()
+        return all(any(path == root or root in path.parents for root in roots)
+                   for path in self.paths())
 
     def present(self) -> List[RemovalItem]:
         return [item for item in self.items if item.exists]
@@ -188,44 +212,87 @@ class UninstallReport:
 # ---------------------------------------------------------------- planning
 
 
-def application_locations(home: pathlib.Path) -> List[pathlib.Path]:
-    """The only two places an installed BabelFishR.app is accepted from.
+def application_locations(
+        home: pathlib.Path,
+        system_applications: Optional[pathlib.Path]) -> List[pathlib.Path]:
+    """The only places an installed BabelFishR.app is accepted from.
 
     Not a search of the whole disk: a Spotlight sweep could turn up a copy in
     a Downloads folder, a Time Machine backup or another user's account, and
     none of those are ours to delete.
+
+    ``system_applications`` is ``None`` for every plan built against an
+    injected home. See :func:`build_plan`.
     """
-    return [pathlib.Path("/Applications") / APP_BUNDLE_NAME,
-            home / "Applications" / APP_BUNDLE_NAME]
+    locations = [home / "Applications" / APP_BUNDLE_NAME]
+    if system_applications is not None:
+        locations.insert(0, pathlib.Path(system_applications) / APP_BUNDLE_NAME)
+    return locations
 
 
-def build_plan(home: Optional[os.PathLike] = None) -> UninstallPlan:
-    """Compute the removal plan for one home directory.
+#: Sentinel: "the caller said nothing about /Applications", which is not the
+#: same as "the caller said not to touch it".
+_UNSET = object()
 
-    ``home`` is injected rather than discovered so tests can only ever run
-    against a temporary directory. Configuration is deliberately not consulted.
+
+def build_plan(home: Optional[os.PathLike] = None, *,
+               system_applications=_UNSET) -> UninstallPlan:
+    """Compute the removal plan, either for real or for an injected root.
+
+    Two modes, and the difference is deliberate:
+
+    * **No argument** - the real runtime plan. ``~`` is the operator's home and
+      the machine's ``/Applications`` is included, because that is where the
+      app they are removing actually lives.
+
+    * **An injected home** - a test, or the packaged ``--selftest-dry-run``.
+      ``/Applications`` is then *excluded*, and every path in the plan lies
+      inside the supplied root.
+
+    The first version did not make that distinction: ``build_plan(tmp_path)``
+    still put the literal ``/Applications/BabelFishR.app`` in the plan, so a
+    destructive test running on a developer's Mac would have deleted their
+    real installed application. An injected root now means an injected root.
+
+    Configuration is never consulted, in either mode.
     """
-    root = pathlib.Path(home).expanduser() if home is not None else pathlib.Path.home()
+    if home is None:
+        root = pathlib.Path.home()
+        if system_applications is _UNSET:
+            system_applications = SYSTEM_APPLICATIONS
+    else:
+        root = pathlib.Path(home).expanduser()
+        if system_applications is _UNSET:
+            # An injected home cannot widen into the machine's own
+            # /Applications. A caller that genuinely wants a different
+            # applications root has to name it.
+            system_applications = None
     root = root.resolve() if root.exists() else root
+    system = (pathlib.Path(system_applications)
+              if system_applications is not None else None)
+
     items: List[RemovalItem] = [
         RemovalItem(root / relative, description, irreplaceable)
         for relative, description, irreplaceable in _MANAGED
     ]
     items += [RemovalItem(path, "The BabelFishR application")
-              for path in application_locations(root)]
+              for path in application_locations(root, system)]
+    plan = UninstallPlan(home=root, items=tuple(items),
+                         system_applications=system)
     for item in items:
-        _assert_allowlisted(root, item.path)
-    return UninstallPlan(home=root, items=tuple(items))
+        _assert_allowlisted(plan, item.path)
+    return plan
 
 
-def _assert_allowlisted(home: pathlib.Path, path: pathlib.Path) -> None:
+def _assert_allowlisted(plan: "UninstallPlan", path: pathlib.Path) -> None:
     """Refuse anything that is not one of the paths we constructed ourselves.
 
     Belt and braces: build_plan already only joins constants, so this can only
     fire if somebody later adds a path from an untrusted source.
     """
+    home = plan.home
     allowed = {home / relative for relative, _, _ in _MANAGED}
-    allowed |= set(application_locations(home))
+    allowed |= set(application_locations(home, plan.system_applications))
     if path not in allowed:
         raise UninstallRefused(f"{path} is not on the removal allowlist")
     if path == home or path == pathlib.Path("/") or len(path.parts) <= 2:
@@ -255,21 +322,68 @@ def describe_plan(plan: UninstallPlan) -> str:
 
 
 def app_is_running(*, runner=subprocess.run) -> Optional[bool]:
-    """Is BabelFishR running right now?
+    """Is BabelFishR - the application, not this uninstaller - running?
 
-    ``None`` means we could not tell - which is treated as "assume it is",
-    because deleting a running application's bundle out from under it leaves
-    half-written files and a confusing crash.
+    The first version of this matched ``pgrep -f
+    BabelFishR.app/Contents/MacOS``, which is a substring of
+    ``Uninstall BabelFishR.app/Contents/MacOS/UninstallBabelFishR``. The
+    running uninstaller therefore found *itself*, concluded the application
+    was still open, and refused every removal. There was no way for an
+    operator to get past it.
+
+    So no substring is used at all. ``pgrep -x`` matches the process name
+    exactly - ``BabelFishR`` never equals ``UninstallBabelFishR`` - and each
+    matching pid is then confirmed by comparing the *last component* of its
+    executable path, again exactly. Two independent exact checks, no pattern
+    that one name can be a prefix, suffix or substring of the other.
+
+    ``None`` means we could not tell, and is treated by :func:`uninstall` as
+    "assume it is running": deleting a live application's bundle out from
+    under it leaves half-written files and a confusing crash.
     """
     try:
-        result = runner(["/usr/bin/pgrep", "-f", "BabelFishR.app/Contents/MacOS"],
-                        capture_output=True, text=True, timeout=10)
+        found = runner(["/usr/bin/pgrep", "-x", MAIN_EXECUTABLE_NAME],
+                       capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return None
-    if result.returncode == 0:
-        return bool((result.stdout or "").strip())
-    if result.returncode == 1:
+    if found.returncode == 1:
+        return False          # pgrep's documented "no process matched"
+    if found.returncode != 0:
+        return None           # anything else: we do not know, so fail closed
+
+    pids = [line.strip() for line in (found.stdout or "").splitlines()
+            if line.strip().isdigit()]
+    if not pids:
         return False
+    return _any_pid_is_the_application(pids, runner=runner)
+
+
+def _any_pid_is_the_application(pids: Sequence[str], *, runner) -> Optional[bool]:
+    """Confirm at least one pid really is BabelFishR's own executable.
+
+    ``ps -o comm=`` prints the executable path on macOS. The comparison is on
+    the final path component only, and it is equality, never containment - so
+    ``.../Uninstall BabelFishR.app/Contents/MacOS/UninstallBabelFishR`` cannot
+    satisfy it however the process was named.
+    """
+    argv = ["/bin/ps", "-o", "comm="]
+    for pid in pids:
+        argv += ["-p", pid]
+    try:
+        listed = runner(argv, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if listed.returncode not in (0, 1):
+        return None
+    for line in (listed.stdout or "").splitlines():
+        command = line.strip()
+        if not command:
+            continue
+        if pathlib.PurePosixPath(command).name == MAIN_EXECUTABLE_NAME:
+            return True
+    # pgrep named some pids and ps could not confirm any of them. That is a
+    # disagreement between two views of the process table, not evidence that
+    # nothing is running, so it is reported as "cannot tell".
     return None
 
 
@@ -384,7 +498,7 @@ def uninstall(plan: UninstallPlan, *, dry_run: bool = False,
                 "deleted.")
 
     for item in plan.items:
-        _assert_allowlisted(plan.home, item.path)
+        _assert_allowlisted(plan, item.path)
         _remove_one(item, report, dry_run=dry_run)
 
     if report.failed and allow_elevation and not dry_run:
@@ -404,6 +518,21 @@ def uninstall(plan: UninstallPlan, *, dry_run: bool = False,
             report.notes.append(
                 "An administrator prompt was needed and did not complete, so "
                 "some items were left in place.")
+
+    # Directories earlier builds left in the home directory, before Argos was
+    # confined to Application Support. Named files and empty directories only;
+    # anything else is reported rather than removed, because those folders are
+    # shared with any other Argos installation on the machine.
+    from .argos_home import clean_legacy_argos
+
+    try:
+        legacy = clean_legacy_argos(plan.home, dry_run=dry_run)
+    except Exception as exc:  # noqa: BLE001 - never abort a removal on this
+        report.notes.append(f"Legacy Argos directories were not tidied: {exc}")
+    else:
+        report.removed += legacy.removed
+        report.notes += [f"Left in place: {path} - {why}"
+                         for path, why in legacy.kept]
 
     if not dry_run:
         report.microphone_permission_reset = reset_microphone_permission(

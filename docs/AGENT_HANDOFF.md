@@ -722,3 +722,229 @@ Nothing here has been run on physical hardware. Specifically unproven:
 Item 5 is the one that matters most: run it on a Mac that has a full prepared
 installation, and read the itemized report rather than trusting the absence of
 an error.
+
+---
+
+# Release-blocking correction: self-matching process check, test isolation, Argos paths
+
+Branch `claude/radio-decoder-translator-0oslya`, from
+`cf5c3bd493097b97c9a7f935f594d78052529b37`. Alpha 1 and Alpha 2 untouched;
+Alpha 3 not published.
+
+## 1. The uninstaller found itself and refused every removal
+
+**Defect.** `app_is_running()` ran `pgrep -f BabelFishR.app/Contents/MacOS`.
+That string is a substring of
+
+```
+Uninstall BabelFishR.app/Contents/MacOS/UninstallBabelFishR
+```
+
+so the *running uninstaller* matched the pattern, `uninstall()` concluded the
+application was still open, and every removal was refused. There was no way for
+an operator to get past it: quitting BabelFishR could not help, because the
+process being found was the uninstaller itself.
+
+**Correction.** No substring is used anywhere. Two independent exact checks:
+
+1. `pgrep -x BabelFishR` — exact process-name match. `BabelFishR` is never
+   equal to `UninstallBabelFishR`.
+2. Each matching pid is confirmed with `ps -o comm=`, comparing the **last
+   component** of the executable path with `==` against `MAIN_EXECUTABLE_NAME`.
+
+Both tools failing, an unexpected `pgrep` exit code, or `pgrep` naming pids
+that `ps` cannot confirm all return `None`, which `uninstall()` treats as "it
+is running" and refuses. Fail closed in every direction.
+
+**Tests** (`tests/test_uninstaller.py`) drive a `process_table()` fake that
+models the real `pgrep` semantics — `-x` matches the last path component
+exactly, `-f` matches the whole command line as a substring — so a revert to a
+pattern is caught rather than papered over:
+
+- `test_the_running_uninstaller_is_not_mistaken_for_the_application` (only
+  `UninstallBabelFishR` running → stopped)
+- `test_the_running_application_is_found`
+- `test_both_running_is_reported_as_running` (both orderings)
+- `test_a_process_inspection_failure_fails_closed` (pgrep unavailable, and ps
+  unavailable) and `test_an_unexpected_pgrep_exit_code_fails_closed`
+- `test_the_command_is_an_exact_match_not_a_substring_pattern` asserts the
+  **real argv** — `["/usr/bin/pgrep", "-x", "BabelFishR"]` — and that no call
+  carries `-f` or a `Contents/MacOS` fragment
+- two end-to-end tests through `uninstall()` itself
+
+Reverting `app_is_running` to the old `pgrep -f` line fails three of these,
+including the end-to-end removal.
+
+## 2. Destructive tests could have deleted a real installed application
+
+**Defect.** `build_plan(tmp_path)` still put the literal
+`/Applications/BabelFishR.app` into the plan. Every destructive test in
+`tests/test_uninstaller.py` called `uninstall()` on such a plan, so running the
+suite on a developer's Mac with BabelFishR installed would have deleted their
+actual application. The existing "fake homes only" guard did not catch it: the
+home *was* fake, the applications root was not.
+
+**Correction.** Runtime application roots are now separated from injected ones.
+
+- `build_plan()` with no argument — the real plan: the operator's home, plus
+  `/Applications`. `plan.roots()` is `[home, /Applications]`.
+- `build_plan(home)` — an injected root: `system_applications` defaults to
+  `None`, so `/Applications` is not in the plan at all and every path lies
+  inside the supplied root. A caller that genuinely wants another applications
+  root has to name it (`system_applications=`), and it is still not
+  `/Applications` unless written out.
+
+`UninstallPlan` gained `system_applications`, `roots()` and
+`contains_only_paths_within_its_roots()`. `_assert_allowlisted()` now takes the
+plan, so the allowlist is derived from that plan's roots rather than from a
+constant.
+
+`packaging/uninstaller_entry.py --selftest-dry-run <home>` passes the scratch
+home through, so it neither names nor stats the real `/Applications`; with no
+argument it builds the real runtime plan.
+
+**Tests.**
+- `test_a_plan_built_on_a_fake_home_never_leaves_that_home` — the guard the
+  requirement asks for: `roots() == [home]`, `system_applications is None`, and
+  every path inside the injected root.
+- `test_a_real_application_path_is_refused_by_a_fake_home_plan` — checked at
+  the allowlist; that test never calls `uninstall()`.
+- The file guard now also parses the syntax tree and fails if the literal
+  `/Applications/BabelFishR.app` appears as a string constant anywhere in the
+  destructive test file.
+- The real runtime plan is asserted in a **separate, non-destructive** file,
+  `tests/test_uninstaller_runtime_paths.py`, which ends with a guard rejecting
+  any call that could change the disk (`uninstall`, `rmtree`, `unlink`,
+  `rmdir`, `remove`, `mkdir`, `write_text`, …). That is the only file that
+  builds a real plan, and it cannot delete anything.
+
+## 3. Argos data now lives under BabelFishR
+
+**Defect.** `argostranslate.settings` (1.11.0) resolves three roots from the
+XDG variables **at import time** and `os.makedirs` them immediately:
+
+```
+data_dir   = $XDG_DATA_HOME/argos-translate    default ~/.local/share
+config_dir = $XDG_CONFIG_HOME/argos-translate  default ~/.config
+cache_dir  = $XDG_CACHE_HOME/argos-translate   default ~/.local/cache
+```
+
+`ARGOS_PACKAGES_DIR` moves the installed packages and nothing else. So the
+local package index (`data_dir/index.json`), the downloads cache
+(`cache_dir/downloads`) and the configuration were all outside
+`~/Library/Application Support/BabelFishR` — invisible to the operator and
+invisible to the uninstaller.
+
+**Correction.** `babelfishr/argos_home.py` sets the three XDG roots and then
+imports `argostranslate.settings` itself, inside a context manager that
+restores the previous environment afterwards. Setting them permanently would
+relocate every other XDG-aware library in the process and would be inherited by
+every child process BabelFishR launches, which is not ours to change.
+`modes.bootstrap_environment()` calls it before anything can import Argos.
+
+**Final managed layout**, all under `~/Library/Application Support/BabelFishR`:
+
+```
+argos/data/argos-translate              data_dir
+argos/data/argos-translate/index.json   local_package_index
+argos/config/argos-translate            config_dir
+argos/cache/argos-translate             cache_dir
+argos/cache/argos-translate/downloads   downloads_dir
+language-packs                          package_data_dir (ARGOS_PACKAGES_DIR)
+```
+
+Installed packages stay in `language-packs/` — `ARGOS_PACKAGES_DIR` wins over
+`data_dir/packages`, and alpha 2's packs are already there.
+
+`--selftest-argos-paths` proves this **in the frozen bundle**: it bootstraps,
+reads the paths back out of the imported `argostranslate.settings`, and fails
+if any resolves outside the managed root. `verify_independence.sh` runs it and
+treats a stray path as fatal. `_selftest_independence` now bootstraps before
+importing its module list, because it imports `argostranslate` and would
+otherwise create the very directories this fixes.
+
+**Test against the real library, not a fake.**
+`tests/test_argos_home.py::test_the_real_argos_resolves_every_path_inside_the_injected_root`
+runs a fresh interpreter with `HOME` and `BABELFISHR_HOME` pointed at a
+temporary directory, calls `bootstrap_environment()`, imports the actually
+installed argostranslate 1.11.0, and asserts that all six resolved paths are
+inside the injected root, that none of the three home-directory folders was
+created, and that the XDG variables were left unset afterwards.
+
+### Legacy cleanup
+
+`clean_legacy_argos(home)` tidies what earlier builds left behind, called
+best-effort from `bootstrap_environment()` and again from `uninstall()`:
+
+1. Only **exact named files** are deleted, and only when a content check
+   confirms they are what the name says — currently just
+   `.local/share/argos-translate/index.json`, and only if it parses as a JSON
+   list of package dictionaries.
+2. A legacy directory is removed only when **empty**, with `os.rmdir`, which
+   fails rather than recursing. There is no `rmtree` in that function and
+   `test_the_cleanup_can_never_recurse` parses the module's syntax tree to
+   assert no `rmtree`, `removedirs`, `system` or `run` call exists anywhere in
+   it.
+3. Shared parents (`~/.local/share`, `~/.config`, `~/.local/cache`) are never
+   touched, and a symlinked legacy directory is neither followed nor removed.
+4. Anything left is reported by **exact path** with the reason, and
+   `LegacyCleanup.complete` is false — nothing is ever described as removed
+   unless it is gone.
+
+Tests: known artifacts cleaned; a stranger's `packages/translate-fr_en-1_9`
+and a hand-written `settings.json` survive and are named in the report; a
+file called `index.json` that is not an Argos index is left alone; a symlinked
+legacy directory's target survives; the dry run changes nothing.
+
+## Tests and results
+
+Focused: `tests/test_uninstaller.py` 45 passed ·
+`tests/test_uninstaller_runtime_paths.py` 5 passed ·
+`tests/test_argos_home.py` 10 passed · `tests/test_release_pipeline.py` 43
+passed.
+
+Full suite: **649 passed, 9 skipped** in 73s (same nine skips as before:
+CoreAudio needs a real macOS host, PlistBuddy is macOS-only, and the
+real-engine tests need a prepared model and language pack).
+
+Non-vacuity: reverting `app_is_running` to `pgrep -f BabelFishR.app/Contents/MacOS`
+fails `test_the_running_uninstaller_is_not_mistaken_for_the_application`,
+`test_the_command_is_an_exact_match_not_a_substring_pattern` and
+`test_the_uninstaller_removes_while_only_itself_is_running`.
+
+## Files changed
+
+```
+babelfishr/uninstall.py                  exact process identity; injected roots
+babelfishr/argos_home.py                 NEW  managed XDG roots, legacy tidy
+babelfishr/modes.py                      bootstrap configures Argos, tidies legacy
+packaging/app_entry.py                   --selftest-argos-paths; bootstrap first
+packaging/uninstaller_entry.py           scratch home never names /Applications
+packaging/verify_independence.sh         Argos paths are a fatal check
+README.md                                argos/ directory, legacy behaviour
+tests/test_uninstaller.py                process table, injected-root guard
+tests/test_uninstaller_runtime_paths.py  NEW  real plan, non-destructive
+tests/test_argos_home.py                 NEW  real argos 1.11, legacy cleanup
+tests/test_release_pipeline.py           the new self-test and import order
+```
+
+## Final commit
+
+One commit, on `claude/radio-decoder-translator-0oslya`, whose parent is
+`cf5c3bd493097b97c9a7f935f594d78052529b37`. A commit cannot contain its own
+hash, so read it with:
+
+```
+git rev-parse claude/radio-decoder-translator-0oslya
+```
+
+It is also the head SHA of the verification run dispatched for this pass.
+
+## Still requiring a real Mac
+
+Unchanged from the previous section, minus nothing, plus:
+
+- That `pgrep -x BabelFishR` matches a genuinely launched frozen bundle — the
+  process name comes from the bundle's executable, which is `BabelFishR`, but
+  that has only been modelled here, never observed.
+- That `--selftest-argos-paths` passes inside the signed bundle on the runner.

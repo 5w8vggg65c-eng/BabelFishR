@@ -102,6 +102,13 @@ def _module_origin(module) -> str:
 
 def _selftest_independence(verbose: bool = True) -> int:
     """Prove the frozen app loads nothing from the machine that built it."""
+    # Before argostranslate is imported below: its data, config and cache
+    # directories are resolved at import time, and importing it first would
+    # create three folders in the operator's home that BabelFishR does not
+    # manage and its uninstaller would not find.
+    from babelfishr.modes import bootstrap_environment
+
+    bootstrap_environment()
     roots = _bundle_roots()
     failures = []
     lines = [
@@ -252,6 +259,43 @@ def _selftest_https() -> int:
         return 0
 
 
+def _selftest_argos_paths() -> int:
+    """Prove every Argos directory resolves inside Application Support.
+
+    argostranslate resolves its data, config and cache roots once, at import,
+    from the XDG variables, and creates them immediately. ARGOS_PACKAGES_DIR
+    moves only the installed packages - so up to alpha 2 the package index,
+    the downloads cache and the configuration lived in the operator's home,
+    outside anything BabelFishR managed or could remove.
+    """
+    from babelfishr.argos_home import resolved_argos_paths, verify_argos_paths
+    from babelfishr.modes import AppPaths, bootstrap_environment
+
+    bootstrap_environment()
+    root = AppPaths.resolve().root
+    print(f"managed root : {root}")
+    try:
+        resolved = resolved_argos_paths()
+    except Exception as exc:  # noqa: BLE001
+        print(f"FAIL: argostranslate did not import: {exc}")
+        return 1
+    for name, path in sorted(resolved.items()):
+        print(f"{name:<20}: {path}")
+    stray = verify_argos_paths(root)
+    if stray:
+        print("FAIL: these Argos paths are outside the managed root:")
+        for item in stray:
+            print(f"  {item}")
+        return 1
+    home = pathlib.Path.home()
+    for legacy in (".local/share/argos-translate", ".config/argos-translate",
+                   ".local/cache/argos-translate"):
+        if (home / legacy).exists():
+            print(f"note: a legacy directory still exists: {home / legacy}")
+    print("ok:   every Argos path resolves inside the managed root")
+    return 0
+
+
 def _selftest_gui() -> int:
     """Construct and show the real main window, headless."""
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -308,6 +352,9 @@ def main(argv=None) -> int:
 
     if argv == ["--selftest-https"]:
         return _selftest_https()
+
+    if argv == ["--selftest-argos-paths"]:
+        return _selftest_argos_paths()
 
     if argv == ["--selftest-gui"]:
         return _selftest_gui()

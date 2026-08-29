@@ -99,13 +99,43 @@ def plan_for(home: pathlib.Path) -> U.UninstallPlan:
 def test_the_plan_only_contains_babelfishr_paths(tmp_path):
     populate(tmp_path)
     plan = plan_for(tmp_path)
-    home = plan.home
     for path in plan.paths():
         text = str(path)
         assert ("BabelFishR" in text or "babelfishr" in text), (
             f"{path} is not obviously a BabelFishR path")
-        assert path == pathlib.Path("/Applications/BabelFishR.app") or \
-            str(path).startswith(str(home) + os.sep)
+
+
+def test_a_plan_built_on_a_fake_home_never_leaves_that_home(tmp_path):
+    """The guard that makes every other test in this file safe to run.
+
+    The first version of build_plan put the machine's real
+    /Applications/BabelFishR.app into every plan, injected home or not. A
+    destructive test run on a developer's Mac would have deleted their actual
+    installed application. An injected root now means an injected root.
+    """
+    populate(tmp_path)
+    plan = plan_for(tmp_path)
+    assert plan.roots() == [plan.home], (
+        "a fake-home plan reaches outside the home it was given")
+    assert plan.system_applications is None
+    assert plan.contains_only_paths_within_its_roots()
+    for path in plan.paths():
+        assert path == plan.home or plan.home in path.parents, (
+            f"{path} is outside the injected root {plan.home}")
+
+
+def test_a_real_application_path_is_refused_by_a_fake_home_plan(tmp_path):
+    """Checked at the allowlist, never by attempting a removal.
+
+    Nothing in this test calls uninstall(), so there is no code path here that
+    could reach a developer's installed application even if the allowlist were
+    wrong - the assertion is that the allowlist rejects it.
+    """
+    plan = plan_for(tmp_path)
+    outside = pathlib.Path("/Applications") / U.APP_BUNDLE_NAME
+    assert outside not in plan.paths()
+    with pytest.raises(U.UninstallRefused):
+        U._assert_allowlisted(plan, outside)
 
 
 def test_the_plan_covers_every_documented_removal(tmp_path):
@@ -328,18 +358,128 @@ def test_an_undetermined_running_state_also_refuses(tmp_path):
             / "Recordings" / "one.wav").exists()
 
 
-def test_app_is_running_reads_pgrep_honestly():
-    assert U.app_is_running(runner=lambda *a, **k: types.SimpleNamespace(
-        returncode=0, stdout="4231\n", stderr="")) is True
-    assert U.app_is_running(runner=lambda *a, **k: types.SimpleNamespace(
-        returncode=1, stdout="", stderr="")) is False
-    assert U.app_is_running(runner=lambda *a, **k: types.SimpleNamespace(
-        returncode=2, stdout="", stderr="")) is None
+def process_table(processes, *, ps_fails=False, pgrep_fails=False):
+    """A subprocess.run stand-in that models pgrep and ps for real.
 
-    def explode(*a, **k):
-        raise OSError("no pgrep here")
+    ``processes`` are full executable paths. ``pgrep -x`` matches the last
+    path component exactly; ``pgrep -f`` matches the whole command line as a
+    substring, exactly as the real tool does - so a test written against this
+    fake fails if the implementation goes back to a substring pattern.
+    """
+    def run(argv, **kwargs):
+        if argv[:2] == ["/usr/bin/pgrep", "-x"]:
+            if pgrep_fails:
+                raise OSError("pgrep is not available")
+            matched = [i for i, path in enumerate(processes)
+                       if pathlib.PurePosixPath(path).name == argv[2]]
+        elif argv[:2] == ["/usr/bin/pgrep", "-f"]:
+            if pgrep_fails:
+                raise OSError("pgrep is not available")
+            matched = [i for i, path in enumerate(processes) if argv[2] in path]
+        elif argv[0] == "/bin/ps":
+            if ps_fails:
+                raise OSError("ps is not available")
+            wanted = {a for a in argv if a.isdigit()}
+            lines = [path for i, path in enumerate(processes)
+                     if str(900 + i) in wanted]
+            return types.SimpleNamespace(
+                returncode=0 if lines else 1, stdout="\n".join(lines), stderr="")
+        else:
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        pids = [str(900 + i) for i in matched]
+        return types.SimpleNamespace(returncode=0 if pids else 1,
+                                     stdout="\n".join(pids), stderr="")
 
-    assert U.app_is_running(runner=explode) is None
+    return run
+
+
+UNINSTALLER_PROCESS = ("/Volumes/BabelFishR/Uninstall BabelFishR.app"
+                       "/Contents/MacOS/UninstallBabelFishR")
+APPLICATION_PROCESS = "/Applications/BabelFishR.app/Contents/MacOS/BabelFishR"
+
+
+def test_the_running_uninstaller_is_not_mistaken_for_the_application():
+    """The defect that made removal impossible.
+
+    `pgrep -f BabelFishR.app/Contents/MacOS` is a substring of the
+    uninstaller's own executable path, so the uninstaller found itself,
+    decided BabelFishR was open, and refused every removal - with no way for
+    the operator to get past it.
+    """
+    assert U.app_is_running(
+        runner=process_table([UNINSTALLER_PROCESS])) is False
+
+
+def test_the_running_application_is_found():
+    assert U.app_is_running(
+        runner=process_table([APPLICATION_PROCESS])) is True
+
+
+def test_both_running_is_reported_as_running():
+    assert U.app_is_running(
+        runner=process_table([UNINSTALLER_PROCESS, APPLICATION_PROCESS])) is True
+    assert U.app_is_running(
+        runner=process_table([APPLICATION_PROCESS, UNINSTALLER_PROCESS])) is True
+
+
+def test_nothing_running_is_reported_as_stopped():
+    assert U.app_is_running(runner=process_table([])) is False
+
+
+@pytest.mark.parametrize("kwargs", [{"pgrep_fails": True}, {"ps_fails": True}])
+def test_a_process_inspection_failure_fails_closed(kwargs):
+    """Cannot tell is not the same as not running, and must never delete."""
+    runner = process_table([APPLICATION_PROCESS], **kwargs)
+    assert U.app_is_running(runner=runner) is None
+
+
+def test_an_unexpected_pgrep_exit_code_fails_closed():
+    def run(argv, **kwargs):
+        return types.SimpleNamespace(returncode=2, stdout="", stderr="usage")
+
+    assert U.app_is_running(runner=run) is None
+
+
+def test_the_command_is_an_exact_match_not_a_substring_pattern():
+    """Asserted against the real argv, not a mocked return value."""
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(list(argv))
+        if argv[0] == "/bin/ps":
+            return types.SimpleNamespace(
+                returncode=0, stdout=APPLICATION_PROCESS, stderr="")
+        return types.SimpleNamespace(returncode=0, stdout="901", stderr="")
+
+    assert U.app_is_running(runner=run) is True
+    assert calls[0] == ["/usr/bin/pgrep", "-x", "BabelFishR"], (
+        f"app_is_running ran {calls[0]}, which is not an exact-name match")
+    for call in calls:
+        assert "-f" not in call, (
+            "a pgrep full-command-line pattern can match the uninstaller")
+        for argument in call:
+            assert "Contents/MacOS" not in argument, (
+                "a path substring pattern is exactly the defect being fixed")
+
+
+def test_the_uninstaller_refuses_to_delete_while_the_application_runs(tmp_path):
+    """End to end: the real check, driven by a modelled process table."""
+    populate(tmp_path)
+    with pytest.raises(U.UninstallRefused):
+        U.uninstall(plan_for(tmp_path),
+                    runner=process_table([APPLICATION_PROCESS]))
+    assert (tmp_path / "Library" / "Application Support" / "BabelFishR"
+            / "Recordings" / "one.wav").exists()
+
+
+def test_the_uninstaller_removes_while_only_itself_is_running(tmp_path):
+    """The same end-to-end path, with only the uninstaller in the table."""
+    populate(tmp_path)
+    report = U.uninstall(plan_for(tmp_path),
+                         runner=process_table([UNINSTALLER_PROCESS]))
+    assert report.complete, report.summary()
+    assert not (tmp_path / "Library" / "Application Support"
+                / "BabelFishR").exists()
 
 
 # ----------------------------------------------------------- reporting

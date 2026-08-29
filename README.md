@@ -81,6 +81,7 @@ Complete removal permanently deletes:
 - your settings
 - diagnostic reports and logs
 - BabelFishR's caches, preferences and saved application state
+- the Argos index, download cache and configuration under `argos/`
 
 It also asks macOS to forget BabelFishR's microphone permission. Copy anything
 you want to keep somewhere else first. If something cannot be removed, the
@@ -321,8 +322,18 @@ Everything writable resolves under one place:
 ├── Recordings/         original WAVs, never modified
 ├── models/             prepared Whisper models
 ├── language-packs/     Argos packages (ARGOS_PACKAGES_DIR)
+├── argos/              Argos package index, download cache and config
 └── Logs/
 ```
+
+`argos/` is there because Argos Translate otherwise puts its index, its
+download cache and its configuration in three folders in your home directory
+(`~/.local/share/argos-translate`, `~/.config/argos-translate`,
+`~/.local/cache/argos-translate`). BabelFishR points them here instead, so
+everything it creates is in one place and the uninstaller can find all of it.
+If an earlier version left those folders behind, BabelFishR removes the files
+it wrote and the folders once they are empty — and leaves anything it did not
+write, naming it, in case another Argos installation owns it.
 
 Reinstalling or upgrading the application does not touch any of it. Help ▸
 "Where are my recordings?" shows the resolved paths in the app.

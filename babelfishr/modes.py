@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import logging
 import os
 import pathlib
 import platform
@@ -163,6 +164,16 @@ def bootstrap_environment(config=None) -> Dict[str, str]:
     os.environ.setdefault("ARGOS_PACKAGES_DIR", str(paths.language_packs))
     os.environ["ARGOS_PACKAGES_DIR"] = str(paths.language_packs)
 
+    # ARGOS_PACKAGES_DIR moves the installed packages and nothing else. Argos
+    # also resolves a data, config and cache directory from the XDG variables
+    # at import time and creates all three immediately, so up to alpha 2 its
+    # package index, its downloads cache and its configuration lived in three
+    # folders in the operator's home that BabelFishR never mentioned. Done
+    # here, before anything imports argostranslate.
+    from .argos_home import clean_legacy_argos, configure_argos_home
+
+    applied.update(configure_argos_home(paths.root))
+
     # A frozen bundle carries its own OpenSSL but not the system trust store,
     # so without this every HTTPS download fails with "unable to get local
     # issuer certificate" - which is exactly what happened to Argos on a real
@@ -172,6 +183,18 @@ def bootstrap_environment(config=None) -> Dict[str, str]:
     bundle = configure_certificates()
     if bundle:
         applied["SSL_CERT_FILE"] = bundle
+
+    # Tidy what earlier builds left in the home directory. Best effort and
+    # never fatal: it removes named files and empty directories only, and
+    # reports anything it will not touch.
+    try:
+        legacy = clean_legacy_argos()
+        if legacy.removed or legacy.kept:
+            logging.getLogger(__name__).info(
+                "legacy Argos directories:\n%s", legacy.summary())
+    except Exception:  # noqa: BLE001 - housekeeping must not block startup
+        logging.getLogger(__name__).debug("legacy Argos tidy-up failed",
+                                          exc_info=True)
     return applied
 
 

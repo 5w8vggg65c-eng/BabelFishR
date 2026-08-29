@@ -24,10 +24,17 @@ def _selftest_dry_run(home: str = None) -> int:
     """Prove the plan is computable and that a dry run removes nothing."""
     from babelfishr.uninstall import build_plan, describe_plan, uninstall
 
-    root = pathlib.Path(home or os.environ.get("BABELFISHR_UNINSTALL_HOME")
-                        or pathlib.Path.home())
-    plan = build_plan(root)
+    # A supplied home is a scratch root: build_plan then excludes the
+    # machine's own /Applications entirely, so the self-test cannot so much as
+    # name it, let alone stat it. No argument means the real runtime plan.
+    supplied = home or os.environ.get("BABELFISHR_UNINSTALL_HOME")
+    plan = build_plan(supplied) if supplied else build_plan()
     print(f"Uninstaller dry run for home: {plan.home}")
+    print(f"Applications roots in scope: "
+          f"{', '.join(str(root) for root in plan.roots())}")
+    if supplied and not plan.contains_only_paths_within_its_roots():
+        print("FAIL: the plan reaches outside the supplied root")
+        return 1
     print(describe_plan(plan))
 
     before = [p for p in plan.paths() if os.path.lexists(p)]

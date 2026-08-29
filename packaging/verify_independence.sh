@@ -102,6 +102,20 @@ else
 fi
 
 echo
+echo "== every Argos directory resolves inside Application Support =="
+# Fatal. Argos resolves its data, config and cache roots at import time, so a
+# bundle that imports it before those roots are set writes an index and a
+# download cache into three folders in the operator's home that BabelFishR
+# neither manages nor removes.
+if OUTPUT=$(run_isolated_limited 90 --selftest-argos-paths); then
+  echo "$OUTPUT"
+  pass "Argos directories are managed"
+else
+  echo "$OUTPUT"
+  fail "Argos writes outside the managed Application Support root"
+fi
+
+echo
 echo "== main window construction (offscreen) =="
 if OUTPUT=$(run_isolated --selftest-gui 2>&1); then
   pass "$(echo "$OUTPUT" | tail -n 1)"
