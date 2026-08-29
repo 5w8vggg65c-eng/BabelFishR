@@ -42,8 +42,28 @@ cancel button. Cancelling is safe: a partly downloaded model is detected as
 Field readiness is only claimed, and the mode only switched to Field Offline,
 once the model and the requested routes actually load with downloads disabled.
 
+The assistant lists the translation routes that are genuinely installed, by
+name. It does not claim to handle "any language": only the pairs you install
+can be translated offline.
+
+If anything fails, press **Copy Diagnostic Report**. That puts a complete
+description of the installation — paths, models, language packs, connected
+audio inputs, which one is selected, and the recent log — on the clipboard, and
+saves a copy beside the log. Nothing is sent anywhere. You do not need to open
+Terminal or find any files.
+
 If you would rather not prepare yet, choose **Record only for now**. That
 choice is remembered.
+
+### Before the watch: the input
+
+Preparation and input selection are separate steps, and both have to be done.
+Choose the input in the *Audio input* panel at the top of the window; nothing
+is chosen for you and monitoring will not start until you choose. Field Check
+reports which input is selected and whether it is connected, but does not fail
+on a missing one: preparing models on a laptop with nothing plugged in is a
+perfectly ordinary thing to do. The refusal happens where it matters, when you
+press Start.
 
 ### From a terminal (the same work)
 

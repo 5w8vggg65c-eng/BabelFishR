@@ -5,6 +5,11 @@ build/
 dist/
 .venv/
 venv/
+# The clean venv and the reports the macOS build produces.
+.venv-build/
+build-reports/
+*.dmg
+*.dmg.sha256
 .pytest_cache/
 .coverage
 htmlcov/
