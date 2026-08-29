@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from .filters import convolve, dc_block, design_fir_lowpass
-from .resample import resample
+from ..dsp.filters import convolve, dc_block, design_fir_lowpass
+from ..dsp.resample import resample
 
 
 def fm_demod(iq: np.ndarray, deviation_hz: float = 5000.0,
