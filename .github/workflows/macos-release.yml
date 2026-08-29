@@ -37,7 +37,9 @@ jobs:
   build:
     name: Build, test and package on Apple Silicon
     runs-on: ${{ inputs.runner_label || 'macos-26' }}
-    timeout-minutes: 120
+    # A healthy run takes six minutes. Anything approaching this is wedged, and
+    # holding a runner for two hours to discover that helps nobody.
+    timeout-minutes: 40
 
     steps:
       # ------------------------------------------------------------------
@@ -68,8 +70,14 @@ jobs:
             exit 1
           fi
 
+      # Deliberately v4, not v5. On macos-26, v5's post-job cleanup step hung:
+      # runs 7, 8 and 9 all sat in "Post Check out the source" until they were
+      # killed, and the only difference from the six healthy runs before them
+      # was this bump. A pipeline that cannot finish is worse than a
+      # deprecation annotation, so this one stays until v5 is shown to be
+      # well behaved on this runner image.
       - name: Check out the source
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Install Python 3.12
         uses: actions/setup-python@v6

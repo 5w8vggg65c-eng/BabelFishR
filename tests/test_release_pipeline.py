@@ -149,12 +149,18 @@ def test_the_workflow_uses_maintained_action_versions():
 
     body = _workflow()
     used = dict(re.findall(r"uses:\s*(actions/[a-z-]+)@v(\d+)", body))
-    minimums = {"actions/checkout": 5, "actions/setup-python": 6,
-                "actions/upload-artifact": 5}
+    minimums = {"actions/setup-python": 6, "actions/upload-artifact": 5}
     for action, minimum in minimums.items():
         assert action in used, f"{action} is not used"
         assert int(used[action]) >= minimum, (
             f"{action}@v{used[action]} is below the maintained v{minimum}")
+
+    # actions/checkout is held at v4 on purpose: v5's post-job cleanup hung on
+    # macos-26. The pin must stay explained, so that nobody "fixes" the
+    # deprecation warning by walking back into a wedged pipeline.
+    assert used.get("actions/checkout") == "4"
+    assert "post-job cleanup step hung" in body, (
+        "the checkout pin needs the reason next to it, or it will be undone")
 
 
 def test_the_workflow_exercises_coreaudio_in_the_built_bundle():
