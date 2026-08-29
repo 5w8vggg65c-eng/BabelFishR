@@ -10,13 +10,13 @@ not.
 |---|---|
 | Audited base commit | `bc2c72d` (released as `v0.3.0-alpha.1`) |
 | Branch | `claude/radio-decoder-translator-0oslya` |
-| Final branch commit | `FINAL_COMMIT` |
-| Release tag | `v0.3.0-alpha.2` at `RELEASE_COMMIT` |
-| Release URL | `RELEASE_URL` |
-| Actions run | `RUN_URL` |
-| DMG | `BabelFishR-macOS-arm64.dmg` |
-| DMG size | `DMG_SIZE` bytes |
-| DMG SHA-256 | `DMG_SHA` |
+| Final branch commit | `fda9e5a` |
+| Release tag | **NOT PUBLISHED** — see *Release status* below |
+| Release URL | none yet |
+| Last publish attempt | https://github.com/5w8vggg65c-eng/BabelFishR/actions/runs/33276322107 |
+| DMG | not produced for alpha 2 |
+| DMG size | n/a |
+| DMG SHA-256 | n/a |
 
 **Alpha 1 was not mutated.** The `v0.3.0-alpha.1` tag still points at `bc2c72d`
 and its two release assets are the ones published on 2026-08-29T20:41:55Z. No
@@ -132,8 +132,15 @@ on device enumeration is a real exposure regardless.
 
 ## Tests
 
-`TEST_SUMMARY_LINUX` on the Linux development host.
-`TEST_SUMMARY_MACOS` on the macOS arm64 runner.
+**535 passed, 9 skipped, 0 failed** on the Linux development host, at
+commit `fda9e5a`.
+
+No macOS figure for this branch: the last four runs on the Apple Silicon
+runner were either cancelled by me or could not be observed to completion (see
+*Release status*). The most recent confirmed macOS arm64 result is from
+`v0.3.0-alpha.1`: **473 passed, 7 skipped**. Everything added since then is
+platform-independent Python plus the CoreAudio probe, but that is an argument,
+not a measurement, and it should not be treated as one.
 
 Skips, all with reasons:
 
@@ -167,6 +174,39 @@ restoration, profile restoration, and reconnect. Six further tests in
 `tests/test_input_panel.py` cover the window and panel, including that removing
 the duplicate makes the input usable again.
 
+## Release status — alpha 2 was NOT published
+
+This is the one thing a reader must not be allowed to misunderstand.
+
+All the code, test and documentation corrections below are complete, committed
+and pushed to `claude/radio-decoder-translator-0oslya` at `fda9e5a`. The full suite
+passes locally. **No `v0.3.0-alpha.2` tag, release or DMG exists.**
+
+What happened, plainly: I dispatched eleven workflow runs. Runs 1-6 completed
+normally (run 1 failed on a real macOS-only test defect, since fixed; runs 2,
+3, 4 and 6 succeeded and run 6 produced alpha 1). Runs 7, 8 and 9 I cancelled,
+believing each had hung. They had not: their `created_at` to `updated_at`
+spans are two to three minutes, and `updated_at` is the moment my cancellation
+landed. I had been estimating elapsed time from local `sleep` calls that bear
+no relation to GitHub's clock, so I killed three healthy builds and then
+constructed two false diagnoses to explain the imaginary hangs - first the
+CoreAudio self-test, then `actions/checkout@v5`. Both were retracted in commit
+`fda9e5a`.
+
+Run 10 I cancelled deliberately and correctly: it was queued ahead of the
+publish run and built from the commit whose premise I had just retracted.
+
+Run 11 is the alpha 2 publish attempt, dispatched with
+`publish_prerelease=true` and `release_tag=v0.3.0-alpha.2` at `fda9e5a`. It
+reached the build step and, from this session, its status never advanced past
+that point in the API. I did not cancel it. It carries `timeout-minutes: 40`,
+so it has terminated one way or the other by now; I could not observe which.
+
+**To finish the release**, check that run, and if it did not publish, dispatch
+the workflow again on the branch with those same two inputs. Nothing in the
+tree needs changing first. Do not judge a run's health by how long it feels
+like it has been going - read `created_at` against `updated_at` from the API.
+
 ## Unresolved risks
 
 1. **No physical validation of anything.** No radio, no FalconClaw PTT, no USB
@@ -190,7 +230,11 @@ the duplicate makes the input usable again.
 5. **`--selftest-gui` has no wall-clock watchdog**, unlike the CoreAudio check.
    It constructs a real QApplication and reaches device enumeration, which is
    now internally bounded, but the Qt side is not.
-6. **The CoreAudio ctypes layer has still never returned a real device.** The
+6. **The build-phase timings have never been read.** They were added in
+   `8f72751` to answer a question that turned out not to exist. They are
+   harmless and will be useful the first time a build really is slow, but
+   nobody has yet seen their output.
+7. **The CoreAudio ctypes layer has still never returned a real device.** The
    probe proves the ABI is callable; it has never parsed an actual
    `AudioBufferList` from real hardware, and that is where a struct-layout
    error would show up.
