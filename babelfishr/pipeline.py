@@ -175,6 +175,12 @@ class ProcessingPipeline:
         self._threads: List[threading.Thread] = []
         self._running = False
         self._session: Optional[Session] = None
+        # Work in flight is not in the queue any more but is not done either;
+        # counting only the queue would let a caller stop mid-transcription.
+        self._active = 0
+        self._active_lock = threading.Lock()
+        self._idle = threading.Event()
+        self._idle.set()
 
     # -- lifecycle -------------------------------------------------------
     def start(self, session: Session) -> None:
@@ -197,9 +203,23 @@ class ProcessingPipeline:
 
     @property
     def pending(self) -> int:
-        return self._queue.qsize()
+        """Queued work plus work currently being processed."""
+        with self._active_lock:
+            return self._queue.qsize() + self._active
+
+    def wait_until_idle(self, timeout: float = 120.0) -> bool:
+        """Block until nothing is queued or in flight."""
+        import time
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.pending == 0:
+                return True
+            self._idle.wait(timeout=0.05)
+        return self.pending == 0
 
     def submit(self, tx_id: str) -> None:
+        self._idle.clear()
         self._queue.put(tx_id)
 
     def resume_pending(self) -> int:
@@ -232,10 +252,17 @@ class ProcessingPipeline:
                 continue
             if tx_id is None:
                 break
+            with self._active_lock:
+                self._active += 1
             try:
                 self._process(tx_id)
             except Exception:  # noqa: BLE001 - a worker must never die
                 log.exception("unhandled error processing %s", tx_id)
+            finally:
+                with self._active_lock:
+                    self._active -= 1
+                    if self._active == 0 and self._queue.empty():
+                        self._idle.set()
 
     def _process(self, tx_id: str) -> None:
         tx = self.store.get_transmission(tx_id)

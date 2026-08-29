@@ -4,38 +4,52 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "babelfishr"
-version = "0.1.0"
-description = "Receive, decode, record and translate radio transmissions across the spectrum"
+version = "0.2.0"
+description = "Receive-only desktop app that records, transcribes and translates radio transmissions"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "BabelFishR contributors" }]
-keywords = ["radio", "sdr", "vhf", "uhf", "gmrs", "aprs", "pocsag", "whisper", "translation"]
+keywords = ["radio", "scanner", "transcription", "translation", "whisper", "gmrs", "vhf", "uhf"]
 classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: MacOS X",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS :: MacOS X",
+  "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Topic :: Communications :: Ham Radio",
+  "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
 ]
 
-# Core runtime needs only numpy. Everything else degrades gracefully.
+# The core runs on numpy alone: replay, detection, storage, export and the
+# mock engines all work with no other dependency.
 dependencies = ["numpy>=1.21"]
 
 [project.optional-dependencies]
 audio = ["sounddevice>=0.4.6"]
+gui = ["PySide6>=6.5"]
 asr = ["faster-whisper>=1.0"]
 translate = ["argostranslate>=1.9"]
 cloud = ["anthropic>=0.40"]
-sdr = ["SoapySDR"]
-dev = ["pytest>=7", "scipy>=1.9"]
-all = ["sounddevice>=0.4.6", "faster-whisper>=1.0", "argostranslate>=1.9", "anthropic>=0.40"]
+dev = ["pytest>=7"]
+all = [
+  "sounddevice>=0.4.6",
+  "PySide6>=6.5",
+  "faster-whisper>=1.0",
+  "argostranslate>=1.9",
+  "anthropic>=0.40",
+]
 
 [project.scripts]
 babelfishr = "babelfishr.cli:main"
 
+[project.gui-scripts]
+babelfishr-gui = "babelfishr.ui:run"
+
 [tool.setuptools.packages.find]
 include = ["babelfishr*"]
-
-[tool.setuptools.package-data]
-"babelfishr.server" = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -219,20 +219,15 @@ class BabelFishRApp:
         return captured
 
     def wait_for_processing(self, timeout: float = 120.0) -> bool:
-        """Block until the processing queue drains. Returns False on timeout."""
-        import time
+        """Block until queued *and in-flight* work is finished.
 
+        Waiting on queue depth alone would return while a worker was still
+        inside a slow transcription, so this delegates to the pipeline's own
+        in-flight accounting.
+        """
         if self.pipeline is None:
             return True
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self.pipeline.pending == 0:
-                # Give in-flight work a moment to write its final state.
-                time.sleep(0.05)
-                if self.pipeline.pending == 0:
-                    return True
-            time.sleep(0.02)
-        return False
+        return self.pipeline.wait_until_idle(timeout=timeout)
 
     def stop_session(self) -> Optional[Session]:
         session = self.session
