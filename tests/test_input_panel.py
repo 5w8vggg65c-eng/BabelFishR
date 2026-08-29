@@ -309,3 +309,43 @@ def test_the_permission_wording_is_plain(qt_app):
     # macOS calls all audio capture "microphone", including a USB interface,
     # so the wording has to make clear what the operator is really choosing.
     assert "USB audio interface" in text and "MacBook microphone" in text
+
+
+def test_calibration_uses_the_selected_input_not_a_stale_widget(qt_app, app,
+                                                                wired,
+                                                                monkeypatch):
+    """Calibrating a different device than you monitor is worse than useless.
+
+    This also guards a real break: _calibrate still read a combo box that had
+    moved into the input panel, so pressing Calibrate raised AttributeError.
+    """
+    from babelfishr.ui.main_window import MainWindow
+
+    wired(builtin_mic(), radio_interface())
+    window = MainWindow(app)
+    seen = {}
+    monkeypatch.setattr(window, "_resolve_input_problem",
+                        lambda message: seen.setdefault("message", message))
+
+    # Nothing chosen: calibration must refuse the same way monitoring does,
+    # rather than falling back to a device.
+    window._calibrate()
+    assert "Choose an audio input first" in seen["message"]
+
+    radio = radio_interface()
+    _select(window.input_panel, radio)
+    opened = {}
+
+    class FakeSource:
+        def __init__(self, **kwargs):
+            opened.update(kwargs)
+
+        def start(self):
+            raise RuntimeError("stop here; the identity is what matters")
+
+    monkeypatch.setattr("babelfishr.audio.source.LiveAudioSource", FakeSource)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning",
+                        staticmethod(lambda *a, **k: None))
+    window._calibrate()
+
+    assert opened["identity"].uid == radio.uid

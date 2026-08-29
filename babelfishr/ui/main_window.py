@@ -487,12 +487,18 @@ class MainWindow(QtWidgets.QMainWindow):
         from ..audio.meter import calibrate
         from ..audio.source import LiveAudioSource
 
-        device = self.device_box.currentData()
+        # Calibrate the input that will actually be monitored. A threshold
+        # measured on a different device is worse than no threshold at all.
+        ok, message = self.input_panel.ready_to_monitor()
+        if not ok:
+            self._resolve_input_problem(message)
+            return
         try:
-            source = LiveAudioSource(device=None if device is None else str(device),
-                                     sample_rate=self.app.config.audio.sample_rate,
-                                     block_size=self.app.config.audio.block_size,
-                                     reconnect=False)
+            source = LiveAudioSource(
+                identity=self.input_panel.selected_identity(),
+                sample_rate=self.app.config.audio.sample_rate,
+                block_size=self.app.config.audio.block_size,
+                reconnect=False)
             source.start()
         except Exception as exc:  # noqa: BLE001
             QtWidgets.QMessageBox.warning(self, "Calibration", str(exc))
