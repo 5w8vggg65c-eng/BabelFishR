@@ -55,3 +55,14 @@ include = ["babelfishr*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
+# Test categories, so "the suite passes" is never mistaken for "the real
+# engines work". Only `unit` runs by default in CI and in this repo's
+# development environment.
+markers = [
+  "unit: deterministic, no models, no network, no hardware (the default suite)",
+  "real_model: needs a downloaded Whisper model or Argos language pack",
+  "real_dsd: needs a real dsd-neo binary and known digital recordings",
+  "macos_audio: needs a Mac with a real audio input device",
+  "falconclaw: needs the physical radio and FalconClaw chain",
+  "sdr: needs SDR hardware",
+]

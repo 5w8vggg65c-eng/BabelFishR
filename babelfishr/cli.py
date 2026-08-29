@@ -165,27 +165,44 @@ def cmd_test_record(args) -> int:
 
 def cmd_engines(args) -> int:
     from .config import Config
-    from .providers import (transcription_engine_status,
+    from .modes import OperatingMode
+    from .providers import (CLOUD_ENGINES, PLACEHOLDER_ENGINES,
+                            EngineUnavailable, build_transcription_engine,
+                            build_translation_engine,
+                            transcription_engine_status,
                             translation_engine_status)
 
     config = Config.load(args.config)
-    print("Transcription engines:")
-    for status in transcription_engine_status(config):
-        mark = "OK " if status.available else "-- "
-        note = " (PLACEHOLDER, not real output)" if status.is_placeholder else ""
-        print(f"  [{mark}] {status.name}{note}")
-        if status.reason:
-            for line in status.reason.splitlines():
-                print(f"          {line}")
-    print("\nTranslation engines:")
-    for status in translation_engine_status(config):
-        mark = "OK " if status.available else "-- "
-        note = " (PLACEHOLDER, not real output)" if status.is_placeholder else ""
-        print(f"  [{mark}] {status.name}{note}")
-        print(f"          privacy: {status.privacy}")
-        if status.reason:
-            for line in status.reason.splitlines():
-                print(f"          {line}")
+    mode = config.operating_mode()
+    print(f"Mode: {mode.label}")
+    print(f"  {mode.describe()}\n")
+
+    def show(title, statuses, builder):
+        print(f"{title}:")
+        for status in statuses:
+            blocked = ""
+            if status.id in CLOUD_ENGINES and not mode.allows_cloud:
+                blocked = f"  [BLOCKED by {mode.label}: sends data off this Mac]"
+            elif status.id in PLACEHOLDER_ENGINES and not mode.allows_mock:
+                blocked = f"  [BLOCKED by {mode.label}: placeholder output]"
+            mark = "OK " if status.available and not blocked else "-- "
+            note = " (PLACEHOLDER, not real output)" if status.is_placeholder else ""
+            print(f"  [{mark}] {status.name}{note}{blocked}")
+            if status.privacy:
+                print(f"          privacy: {status.privacy}")
+            if status.reason:
+                for line in status.reason.splitlines():
+                    print(f"          {line}")
+        try:
+            selected = builder(config)
+            print(f"  -> would use: {selected.name}\n")
+        except EngineUnavailable as exc:
+            print(f"  -> would use: NONE ({str(exc).splitlines()[0]})\n")
+
+    show("Transcription engines", transcription_engine_status(config),
+         build_transcription_engine)
+    show("Translation engines", translation_engine_status(config),
+         build_translation_engine)
     return 0
 
 
