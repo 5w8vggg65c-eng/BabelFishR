@@ -320,6 +320,27 @@ class MainWindow(QtWidgets.QMainWindow):
         assistant.triggered.connect(self._show_assistant)
         tools_menu.addAction(assistant)
 
+        # Diagnostics live on the main window, not only inside the setup
+        # assistant. An operator whose first run failed has already closed that
+        # dialog by the time they need to describe the problem to somebody, and
+        # they should not have to reopen a wizard - or find a log directory by
+        # hand - to do it.
+        tools_menu.addSeparator()
+        self.copy_diagnostics_action = QtGui.QAction(
+            "Copy Diagnostic Report", self)
+        self.copy_diagnostics_action.setToolTip(
+            "Copy a complete description of this installation to the "
+            "clipboard. Nothing is sent anywhere.")
+        self.copy_diagnostics_action.triggered.connect(
+            self._copy_diagnostic_report)
+        tools_menu.addAction(self.copy_diagnostics_action)
+
+        self.reveal_logs_action = QtGui.QAction("Reveal Logs in Finder", self)
+        self.reveal_logs_action.setToolTip("Open the folder containing the "
+                                           "application log.")
+        self.reveal_logs_action.triggered.connect(self._reveal_logs)
+        tools_menu.addAction(self.reveal_logs_action)
+
         help_menu = self.menuBar().addMenu("&Help")
         where = QtGui.QAction("Where are my recordings?", self)
         where.triggered.connect(self._show_storage_location)
@@ -377,6 +398,60 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status.showMessage(
             f"Transcription: {summary.transcription}  |  "
             f"Translation: {summary.translation}  |  {backend_status()}")
+
+    # -- diagnostics -----------------------------------------------------
+    def diagnostic_report_path(self) -> pathlib.Path:
+        """Where Copy Diagnostic Report leaves a copy on disk."""
+        return self.app.config.paths().logs / "diagnostic-report.txt"
+
+    def logs_directory(self) -> pathlib.Path:
+        return self.app.config.paths().logs
+
+    def _copy_diagnostic_report(self) -> None:
+        from ..diagnostics import diagnostic_report
+
+        try:
+            text = diagnostic_report(self.app.config, readiness=self._readiness)
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must not crash
+            QtWidgets.QMessageBox.warning(
+                self, "Diagnostic report",
+                f"The report could not be assembled: {exc}")
+            return
+
+        clipboard = QtWidgets.QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(text)
+
+        saved = ""
+        try:
+            path = self.diagnostic_report_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+            saved = f"\n\nAlso saved to:\n{path}"
+        except Exception as exc:  # noqa: BLE001
+            saved = f"\n\n(It could not be saved to a file: {exc})"
+        QtWidgets.QMessageBox.information(
+            self, "Diagnostic report copied",
+            "The report is on the clipboard. Paste it into a message to "
+            "whoever is helping you. Nothing was sent anywhere." + saved)
+
+    def _reveal_logs(self) -> None:
+        """Open the log folder in the platform's file manager."""
+        directory = self.logs_directory()
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(
+                self, "Logs", f"The log folder could not be created: {exc}")
+            return
+        url = QtCore.QUrl.fromLocalFile(str(directory))
+        if not QtGui.QDesktopServices.openUrl(url):
+            # Never leave the operator with nothing: if the file manager will
+            # not open, at least tell them the path they can copy.
+            QtWidgets.QMessageBox.information(
+                self, "Logs",
+                f"The log folder could not be opened automatically.\n\n"
+                f"It is at:\n{directory}")
 
     def _warn(self, text: str) -> None:
         self.warning_banner.setText("⚠ " + text)

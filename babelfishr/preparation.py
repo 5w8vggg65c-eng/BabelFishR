@@ -20,6 +20,10 @@ log = logging.getLogger(__name__)
 
 Reporter = Callable[[str], None]
 
+#: The name of the ASR step, in one place, because both the GUI and the tests
+#: ask whether *that particular* step passed.
+ASR_STEP = "Local ASR model"
+
 #: Approximate on-disk size of each Whisper model, for the storage estimate.
 MODEL_SIZES_MB = {
     "tiny": 75, "base": 145, "small": 480, "medium": 1500,
@@ -55,6 +59,23 @@ class PreparationResult:
     @property
     def ok(self) -> bool:
         return all(ok for _, ok, _ in self.steps)
+
+    def succeeded(self, name: str) -> bool:
+        """Did the step whose name starts with *name* pass?
+
+        Used to persist a successful Whisper preparation even when translation
+        packages failed: those are independent pieces of work and losing the
+        model download because a language pack could not be fetched would make
+        the operator do the slowest step twice.
+        """
+        return any(ok for step, ok, _ in self.steps if step.startswith(name))
+
+    @property
+    def asr_ok(self) -> bool:
+        return self.succeeded(ASR_STEP)
+
+    def failures(self) -> List[Tuple[str, str]]:
+        return [(name, detail) for name, ok, detail in self.steps if not ok]
 
     def summary(self) -> str:
         lines = []
@@ -114,8 +135,22 @@ def prepare_field(config, *, asr_model: Optional[str] = None,
     result.add(*_prepare_asr(config, paths, model_name, say, skip_download))
 
     # -- translation packages -------------------------------------------
-    for source, target in (language_pairs or []):
-        result.add(*_prepare_language(source, target, say, skip_download))
+    # A failure to fetch the package index is about the catalogue, not about
+    # any one pair. Reporting it five times - once per requested language -
+    # buries the real cause in duplicates and tells the operator nothing they
+    # did not already know from the first line.
+    pending = list(language_pairs or [])
+    for index, (source, target) in enumerate(pending):
+        try:
+            result.add(*_prepare_language(source, target, say, skip_download))
+        except _IndexUnavailable as stop:
+            result.add(f"Language pack {source}->{target}", False, str(stop))
+            for skipped_source, skipped_target in pending[index + 1:]:
+                result.add(
+                    f"Language pack {skipped_source}->{skipped_target}", False,
+                    "not attempted: the package index could not be retrieved "
+                    "(see the error above)")
+            break
 
     # -- optional DSD ----------------------------------------------------
     from .analysis import DsdNeoAnalyser
@@ -136,7 +171,7 @@ def _prepare_asr(config, paths: AppPaths, model_name: str, say: Reporter,
     try:
         from faster_whisper import WhisperModel  # noqa: F401
     except Exception:
-        return ("Local ASR model", False,
+        return (ASR_STEP, False,
                 "faster-whisper is not installed (pip install 'babelfishr[asr]')")
 
     from .providers.whisper_local import FasterWhisperEngine
@@ -149,7 +184,7 @@ def _prepare_asr(config, paths: AppPaths, model_name: str, say: Reporter,
 
     if skip_download:
         if state is not ModelState.COMPLETE:
-            return ("Local ASR model", False,
+            return (ASR_STEP, False,
                     f"{state.value} at {directory} (missing: "
                     f"{', '.join(missing)}) and downloads were skipped")
     else:
@@ -164,10 +199,10 @@ def _prepare_asr(config, paths: AppPaths, model_name: str, say: Reporter,
         try:
             resolved = prepare_model(model_name, paths.models)
         except Exception as exc:  # noqa: BLE001
-            return ("Local ASR model", False, f"could not prepare: {exc}")
+            return (ASR_STEP, False, f"could not prepare: {exc}")
         state, missing = inspect_model_directory(resolved)
         if state is not ModelState.COMPLETE:
-            return ("Local ASR model", False,
+            return (ASR_STEP, False,
                     f"download finished but the directory is {state.value} "
                     f"(missing: {', '.join(missing)})")
 
@@ -182,14 +217,14 @@ def _prepare_asr(config, paths: AppPaths, model_name: str, say: Reporter,
         result = offline.warm_up()
         elapsed = time.monotonic() - started
     except Exception as exc:  # noqa: BLE001
-        return ("Local ASR model", False,
+        return (ASR_STEP, False,
                 f"present but not loadable offline: {exc}")
 
     directory = offline.model_directory()
     size_mb = (sum(f.stat().st_size for f in directory.rglob('*') if f.is_file())
                / 1e6) if directory and directory.exists() else 0
     _write_manifest(paths, model_name, directory, size_mb, result.engine_version)
-    return ("Local ASR model", True,
+    return (ASR_STEP, True,
             f"{model_name} at {directory} ({size_mb:.0f} MB), "
             f"offline transcription smoke test passed in {elapsed:.1f}s")
 
@@ -215,9 +250,13 @@ def _write_manifest(paths: AppPaths, model_name: str,
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 
+class _IndexUnavailable(RuntimeError):
+    """Internal signal: stop trying language packs, the catalogue is missing."""
+
+
 def _prepare_language(source: str, target: str, say: Reporter,
                       skip_download: bool):
-    from .providers.argos import ArgosTranslateEngine
+    from .providers.argos import ArgosTranslateEngine, PackageIndexUnavailable
 
     engine = ArgosTranslateEngine()
     if not engine.library_installed():
@@ -232,6 +271,10 @@ def _prepare_language(source: str, target: str, say: Reporter,
     say(f"Installing Argos language pack {source} -> {target}...")
     try:
         installed = engine.install_pair(source, target)
+    except PackageIndexUnavailable as exc:
+        # Not this pair's fault. Stop the whole loop rather than repeating it.
+        say(str(exc))
+        raise _IndexUnavailable(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         return (f"Language pack {source}->{target}", False, str(exc))
     if not installed:
@@ -266,15 +309,14 @@ def installed_routes(config=None) -> List[Tuple[str, str, str]]:
 
 
 def available_languages() -> List[Tuple[str, str]]:
-    """Packages published upstream. Needs the network."""
-    try:
-        import argostranslate.package as package
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(
-            "argostranslate is not installed "
-            "(pip install 'babelfishr[translate]')") from exc
-    package.update_package_index()
-    return sorted((p.from_code, p.to_code) for p in package.get_available_packages())
+    """Packages published upstream. Needs the network.
+
+    Goes through the bounded refresh, so a failure here raises once with the
+    real cause rather than recursing inside argostranslate.
+    """
+    from .providers.argos import available_packages
+
+    return sorted((p.from_code, p.to_code) for p in available_packages())
 
 
 def install_language(source: str, target: str, mode: OperatingMode) -> bool:

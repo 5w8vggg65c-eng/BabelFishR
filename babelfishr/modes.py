@@ -162,6 +162,16 @@ def bootstrap_environment(config=None) -> Dict[str, str]:
     applied = {"ARGOS_PACKAGES_DIR": str(paths.language_packs)}
     os.environ.setdefault("ARGOS_PACKAGES_DIR", str(paths.language_packs))
     os.environ["ARGOS_PACKAGES_DIR"] = str(paths.language_packs)
+
+    # A frozen bundle carries its own OpenSSL but not the system trust store,
+    # so without this every HTTPS download fails with "unable to get local
+    # issuer certificate" - which is exactly what happened to Argos on a real
+    # Mac. Done here because this runs before any library that opens a socket.
+    from .certificates import configure_certificates
+
+    bundle = configure_certificates()
+    if bundle:
+        applied["SSL_CERT_FILE"] = bundle
     return applied
 
 

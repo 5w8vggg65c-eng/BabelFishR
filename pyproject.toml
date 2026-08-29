@@ -30,8 +30,10 @@ dependencies = ["numpy>=1.21"]
 [project.optional-dependencies]
 audio = ["sounddevice>=0.4.6"]
 gui = ["PySide6>=6.5"]
-asr = ["faster-whisper>=1.0"]
-translate = ["argostranslate>=1.9"]
+# certifi: a frozen bundle has no system trust store, so the CA data has
+# to be shipped with the application or every download fails.
+asr = ["faster-whisper>=1.0", "certifi>=2023.7.22"]
+translate = ["argostranslate>=1.9", "certifi>=2023.7.22"]
 cloud = ["anthropic>=0.40"]
 # pyyaml lets the tests read the release workflow and check its
 # shape, rather than grepping YAML with regular expressions.
@@ -45,6 +47,7 @@ all = [
   "faster-whisper>=1.0",
   "argostranslate>=1.9",
   "anthropic>=0.40",
+  "certifi>=2023.7.22",
 ]
 
 [project.scripts]

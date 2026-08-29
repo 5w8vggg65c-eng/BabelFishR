@@ -118,7 +118,12 @@ class SetupAssistant(QtWidgets.QDialog):
         for name, note, size in MODELS:
             label = f"{name} - about {size} MB" + (f", {note}" if note else "")
             self.model_box.addItem(label, name)
-        self.model_box.setCurrentIndex(2)
+        # Start from the model that is actually configured, which after a
+        # partial success is the one already downloaded and verified. Defaulting
+        # to 'small' here sent an operator with a working Medium back to
+        # downloading 480 MB they did not need.
+        configured = self.model_box.findData(self.app.config.asr.model)
+        self.model_box.setCurrentIndex(configured if configured >= 0 else 2)
         self.model_box.currentIndexChanged.connect(self._update_advanced)
         model_layout.addWidget(self.model_box)
         self.size_label = QtWidgets.QLabel()
@@ -277,17 +282,47 @@ class SetupAssistant(QtWidgets.QDialog):
                 language_pairs=payload.get("language_pairs")
                 or self.language_pairs())
             self.app.set_mode(OperatingMode.FIELD_OFFLINE.value)
-        elif readiness.field_ready:
-            self._report_incomplete_preparation(result)
-        elif readiness.can_record:
-            self.status_label.setText(
-                "Partly ready - recording works, processing does not")
         else:
-            self.status_label.setText("Not ready")
+            # Something did not work. Keep whatever genuinely did.
+            self._persist_partial_success(result, payload)
+            if readiness.field_ready:
+                self._report_incomplete_preparation(result)
+            elif readiness.can_record:
+                self.status_label.setText(
+                    "Partly ready - recording works, processing does not")
+            else:
+                self.status_label.setText("Not ready")
         self.cancel_button.setText("Close")
         self.prepare_button.setEnabled(True)
         self.prepare_button.setText("Prepare again")
         self.record_only_button.setEnabled(True)
+
+    def _persist_partial_success(self, result, payload) -> None:
+        """Remember a speech model that downloaded and passed its smoke test.
+
+        The observed case: Whisper Medium downloaded, loaded offline and
+        transcribed, and then every Argos route failed on a certificate error.
+        The old code persisted nothing, so settings still said ``small`` and
+        ``setup_complete = false`` - and reopening setup went looking for a
+        model the operator had not asked for while a working 1.5 GB Medium sat
+        on disk.
+
+        What is persisted is only the model. ``setup.completed`` stays false
+        and the operating mode is untouched, so Field Offline remains
+        unreachable while translation is unavailable. This records a fact, it
+        does not claim readiness.
+        """
+        if not getattr(result, "asr_ok", False):
+            return
+        model = payload.get("asr_model") or self.selected_model()
+        if not model:
+            return
+        self.app.config.record_setup(asr_model=model, completed=False)
+        self._append("")
+        self._append(
+            f"Kept the prepared speech model {model!r} so it does not have to "
+            f"be downloaded again. Setup is still incomplete and the mode is "
+            f"unchanged, because translation is not available.")
 
     def _report_incomplete_preparation(self, result) -> None:
         """Field Check passed, but not everything the operator asked for.

@@ -454,3 +454,86 @@ def test_an_ambiguous_device_mid_watch_is_shown_in_red(qt_app, app, wired):
     assert "cannot safely determine" in panel.alert_label.text()
     assert "Recordings already captured are unaffected" in \
         panel.alert_label.text()
+
+
+# ---- diagnostics are reachable after the setup assistant is closed -----
+def test_the_main_window_has_permanent_diagnostic_actions(qt_app, app, wired):
+    """An operator whose first run failed has already closed the wizard.
+
+    They should not have to reopen it, or find a log directory by hand, to
+    describe the problem to somebody.
+    """
+    from babelfishr.ui.main_window import MainWindow
+
+    wired(builtin_mic(), radio_interface())
+    window = MainWindow(app)
+
+    assert window.copy_diagnostics_action.text() == "Copy Diagnostic Report"
+    assert window.reveal_logs_action.text() == "Reveal Logs in Finder"
+    assert window.copy_diagnostics_action.isEnabled()
+    assert window.reveal_logs_action.isEnabled()
+
+    # Both live on a menu, not on a dialog that can be dismissed.
+    titles = [m.title() for m in window.menuBar().findChildren(QtWidgets.QMenu)]
+    assert any("Tools" in title for title in titles)
+    actions = [a.text() for a in window.menuBar().actions()
+               if a.menu() for a in a.menu().actions()]
+    assert "Copy Diagnostic Report" in actions
+    assert "Reveal Logs in Finder" in actions
+
+
+def test_the_diagnostic_actions_target_the_managed_locations(qt_app, app,
+                                                             wired):
+    from babelfishr.ui.main_window import MainWindow
+
+    wired(builtin_mic(), radio_interface())
+    window = MainWindow(app)
+    paths = app.config.paths()
+
+    assert window.logs_directory() == paths.logs
+    assert window.diagnostic_report_path() == paths.logs / "diagnostic-report.txt"
+
+
+def test_copying_the_report_writes_it_where_the_dialog_says(qt_app, app, wired,
+                                                            monkeypatch):
+    from babelfishr.ui.main_window import MainWindow
+
+    wired(builtin_mic(), radio_interface())
+    window = MainWindow(app)
+    shown = {}
+    monkeypatch.setattr(QtWidgets.QMessageBox, "information",
+                        staticmethod(lambda *a, **k: shown.setdefault("msg", a)))
+
+    window._copy_diagnostic_report()
+
+    path = window.diagnostic_report_path()
+    assert path.is_file()
+    text = path.read_text(encoding="utf-8")
+    assert "BabelFishR diagnostic report" in text
+    assert "Audio input" in text
+    clipboard = QtWidgets.QApplication.clipboard()
+    if clipboard is not None:
+        assert "BabelFishR diagnostic report" in clipboard.text()
+
+
+def test_revealing_logs_creates_the_folder_and_opens_it(qt_app, app, wired,
+                                                        monkeypatch):
+    import shutil
+
+    from PySide6 import QtGui
+
+    from babelfishr.ui.main_window import MainWindow
+
+    wired(builtin_mic(), radio_interface())
+    window = MainWindow(app)
+    logs = window.logs_directory()
+    shutil.rmtree(logs, ignore_errors=True)
+
+    opened = {}
+    monkeypatch.setattr(QtGui.QDesktopServices, "openUrl",
+                        staticmethod(lambda url: opened.setdefault("url", url)
+                                     is None or True))
+    window._reveal_logs()
+
+    assert logs.is_dir(), "the folder is created rather than failing to open"
+    assert opened["url"].toLocalFile().rstrip("/") == str(logs).rstrip("/")

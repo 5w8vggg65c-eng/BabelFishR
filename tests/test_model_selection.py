@@ -361,8 +361,22 @@ def test_partial_preparation_names_what_failed(qt_app, app, monkeypatch):
     assert "NOT been saved" in log or "not been saved" in log.lower()
 
 
-def test_partial_preparation_persists_nothing(qt_app, app, monkeypatch):
-    """The previous configuration must survive an incomplete preparation."""
+def test_partial_preparation_persists_the_model_but_not_the_claim(
+        qt_app, app, monkeypatch):
+    """A verified model is kept; a failed language selection is not.
+
+    This test used to assert that an incomplete preparation persisted
+    *nothing*. That was too broad, and it cost a real operator: Whisper Medium
+    downloaded, loaded offline and passed its smoke test, then every Argos
+    route failed on a certificate error - and because nothing was saved,
+    settings still said `small` and reopening setup went looking for a model
+    they had never asked for while a working 1.5 GB Medium sat on disk.
+
+    The distinction that matters is between a fact and a claim. "This model is
+    present and verified" is a fact worth keeping. "You are ready for offline
+    field use" is a claim, and it is still refused: the language-pair
+    selection, the completion flag and the operating mode are all untouched.
+    """
     app.config.record_setup(asr_model=DEFAULT,
                             language_pairs=[("es", "en")])
     before = Config.load()
@@ -373,10 +387,15 @@ def test_partial_preparation_persists_nothing(qt_app, app, monkeypatch):
                    _partial_preparation(), _field_ready_report())
 
     after = Config.load()
-    assert after.asr.model == DEFAULT, "the model selection was persisted"
-    assert after.setup.asr_model == DEFAULT
+    # The ASR step succeeded in this fixture, so the model is kept.
+    assert after.asr.model == NON_DEFAULT
+    assert after.setup.asr_model == NON_DEFAULT
+
+    # Nothing that would amount to a claim of readiness is saved.
     assert after.setup.language_pairs == ["es-en"], (
         "the failed language-pair selection was persisted")
+    assert after.setup.completed is False
+    assert after.operating_mode() is not OperatingMode.FIELD_OFFLINE
 
 
 def test_partial_preparation_does_not_switch_to_field_offline(qt_app, app,

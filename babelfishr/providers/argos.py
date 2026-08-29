@@ -57,6 +57,162 @@ def configure_package_dir(directory) -> bool:
     return True
 
 
+class PackageIndexUnavailable(EngineError):
+    """The upstream package index could not be retrieved or read.
+
+    Its own type because the answer is specific: this is not "no such language
+    pair", it is "we never got the catalogue", and the operator needs the
+    underlying cause - usually a certificate or connectivity failure - rather
+    than a list of packages that failed to install.
+    """
+
+
+#: Result of the one index refresh this process is allowed to attempt, so five
+#: requested language pairs produce one network attempt and one error rather
+#: than five identical failures. Either ("ok", path) or ("failed", exception).
+_INDEX_ATTEMPT: Optional[Tuple[str, Any]] = None
+
+
+def reset_package_index_state() -> None:
+    """Forget the cached outcome, so a later attempt really tries again.
+
+    Called when the operator asks for preparation again - having fixed their
+    network, say - and by tests.
+    """
+    global _INDEX_ATTEMPT
+    _INDEX_ATTEMPT = None
+
+
+def package_index_path() -> Optional[pathlib.Path]:
+    """Where argostranslate keeps the downloaded package index, if we can tell."""
+    try:
+        import argostranslate.settings as settings
+    except Exception:  # noqa: BLE001
+        return None
+    for attribute in ("local_package_index", "package_index_path",
+                      "downloaded_packages_index"):
+        value = getattr(settings, attribute, None)
+        if value:
+            return pathlib.Path(str(value))
+    directory = getattr(settings, "downloads_dir", None)
+    return pathlib.Path(str(directory)) / "index.json" if directory else None
+
+
+def _index_is_readable(path: Optional[pathlib.Path]) -> bool:
+    """True only when the index exists and parses as JSON.
+
+    An empty or truncated file - a download that died halfway - is worse than a
+    missing one, because upstream treats it as present and then fails obscurely
+    later.
+    """
+    if path is None or not path.is_file():
+        return False
+    try:
+        import json
+
+        return bool(json.loads(path.read_text(encoding="utf-8")))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("package index at %s is not readable: %s", path, exc)
+        return False
+
+
+def refresh_package_index(force: bool = False):
+    """One bounded attempt to fetch the package index. Never recurses.
+
+    argostranslate's ``get_available_packages()`` calls ``update_package_index()``
+    when the index file is missing, and that path can come straight back into
+    ``get_available_packages()``. With HTTPS failing, that loop ran until the
+    interpreter raised ``RecursionError: maximum recursion depth exceeded`` -
+    which buried the real error, a certificate verification failure, under
+    hundreds of identical log lines.
+
+    So: one update attempt, then check the file on disk ourselves, and only
+    call upstream once we know the index is actually there. If it is not, raise
+    :class:`PackageIndexUnavailable` carrying the original cause.
+    """
+    global _INDEX_ATTEMPT
+    if force:
+        _INDEX_ATTEMPT = None
+    if _INDEX_ATTEMPT is not None:
+        status, value = _INDEX_ATTEMPT
+        if status == "failed":
+            raise value
+        return value
+
+    try:
+        import argostranslate.package as package
+    except Exception as exc:  # noqa: BLE001
+        failure = PackageIndexUnavailable(
+            "argostranslate is not installed "
+            "(pip install 'babelfishr[translate]')")
+        failure.__cause__ = exc
+        _INDEX_ATTEMPT = ("failed", failure)
+        raise failure from exc
+
+    path = package_index_path()
+    original: Optional[BaseException] = None
+    try:
+        package.update_package_index()
+    except RecursionError as exc:  # pragma: no cover - upstream guard
+        original = exc
+        log.error("argostranslate recursed while refreshing its package index; "
+                  "treating the index as unavailable")
+    except Exception as exc:  # noqa: BLE001
+        original = exc
+        log.warning("could not refresh the Argos package index: %s", exc)
+
+    if not _index_is_readable(path):
+        failure = PackageIndexUnavailable(_index_failure_message(original, path))
+        if original is not None:
+            failure.__cause__ = original
+        _INDEX_ATTEMPT = ("failed", failure)
+        raise failure
+
+    _INDEX_ATTEMPT = ("ok", path)
+    return path
+
+
+def _index_failure_message(original: Optional[BaseException],
+                           path: Optional[pathlib.Path]) -> str:
+    """An error an operator can act on, with the real cause in it."""
+    from ..certificates import describe as describe_certificates
+
+    if original is None:
+        detail = (f"the index was not written to {path}"
+                  if path else "the index file was not written")
+        return ("Could not retrieve the Argos language package index: "
+                f"{detail}.")
+
+    name = type(original).__name__
+    lines = [f"Could not retrieve the Argos language package index: "
+             f"{name}: {original}"]
+    text = f"{name}: {original}".lower()
+    if "certificate" in text or "ssl" in text:
+        lines.append("")
+        lines.append(
+            "This is a certificate verification failure, not a missing "
+            "language pack. The application could not verify the identity of "
+            "the download server, so it refused to continue - it will never "
+            "disable verification to get past this.")
+        lines.append(describe_certificates())
+        lines.append(
+            "If you are on a network that inspects TLS traffic, set "
+            "SSL_CERT_FILE to your organisation's CA bundle and try again.")
+    return "\n".join(lines)
+
+
+def available_packages():
+    """Upstream packages, after a bounded index refresh.
+
+    The only supported way to reach ``get_available_packages()``: calling it
+    directly with no index on disk is what recursed.
+    """
+    refresh_package_index()
+    import argostranslate.package as package
+
+    return package.get_available_packages()
+
+
 def active_package_dir():
     """Where Argos is actually reading packages from, right now."""
     try:
@@ -225,9 +381,12 @@ class ArgosTranslateEngine(TranslationEngine):
             import argostranslate.package as package
         except Exception as exc:  # noqa: BLE001
             raise EngineUnavailable(self.unavailable_reason()) from exc
+        # Index first, bounded and cached. A failure here is about the
+        # catalogue, not about this pair, so it propagates unchanged: five
+        # requested pairs must not produce five identical certificate errors.
+        candidates = available_packages()
         try:
-            package.update_package_index()
-            for candidate in package.get_available_packages():
+            for candidate in candidates:
                 if candidate.from_code == source and candidate.to_code == target:
                     package.install_from_path(candidate.download())
                     self._checked_pairs.pop((source, target), None)

@@ -165,6 +165,27 @@ def test_the_workflow_exercises_coreaudio_in_the_built_bundle():
     assert "does NOT prove audio capture works" in independence
 
 
+def test_the_build_proves_https_works_from_inside_the_bundle():
+    """Mocked unit tests cannot show a bundle has a usable trust store."""
+    independence = (PACKAGING / "verify_independence.sh").read_text()
+    assert "--selftest-https" in independence
+    assert "certificate" in independence.lower()
+
+    source = (PACKAGING / "app_entry.py").read_text()
+    # A certificate failure must be fatal; an absent network must not be.
+    assert "SSLCertVerificationError" in source
+    assert "no network access from this environment" in source
+    assert "Certificate verification was NOT exercised" in source, (
+        "a skipped check must say it was skipped, not imply it passed")
+
+
+def test_the_https_selftest_never_disables_verification():
+    source = (PACKAGING / "app_entry.py").read_text()
+    for forbidden in ("_create_unverified_context", "CERT_NONE",
+                      "check_hostname = False", "verify=False"):
+        assert forbidden not in source
+
+
 def test_the_independence_check_scrubs_the_environment():
     """Otherwise it proves nothing: the build machine would satisfy imports."""
     body = (PACKAGING / "verify_independence.sh").read_text(encoding="utf-8")
@@ -174,7 +195,7 @@ def test_the_independence_check_scrubs_the_environment():
     assert "cd /" in body, "it must run from outside the repository"
     for flag in ("--version", "--help", "--selftest-import",
                  "--selftest-independence", "--selftest-gui",
-                 "--selftest-coreaudio"):
+                 "--selftest-coreaudio", "--selftest-https"):
         assert flag in body
 
 
@@ -202,9 +223,10 @@ def test_the_entry_point_supports_the_checks_the_scripts_run():
     names = {node.name for node in ast.walk(tree)
              if isinstance(node, ast.FunctionDef)}
     assert {"_selftest_independence", "_selftest_gui",
-            "_selftest_coreaudio"} <= names
+            "_selftest_coreaudio", "_selftest_https"} <= names
     for flag in ("--selftest-import", "--selftest-independence",
-                 "--selftest-gui", "--selftest-coreaudio"):
+                 "--selftest-gui", "--selftest-coreaudio",
+                 "--selftest-https"):
         assert flag in source
 
 

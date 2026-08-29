@@ -24,6 +24,23 @@ ICON = ROOT / "packaging" / "BabelFishR.icns"
 
 hidden = collect_submodules("babelfishr")
 datas = []
+
+# certifi's cacert.pem, explicitly. Without a CA bundle inside the bundle the
+# frozen app has no trust store at all - macOS keeps its roots in the Keychain,
+# not in a PEM file OpenSSL can read - and every HTTPS download fails with
+# "unable to get local issuer certificate". A real Mac proved that the hard
+# way. This is not left to an implicit hook.
+try:
+    import certifi
+
+    datas += [(certifi.where(), "certifi")]
+    hidden += ["certifi"]
+except Exception as exc:  # noqa: BLE001
+    raise SystemExit(
+        "certifi is required to build a working bundle: without its CA data "
+        "the packaged app cannot complete any HTTPS download. "
+        f"(pip install certifi)  [{exc}]")
+
 # Optional engines: include when installed, so a prepared machine can build a
 # self-contained app, but never fail the build when they are absent.
 for package in ("faster_whisper", "argostranslate", "ctranslate2"):

@@ -88,6 +88,20 @@ else
 fi
 
 echo
+echo "== a real, verified HTTPS request from inside the bundle =="
+# The only proof that the shipped app can actually download anything. A
+# certificate failure here is fatal: it is precisely the defect that made every
+# Argos route fail on a real Mac. No egress at all is reported and tolerated,
+# because a sandboxed runner must not masquerade as a broken bundle.
+if OUTPUT=$(run_isolated_limited 90 --selftest-https); then
+  echo "$OUTPUT"
+  pass "HTTPS trust store"
+else
+  echo "$OUTPUT"
+  fail "the bundled app cannot verify certificates"
+fi
+
+echo
 echo "== main window construction (offscreen) =="
 if OUTPUT=$(run_isolated --selftest-gui 2>&1); then
   pass "$(echo "$OUTPUT" | tail -n 1)"

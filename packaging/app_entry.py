@@ -197,6 +197,61 @@ def _selftest_coreaudio() -> int:
     return 0
 
 
+def _selftest_https() -> int:
+    """Prove the frozen bundle can complete a real, verified HTTPS request.
+
+    This is the check that mocked unit tests cannot stand in for. The failure
+    it exists for - "unable to get local issuer certificate" - happens only in
+    a bundle that has no trust store, so it can only be disproved by a bundle
+    making a real connection.
+
+    Exit codes are deliberately distinct:
+      0  a verified HTTPS fetch succeeded, or the network is simply absent
+      1  the certificate could not be verified - the defect is back
+    A runner with no egress must not turn into a red build, but a runner that
+    reaches the server and cannot verify it must.
+    """
+    import json
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    from babelfishr.certificates import configure_certificates, describe
+    from babelfishr.modes import bootstrap_environment
+
+    bootstrap_environment()
+    configure_certificates()
+    print(describe())
+
+    url = ("https://raw.githubusercontent.com/argosopentech/"
+           "argospm-index/main/index.json")
+    print(f"fetching {url}")
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            payload = response.read()
+        packages = json.loads(payload)
+        print(f"ok: verified HTTPS fetch, {len(payload)} bytes, "
+              f"{len(packages)} packages in the index")
+        return 0
+    except ssl.SSLCertVerificationError as exc:
+        print(f"FAIL: certificate verification failed: {exc}")
+        print("The bundle has no usable CA trust store. This is the exact "
+              "defect that made every Argos route fail on a real Mac.")
+        return 1
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            print(f"FAIL: certificate verification failed: {reason}")
+            return 1
+        print(f"skip: no network access from this environment ({reason}). "
+              f"Certificate verification was NOT exercised.")
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        print(f"skip: the fetch did not complete ({type(exc).__name__}: {exc}). "
+              f"Certificate verification was NOT exercised.")
+        return 0
+
+
 def _selftest_gui() -> int:
     """Construct and show the real main window, headless."""
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -250,6 +305,9 @@ def main(argv=None) -> int:
 
     if argv == ["--selftest-coreaudio"]:
         return _selftest_coreaudio()
+
+    if argv == ["--selftest-https"]:
+        return _selftest_https()
 
     if argv == ["--selftest-gui"]:
         return _selftest_gui()

@@ -1,4 +1,4 @@
-# Agent handoff — BabelFishR v0.3.0-alpha.2
+# Agent handoff — BabelFishR (post-alpha.2 repair pass)
 
 Written for the next agent or reviewer picking this up cold. It records what
 changed, what was verified and how, and — at least as importantly — what was
@@ -234,6 +234,125 @@ standalone, the disk image was produced and the prerelease was published.
 Do not judge a run's health by how long it feels like it has been going - read
 `created_at` against `updated_at` from the API. A healthy run on this pipeline
 is three to six minutes by that clock.
+
+## Repair pass: Argos HTTPS on a real Mac
+
+Reported from the frozen Apple Silicon app after alpha 2: Whisper Medium
+downloaded, loaded offline and passed its transcription smoke test, but every
+Argos route failed, `settings.toml` still said `small` with
+`setup_complete = false`, and the log's first real error was
+
+```
+SSLCertVerificationError: certificate verify failed:
+unable to get local issuer certificate
+```
+
+followed by repeated retries ending in
+`RecursionError: maximum recursion depth exceeded`.
+
+### Root cause
+
+**Two independent defects, one visible symptom.**
+
+1. **No trust store in the bundle.** A PyInstaller bundle carries its own
+   Python and its own OpenSSL but not the system's roots, and macOS keeps its
+   roots in the Keychain rather than in a PEM file OpenSSL can read. OpenSSL
+   fell back to a compiled-in default path that does not exist inside the
+   bundle, found no roots, and rejected every certificate — including valid
+   ones. That is the certificate error.
+2. **Unbounded recursion hid it.** argostranslate's
+   `get_available_packages()` calls `update_package_index()` when the index
+   file is missing, and that path comes back into `get_available_packages()`.
+   With HTTPS failing the index was never written, so the loop ran until the
+   interpreter gave up — burying the real cause under hundreds of identical
+   lines, once per requested language pair.
+
+`RecursionError` was the noise. The certificate failure was the fault.
+
+### Files changed
+
+| File | Change |
+|---|---|
+| `babelfishr/certificates.py` | **new** — resolves a CA bundle (certifi, or an administrator's existing `SSL_CERT_FILE`), sets `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE`, and binds `ssl._create_default_https_context` to it. Verification is never disabled. |
+| `babelfishr/modes.py` | `bootstrap_environment()` configures certificates before any library that opens a socket is imported. |
+| `babelfishr/providers/argos.py` | `refresh_package_index()` — one bounded attempt, then checks the index file exists and parses, and only then calls upstream. Result cached, so five pairs cause one attempt. New `PackageIndexUnavailable` carries the original exception. |
+| `babelfishr/preparation.py` | An index failure stops the language loop; remaining pairs are marked "not attempted" rather than repeating the error. `PreparationResult.asr_ok` / `succeeded()` / `failures()`. |
+| `babelfishr/ui/setup_assistant.py` | `_persist_partial_success()` keeps a verified model when translation fails; the model list preselects the configured model instead of always `small`. |
+| `babelfishr/ui/main_window.py` | Permanent **Copy Diagnostic Report** and **Reveal Logs in Finder** actions under Tools. |
+| `packaging/babelfishr.spec` | Ships `certifi`'s `cacert.pem` explicitly; the build **fails** if certifi is absent. |
+| `packaging/app_entry.py` | `--selftest-https` — a real verified HTTPS fetch from inside the bundle. |
+| `packaging/verify_independence.sh` | Runs it; a certificate failure is fatal, no egress is not. |
+| `pyproject.toml` | `certifi` declared in the `asr`, `translate` and `all` extras. |
+
+### What is persisted after a partial success
+
+Only the fact, never the claim. `asr_model` becomes `medium`;
+`setup.completed` stays `false`; `setup.language_pairs` is untouched; the
+operating mode is unchanged, so **Field Offline remains unreachable** while
+translation is unavailable. Readiness reports record=yes, transcribe=yes,
+translate=no. Reopening setup preselects `medium`.
+
+One pre-existing test, `test_partial_preparation_persists_nothing`, asserted
+the opposite and was rewritten as
+`test_partial_preparation_persists_the_model_but_not_the_claim`. That was a
+deliberate behaviour change, not a test bent to fit: the old rule cost an
+operator a working 1.5 GB download.
+
+### Tests and results
+
+New: `tests/test_argos_index_failure.py` (8), `tests/test_partial_preparation.py`
+(8), `tests/test_certificates.py` (8), plus 4 diagnostic-action tests in
+`tests/test_input_panel.py` and 2 pipeline tests in
+`tests/test_release_pipeline.py`.
+
+```
+Focused    (argos index + partial preparation + certificates + pipeline):  55 passed
+Full suite:                                        570 passed, 9 skipped, 0 failed
+```
+
+Skip reasons are unchanged and listed under *Tests* below.
+
+**Not vacuous:** restoring the pre-fix behaviour — dropping the index-presence
+check and calling `get_available_packages()` directly — fails
+`test_a_failed_index_refresh_terminates_without_recursion` and
+`test_available_packages_never_asks_upstream_without_an_index`, with the
+original `SSLCertVerificationError` escaping.
+
+### Frozen macOS verification — what was and was not proven
+
+**Proven here (Linux dev host):** `--selftest-https` performed a *real* HTTPS
+fetch of the actual Argos package index
+(`raw.githubusercontent.com/argosopentech/argospm-index`), verified the
+certificate against the configured CA bundle, and read 34,612 bytes / 100
+packages. The certificate mechanism works end to end and is not a mock.
+
+**Proven by CI (macOS arm64), if the run is green:** that the *frozen bundle*
+contains certifi's CA data and can complete the same verified fetch, because
+`verify_independence.sh` runs `--selftest-https` against the built app and a
+certificate failure fails the build.
+
+**NOT proven anywhere:** that this fixes it on *the operator's* Mac. The
+reported failure was on their machine, on their network. A hosted runner has
+different egress and may not exercise the same path. If their network inspects
+TLS, certifi's roots will not be enough and `SSL_CERT_FILE` must point at their
+organisation's bundle — the error message now says so.
+
+**Also note:** if CI has no egress, `--selftest-https` prints
+`Certificate verification was NOT exercised` and exits 0. A green build is
+therefore not by itself proof the fetch happened; read the line.
+
+### Remaining real-Mac validation needed
+
+1. Install the next build, run first-run preparation, and confirm the Argos
+   packages actually download.
+2. If they still fail, confirm the error is now a single actionable line naming
+   the real cause — no `RecursionError`, no hundreds of duplicates.
+3. Confirm `settings.toml` keeps `asr_model = "medium"` and
+   `setup_complete = false` across a restart.
+4. Confirm reopening setup offers Medium, not Small.
+5. Confirm Tools ▸ Copy Diagnostic Report and Reveal Logs in Finder work after
+   the setup assistant has been closed.
+6. Everything in `docs/MACOS_VALIDATION.md` §3a remains outstanding.
 
 ## The confirmed failure and its exact correction
 
