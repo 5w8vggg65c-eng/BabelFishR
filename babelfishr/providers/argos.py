@@ -12,6 +12,8 @@ and preferred renderings are substituted in the output.
 from __future__ import annotations
 
 import logging
+import os
+import pathlib
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .base import (EngineError, EngineUnavailable, PrivacyProfile,
@@ -19,6 +21,51 @@ from .base import (EngineError, EngineUnavailable, PrivacyProfile,
 from .glossary import protect_terms, restore_terms
 
 log = logging.getLogger(__name__)
+
+#: Argos reads this at *import* time (argostranslate.settings resolves
+#: package_data_dir once), so it has to be set before anything imports the
+#: library. Every entry point - GUI, CLI and preparation - calls
+#: configure_package_dir() before touching Argos.
+PACKAGES_DIR_ENV = "ARGOS_PACKAGES_DIR"
+
+
+def configure_package_dir(directory) -> bool:
+    """Point Argos at the managed language-pack directory.
+
+    Returns True if the setting will take effect. Returns False - and warns -
+    if argostranslate was already imported, because by then it has resolved its
+    package directory and this call would silently do nothing.
+    """
+    import sys
+
+    target = pathlib.Path(directory).expanduser()
+    target.mkdir(parents=True, exist_ok=True)
+    current = os.environ.get(PACKAGES_DIR_ENV)
+    os.environ[PACKAGES_DIR_ENV] = str(target)
+
+    if "argostranslate.settings" in sys.modules:
+        already = getattr(sys.modules["argostranslate.settings"],
+                          "package_data_dir", None)
+        if already is not None and pathlib.Path(already) != target:
+            log.warning(
+                "argostranslate was imported before %s was set; it is using %s "
+                "and will ignore %s until the process restarts",
+                PACKAGES_DIR_ENV, already, target)
+            return False
+    if current and current != str(target):
+        log.info("%s changed from %s to %s", PACKAGES_DIR_ENV, current, target)
+    return True
+
+
+def active_package_dir():
+    """Where Argos is actually reading packages from, right now."""
+    try:
+        from argostranslate import settings
+
+        return pathlib.Path(settings.package_data_dir)
+    except Exception:  # noqa: BLE001
+        value = os.environ.get(PACKAGES_DIR_ENV)
+        return pathlib.Path(value) if value else None
 
 #: Short phrases used to prove a translation path really runs.
 _SMOKE_PHRASES = {
@@ -44,6 +91,9 @@ class ArgosTranslateEngine(TranslationEngine):
                  target_language: Optional[str] = None,
                  package_dir: Optional[str] = None):
         self.auto_install = auto_install
+        if package_dir:
+            # Applied before any Argos import so it actually takes effect.
+            configure_package_dir(package_dir)
         #: The session's target language, so availability can mean "can
         #: actually translate into the language the operator asked for".
         self.target_language = target_language
@@ -81,13 +131,16 @@ class ArgosTranslateEngine(TranslationEngine):
             return ("Argos Translate is not installed. Install the translate "
                     "extra:\n    pip install 'babelfishr[translate]'")
         pairs = self.installed_pairs()
+        location = active_package_dir()
         if not pairs:
-            return ("Argos Translate is installed but no language packages are. "
-                    "Install one with a network connection:\n"
-                    "    babelfishr languages install es en")
-        return (f"No installed Argos package translates into "
-                f"{self.target_language!r}. Installed paths: "
-                f"{', '.join(f'{a}->{b}' for a, b in sorted(pairs))}\n"
+            return (f"Argos Translate is installed but no language packages are. "
+                    f"Looking in: {location}\n"
+                    f"Install one with a network connection:\n"
+                    f"    babelfishr languages install es en")
+        return (f"No installed Argos route translates into "
+                f"{self.target_language!r}. Usable routes: "
+                f"{', '.join(f'{a}->{b}' for a, b in pairs)}\n"
+                f"Looking in: {location}\n"
                 f"    babelfishr languages install <source> "
                 f"{self.target_language}")
 
@@ -95,7 +148,10 @@ class ArgosTranslateEngine(TranslationEngine):
         """Structured view for Field Check."""
         return {
             "library_installed": self.library_installed(),
-            "pairs": sorted(self.installed_pairs()),
+            "package_dir": str(active_package_dir() or ""),
+            "pairs": self.installed_pairs(),
+            "direct": self.direct_pairs(),
+            "pivot": self.pivot_pairs(),
             "target_language": self.target_language,
             "available": self.available(),
             "reason": self.unavailable_reason(),
@@ -107,16 +163,51 @@ class ArgosTranslateEngine(TranslationEngine):
                               source_language=source)
 
     # -- pair management -------------------------------------------------
-    def installed_pairs(self) -> List[Tuple[str, str]]:
+    def routes(self) -> List[Tuple[str, str, str]]:
+        """Usable routes as ``(from, to, kind)`` from Argos's own graph.
+
+        Argos composes *pivot* routes at load time (es->en plus en->de yields a
+        CompositeTranslation for es->de), so asking the resolved graph reports
+        what can genuinely be translated. Assuming one package equals one route
+        would understate what is available offline.
+
+        Identity translations (a language to itself) are excluded: Argos adds
+        them to the graph, but "en->en is installed" is not a translation
+        capability.
+        """
+        if self.package_dir:
+            configure_package_dir(self.package_dir)
         try:
             import argostranslate.translate as translate
         except Exception:  # noqa: BLE001
             return []
-        pairs: List[Tuple[str, str]] = []
-        for language in translate.get_installed_languages():
-            for target in getattr(language, "translations_from", []):
-                pairs.append((language.code, target.to_lang.code))
-        return pairs
+        try:
+            languages = translate.get_installed_languages()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("could not enumerate Argos languages: %s", exc)
+            return []
+
+        out: List[Tuple[str, str, str]] = []
+        for language in languages:
+            for translation in getattr(language, "translations_from", []):
+                target = getattr(getattr(translation, "to_lang", None), "code", None)
+                if not target or target == language.code:
+                    continue  # identity translation
+                kind = ("pivot"
+                        if type(translation).__name__ == "CompositeTranslation"
+                        else "direct")
+                out.append((language.code, target, kind))
+        return sorted(set(out))
+
+    def installed_pairs(self) -> List[Tuple[str, str]]:
+        """Every usable ``(from, to)`` route, direct or pivoted."""
+        return sorted({(a, b) for a, b, _ in self.routes()})
+
+    def direct_pairs(self) -> List[Tuple[str, str]]:
+        return sorted({(a, b) for a, b, kind in self.routes() if kind == "direct"})
+
+    def pivot_pairs(self) -> List[Tuple[str, str]]:
+        return sorted({(a, b) for a, b, kind in self.routes() if kind == "pivot"})
 
     def supports_pair(self, source: Optional[str], target: str) -> bool:
         if source is None:

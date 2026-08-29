@@ -331,20 +331,25 @@ def cmd_languages(args) -> int:
     action = args.action or "list"
 
     if action == "list":
-        installed = installed_languages()
+        installed = installed_languages(config)
         if not installed:
             print("No translation language packs are installed.")
             print("Install one with a network connection:")
             print("    babelfishr languages install es en")
             return 1
-        print(f"{len(installed)} installed language pack(s):\n")
-        for source, target in installed:
-            print(f"  {source} -> {target}")
+        from .preparation import installed_routes
+        from .providers.argos import active_package_dir
+
+        print(f"Packages directory: {active_package_dir()}")
+        print(f"\n{len(installed)} usable translation route(s):\n")
+        for source, target, kind in installed_routes(config):
+            suffix = "" if kind == "direct" else "  (via pivot)"
+            print(f"  {source} -> {target}{suffix}")
         target = config.translate.target_language
-        routes = translation_paths(target)
+        routes = translation_paths(target, config)
         print(f"\nInto your target language ({target}):")
         print(f"  direct   : {', '.join(routes['direct']) or 'none'}")
-        print(f"  via en   : {', '.join(routes['pivot_via_en']) or 'none'}")
+        print(f"  via pivot: {', '.join(routes['pivot']) or 'none'}")
         if args.available:
             print("\nAvailable to install (needs the network):")
             try:
@@ -875,6 +880,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     _configure_logging(args.log_level)
+    # Must happen before any provider import: Argos resolves its package
+    # directory at import time.
+    from .modes import bootstrap_environment
+
+    bootstrap_environment()
     try:
         return int(args.func(args) or 0)
     except KeyboardInterrupt:

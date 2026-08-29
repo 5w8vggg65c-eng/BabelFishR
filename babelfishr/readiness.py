@@ -313,8 +313,12 @@ def _check_translation(config, report: ReadinessReport,
                        run_smoke_tests: bool) -> None:
     from .providers.argos import ArgosTranslateEngine
 
+    from .modes import bootstrap_environment
+
+    bootstrap_environment(config)
     target = config.translate.target_language
-    engine = ArgosTranslateEngine(target_language=target)
+    engine = ArgosTranslateEngine(target_language=target,
+                                  package_dir=str(config.paths().language_packs))
 
     if not engine.library_installed():
         report.add(Check("Installed translation paths", CheckStatus.FAIL,
@@ -343,9 +347,13 @@ def _check_translation(config, report: ReadinessReport,
                          f"nothing translates into {target}"))
         return
 
+    direct = {(a, b) for a, b in engine.direct_pairs()}
+    described = ", ".join(
+        f"{a}->{b}" + ("" if (a, b) in direct else " (via pivot)")
+        for a, b in usable)
     report.add(Check(
-        "Installed translation paths", CheckStatus.PASS,
-        ", ".join(f"{a}->{b}" for a, b in usable), data={"pairs": pairs}))
+        "Installed translation paths", CheckStatus.PASS, described,
+        data=engine.readiness()))
 
     if not run_smoke_tests:
         report.add(Check("Local translation smoke test", CheckStatus.SKIP,

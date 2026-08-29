@@ -96,13 +96,16 @@ def _transcription_factories(config=None, mode=None
 
 def _translation_factories(config=None, mode=None
                            ) -> Dict[str, Callable[[], TranslationEngine]]:
+    from ..modes import AppPaths
     from .argos import ArgosTranslateEngine
     from .claude import ClaudeTranslationEngine
 
     translate = getattr(config, "translate", None)
     return {
         "argos": lambda: ArgosTranslateEngine(
-            target_language=getattr(translate, "target_language", None)),
+            target_language=getattr(translate, "target_language", None),
+            package_dir=str(AppPaths.resolve(
+                getattr(config, "app_home", None)).language_packs)),
         "claude": lambda: ClaudeTranslationEngine(
             model=getattr(translate, "model", None) or None),
         "mock": MockTranslationEngine,

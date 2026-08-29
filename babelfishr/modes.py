@@ -150,6 +150,21 @@ class AppPaths:
         return {k: str(v) for k, v in dataclasses.asdict(self).items()}
 
 
+def bootstrap_environment(config=None) -> Dict[str, str]:
+    """Prepare process-wide state that must be set before libraries import.
+
+    Argos resolves its package directory once, at import time, so the managed
+    location has to be in the environment before anything touches it. Every
+    entry point - GUI, CLI, preparation and the packaged app - calls this
+    first.
+    """
+    paths = (config.paths() if config is not None else AppPaths.resolve()).ensure()
+    applied = {"ARGOS_PACKAGES_DIR": str(paths.language_packs)}
+    os.environ.setdefault("ARGOS_PACKAGES_DIR", str(paths.language_packs))
+    os.environ["ARGOS_PACKAGES_DIR"] = str(paths.language_packs)
+    return applied
+
+
 def guard_download(mode: OperatingMode, what: str) -> None:
     """Refuse a download unless the mode permits one."""
     if not mode.allows_downloads:

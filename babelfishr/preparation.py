@@ -62,6 +62,10 @@ def prepare_field(config, *, asr_model: Optional[str] = None,
     say = report or (lambda text: None)
     result = PreparationResult()
     paths = config.paths().ensure()
+    # Argos must see the managed directory before it is imported anywhere.
+    from .modes import bootstrap_environment
+
+    bootstrap_environment(config)
     model_name = asr_model or config.asr.model
 
     say(f"Preparing field assets in {paths.root}")
@@ -217,10 +221,21 @@ def _prepare_language(source: str, target: str, say: Reporter,
 
 
 # ---- language pack management ----------------------------------------
-def installed_languages() -> List[Tuple[str, str]]:
+def installed_languages(config=None) -> List[Tuple[str, str]]:
+    from .modes import bootstrap_environment
     from .providers.argos import ArgosTranslateEngine
 
-    return sorted(ArgosTranslateEngine().installed_pairs())
+    bootstrap_environment(config)
+    return ArgosTranslateEngine().installed_pairs()
+
+
+def installed_routes(config=None) -> List[Tuple[str, str, str]]:
+    """Usable routes with their kind (direct or pivot)."""
+    from .modes import bootstrap_environment
+    from .providers.argos import ArgosTranslateEngine
+
+    bootstrap_environment(config)
+    return ArgosTranslateEngine().routes()
 
 
 def available_languages() -> List[Tuple[str, str]]:
@@ -254,18 +269,15 @@ def remove_language(source: str, target: str) -> bool:
     return False
 
 
-def translation_paths(target: str) -> Dict[str, List[str]]:
-    """Direct and pivot routes into *target*, so the UI can be specific.
+def translation_paths(target: str, config=None) -> Dict[str, List[str]]:
+    """Sources that can reach *target*, split by how Argos gets there.
 
-    Argos can translate via English, so a Spanish->German path may exist even
-    with no direct package. Reporting only direct pairs would understate what
-    is actually available offline.
+    Taken from Argos's resolved translation graph rather than inferred from the
+    package list, so composite routes (es->en->de) are reported as the usable
+    routes they actually are.
     """
-    pairs = installed_languages()
-    direct = sorted({a for a, b in pairs if b == target})
-    into_pivot = {a for a, b in pairs if b == "en"}
-    pivot_out = {b for a, b in pairs if a == "en"}
-    pivot: List[str] = []
-    if target in pivot_out or target == "en":
-        pivot = sorted(into_pivot - set(direct) - {target})
-    return {"direct": direct, "pivot_via_en": pivot}
+    routes = installed_routes(config)
+    direct = sorted({a for a, b, kind in routes if b == target and kind == "direct"})
+    pivot = sorted({a for a, b, kind in routes if b == target and kind == "pivot"})
+    return {"direct": direct, "pivot": pivot,
+            "all": sorted(set(direct) | set(pivot))}
