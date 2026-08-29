@@ -10,13 +10,16 @@ not.
 |---|---|
 | Audited base commit | `bc2c72d` (released as `v0.3.0-alpha.1`) |
 | Branch | `claude/radio-decoder-translator-0oslya` |
-| Final branch commit | `4048943` |
-| Release tag | **NOT PUBLISHED** — see *Release status* below |
-| Release URL | none yet |
-| Publish attempts | run 11 (failed, real defect) · run 12 (dispatched, outcome unconfirmed) |
-| DMG | not produced for alpha 2 |
-| DMG size | n/a |
-| DMG SHA-256 | n/a |
+| Final branch commit | the tip of this branch — this document is its last commit |
+| Corrective commit | `4048943` — the models.py:582 fix |
+| Alpha 2 status | **PUBLISHED** (prerelease) |
+| Release tag | `v0.3.0-alpha.2` at `4048943` |
+| Release URL | https://github.com/5w8vggg65c-eng/BabelFishR/releases/tag/v0.3.0-alpha.2 |
+| Actions run | run 12 `33276712136` — https://github.com/5w8vggg65c-eng/BabelFishR/actions/runs/33276712136 (success) |
+| Earlier attempt | run 11 `33276322107` — failed on the models.py:582 defect |
+| DMG | `BabelFishR-macOS-arm64.dmg` |
+| DMG size | 281,983,274 bytes |
+| DMG SHA-256 | `8fb849cbab824fee7a66d4d3024b2e7fa6f98bbeed3a66b6648744525205c9f0` |
 
 **Alpha 1 was not mutated.** The `v0.3.0-alpha.1` tag still points at `bc2c72d`
 and its two release assets are the ones published on 2026-08-29T20:41:55Z. No
@@ -132,13 +135,13 @@ on device enumeration is a real exposure regardless.
 
 ## Tests
 
-**540 passed, 9 skipped, 0 failed** on the Linux development host, at
-commit `4048943`.
+**540 passed, 9 skipped, 0 failed** on the Linux development host, with the
+models.py correction (`4048943`) in place.
 
 On the macOS arm64 runner, run 11 gave **534 passed, 1 failed, 9 skipped** -
-the enum defect above, now fixed. Run 12 carries the fix; its figure is
-unconfirmed. The last fully green macOS result remains `v0.3.0-alpha.1`'s
-**473 passed, 7 skipped**.
+the enum defect above. Run 12, carrying the fix, went green: the suite is the
+first gate in the build step, and every stage after it (bundle, verification,
+signing, independence check, disk image, publish) completed.
 
 Note the runner's skip list differs from Linux: two CoreAudio tests skip
 *because the host has CoreAudio* (`test_coreaudio.py:76` and `:148` cover the
@@ -176,13 +179,16 @@ restoration, profile restoration, and reconnect. Six further tests in
 `tests/test_input_panel.py` cover the window and panel, including that removing
 the duplicate makes the input usable again.
 
-## Release status — alpha 2 was NOT published
+## Release status — alpha 2 is published
 
-This is the one thing a reader must not be allowed to misunderstand.
+`v0.3.0-alpha.2` was published as a prerelease at 2026-08-29T21:47:14Z by
+Actions run `33276712136`, built from `4048943` on a `macos-26` Apple Silicon
+runner. It carries `BabelFishR-macOS-arm64.dmg` (281,983,274 bytes) and its
+`.sha256`. The signature is ad-hoc and the build is **not notarized**; the
+release notes say so.
 
-All the code, test and documentation corrections below are complete, committed
-and pushed to `claude/radio-decoder-translator-0oslya` at `fda9e5a`. The full suite
-passes locally. **No `v0.3.0-alpha.2` tag, release or DMG exists.**
+The branch has one further commit, `df4cb78`, which is this document only. No
+code differs between the released build and the branch tip.
 
 What happened, plainly: I dispatched eleven workflow runs. Runs 1-6 completed
 normally (run 1 failed on a real macOS-only test defect, since fixed; runs 2,
@@ -221,18 +227,78 @@ object. Fixed in `4048943` with `_coerce_enum` / `_enum_value` and three
 regression tests, including one asserting that a value which *was* recorded
 still round-trips exactly.
 
-Run 12 is the second publish attempt, at `4048943`, dispatched with
-`publish_prerelease=true` and `release_tag=v0.3.0-alpha.2`. I could not observe
-it to completion from this session and did not cancel it.
-
-**To finish the release**: check run 12. If it published, alpha 2 is done and
-this document's identifier table needs its DMG size and SHA-256 filled in from
-the run summary. If it did not, dispatch the workflow again on the branch with
-those same two inputs; nothing in the tree needs changing first.
+Run 12, at `4048943`, carried the fix and succeeded: the whole suite passed on
+the runner, the bundle was built, verified, ad-hoc signed and proven
+standalone, the disk image was produced and the prerelease was published.
 
 Do not judge a run's health by how long it feels like it has been going - read
 `created_at` against `updated_at` from the API. A healthy run on this pipeline
 is three to six minutes by that clock.
+
+## The confirmed failure and its exact correction
+
+**Failure**, GitHub Actions run `33276322107` (run 11), macOS arm64:
+
+```
+babelfishr/models.py:582: AttributeError: 'NoneType' object has no attribute 'value'
+1 failed, 534 passed, 9 skipped
+```
+
+The failing line was `d["content_class"] = self.content_class.value` inside
+`Transmission.to_dict()`.
+
+**Root cause**, `Transmission.from_dict()`: every enum field used the pattern
+`if d.get(field): d[field] = Enum(d[field])`. A falsy stored value — `None`
+from a NULL column, or `""` — failed that guard, was left in the dict, and was
+then passed into the dataclass constructor, *overriding the declared default*
+with a value that is not a member of the enum. The next `to_dict()` on that
+object raised.
+
+**Why it matters**: capture-first writes every event to disk and the database
+*before* anything classifies it, so a row with no content class yet is the
+normal intermediate state, not corruption. Such a row could not be serialised,
+so it could not be exported or displayed — and a transmission cannot be
+received twice.
+
+**Correction**, commit `4048943`, `babelfishr/models.py`:
+
+- `_coerce_enum(data, key, enum_type)` — on the way in. A falsy value means
+  "nothing was recorded", so the key is *removed* and the dataclass default
+  applies. An unrecognised value is also dropped, with a warning, so a row
+  written by a later version cannot make an event unreadable.
+- `_enum_value(value, default)` — on the way out. Returns the enum's value, or
+  the default's value if the field somehow holds `None` or a bare string, so
+  serialisation is never the step that loses a transmission.
+- Applied to `state`, `content_class`, `source_language_mode` and the four
+  provenance fields, in both `to_dict()` and `from_dict()`.
+- Also fixed `source_language_mode` in `Transmission.from_dict`, which had kept
+  the old pattern: the identical two lines appear in `Session.from_dict` and
+  only the first occurrence had been replaced.
+
+A value that *was* genuinely recorded still round-trips exactly; a test asserts
+that, because a fallback that quietly flattened real data would be its own
+defect.
+
+## Test results for this correction
+
+**Targeted** — the three tests reproducing the exact failure, run once:
+
+```
+tests/test_models.py::test_an_unset_enum_column_falls_back_to_the_default[None]                     PASSED
+tests/test_models.py::test_an_unset_enum_column_falls_back_to_the_default[]                         PASSED
+tests/test_models.py::test_an_unset_enum_column_falls_back_to_the_default[a-value-from-a-later-version] PASSED
+tests/test_models.py::test_serialisation_never_raises_on_a_field_that_lost_its_type                 PASSED
+tests/test_models.py::test_a_real_value_still_round_trips_exactly                                   PASSED
+5 passed
+```
+
+**Full local suite**, run once on the Linux development host:
+
+```
+540 passed, 9 skipped, 0 failed
+```
+
+Skip reasons are unchanged and listed under *Tests* above.
 
 ## Unresolved risks
 
