@@ -110,29 +110,41 @@ def _prepare_asr(config, paths: AppPaths, model_name: str, say: Reporter,
 
     from .providers.whisper_local import FasterWhisperEngine
 
+    from .providers.whisper_local import (ModelState, inspect_model_directory,
+                                          model_directory_for, prepare_model)
+
+    directory = model_directory_for(paths.models, model_name)
+    state, missing = inspect_model_directory(directory)
+
     if skip_download:
-        engine = FasterWhisperEngine(model=model_name,
-                                     download_root=str(paths.models),
-                                     local_files_only=True)
-        if not engine.model_present():
+        if state is not ModelState.COMPLETE:
             return ("Local ASR model", False,
-                    f"not present at {engine.model_directory()} and downloads "
-                    f"were skipped")
+                    f"{state.value} at {directory} (missing: "
+                    f"{', '.join(missing)}) and downloads were skipped")
     else:
-        say(f"Downloading Whisper model {model_name!r} into {paths.models} "
+        if state is ModelState.INCOMPLETE:
+            # Repair rather than delete: download_model re-fetches only what is
+            # missing, so an interrupted download costs the gap, not the whole
+            # model, and a complete model is never destroyed by a re-run.
+            say(f"Model at {directory} is incomplete (missing: "
+                f"{', '.join(missing)}); repairing...")
+        say(f"Preparing Whisper model {model_name!r} into {directory} "
             f"(this is the step that needs the network)...")
-        engine = FasterWhisperEngine(
-            model=model_name, download_root=str(paths.models),
-            local_files_only=False)
         try:
-            engine.warm_up()
+            resolved = prepare_model(model_name, paths.models)
         except Exception as exc:  # noqa: BLE001
             return ("Local ASR model", False, f"could not prepare: {exc}")
+        state, missing = inspect_model_directory(resolved)
+        if state is not ModelState.COMPLETE:
+            return ("Local ASR model", False,
+                    f"download finished but the directory is {state.value} "
+                    f"(missing: {', '.join(missing)})")
 
-    # Re-open exactly as the field would: local files only, no network.
+    # Re-open exactly as the field would: from the resolved directory, local
+    # files only, no network.
     say("Verifying the model loads with downloads disabled...")
     offline = FasterWhisperEngine(model=model_name,
-                                  download_root=str(paths.models),
+                                  models_root=str(paths.models),
                                   local_files_only=True)
     try:
         started = time.monotonic()

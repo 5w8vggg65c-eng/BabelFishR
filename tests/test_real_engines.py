@@ -26,7 +26,7 @@ def _whisper_engine(model: str = "small"):
     from babelfishr.providers.whisper_local import FasterWhisperEngine
 
     paths = AppPaths.resolve()
-    engine = FasterWhisperEngine(model=model, download_root=str(paths.models),
+    engine = FasterWhisperEngine(model=model, models_root=str(paths.models),
                                  local_files_only=True)
     if not engine.available():
         pytest.skip(f"no prepared Whisper model at {engine.model_directory()}; "

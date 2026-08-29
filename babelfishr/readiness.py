@@ -240,7 +240,7 @@ def _check_transcription(config, report: ReadinessReport,
     engine = FasterWhisperEngine(
         model=config.asr.model, device=config.asr.device,
         compute_type=config.asr.compute_type,
-        download_root=str(paths.models),
+        models_root=str(paths.models),
         model_path=getattr(config.asr, "model_path", None) or None,
         local_files_only=True)
 
@@ -253,14 +253,22 @@ def _check_transcription(config, report: ReadinessReport,
         return
 
     if not engine.model_present():
+        from .providers.whisper_local import ModelState
+
+        state, missing = engine.model_state()
+        detail = (f"incomplete at {engine.model_directory()} "
+                  f"(missing: {', '.join(missing)})"
+                  if state is ModelState.INCOMPLETE
+                  else f"no model at {engine.model_directory()}")
         report.add(Check(
-            "Local ASR model present", CheckStatus.FAIL,
-            f"no model at {engine.model_directory()}",
-            remedy=f"babelfishr prepare-field --asr-model {config.asr.model}"))
+            "Local ASR model present", CheckStatus.FAIL, detail,
+            remedy=f"babelfishr prepare-field --asr-model {config.asr.model}",
+            data={"state": state.value, "missing": missing,
+                  "path": str(engine.model_directory())}))
         report.add(Check("Local ASR model loadable", CheckStatus.SKIP,
-                         "no model to load"))
+                         "no complete model to load"))
         report.add(Check("Local transcription smoke test", CheckStatus.SKIP,
-                         "no model to test"))
+                         "no complete model to test"))
         return
 
     directory = engine.model_directory()

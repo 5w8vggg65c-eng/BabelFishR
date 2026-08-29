@@ -85,7 +85,7 @@ def _transcription_factories(config=None, mode=None
             device=getattr(asr, "device", "auto"),
             compute_type=getattr(asr, "compute_type", "default"),
             beam_size=getattr(asr, "beam_size", 5),
-            download_root=str(paths.models),
+            models_root=str(paths.models),
             model_path=getattr(asr, "model_path", None) or None,
             # Downloads only ever happen in preparation mode.
             local_files_only=not mode.allows_downloads,

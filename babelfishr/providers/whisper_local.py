@@ -4,6 +4,17 @@ This is the recommended path on Apple silicon: the model runs on the machine,
 nothing is uploaded, and an M-series Mac with 24 GB comfortably runs the
 ``small`` or ``medium`` model in better than real time for short transmissions.
 
+Model layout
+------------
+Models are prepared into ``<AppPaths.models>/<model-name>/`` with
+``faster_whisper.utils.download_model(name, output_dir=...)``, and loaded by
+passing that directory to ``WhisperModel``.  This matters: passing
+``download_root`` instead makes faster-whisper treat the path as a *Hugging
+Face cache*, which uses a ``models--org--repo/snapshots/<sha>/`` layout - so a
+presence check for ``<models>/<name>/model.bin`` would never find anything a
+download had actually written, and field loading would depend on the HF cache
+still existing. The explicit directory removes both problems.
+
 Radio audio is not podcast audio.  Transmissions are short, band-limited,
 often clipped, and frequently in a language the operator does not speak, so
 this wrapper leans on Whisper's own language detection, keeps the ASR-side VAD
@@ -14,6 +25,7 @@ vocabulary in as an initial prompt.
 from __future__ import annotations
 
 import logging
+import enum
 import pathlib
 from typing import Any, List, Optional, Sequence
 
@@ -31,6 +43,66 @@ TARGET_RATE = 16_000
 
 MODEL_SIZES = ("tiny", "base", "small", "medium", "large-v3", "large-v3-turbo")
 
+#: Assets faster-whisper's own download_model fetches. ``model.bin`` and
+#: ``config.json`` are mandatory; a model also needs one tokenizer asset, which
+#: is ``tokenizer.json`` on newer conversions and ``vocabulary.*`` on older
+#: ones, so either satisfies the check.
+REQUIRED_ASSETS = ("model.bin", "config.json")
+TOKENIZER_ASSETS = ("tokenizer.json", "vocabulary.json", "vocabulary.txt")
+
+
+class ModelState(str, enum.Enum):
+    """What a prepared model directory actually contains."""
+
+    MISSING = "missing"
+    INCOMPLETE = "incomplete"
+    """The directory exists but assets are absent - an interrupted download."""
+
+    COMPLETE = "complete"
+
+
+def model_directory_for(models_root, model_name: str) -> pathlib.Path:
+    """The single authoritative location for a prepared model.
+
+    Everything - preparation, the manifest, presence checks, Field Check, the
+    engine factory and the real-model tests - resolves through this one
+    function, so they cannot disagree about where a model lives.
+    """
+    return pathlib.Path(models_root).expanduser() / str(model_name)
+
+
+def inspect_model_directory(directory) -> tuple:
+    """Return ``(ModelState, missing_assets)`` for a model directory."""
+    path = pathlib.Path(directory)
+    if not path.is_dir():
+        return (ModelState.MISSING, list(REQUIRED_ASSETS))
+    missing = [name for name in REQUIRED_ASSETS if not (path / name).exists()]
+    if not any((path / name).exists() for name in TOKENIZER_ASSETS):
+        missing.append("tokenizer.json or vocabulary.*")
+    if missing:
+        # An empty or half-written directory is worse than none: it looks
+        # prepared. Report it as incomplete so it can be repaired.
+        return (ModelState.INCOMPLETE if any(path.iterdir()) else ModelState.MISSING,
+                missing)
+    return (ModelState.COMPLETE, [])
+
+
+def prepare_model(model_name: str, models_root, local_files_only: bool = False
+                  ) -> pathlib.Path:
+    """Download (or verify) a model into its own directory. Returns the path.
+
+    Uses faster-whisper's supported preparation entry point with an explicit
+    ``output_dir``, so the result is a plain directory we own rather than an
+    entry in a shared cache.
+    """
+    from faster_whisper.utils import download_model
+
+    target = model_directory_for(models_root, model_name)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    resolved = download_model(model_name, output_dir=str(target),
+                              local_files_only=local_files_only)
+    return pathlib.Path(resolved)
+
 
 class FasterWhisperEngine(TranscriptionEngine):
     """faster-whisper wrapper. Loads the model lazily on first use."""
@@ -42,7 +114,7 @@ class FasterWhisperEngine(TranscriptionEngine):
 
     def __init__(self, model: str = "small", device: str = "auto",
                  compute_type: str = "default", beam_size: int = 5,
-                 download_root: Optional[str] = None,
+                 models_root: Optional[str] = None,
                  condition_on_previous_text: bool = False,
                  local_files_only: bool = True,
                  model_path: Optional[str] = None):
@@ -50,7 +122,7 @@ class FasterWhisperEngine(TranscriptionEngine):
         self.device = device
         self.compute_type = compute_type
         self.beam_size = beam_size
-        self.download_root = download_root
+        self.models_root = models_root
         self.condition_on_previous_text = condition_on_previous_text
         #: Default True: in the field a silent 1.5 GB download attempt is a
         #: failure, not a feature. Preparation mode sets this False on purpose.
@@ -73,23 +145,34 @@ class FasterWhisperEngine(TranscriptionEngine):
         """The local directory this engine would load, if one is configured."""
         if self.model_path:
             return pathlib.Path(self.model_path).expanduser()
-        if self.download_root:
-            return pathlib.Path(self.download_root).expanduser() / self.model_size
+        if self.models_root:
+            return model_directory_for(self.models_root, self.model_size)
         return None
 
-    def model_present(self) -> bool:
-        """Whether a usable model exists locally, without loading it.
-
-        A converted CTranslate2 model is a directory containing ``model.bin``
-        and a tokenizer; checking for those is what lets Field Check say "the
-        model is missing" instead of discovering it at the first transmission.
-        """
+    def model_state(self) -> tuple:
+        """``(ModelState, missing_assets)`` without loading anything."""
         directory = self.model_directory()
         if directory is None:
-            return False
-        if not directory.is_dir():
-            return False
-        return (directory / "model.bin").exists()
+            return (ModelState.MISSING, list(REQUIRED_ASSETS))
+        return inspect_model_directory(directory)
+
+    def model_present(self) -> bool:
+        """Whether a *complete* model exists locally, without loading it.
+
+        Completeness matters: an interrupted download leaves a directory that
+        looks prepared but fails at the first transmission, which in the field
+        is the worst possible moment to find out.
+        """
+        return self.model_state()[0] is ModelState.COMPLETE
+
+    def prepare(self, local_files_only: bool = False) -> pathlib.Path:
+        """Fetch or verify this engine's model. Returns the resolved directory."""
+        if self.model_path:
+            return pathlib.Path(self.model_path).expanduser()
+        if not self.models_root:
+            raise EngineUnavailable("no model directory is configured")
+        return prepare_model(self.model_size, self.models_root,
+                             local_files_only=local_files_only)
 
     def available(self) -> bool:
         """Installed AND, when restricted to local files, actually present.
@@ -109,7 +192,13 @@ class FasterWhisperEngine(TranscriptionEngine):
         if not self.library_installed():
             return ("faster-whisper is not installed. Install the ASR extra:\n"
                     "    pip install 'babelfishr[asr]'")
+        state, missing = self.model_state()
         directory = self.model_directory()
+        if state is ModelState.INCOMPLETE:
+            return (f"The Whisper model at {directory} is incomplete - an "
+                    f"interrupted download. Missing: {', '.join(missing)}.\n"
+                    f"Repair it with a network connection:\n"
+                    f"    babelfishr prepare-field --asr-model {self.model_size}")
         return (f"No local Whisper model at {directory}.\n"
                 f"Prepare one with a network connection:\n"
                 f"    babelfishr prepare-field --asr-model {self.model_size}")
@@ -147,13 +236,21 @@ class FasterWhisperEngine(TranscriptionEngine):
         elif compute_type == "default":
             compute_type = "float16" if device == "cuda" else "int8"
 
-        # An explicit directory wins: in the field, loading must not depend on
-        # a shared cache still being intact.
-        target = str(self.model_path) if self.model_path else self.model_size
+        # Always load from the resolved directory when one exists, in both
+        # Online/Setup and Field Offline: loading must never depend on a shared
+        # Hugging Face cache still being intact.
+        directory = self.model_directory()
+        if directory is not None and self.model_present():
+            target = str(directory)
+        elif self.local_files_only:
+            raise EngineUnavailable(self.unavailable_reason())
+        else:
+            # Online/Setup with nothing prepared yet: fetch into our directory
+            # rather than letting faster-whisper populate a cache we do not own.
+            target = str(self.prepare())
         try:
             self._model = WhisperModel(
                 target, device=device, compute_type=compute_type,
-                download_root=self.download_root,
                 local_files_only=self.local_files_only)
         except Exception as exc:  # noqa: BLE001
             hint = ""

@@ -116,7 +116,7 @@ def test_whisper_defaults_to_local_files_only():
 def test_whisper_availability_requires_the_model_not_just_the_library(tmp_path):
     from babelfishr.providers.whisper_local import FasterWhisperEngine
 
-    engine = FasterWhisperEngine(model="tiny", download_root=str(tmp_path),
+    engine = FasterWhisperEngine(model="tiny", models_root=str(tmp_path),
                                  local_files_only=True)
     assert not engine.model_present()
     assert not engine.available(), (
@@ -129,22 +129,32 @@ def test_whisper_offline_failure_is_honest_and_immediate(tmp_path):
     from babelfishr.providers.whisper_local import FasterWhisperEngine
 
     pytest.importorskip("faster_whisper")
-    engine = FasterWhisperEngine(model="tiny", download_root=str(tmp_path),
+    engine = FasterWhisperEngine(model="tiny", models_root=str(tmp_path),
                                  local_files_only=True)
     with pytest.raises(ProviderUnavailable) as info:
         engine.transcribe(np.zeros(16_000), 16_000)
-    assert "will not download" in str(info.value)
+    assert "prepare-field" in str(info.value)
 
 
-def test_whisper_model_presence_detects_a_real_directory(tmp_path):
-    from babelfishr.providers.whisper_local import FasterWhisperEngine
+def test_whisper_model_presence_requires_every_asset(tmp_path):
+    """model.bin alone is an interrupted download, not a usable model."""
+    from babelfishr.providers.whisper_local import (FasterWhisperEngine,
+                                                    ModelState)
 
     directory = tmp_path / "tiny"
     directory.mkdir()
-    engine = FasterWhisperEngine(model="tiny", download_root=str(tmp_path))
+    engine = FasterWhisperEngine(model="tiny", models_root=str(tmp_path))
     assert not engine.model_present(), "an empty directory is not a model"
+
     (directory / "model.bin").write_bytes(b"x" * 128)
+    assert not engine.model_present(), "model.bin alone is not a usable model"
+    assert engine.model_state()[0] is ModelState.INCOMPLETE
+    assert "incomplete" in engine.unavailable_reason()
+
+    (directory / "config.json").write_text("{}")
+    (directory / "tokenizer.json").write_text("{}")
     assert engine.model_present()
+    assert engine.model_state()[0] is ModelState.COMPLETE
 
 
 # ---- translation pair awareness ---------------------------------------
