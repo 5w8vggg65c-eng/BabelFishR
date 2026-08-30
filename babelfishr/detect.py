@@ -129,20 +129,22 @@ class DetectorSettings:
 
     auto_process_speech: bool = True
     auto_process_unknown: bool = True
-    auto_process_noise: bool = True
-    """Static often has a weak voice under it. Recovering it is the product."""
-
     auto_process_tone: bool = False
     """A steady single-frequency carrier or courtesy beep. The one genuinely
     trivial class: it cannot carry speech, so it is the only classification
     still allowed to keep an ASR call from happening by itself."""
 
-    # There is deliberately no auto_process_digital. A real Mac classified
-    # ordinary speech through the MacBook microphone as a digital burst, and
-    # the setting that used to exist here then stopped Whisper from ever
-    # seeing it - so the operator got no transcript, and Argos got nothing to
-    # translate. "Possibly digital" is advisory metadata. It may offer digital
-    # analysis; it may not take transcription away.
+    # There is deliberately no auto_process_digital and no auto_process_noise.
+    # A real Mac classified ordinary speech through the MacBook microphone as
+    # a digital burst, and the setting that used to exist here then stopped
+    # Whisper from ever seeing it - so the operator got no transcript, and
+    # Argos got nothing to translate. Static is the same story with a
+    # different label: radio static frequently has a weak voice under it.
+    #
+    # Removing the settings, rather than changing their defaults, is the
+    # point. Alpha 3 wrote `auto_process_noise = false` into every
+    # settings.toml it saved, so a new default would have fixed nothing for
+    # anyone upgrading. Both keys are dropped on load - see RETIRED_OPTIONS.
 
     noise_flatness: float = 0.25
     """In-band flatness above which an event *may* be static (see modulation)."""
@@ -248,14 +250,13 @@ class DetectedTransmission:
         if self.duration < 0.25:
             return False
         content = self.content_class or ContentClass.UNKNOWN
-        if content is ContentClass.DIGITAL_SUSPECTED:
+        if content in (ContentClass.DIGITAL_SUSPECTED, ContentClass.NOISE):
             # Not a lookup, and not settings-dependent: no configuration may
             # reintroduce the veto, including one persisted by alpha 3.
             return True
         return {
             ContentClass.SPEECH: settings.auto_process_speech,
             ContentClass.UNKNOWN: settings.auto_process_unknown,
-            ContentClass.NOISE: settings.auto_process_noise,
             ContentClass.TONE: settings.auto_process_tone,
         }.get(content, True)
 

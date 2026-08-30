@@ -195,16 +195,18 @@ def test_recording_survives_when_no_engines_exist_at_all(config, store, mixed_wa
 def test_settings_separate_recording_from_processing():
     """The two thresholds must be genuinely independent knobs."""
     settings = DetectorSettings()
-    processing_knobs = {"auto_process_speech", "auto_process_noise",
-                        "auto_process_tone", "auto_process_unknown"}
+    processing_knobs = {"auto_process_speech", "auto_process_tone",
+                        "auto_process_unknown"}
     recording_knobs = {"min_duration", "open_margin_db", "threshold_dbfs"}
     for name in processing_knobs | recording_knobs:
         assert hasattr(settings, name)
     # No setting may exist whose purpose is to discard a classified event.
     assert not hasattr(settings, "reject_noise")
     # And none may exist that can cancel the transcription of a suspected
-    # digital burst: on a real Mac that classification landed on speech.
+    # digital burst or of static: on a real Mac the first classification
+    # landed on speech, and the second is where a voice under static goes.
     assert not hasattr(settings, "auto_process_digital")
+    assert not hasattr(settings, "auto_process_noise")
 
 
 def test_digital_shaped_audio_reaches_the_digital_queue(app, mixed_wav):

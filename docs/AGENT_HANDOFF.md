@@ -1249,3 +1249,183 @@ Nothing below has been run on physical hardware:
 Also unverified on hardware: that the readiness badge settles from "Checking"
 to "Field ready" on a genuinely prepared machine, and that completing first-run
 setup updates the window without a restart.
+
+---
+
+# Audit correction on the alpha 3 repair pass
+
+Branch `claude/radio-decoder-translator-0oslya`, from
+`cfdc214ec5189a0d6121ce59cb63df65dd30dbc5`. Three findings against the previous
+commit, all valid, all confirmed against the source before anything changed.
+No workflow dispatched, nothing published, alpha 1/2/3 untouched.
+
+## Finding 1 — the noise fix did not survive an upgrade
+
+The previous pass flipped `auto_process_noise` from `False` to `True`. That
+fixes a fresh install and nobody else: alpha 3 wrote `auto_process_noise =
+false` into every `settings.toml` it saved, and a persisted value beats a
+changed default. The exact upgrade hole that had just been closed for
+`auto_process_digital` was left open next to it.
+
+`NOISE` is now handled the same way `DIGITAL_SUSPECTED` is:
+
+- `should_auto_transcribe()` returns `True` for both **unconditionally**, not
+  through a settings lookup.
+- `auto_process_noise` is removed from `DetectorSettings` and `DetectorConfig`
+  and added to `RETIRED_OPTIONS`, so an alpha 3 file loads, drops the key, and
+  keeps the rest of its `[detector]` section.
+- `TONE` and events under 0.25 s remain the only suppressible cases.
+- The now-unreachable `"noise"` entry in `_skip_reason` is gone.
+
+**Tests.** `test_an_alpha_3_settings_file_cannot_suppress_noise_or_digital`
+loads a config carrying *both* keys as `false` and then runs a real capture
+through the pipeline with those settings in force, asserting that the static
+burst and the digital burst are both transcribed. A second test loads an actual
+`babelfishr.toml` from disk and checks the retired keys are dropped without
+taking `threshold_dbfs` with them. `test_detect.py` and `test_pipeline.py` lost
+their "operator can opt out of noise" tests, since there is no longer a knob to
+turn off; both were replaced with tests that assert the knob's absence and that
+static still reaches the engine.
+
+## Finding 2 — a cached processor outlived its operating mode
+
+The standalone pipeline introduced in the previous pass is cached on the app.
+`set_mode()` cleared `self.transcription` and `self.translation` but left
+`standalone_pipeline` holding its own references to those same engine objects.
+So: build a standalone processor in Online/Setup with a cloud-capable engine,
+switch to Field Offline, process another saved recording — and
+`_processing_pipeline()` returned the cached online processor. Field Offline is
+the one mode that promises audio never leaves the machine.
+
+Fixed at the application layer:
+
+- `mode_change_problem()` is checked **before anything is mutated**. Monitoring
+  running, or a standalone job in flight, returns a precise sentence and
+  `set_mode()` raises `ModeChangeRefused` with `config.mode`, the engines and
+  the badge all untouched.
+- `_retire_processing()` stops the standalone pipeline and closes its engines,
+  and it runs *before* `config.mode` moves — so there is no instant at which a
+  cloud-capable processor is reachable while the mode says Field Offline.
+- Each pipeline records the mode it was built under (`_standalone_mode`,
+  `_session_mode`). `_processing_pipeline()` refuses to hand back a pipeline
+  whose mode no longer matches, which also covers a direct write to
+  `config.mode` that bypasses `set_mode()` entirely.
+- `_discard_standalone_pipeline()` no longer waits up to thirty seconds when
+  Start Monitoring meets in-flight work. It retires an idle processor
+  instantly, and otherwise raises `ProcessingBusy` immediately — before a
+  Session row is written. The GUI shows that message; nothing freezes.
+- The GUI disables the processing-mode combo *and* the clickable mode badge
+  while monitoring, and `_apply_mode()` catches `ModeChangeRefused`, shows it
+  and re-syncs the combo. The app-layer guard remains the enforcement; the
+  greying-out is the courtesy.
+- Recorded WAVs and database rows are untouched throughout, and a test asserts
+  the bytes are identical after a refused start.
+
+**Tests** use a `_SentinelCloudEngine` routed through the real
+`build_transcription_engine` factory — assigning `app.transcription` directly
+would not work, because `_processing_pipeline()` re-selects engines for the
+current mode, which is the behaviour under test. All of it happens on **one**
+`BabelFishRApp` instance. Removing `_retire_processing()` from `set_mode()` and
+the mode check from `_processing_pipeline()` fails four of these tests.
+
+## Finding 3 — the readiness test checked a name that does not exist
+
+`translation_unverified` looked for a check called `"Translation packages
+installed"`. `field_check()` emits `"Installed translation paths"`. The
+property therefore answered `False` for every real report, and the unit test
+that "covered" it invented the same name and passed without ever touching a
+real one.
+
+- The property now uses the production name.
+- The hand-built report is gone. `_prepared_report()` drives the real
+  `field_check(run_smoke_tests=False)` with only the three things this
+  environment cannot supply stubbed — the PortAudio backend, the Whisper model
+  and the Argos route — and proves a prepared-but-untested installation is
+  `field_ready_unknown` rather than Record Only.
+- A separate test proves a machine with **no** translation route is
+  definitively not ready and recommends `record-only`: unknown is for untested,
+  never for absent.
+- `test_the_unverified_properties_use_names_that_field_check_emits` reads the
+  quoted names out of the properties' own source and asserts each one appears
+  in a real report, so this class of mistake cannot recur silently.
+
+`_refresh_readiness()` now writes "… Checking" to the badge **before** the
+worker is launched. It previously started blank and only reached "Checking" if
+a *finished* report happened to contain a skipped smoke test, so during the
+seconds the check actually takes the toolbar said nothing. A test replaces the
+worker factory with one that never calls back and asserts the badge visibly
+says Checking throughout; it also drives `_render_readiness` to Field ready and
+to Not ready, so the honest end states are still covered.
+
+That test was vacuous on the first attempt — the readiness check started by
+`MainWindow.__init__` could land on the badge mid-test — so it now waits for
+that report to arrive before it begins. Confirmed by mutation: with the
+immediate `setText` removed, it fails.
+
+## Non-vacuity
+
+Each fix was reverted in isolation and the suite re-run:
+
+| Mutation | Tests that fail |
+|---|---|
+| Put the `NOISE: False` veto back | 2 |
+| `set_mode` stops retiring, `_processing_pipeline` stops checking the mode | 4 |
+| Restore the fabricated readiness check name | 2 |
+| Remove the immediate "… Checking" badge write | 1 |
+
+## Files changed
+
+```
+babelfishr/detect.py            NOISE unconditional; setting removed
+babelfishr/config.py            auto_process_noise retired and migrated
+babelfishr/pipeline.py          the unreachable noise skip reason removed
+babelfishr/app.py               ModeChangeRefused, ProcessingBusy,
+                                mode_change_problem, _retire_processing,
+                                mode-bound pipelines, no 30s wait on start
+babelfishr/readiness.py         the real translation check name
+babelfishr/ui/main_window.py    _apply_mode/_sync_mode_box, mode controls
+                                disabled while monitoring, immediate Checking
+tests/test_alpha3_repairs.py    +11 tests (39 total)
+tests/{test_detect,test_pipeline,test_capture_invariant}.py
+                                the noise knob is gone, not re-defaulted
+```
+
+## Test results
+
+Focused (alpha3 repairs, capture-invariant, detect, pipeline, offline,
+offline-integration, storage, ui, gui_setup, providers, release_pipeline,
+acceptance): **279 passed**.
+
+Full suite: **694 passed, 9 skipped** in 54s. The nine skips are unchanged and
+all environmental:
+
+- `test_coreaudio.py:255` — needs a real macOS host with CoreAudio (1)
+- `test_packaging.py:373` — PlistBuddy is macOS-only (1)
+- `test_real_engines.py:32` — no prepared Whisper model (5)
+- `test_real_engines.py:107` — no Argos language pack installed (2)
+
+## Remaining physical-Mac validation
+
+Everything from the previous pass still stands, plus these, none of which has
+run on hardware:
+
+1. Spoken English through the MacBook microphone is transcribed whatever the
+   classifier calls it — now including anything it calls static.
+2. Spoken Spanish translated to English.
+3. Stop monitoring, then transcribe a saved item; and again after quitting and
+   reopening.
+4. Stop/start and relaunch persistence of the message thread.
+5. The text-only bubble.
+6. **New:** switching to Field Offline on a machine that has been running in
+   Online/Setup, and confirming the engine list in Tools ▸ Engine status
+   changes with it rather than reporting the old selection.
+7. **New:** pressing Start Monitoring while a saved recording is transcribing —
+   the refusal should be instant, with the window still responsive.
+8. **New:** that the readiness badge visibly passes through "… Checking" on
+   launch and settles on "Field ready" on a prepared machine.
+
+An upgrade path worth exercising deliberately: launch this build over an
+existing alpha 3 `~/Library/Application Support/BabelFishR/settings.toml` and
+confirm it starts, that the two retired keys are gone from the file the next
+time settings are saved, and that static and "possibly digital" transmissions
+are transcribed.

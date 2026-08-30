@@ -28,6 +28,19 @@ from .storage import Store
 log = logging.getLogger(__name__)
 
 
+class ModeChangeRefused(RuntimeError):
+    """The operating mode was not changed, and nothing else changed either.
+
+    Raised rather than returned so a caller cannot ignore it and leave the
+    badge, the combo box and ``config.mode`` disagreeing with the engines that
+    are actually loaded.
+    """
+
+
+class ProcessingBusy(RuntimeError):
+    """An operation was refused because saved-recording work is in flight."""
+
+
 @dataclasses.dataclass
 class EngineSummary:
     """What the UI must show the operator before a session starts."""
@@ -71,6 +84,12 @@ class BabelFishRApp:
         # with monitoring. This pipeline exists so "Transcribe anyway" and
         # Retry work after the session has stopped, and after a relaunch.
         self.standalone_pipeline: Optional[ProcessingPipeline] = None
+        # The mode each pipeline was built under. An engine chosen in
+        # Online/Setup may be cloud-capable; reusing it after a switch to
+        # Field Offline would send audio off the machine in the one mode that
+        # promises it never will.
+        self._standalone_mode = None
+        self._session_mode = None
 
     # -- setup -----------------------------------------------------------
     def glossary_path(self) -> pathlib.Path:
@@ -93,18 +112,70 @@ class BabelFishRApp:
     def mode(self):
         return self.config.operating_mode()
 
+    def mode_change_problem(self) -> str:
+        """Why the mode cannot be changed right now, or "" when it can.
+
+        Checked before anything is mutated, so a refusal leaves the
+        configuration, the engines and the badge exactly as they were.
+        """
+        if self.session is not None:
+            return ("Monitoring is running. Stop monitoring before changing "
+                    "the processing mode - switching underneath a live "
+                    "capture would leave the session recording with engines "
+                    "chosen for a different mode.")
+        pending = (self.standalone_pipeline.pending
+                   if self.standalone_pipeline is not None else 0)
+        if pending:
+            return (f"{pending} saved recording(s) are still being processed. "
+                    f"Wait for that to finish, then change the mode - the "
+                    f"recordings are safe either way.")
+        return ""
+
+    def _retire_processing(self) -> None:
+        """Drop every engine and pipeline built under the outgoing mode.
+
+        Only ever called when nothing is in flight, so the stop is immediate.
+        """
+        if self.standalone_pipeline is not None:
+            self.standalone_pipeline.stop(wait=True, timeout=5.0)
+            self.standalone_pipeline = None
+        self._standalone_mode = None
+        for engine in (self.transcription, self.translation):
+            if engine is not None:
+                try:
+                    engine.close()
+                except Exception:  # noqa: BLE001 - closing must not block a switch
+                    log.debug("engine close failed during mode change",
+                              exc_info=True)
+        self.transcription = None
+        self.translation = None
+
     def set_mode(self, mode, persist: bool = True) -> None:
         """Switch operating mode, persisting it so it survives a restart.
 
         An in-memory-only switch meant an operator who selected Field Offline
         was silently back in Online/Setup after relaunching - exactly the
         situation where a cloud engine could become selectable again.
+
+        Two things happen in this order, and the order is the point. The
+        refusal is checked first, so an unsafe switch changes nothing at all.
+        Then every engine and pipeline built under the outgoing mode is
+        retired *before* ``config.mode`` moves, so there is no instant at
+        which a cloud-capable processor is reachable while the mode says
+        Field Offline.
         """
         from .modes import OperatingMode
 
-        self.config.mode = OperatingMode(mode).value
-        self.transcription = None
-        self.translation = None
+        target = OperatingMode(mode)
+        if target is self.mode:
+            return
+
+        problem = self.mode_change_problem()
+        if problem:
+            raise ModeChangeRefused(problem)
+
+        self._retire_processing()
+        self.config.mode = target.value
         if persist:
             try:
                 self.config.save()
@@ -251,6 +322,10 @@ class BabelFishRApp:
             source = self._build_source(device, replay_path, realtime_replay,
                                         identity)
 
+        # Before anything is written: a busy standalone processor refuses the
+        # start outright rather than being waited on.
+        self._discard_standalone_pipeline()
+
         if self.transcription is None and self.translation is None:
             self.select_engines()
 
@@ -275,15 +350,12 @@ class BabelFishRApp:
         self.store.save_session(session)
         self.session = session
 
-        # A standalone pipeline may be running from a "Transcribe anyway" on a
-        # saved recording. Let it finish, then retire it: two pipelines pulling
-        # the same rows would race each other.
-        self._discard_standalone_pipeline()
         self.pipeline = ProcessingPipeline(
             store=self.store, transcription=self.transcription,
             translation=self.translation, config=self.config, events=self.events,
             glossary=self.glossary, workers=workers)
         self.pipeline.start(session)
+        self._session_mode = self.mode
 
         self.capture = CaptureService(
             source=source, store=self.store, session=session, config=self.config,
@@ -364,11 +436,25 @@ class BabelFishRApp:
         return self.pipeline.wait_until_idle(timeout=timeout)
 
     def _discard_standalone_pipeline(self) -> None:
-        """Two pipelines must never work the same queue at the same time."""
-        if self.standalone_pipeline is not None:
-            self.standalone_pipeline.wait_until_idle(timeout=30.0)
-            self.standalone_pipeline.stop()
-            self.standalone_pipeline = None
+        """Retire an idle standalone pipeline, or refuse immediately.
+
+        The first version waited up to thirty seconds for in-flight work,
+        which froze the window when the operator pressed Start Monitoring
+        while a saved recording was being transcribed. Waiting is not this
+        method's decision to make: it either retires an idle processor at
+        once, or refuses and says why.
+        """
+        if self.standalone_pipeline is None:
+            return
+        pending = self.standalone_pipeline.pending
+        if pending:
+            raise ProcessingBusy(
+                f"{pending} saved recording(s) are still being transcribed. "
+                f"Wait for that to finish, then start monitoring - nothing is "
+                f"lost either way.")
+        self.standalone_pipeline.stop(wait=True, timeout=5.0)
+        self.standalone_pipeline = None
+        self._standalone_mode = None
 
     def stop_session(self) -> Optional[Session]:
         session = self.session
@@ -379,6 +465,7 @@ class BabelFishRApp:
             self.wait_for_processing(timeout=30.0)
             self.pipeline.stop()
             self.pipeline = None
+        self._session_mode = None
         if session is not None:
             self.store.close_session(session.id)
             session.ended_at = utcnow()
@@ -410,6 +497,11 @@ class BabelFishRApp:
             return ("Record Only mode has transcription switched off. Change "
                     "the operating mode, then try again - the recording is "
                     "kept either way.")
+        if (self.pipeline is not None
+                and self._session_mode is not self.mode):
+            return ("Monitoring is running with engines chosen for a "
+                    "different operating mode. Stop monitoring, then try "
+                    "again.")
         if self._processing_pipeline() is None:
             summary = self.select_engines()
             detail = "; ".join(summary.warnings) or "no transcription engine"
@@ -427,9 +519,20 @@ class BabelFishRApp:
         worker thread so the window never freezes.
         """
         if self.pipeline is not None:
-            return self.pipeline
+            # A live pipeline cannot outlive its mode through set_mode, which
+            # refuses while monitoring. This covers the other route in: a
+            # direct write to config.mode. Nothing is processed rather than
+            # processed by engines the current mode forbids.
+            return self.pipeline if self._session_mode is self.mode else None
         if self.standalone_pipeline is not None:
-            return self.standalone_pipeline
+            if self._standalone_mode is self.mode:
+                return self.standalone_pipeline
+            # Defence in depth. set_mode retires this already; reaching here
+            # means the mode moved some other way, and the cached processor
+            # belongs to the old one.
+            if self.standalone_pipeline.pending:
+                return None
+            self._retire_processing()
 
         self.select_engines()          # honours the current operating mode
         if self.transcription is None:
@@ -440,6 +543,7 @@ class BabelFishRApp:
             events=self.events, glossary=self.glossary)
         pipeline.start(None)
         self.standalone_pipeline = pipeline
+        self._standalone_mode = self.mode
         return pipeline
 
     # -- data ------------------------------------------------------------
@@ -568,7 +672,11 @@ class BabelFishRApp:
 
     def close(self) -> None:
         self.stop_session()
-        self._discard_standalone_pipeline()
+        if self.standalone_pipeline is not None:
+            self.standalone_pipeline.wait_until_idle(timeout=30.0)
+            self.standalone_pipeline.stop()
+            self.standalone_pipeline = None
+            self._standalone_mode = None
         for engine in (self.transcription, self.translation):
             if engine is not None:
                 engine.close()

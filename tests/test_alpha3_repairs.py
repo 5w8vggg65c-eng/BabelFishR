@@ -98,7 +98,7 @@ def test_reverting_the_routing_restores_the_alpha_3_failure(
         return {
             DetectorClass.SPEECH: settings.auto_process_speech,
             DetectorClass.UNKNOWN: settings.auto_process_unknown,
-            DetectorClass.NOISE: settings.auto_process_noise,
+            DetectorClass.NOISE: False,        # alpha 3's persisted value
             DetectorClass.TONE: settings.auto_process_tone,
             DetectorClass.DIGITAL_SUSPECTED: False,
         }.get(self.content_class or DetectorClass.UNKNOWN, True)
@@ -150,7 +150,7 @@ def test_no_setting_can_reinstate_the_digital_veto():
         audio=np.zeros(SR), sample_rate=SR, start_offset=0.0, peak_dbfs=-14.0,
         rms_dbfs=-20.0, noise_floor_dbfs=-60.0, active_ratio=0.9,
         confidence=0.8, content_class=DetectorClass.DIGITAL_SUSPECTED)
-    for settings in (DetectorSettings(), DetectorSettings(auto_process_noise=False),
+    for settings in (DetectorSettings(), DetectorSettings(auto_process_tone=False),
                      DetectorSettings(auto_process_speech=False)):
         assert detected.should_auto_transcribe(settings)
 
@@ -161,6 +161,62 @@ def test_no_setting_can_reinstate_the_digital_veto():
 
 
 # ---- B. saved recordings are processable without monitoring -------------
+
+
+class _SlowEngine:
+    """A transcription engine that blocks until the test lets it go."""
+
+    id = "slow"
+    name = "slow test engine"
+
+    def __init__(self):
+        import threading
+
+        self._gate = threading.Event()
+        self.calls = 0
+        self.closed = False
+
+    @property
+    def privacy(self):
+        from babelfishr.providers.base import PrivacyProfile
+
+        return PrivacyProfile()
+
+    def available(self):
+        return True
+
+    def unavailable_reason(self):
+        return ""
+
+    def release(self):
+        self._gate.set()
+
+    def transcribe(self, audio, rate, language=None, vocabulary=None):
+        from babelfishr.providers.base import TranscriptionResult
+
+        self.calls += 1
+        self._gate.wait(timeout=30.0)
+        return TranscriptionResult(text="eventually", confidence=1.0,
+                                   engine=self.name, engine_version="0")
+
+    def close(self):
+        self.closed = True
+
+
+def _second_saved(app, wav, name):
+    """One more saved recording, so a second job has something to run on."""
+    from babelfishr.modes import OperatingMode
+
+    previous = app.mode
+    app.set_mode(OperatingMode.RECORD_ONLY, persist=False)
+    app.select_engines()
+    app.start_session(replay_path=wav, name=name)
+    app.run_replay()
+    app.stop_session()
+    app.set_mode(previous, persist=False)
+    pending = [t for t in app.store.recent_transmissions() if not t.transcript]
+    assert pending, "no second recording was left to process"
+    return pending[-1].id
 
 
 def _one_skipped(app, wav, name):
@@ -476,53 +532,179 @@ def test_a_digital_chip_neither_suppresses_nor_replaces_the_transcript(qt_app):
 # ---- E. readiness ---------------------------------------------------------
 
 
-def test_a_skipped_smoke_test_is_not_reported_as_record_only():
-    """13. "Not tested" and "not available" are different answers."""
-    from babelfishr.readiness import Check, CheckStatus, ReadinessReport
+def _prepared_report(monkeypatch, tmp_path, *, translation_routes=(("es", "en"),)):
+    """A real field_check() over a controlled but genuinely prepared machine.
 
-    report = ReadinessReport()
-    for name in ("Audio backend", "Recording directory writable",
-                 "Local ASR model present", "Translation packages installed"):
-        report.add(Check(name, CheckStatus.PASS, ""))
-    for name in ("Local transcription smoke test",
-                 "Local translation smoke test"):
-        report.add(Check(name, CheckStatus.SKIP, "smoke tests disabled"))
+    Everything is driven through the production code path and the production
+    check names. The three things this environment cannot supply - a
+    PortAudio backend, a Whisper model and an Argos route - are the only
+    things stubbed.
+    """
+    from babelfishr import readiness as readiness_module
+    from babelfishr.providers import argos as argos_module
+    from babelfishr.providers import whisper_local as whisper_module
+
+    class _Whisper:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def library_installed(self):
+            return True
+
+        def model_present(self):
+            return True
+
+        def model_directory(self):
+            return tmp_path / "models" / "small"
+
+    class _Argos:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def library_installed(self):
+            return True
+
+        def installed_pairs(self):
+            return list(translation_routes)
+
+        def direct_pairs(self):
+            return list(translation_routes)
+
+        def readiness(self):
+            return {"pairs": list(translation_routes)}
+
+    monkeypatch.setattr(whisper_module, "FasterWhisperEngine", _Whisper)
+    monkeypatch.setattr(argos_module, "ArgosTranslateEngine", _Argos)
+    monkeypatch.setattr("babelfishr.audio.devices.backend_available",
+                        lambda: True)
+    monkeypatch.setattr("babelfishr.audio.devices.backend_status",
+                        lambda: "stub backend")
+    monkeypatch.setattr("babelfishr.audio.devices.list_input_devices",
+                        lambda: [])
+
+    (tmp_path / "models" / "small").mkdir(parents=True, exist_ok=True)
+    config = Config()
+    config.database = str(tmp_path / "readiness.sqlite3")
+    config.recording.directory = str(tmp_path / "recordings")
+    config.app_home = str(tmp_path / "home")
+    return readiness_module.field_check(config, run_smoke_tests=False)
+
+
+def test_a_prepared_but_untested_installation_is_not_called_record_only(
+        monkeypatch, tmp_path):
+    """13. Driven through the real field_check, with the real check names.
+
+    The first version of this test built a report by hand and asked for a
+    check called "Translation packages installed". No such check exists - the
+    production name is "Installed translation paths" - so the property it was
+    testing answered False for every real report and the test passed anyway.
+    """
+    report = _prepared_report(monkeypatch, tmp_path)
+
+    names = {check.name for check in report.checks}
+    assert "Installed translation paths" in names, (
+        "the production check name changed; this test is fabricating again")
+    assert "Local ASR model present" in names
 
     assert report.can_record
-    assert not report.field_ready          # honest: it has not been proven
+    assert not report.field_ready, "nothing was proven, so nothing is claimed"
+    assert report.transcription_unverified
+    assert report.translation_unverified
     assert report.field_ready_unknown, (
         "a prepared installation whose smoke tests were skipped is being "
         "reported as Record Only")
-    assert report.transcription_unverified and report.translation_unverified
-
-    # A genuinely missing model is still an unambiguous Record Only.
-    missing = ReadinessReport()
-    for name in ("Audio backend", "Recording directory writable"):
-        missing.add(Check(name, CheckStatus.PASS, ""))
-    missing.add(Check("Local ASR model present", CheckStatus.FAIL, "no model"))
-    missing.add(Check("Local transcription smoke test", CheckStatus.SKIP, ""))
-    assert missing.can_record
-    assert not missing.field_ready
-    assert not missing.field_ready_unknown
 
 
-def test_the_badge_says_checking_rather_than_record_only(qt_app, config, store):
-    from babelfishr.readiness import Check, CheckStatus, ReadinessReport
+def test_a_missing_translation_route_is_definitively_not_ready(monkeypatch,
+                                                               tmp_path):
+    """Unknown is only for untested, never for absent."""
+    report = _prepared_report(monkeypatch, tmp_path, translation_routes=())
+
+    assert report.can_record
+    assert not report.field_ready
+    assert not report.translation_unverified
+    assert not report.field_ready_unknown, (
+        "a machine with no translation route is not merely untested")
+    assert report.recommended_mode().value == "record-only"
+
+
+def test_the_unverified_properties_use_names_that_field_check_emits(
+        monkeypatch, tmp_path):
+    """A guard on the guard: the names are read out of a real report."""
+    import inspect
+
+    from babelfishr.readiness import ReadinessReport
+
+    report = _prepared_report(monkeypatch, tmp_path)
+    emitted = {check.name for check in report.checks}
+    source = inspect.getsource(ReadinessReport.transcription_unverified.fget)
+    source += inspect.getsource(ReadinessReport.translation_unverified.fget)
+    for quoted in re.findall(r'"([A-Z][^"]{4,})"', source):
+        assert quoted in emitted, (
+            f"{quoted!r} is not a check field_check ever produces")
+
+
+def test_the_badge_shows_checking_while_the_check_is_still_running(qt_app,
+                                                                    config,
+                                                                    store,
+                                                                    monkeypatch):
+    """The badge must say Checking during the wait, not only afterwards.
+
+    It used to start blank and only ever reach "Checking" if a *finished*
+    report happened to contain a skipped smoke test - so for the seconds the
+    check actually takes, the toolbar said nothing.
+    """
+    from babelfishr.ui import main_window as main_window_module
     from babelfishr.ui.main_window import MainWindow
 
-    window = MainWindow(_mock_app(config, store))
-    qt_app.processEvents()
+    launched = []
 
-    report = ReadinessReport()
-    for name in ("Audio backend", "Recording directory writable",
-                 "Local ASR model present", "Translation packages installed"):
-        report.add(Check(name, CheckStatus.PASS, ""))
+    def _never_finishes(function, *args, **kwargs):
+        """Stand in for run_in_background and never call back."""
+        launched.append(function)
+        return object()
+
+    window = MainWindow(_mock_app(config, store))
+    # Let the readiness check that __init__ starts finish first. Without this
+    # wait, its result could land on the badge mid-test and make the
+    # assertion below pass for the wrong reason.
+    import time
+
+    deadline = time.monotonic() + 30.0
+    while window._readiness is None and time.monotonic() < deadline:
+        qt_app.processEvents()
+        time.sleep(0.01)
+    assert window._readiness is not None, "the startup readiness never returned"
+
+    # From here nothing else can write to the badge: the worker factory is
+    # replaced by one that never calls back.
+    monkeypatch.setattr("babelfishr.ui.workers.run_in_background",
+                        _never_finishes)
+    window.ready_badge.setText("")
+    window._refresh_readiness(run_smoke_tests=True)
+    assert launched, "the background check was never started"
+    assert "Checking" in window.ready_badge.text(), (
+        "the badge is blank while the readiness check runs")
+    for _ in range(10):
+        qt_app.processEvents()
+    assert "Checking" in window.ready_badge.text()
+
+    # And the truthful end states still arrive when the worker does finish.
+    from babelfishr.readiness import Check, CheckStatus, ReadinessReport
+
+    ready = ReadinessReport()
+    for name in ("Audio backend", "Recording directory writable"):
+        ready.add(Check(name, CheckStatus.PASS, ""))
     for name in ("Local transcription smoke test",
                  "Local translation smoke test"):
-        report.add(Check(name, CheckStatus.SKIP, "smoke tests disabled"))
-    window._render_readiness(report)
-    assert "Record only" not in window.ready_badge.text()
-    assert "Checking" in window.ready_badge.text()
+        ready.add(Check(name, CheckStatus.PASS, ""))
+    window._render_readiness(ready)
+    assert "Field ready" in window.ready_badge.text()
+
+    broken = ReadinessReport()
+    broken.add(Check("Audio backend", CheckStatus.FAIL, "no backend"))
+    window._render_readiness(broken)
+    assert "Not ready" in window.ready_badge.text()
     window.hide()
 
 
@@ -622,3 +804,372 @@ def test_generated_release_notes_contain_a_literal_delete(tmp_path):
     assert "v0.0.0-test" in notes and "deadbeef" in notes, (
         "escaping the backticks broke variable expansion")
     assert "```" in notes, "the checksum code fence was lost"
+
+
+# ---- audit: the upgrade hole for noise routing --------------------------
+
+
+ALPHA3_SETTINGS = {
+    "auto_process_noise": False,
+    "auto_process_digital": False,
+}
+
+
+def test_an_alpha_3_settings_file_cannot_suppress_noise_or_digital(config,
+                                                                    store,
+                                                                    tmp_path):
+    """Both keys, exactly as alpha 3 wrote them, loaded and then driven.
+
+    Changing a default fixes nothing for anyone upgrading: alpha 3 saved both
+    of these as false into every settings.toml it wrote. This loads such a
+    file and then runs a real capture through the pipeline, so it measures
+    the routing rather than the dataclass.
+    """
+    upgraded = Config.from_dict({"detector": dict(ALPHA3_SETTINGS)})
+    for key in ALPHA3_SETTINGS:
+        assert not hasattr(upgraded.detector, key), (
+            f"{key} survived the load and can still suppress transcription")
+        assert not hasattr(upgraded.detector.to_settings(), key)
+
+    # And through the whole capture path, with those settings in force.
+    config.detector = upgraded.detector
+    mixed = build_fixture([
+        {"gap": 1.5},
+        {"kind": "static", "duration": 2.0, "level_dbfs": -20},
+        {"gap": 1.5},
+        {"kind": "digital", "duration": 2.0, "level_dbfs": -14},
+        {"gap": 1.5},
+    ], sample_rate=SR).write(str(tmp_path / "alpha3.wav"))
+
+    app = _mock_app(config, store)
+    engine = app.transcription
+    app.start_session(replay_path=mixed, name="upgraded")
+    app.run_replay()
+
+    routed = [t for t in app.transmissions()
+              if t.content_class in (ContentClass.NOISE,
+                                     ContentClass.DIGITAL_SUSPECTED)]
+    assert routed, "the fixture produced neither static nor a digital burst"
+    classes = {t.content_class for t in routed}
+    assert ContentClass.NOISE in classes
+    assert ContentClass.DIGITAL_SUSPECTED in classes
+    for tx in routed:
+        assert tx.state is not ProcessingState.SKIPPED, (
+            f"{tx.content_class.value} was skipped under alpha 3 settings")
+        assert tx.transcript, f"{tx.content_class.value} got no transcript"
+    assert engine.calls >= len(routed)
+    app.stop_session()
+
+
+def test_an_alpha_3_settings_file_still_loads_without_error(tmp_path):
+    """A retired key must be dropped, not raise 'unknown option'."""
+    settings = tmp_path / "babelfishr.toml"
+    settings.write_text(
+        "[detector]\n"
+        "auto_process_noise = false\n"
+        "auto_process_digital = false\n"
+        "threshold_dbfs = -42.0\n", encoding="utf-8")
+    loaded = Config.load(str(settings), resolve_paths=False)
+    assert loaded.detector.threshold_dbfs == -42.0, (
+        "dropping the retired keys lost the rest of the section")
+    assert not hasattr(loaded.detector, "auto_process_noise")
+
+
+# ---- audit: a pipeline is bound to the mode that built it ---------------
+
+
+class _SentinelCloudEngine:
+    """Stands in for an engine that would send audio off the machine."""
+
+    id = "sentinel-cloud"
+    name = "sentinel cloud transcription"
+
+    def __init__(self):
+        self.calls = 0
+        self.closed = False
+
+    @property
+    def privacy(self):
+        from babelfishr.providers.base import PrivacyProfile
+
+        return PrivacyProfile(is_cloud=True, sends_audio=True,
+                              destination="a sentinel cloud service")
+
+    def available(self):
+        return True
+
+    def unavailable_reason(self):
+        return ""
+
+    def transcribe(self, audio, rate, language=None, vocabulary=None):
+        from babelfishr.providers.base import TranscriptionResult
+
+        self.calls += 1
+        return TranscriptionResult(text="sent to the cloud", confidence=1.0,
+                                   engine=self.name, engine_version="0")
+
+    def close(self):
+        self.closed = True
+
+
+def _force_engine(monkeypatch, engine, *, only_mode=None):
+    """Make select_engines() hand back this engine, as a real factory would.
+
+    Assigning ``app.transcription`` directly does not work and should not:
+    ``_processing_pipeline`` always re-selects engines for the current mode,
+    which is the behaviour being tested. So the factory itself is replaced,
+    and - like a genuine cloud provider - it is unavailable outside the mode
+    that permits it.
+    """
+    from babelfishr import app as app_module
+    from babelfishr.providers import EngineUnavailable
+
+    def factory(config=None, requested=None, mode=None):
+        # select_engines() calls this without a mode, exactly as the real
+        # factory is called, so the mode has to come from the config - which
+        # is the whole point of the test.
+        resolved = mode or (config.operating_mode() if config is not None
+                            else None)
+        if only_mode is not None and resolved is not only_mode:
+            raise EngineUnavailable(
+                f"{engine.name} is forbidden in {resolved}")
+        return engine
+
+    monkeypatch.setattr(app_module, "build_transcription_engine", factory)
+    return engine
+
+
+def _cached_online_processor(app, target_id, monkeypatch, engine=None):
+    """Build and cache a standalone processor holding a cloud-capable engine."""
+    from babelfishr.modes import OperatingMode
+
+    app.set_mode(OperatingMode.ONLINE_SETUP, persist=False)
+    sentinel = engine or _SentinelCloudEngine()
+    _force_engine(monkeypatch, sentinel, only_mode=OperatingMode.ONLINE_SETUP)
+    assert app.transcribe_anyway(target_id)
+    assert app.standalone_pipeline is not None
+    assert app.standalone_pipeline.wait_until_idle(timeout=30.0)
+    assert sentinel.calls == 1, "the sentinel never ran, so nothing is proven"
+    assert app.transcription is sentinel
+    return sentinel
+
+
+def test_a_cloud_engine_cached_online_cannot_process_after_field_offline(
+        config, store, digital_wav, monkeypatch):
+    """The unsafe sequence, on one app instance, start to finish."""
+    from babelfishr.modes import OperatingMode
+
+    app = BabelFishRApp(config=config, store=store)
+    first = _one_skipped(app, digital_wav, "cached").id
+    second = _second_saved(app, digital_wav, "cached-two")
+
+    sentinel = _cached_online_processor(app, first, monkeypatch)
+    cached = app.standalone_pipeline
+
+    app.set_mode(OperatingMode.FIELD_OFFLINE, persist=False)
+
+    assert app.mode is OperatingMode.FIELD_OFFLINE
+    assert app.standalone_pipeline is not cached, (
+        "the Online/Setup processor is still cached after the switch")
+    assert app.standalone_pipeline is None
+    assert app.transcription is not sentinel
+    assert sentinel.closed, "the outgoing engine was not closed"
+
+    before = sentinel.calls
+    app.transcribe_anyway(second)
+    if app.standalone_pipeline is not None:
+        app.standalone_pipeline.wait_until_idle(timeout=30.0)
+        assert app.transcription is not sentinel
+        assert not app.transcription.privacy.is_cloud
+    assert sentinel.calls == before, (
+        "a cloud-capable engine built in Online/Setup processed a recording "
+        "in Field Offline")
+    assert store.get_transmission(second).transcript != "sent to the cloud"
+    app.close()
+
+
+def test_a_direct_config_mode_write_also_retires_the_old_processor(
+        config, store, digital_wav, monkeypatch):
+    """Defence in depth: bypassing set_mode must not resurrect it either."""
+    from babelfishr.modes import OperatingMode
+
+    app = BabelFishRApp(config=config, store=store)
+    first = _one_skipped(app, digital_wav, "direct").id
+    second = _second_saved(app, digital_wav, "direct-two")
+    sentinel = _cached_online_processor(app, first, monkeypatch)
+
+    app.config.mode = OperatingMode.FIELD_OFFLINE.value   # no set_mode call
+    before = sentinel.calls
+    app.transcribe_anyway(second)
+    if app.standalone_pipeline is not None:
+        app.standalone_pipeline.wait_until_idle(timeout=30.0)
+    assert sentinel.calls == before
+    app.close()
+
+
+def test_a_mode_change_is_refused_atomically_while_monitoring(config, store,
+                                                              digital_wav):
+    """Nothing moves: not config.mode, not the engines, not the badge."""
+    from babelfishr.app import ModeChangeRefused
+    from babelfishr.modes import OperatingMode
+
+    app = _mock_app(config, store)
+    app.set_mode(OperatingMode.ONLINE_SETUP, persist=False)
+    app.start_session(replay_path=digital_wav, name="live")
+    before_mode = app.config.mode
+    before_engine = app.transcription
+
+    with pytest.raises(ModeChangeRefused) as excinfo:
+        app.set_mode(OperatingMode.FIELD_OFFLINE, persist=False)
+    assert "Stop monitoring" in str(excinfo.value)
+    assert app.config.mode == before_mode
+    assert app.mode is OperatingMode.ONLINE_SETUP
+    assert app.transcription is before_engine
+    assert app.pipeline is not None
+    app.stop_session()
+
+    # And it succeeds once monitoring has stopped.
+    app.set_mode(OperatingMode.FIELD_OFFLINE, persist=False)
+    assert app.mode is OperatingMode.FIELD_OFFLINE
+    app.close()
+
+
+def test_a_mode_change_is_refused_while_a_saved_job_is_in_flight(
+        config, store, digital_wav, monkeypatch):
+    from babelfishr.app import ModeChangeRefused
+    from babelfishr.modes import OperatingMode
+
+    app = BabelFishRApp(config=config, store=store)
+    target = _one_skipped(app, digital_wav, "inflight").id
+    app.set_mode(OperatingMode.ONLINE_SETUP, persist=False)
+    slow = _force_engine(monkeypatch, _SlowEngine())
+    assert app.transcribe_anyway(target)
+
+    before_mode = app.config.mode
+    with pytest.raises(ModeChangeRefused) as excinfo:
+        app.set_mode(OperatingMode.FIELD_OFFLINE, persist=False)
+    assert "still being processed" in str(excinfo.value)
+    assert app.config.mode == before_mode
+    assert app.standalone_pipeline is not None
+
+    slow.release()
+    assert app.standalone_pipeline.wait_until_idle(timeout=30.0)
+    app.set_mode(OperatingMode.FIELD_OFFLINE, persist=False)
+    assert app.mode is OperatingMode.FIELD_OFFLINE
+    assert app.standalone_pipeline is None
+    app.close()
+
+
+def test_an_idle_standalone_processor_is_retired_before_the_new_mode(
+        config, store, digital_wav, monkeypatch):
+    from babelfishr.modes import OperatingMode
+
+    app = BabelFishRApp(config=config, store=store)
+    target = _one_skipped(app, digital_wav, "idle").id
+    sentinel = _cached_online_processor(app, target, monkeypatch)
+    cached = app.standalone_pipeline
+    assert cached.pending == 0
+
+    app.set_mode(OperatingMode.FIELD_OFFLINE, persist=False)
+    assert app.standalone_pipeline is None
+    assert sentinel.closed
+    assert not cached._running, "the retired pipeline's workers are still up"
+    app.close()
+
+
+def test_starting_monitoring_never_waits_on_an_in_flight_saved_job(
+        config, store, digital_wav, monkeypatch):
+    """Refused immediately, not after a thirty-second freeze."""
+    import time
+
+    from babelfishr.app import ProcessingBusy
+
+    app = BabelFishRApp(config=config, store=store)
+    target = _one_skipped(app, digital_wav, "nowait").id
+    slow = _force_engine(monkeypatch, _SlowEngine())
+    assert app.transcribe_anyway(target)
+
+    started = time.monotonic()
+    with pytest.raises(ProcessingBusy) as excinfo:
+        app.start_session(replay_path=digital_wav, name="blocked")
+    elapsed = time.monotonic() - started
+    assert elapsed < 2.0, f"start_session blocked for {elapsed:.1f}s"
+    assert "still being transcribed" in str(excinfo.value)
+    assert app.session is None, "a session row was written despite the refusal"
+
+    slow.release()
+    assert app.standalone_pipeline.wait_until_idle(timeout=30.0)
+    app.close()
+
+
+def test_a_refused_start_leaves_the_recordings_untouched(config, store,
+                                                         digital_wav,
+                                                         monkeypatch):
+    from babelfishr.app import ProcessingBusy
+
+    app = BabelFishRApp(config=config, store=store)
+    target = _one_skipped(app, digital_wav, "untouched").id
+    rows = {t.id: pathlib.Path(t.audio_path).read_bytes()
+            for t in store.recent_transmissions() if t.audio_path}
+    slow = _force_engine(monkeypatch, _SlowEngine())
+    app.transcribe_anyway(target)
+
+    with pytest.raises(ProcessingBusy):
+        app.start_session(replay_path=digital_wav, name="refused")
+
+    for tx_id, data in rows.items():
+        current = store.get_transmission(tx_id)
+        assert current is not None
+        assert pathlib.Path(current.audio_path).read_bytes() == data
+    slow.release()
+    app.standalone_pipeline.wait_until_idle(timeout=30.0)
+    app.close()
+
+
+def test_the_gui_mode_controls_are_disabled_while_monitoring(qt_app, config,
+                                                             store,
+                                                             digital_wav):
+    from babelfishr.ui.main_window import MainWindow
+
+    app = _mock_app(config, store)
+    window = MainWindow(app)
+    qt_app.processEvents()
+    assert window.mode_box.isEnabled()
+    assert window.mode_badge.isEnabled()
+
+    window._start_monitoring(replay_path=digital_wav)
+    qt_app.processEvents()
+    assert not window.mode_box.isEnabled(), (
+        "the processing-mode combo can be changed during monitoring")
+    assert not window.mode_badge.isEnabled()
+
+    window._stop_monitoring()
+    qt_app.processEvents()
+    assert window.mode_box.isEnabled()
+    assert window.mode_badge.isEnabled()
+    window.hide()
+
+
+def test_the_gui_refusal_leaves_the_mode_and_the_combo_consistent(
+        qt_app, config, store, digital_wav, monkeypatch):
+    """The app-layer guard is the enforcement; the GUI just tells the truth."""
+    from PySide6 import QtWidgets
+
+    from babelfishr.modes import OperatingMode
+    from babelfishr.ui.main_window import MainWindow
+
+    app = _mock_app(config, store)
+    app.set_mode(OperatingMode.ONLINE_SETUP, persist=False)
+    window = MainWindow(app)
+    qt_app.processEvents()
+    app.start_session(replay_path=digital_wav, name="gui-guard")
+
+    shown = []
+    monkeypatch.setattr(QtWidgets.QMessageBox, "information",
+                        lambda *a, **k: shown.append(a[-1]))
+    assert window._apply_mode(OperatingMode.FIELD_OFFLINE.value) is False
+    assert shown and "Stop monitoring" in shown[0]
+    assert app.config.mode == OperatingMode.ONLINE_SETUP.value
+    assert window.mode_box.currentData() == OperatingMode.ONLINE_SETUP.value
+    app.stop_session()
+    window.hide()

@@ -107,13 +107,12 @@ class DetectorConfig:
 
     # Automatic-processing routing. None of these can stop a recording being
     # made: they only decide whether an ASR call happens without being asked.
-    # A suspected digital burst is deliberately not on this list - see
+    # Neither a suspected digital burst nor static is on this list - see
     # DetectedTransmission.should_auto_transcribe - because a classifier that
-    # mistakes speech for a digital burst must not be able to cancel the
-    # transcription of that speech.
+    # mistakes speech for either must not be able to cancel the transcription
+    # of that speech.
     auto_process_speech: bool = True
     auto_process_unknown: bool = True
-    auto_process_noise: bool = True
     auto_process_tone: bool = False
 
     def to_settings(self):
@@ -540,7 +539,15 @@ RETIRED_OPTIONS: Dict[str, set] = {
     # matters as much as removing it from the code: an alpha 3 settings.toml
     # carrying `auto_process_digital = false` would otherwise reinstate the
     # defect on the first launch after upgrading.
-    "DetectorConfig": {"auto_process_digital"},
+    # Both of these decided whether a classified event was sent to speech
+    # recognition, and both defaulted to false. On a real Mac the classifier
+    # called ordinary voice a digital burst, so the first silently cancelled
+    # the transcription of speech; static routinely has a weak voice under it,
+    # so the second did the same thing with a different label. Dropping them
+    # on load matters as much as removing them from the code: alpha 3 wrote
+    # both keys into every settings.toml it saved, so changing a default
+    # would have fixed nothing for anybody upgrading.
+    "DetectorConfig": {"auto_process_digital", "auto_process_noise"},
 }
 
 

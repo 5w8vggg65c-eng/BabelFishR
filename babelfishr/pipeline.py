@@ -159,15 +159,13 @@ class Recorder:
 def _skip_reason(detected: DetectedTransmission) -> str:
     """Plain-language note explaining why automatic ASR was not attempted.
 
-    There is deliberately no entry for ``digital-suspected``. That
-    classification no longer routes anything away from speech recognition:
-    on a real Mac it landed on ordinary voice, and the operator got neither a
-    transcript nor a translation. It is a chip on the bubble now, not a veto.
+    There is deliberately no entry for ``digital-suspected`` or ``noise``.
+    Neither classification routes anything away from speech recognition any
+    more: on a real Mac the first landed on ordinary voice, and the second is
+    where a weak voice under static ends up. Both are chips on the bubble now,
+    not vetoes.
     """
     return {
-        "noise": "Classified as broadband noise, and automatic speech "
-                 "recognition is switched off for noise in your settings. The "
-                 "recording is kept - use 'Transcribe anyway' to run it.",
         "tone": "Classified as a steady tone (courtesy beep or unmodulated "
                 "carrier), which cannot contain speech. The recording is kept "
                 "- use 'Transcribe anyway' if you disagree.",

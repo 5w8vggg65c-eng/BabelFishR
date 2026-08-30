@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from babelfishr.app import BabelFishRApp
-from babelfishr.models import ProcessingState
+from babelfishr.models import ContentClass, ProcessingState
 from babelfishr.pipeline import EventBus, PipelineState, Recorder
 from babelfishr.providers.mock import MockTranscriptionEngine, MockTranslationEngine
 
@@ -103,14 +103,14 @@ def test_specified_source_language_is_honoured(config, store, fixture_wav):
     app.stop_session()
 
 
-def test_an_operator_who_opts_out_of_noise_costs_no_asr_call(config, store,
-                                                             tmp_path):
-    """Static reaches ASR by default now; opting out must still work.
+def test_static_reaches_the_transcription_engine(config, store, tmp_path):
+    """Static is transcribed, and no setting can prevent it.
 
-    The old version of this test asserted the opposite default. It was
-    changed deliberately: a real Mac showed the classifier mislabelling
-    speech, and a transmission that is silently never transcribed is a worse
-    outcome than an ASR call spent on static.
+    The original version of this test asserted the opposite, and a real Mac
+    showed why that was wrong: the classifier is a heuristic, and a
+    transmission it mislabels is one the operator never gets to read. There
+    is no longer an auto_process_noise knob to turn off, so the test drives
+    the only remaining lever - the config - and proves it changes nothing.
     """
     from babelfishr.testing import build_fixture
 
@@ -119,7 +119,6 @@ def test_an_operator_who_opts_out_of_noise_costs_no_asr_call(config, store,
          {"gap": 1.0}], sample_rate=48_000)
     path = fixture.write(str(tmp_path / "static.wav"))
 
-    config.detector.auto_process_noise = False
     app = BabelFishRApp(config=config, store=store)
     engine = MockTranscriptionEngine()
     app.transcription = engine
@@ -128,9 +127,10 @@ def test_an_operator_who_opts_out_of_noise_costs_no_asr_call(config, store,
     app.run_replay()
 
     noise = [t for t in app.transmissions()
-             if t.state is ProcessingState.SKIPPED]
-    assert noise, "the static burst should have been captured but skipped"
-    assert engine.calls == 0
+             if t.content_class is ContentClass.NOISE]
+    assert noise, "the static burst was not captured"
+    assert all(t.state is not ProcessingState.SKIPPED for t in noise)
+    assert engine.calls >= len(noise)
     app.stop_session()
 
 

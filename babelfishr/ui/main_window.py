@@ -177,7 +177,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mode_badge.setAccessibleName("Operating mode")
         self.mode_badge.setCursor(QtCore.Qt.PointingHandCursor)
         self.mode_badge.setToolTip("Operating mode - click to change")
-        self.mode_badge.mousePressEvent = lambda event: self._choose_mode()
+        self.mode_badge.mousePressEvent = (
+            lambda event: self._choose_mode() if self.mode_badge.isEnabled()
+            else None)
         row.addWidget(self.mode_badge)
 
         self.ready_badge = QtWidgets.QLabel()
@@ -269,9 +271,37 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_mode_box(self) -> None:
         value = self.mode_box.currentData()
         if value and value != self.app.config.mode:
+            self._apply_mode(value)
+
+    def _apply_mode(self, value: str) -> bool:
+        """Change the mode, or explain why nothing changed.
+
+        The app layer is the guard: it refuses before mutating anything, so a
+        refusal here means the configuration, the engines and the badge are
+        all still consistent with each other. The combo box is put back to
+        match, because a control showing a mode the application is not in is
+        the same lie the badge used to tell.
+        """
+        from ..app import ModeChangeRefused
+
+        try:
             self.app.set_mode(value)
-            self._report_engines()
-            self._refresh_mode_badge()
+        except ModeChangeRefused as exc:
+            QtWidgets.QMessageBox.information(
+                self, "The processing mode was not changed", str(exc))
+            self._sync_mode_box()
+            return False
+        self._report_engines()
+        self._refresh_mode_badge()
+        self._refresh_readiness(run_smoke_tests=True)
+        return True
+
+    def _sync_mode_box(self) -> None:
+        index = self.mode_box.findData(self.app.config.mode)
+        if index >= 0 and index != self.mode_box.currentIndex():
+            blocked = self.mode_box.blockSignals(True)
+            self.mode_box.setCurrentIndex(index)
+            self.mode_box.blockSignals(blocked)
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
@@ -552,8 +582,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_controls_enabled(self, enabled: bool) -> None:
         for widget in (self.profile_box, self.profile_button,
                        self.source_mode_box, self.target_language_box,
-                       self.calibrate_button):
+                       self.calibrate_button,
+                       # The processing mode decides which engines are loaded.
+                       # Changing it under a live capture is refused by the
+                       # app layer anyway; greying it out means the operator
+                       # is not invited to try. The guard stays: this is the
+                       # courtesy, not the enforcement.
+                       self.mode_box):
             widget.setEnabled(enabled)
+        self.mode_badge.setEnabled(enabled)
         self.source_language_box.setEnabled(
             enabled and self.source_mode_box.currentData() == "specified")
 
@@ -672,9 +709,7 @@ class MainWindow(QtWidgets.QMainWindow):
         choice, ok = QtWidgets.QInputDialog.getItem(
             self, "Operating mode", "Mode:", modes, current, False)
         if ok:
-            self.app.set_mode(list(OperatingMode)[modes.index(choice)].value)
-            self._report_engines()
-            self._refresh_mode_badge()
+            self._apply_mode(list(OperatingMode)[modes.index(choice)].value)
 
     def _refresh_readiness(self, run_smoke_tests: bool = True) -> None:
         """Refresh the toolbar badge without blocking the interface.
@@ -684,7 +719,17 @@ class MainWindow(QtWidgets.QMainWindow):
         untested", and they run on a worker thread, so the cost is a badge
         that reads "Checking" for a few seconds rather than one that lies.
         """
+        from . import theme
         from .workers import readiness_job, run_in_background
+
+        # Immediately, before the worker is even launched. The badge used to
+        # start blank and only ever said "Checking" if a *finished* report
+        # happened to contain a skipped smoke test - so during the seconds the
+        # check actually takes, the toolbar said nothing at all.
+        self.ready_badge.setText("\u2026 Checking")
+        self.ready_badge.setStyleSheet(
+            f"color: {theme.status_color('working', self)};")
+        self.ready_badge.setAccessibleDescription("Checking field readiness")
 
         self._readiness_worker = run_in_background(
             readiness_job, self.app, run_smoke_tests,

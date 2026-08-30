@@ -91,14 +91,20 @@ def test_static_is_classified_but_always_retained():
     assert detected[0].worth_digital_analysis
 
 
-def test_an_operator_can_still_opt_out_of_transcribing_noise():
-    """The default changed; the knob did not disappear."""
+def test_no_setting_can_stop_static_reaching_speech_recognition():
+    """The knob is gone, not merely re-defaulted.
+
+    Alpha 3 wrote `auto_process_noise = false` into every settings.toml it
+    saved. Changing the default would have left every upgraded installation
+    still discarding the transcription of a voice under static, so the
+    setting was removed and is dropped on load.
+    """
     fixture = build_fixture(
         [{"gap": 1.0}, {"kind": "static", "duration": 4.0, "level_dbfs": -20},
          {"gap": 1.0}], sample_rate=SR)
     detected = detect_in_array(fixture.audio, SR)
-    assert not detected[0].should_auto_transcribe(
-        DetectorSettings(auto_process_noise=False))
+    assert not hasattr(DetectorSettings(), "auto_process_noise")
+    assert detected[0].should_auto_transcribe(DetectorSettings())
 
 
 def test_steady_tone_is_classified_but_retained():

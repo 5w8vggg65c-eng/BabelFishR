@@ -110,8 +110,13 @@ class ReadinessReport:
 
     @property
     def translation_unverified(self) -> bool:
+        # The production check is named "Installed translation paths" - see
+        # _check_translation. An earlier version of this looked for a name no
+        # check ever emits, so it silently answered False for every real
+        # report, and the unit test that covered it used the same invented
+        # name and passed without touching a real one.
         return self._unverified("Local translation smoke test",
-                                "Translation packages installed")
+                                "Installed translation paths")
 
     @property
     def field_ready(self) -> bool:
