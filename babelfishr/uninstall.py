@@ -160,17 +160,53 @@ class UninstallReport:
     links_removed: List[pathlib.Path] = dataclasses.field(default_factory=list)
     absent: List[pathlib.Path] = dataclasses.field(default_factory=list)
     failed: List[Tuple[pathlib.Path, str]] = dataclasses.field(default_factory=list)
+    preserved: List[Tuple[pathlib.Path, str]] = dataclasses.field(
+        default_factory=list)
+    """Left on purpose, because it may not be BabelFishR's.
+
+    Kept apart from :attr:`failed` because the two need different answers.
+    A failed item is ours and did not go: retrying, or an administrator
+    prompt, is the fix. A preserved item is content in a shared legacy Argos
+    directory that we could not attribute to BabelFishR, so deleting it is
+    never the fix - but it is still something left on the computer, and the
+    report must say so.
+    """
+
+    legacy_uncertain: Optional[str] = None
+    """Set when legacy cleanup raised, so its outcome is simply unknown."""
+
     notes: List[str] = dataclasses.field(default_factory=list)
     microphone_permission_reset: Optional[bool] = None
     dry_run: bool = False
 
     @property
     def complete(self) -> bool:
-        """True only when nothing allowlisted is left behind."""
-        return not self.failed
+        """True only when nothing is left behind, for any reason.
+
+        Preserved content used to be recorded as a note, which is not a
+        blocker - so a run that deliberately left a legacy Argos directory in
+        place still ended with "BabelFishR was completely removed". Anything
+        still on disk, whatever the reason it is still there, now makes this
+        false, and so does a legacy cleanup whose outcome we do not know.
+        """
+        return (not self.failed and not self.preserved
+                and self.legacy_uncertain is None)
 
     def leftovers(self) -> List[pathlib.Path]:
+        """BabelFishR's own items that did not go.
+
+        Deliberately not including :attr:`preserved`: this list is what an
+        administrator prompt is asked to delete, and third-party content must
+        never end up in it.
+        """
         return [path for path, _ in self.failed]
+
+    def preserved_paths(self) -> List[pathlib.Path]:
+        return [path for path, _ in self.preserved]
+
+    def remaining(self) -> List[pathlib.Path]:
+        """Everything still on the computer, whichever reason put it there."""
+        return self.leftovers() + self.preserved_paths()
 
     def summary(self) -> str:
         lines: List[str] = []
@@ -190,6 +226,18 @@ class UninstallReport:
         if self.failed:
             lines.append(f"COULD NOT BE REMOVED ({len(self.failed)}):")
             lines += [f"  ✗ {path} - {why}" for path, why in self.failed]
+        if self.preserved:
+            lines.append(
+                f"LEFT IN PLACE ON PURPOSE ({len(self.preserved)}) - this is "
+                f"in a folder Argos Translate shares between installations, "
+                f"and BabelFishR cannot prove it wrote it, so it was not "
+                f"touched:")
+            lines += [f"  ! {path} - {why}" for path, why in self.preserved]
+        if self.legacy_uncertain:
+            lines.append(
+                f"UNVERIFIED: the older Argos folders could not be checked "
+                f"({self.legacy_uncertain}), so whether anything remains "
+                f"there is unknown.")
         if self.microphone_permission_reset is True:
             lines.append("Microphone permission for BabelFishR was reset.")
         elif self.microphone_permission_reset is False:
@@ -198,7 +246,7 @@ class UninstallReport:
                 "Remove BabelFishR under System Settings > Privacy & Security "
                 "> Microphone if it is still listed.")
         lines += self.notes
-        if self.failed:
+        if not self.complete:
             lines.append("")
             lines.append(
                 "BabelFishR was NOT completely removed. The items above are "
@@ -528,11 +576,12 @@ def uninstall(plan: UninstallPlan, *, dry_run: bool = False,
     try:
         legacy = clean_legacy_argos(plan.home, dry_run=dry_run)
     except Exception as exc:  # noqa: BLE001 - never abort a removal on this
-        report.notes.append(f"Legacy Argos directories were not tidied: {exc}")
+        # Not a note. A note does not block, and this run genuinely does not
+        # know whether anything is left in those folders.
+        report.legacy_uncertain = f"{type(exc).__name__}: {exc}"
     else:
         report.removed += legacy.removed
-        report.notes += [f"Left in place: {path} - {why}"
-                         for path, why in legacy.kept]
+        report.preserved += list(legacy.kept)
 
     if not dry_run:
         report.microphone_permission_reset = reset_microphone_permission(

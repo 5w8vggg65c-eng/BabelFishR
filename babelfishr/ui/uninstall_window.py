@@ -201,8 +201,13 @@ class UninstallWindow(QtWidgets.QWidget):
             self.warning.setText(
                 "⚠️  BabelFishR was NOT completely removed. The items listed "
                 "above are still on this computer.")
-            self.status.setText(
-                f"{len(report.leftovers())} item(s) could not be removed.")
+            if report.legacy_uncertain and not report.remaining():
+                self.status.setText(
+                    "The older Argos folders could not be checked, so whether "
+                    "anything remains there is unknown.")
+            else:
+                self.status.setText(
+                    f"{len(report.remaining())} item(s) are still there.")
 
 
 def run(plan: Optional[UninstallPlan] = None) -> int:

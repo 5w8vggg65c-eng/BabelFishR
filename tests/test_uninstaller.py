@@ -9,6 +9,7 @@ about the file itself, so a future edit cannot quietly reintroduce it.
 from __future__ import annotations
 
 import ast
+import json
 import os
 import pathlib
 import subprocess
@@ -640,3 +641,148 @@ def test_the_uninstaller_is_not_reachable_from_inside_the_app():
         assert "uninstall" not in text.lower(), (
             f"{module.name} references uninstallation; removal must only be "
             f"reachable from the separate uninstaller application")
+
+
+# ------------------------------------- legacy Argos, through uninstall()
+#
+# These go through the whole uninstall() function rather than
+# clean_legacy_argos() on its own, because the defect they exist for was not
+# in the cleanup at all. The cleanup correctly preserved content it could not
+# attribute to BabelFishR and correctly reported it - and uninstall() then
+# recorded that as a *note*. Notes do not block, so report.complete stayed
+# true and the summary still ended "BabelFishR was completely removed" with a
+# legacy Argos folder still sitting in the home directory.
+
+COMPLETE_CLAIM = "BabelFishR was completely removed"
+
+
+def legacy_tree(home: pathlib.Path) -> pathlib.Path:
+    """The folders alpha 2 left behind, with only BabelFishR's own index."""
+    data = home / ".local" / "share" / "argos-translate"
+    data.mkdir(parents=True)
+    (data / "index.json").write_text(
+        json.dumps([{"code": "es", "from_code": "es", "to_code": "en"}]),
+        encoding="utf-8")
+    (home / ".config" / "argos-translate").mkdir(parents=True)
+    (home / ".local" / "cache" / "argos-translate" / "downloads").mkdir(
+        parents=True)
+    return data
+
+
+def test_unknown_legacy_content_survives_and_blocks_the_complete_claim(tmp_path):
+    populate(tmp_path)
+    data = legacy_tree(tmp_path)
+    stranger = data / "packages" / "translate-fr_en-1_9"
+    stranger.mkdir(parents=True)
+    (stranger / "model.bin").write_bytes(b"another installation's model")
+
+    report = U.uninstall(plan_for(tmp_path), runner=fake_runner(),
+                         running_check=not_running)
+
+    # 1. It is still there, untouched.
+    assert (stranger / "model.bin").read_bytes() == b"another installation's model"
+    assert data.exists()
+    # 2. It is preserved, not failed: those need different answers, and a
+    #    preserved path must never reach the administrator prompt.
+    assert data in report.preserved_paths()
+    assert data not in report.leftovers()
+    assert data in report.remaining()
+    # 3. And it blocks the claim.
+    assert report.complete is False
+    summary = report.summary()
+    assert str(data) in summary
+    assert COMPLETE_CLAIM not in summary
+    assert "NOT completely removed" in summary
+    assert "LEFT IN PLACE ON PURPOSE" in summary
+
+
+def test_a_preserved_legacy_path_is_never_offered_to_the_authorization_prompt(
+        tmp_path, monkeypatch):
+    """Elevating over third-party content would be the worse bug."""
+    populate(tmp_path)
+    data = legacy_tree(tmp_path)
+    (data / "packages").mkdir()
+    (data / "packages" / "someone.bin").write_bytes(b"theirs")
+
+    asked = []
+    monkeypatch.setattr(U, "elevate_removal",
+                        lambda paths, **kw: asked.append(list(paths)) or True)
+    report = U.uninstall(plan_for(tmp_path), runner=fake_runner(),
+                         running_check=not_running)
+    assert asked == [], "a preserved path was sent to be deleted as root"
+    assert report.complete is False
+
+
+def test_a_legacy_cleanup_exception_prevents_a_complete_claim(tmp_path,
+                                                              monkeypatch):
+    populate(tmp_path)
+
+    def explode(*args, **kwargs):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr("babelfishr.argos_home.clean_legacy_argos", explode)
+    report = U.uninstall(plan_for(tmp_path), runner=fake_runner(),
+                         running_check=not_running)
+
+    assert report.legacy_uncertain, "an exception left no trace on the report"
+    assert report.complete is False
+    summary = report.summary()
+    assert COMPLETE_CLAIM not in summary
+    assert "UNVERIFIED" in summary
+    # The rest of the removal still happened; the uncertainty is about the
+    # legacy folders only.
+    assert not (tmp_path / "Library" / "Application Support"
+                / "BabelFishR").exists()
+
+
+def test_a_known_only_legacy_tree_still_reports_complete(tmp_path):
+    """The other half: honesty must not become a permanent 'incomplete'."""
+    populate(tmp_path)
+    data = legacy_tree(tmp_path)
+
+    report = U.uninstall(plan_for(tmp_path), runner=fake_runner(),
+                         running_check=not_running)
+
+    assert not data.exists()
+    assert not (tmp_path / ".config" / "argos-translate").exists()
+    assert not (tmp_path / ".local" / "cache" / "argos-translate").exists()
+    assert report.preserved == []
+    assert report.legacy_uncertain is None
+    assert report.complete is True, report.summary()
+    assert COMPLETE_CLAIM in report.summary()
+
+
+def test_no_legacy_directories_at_all_still_reports_complete(tmp_path):
+    populate(tmp_path)
+    report = U.uninstall(plan_for(tmp_path), runner=fake_runner(),
+                         running_check=not_running)
+    assert report.complete is True, report.summary()
+    assert COMPLETE_CLAIM in report.summary()
+
+
+def test_a_preserved_path_is_not_merely_a_note(tmp_path):
+    """The regression guard the defect actually needs.
+
+    Recording preserved content in `notes` again would restore exactly the
+    old behaviour: the path would still appear in the summary, so a test that
+    only searched the text would keep passing. This one asserts the path is
+    carried on a field that blocks completion, and that notes alone cannot.
+    """
+    populate(tmp_path)
+    data = legacy_tree(tmp_path)
+    (data / "packages").mkdir()
+    (data / "packages" / "unknown.bin").write_bytes(b"?")
+
+    report = U.uninstall(plan_for(tmp_path), runner=fake_runner(),
+                         running_check=not_running)
+    assert data in report.preserved_paths()
+    assert not any(str(data) in note for note in report.notes), (
+        "preserved content is being recorded as a note, which does not block "
+        "the complete claim")
+
+    # And prove the field, not the text, is what blocks it: an otherwise
+    # identical report with the entry moved into notes claims completion.
+    demoted = U.UninstallReport(
+        removed=list(report.removed), notes=[f"Left in place: {data}"])
+    assert demoted.complete is True
+    assert COMPLETE_CLAIM in demoted.summary()

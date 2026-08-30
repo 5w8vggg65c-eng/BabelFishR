@@ -948,3 +948,111 @@ Unchanged from the previous section, minus nothing, plus:
   process name comes from the bundle's executable, which is `BabelFishR`, but
   that has only been modelled here, never observed.
 - That `--selftest-argos-paths` passes inside the signed bundle on the runner.
+
+---
+
+# Correction: preserved legacy content no longer counts as complete removal
+
+Branch `claude/radio-decoder-translator-0oslya`, from
+`41b9e701fe3646257ed7db9744745932fa604400`. One issue, nothing else touched.
+
+## The defect
+
+`clean_legacy_argos()` was already right: it preserves content in the shared
+Argos folders that it cannot attribute to BabelFishR, and names it. The bug was
+one level up. `uninstall()` folded that result into `report.notes`, and notes do
+not block anything — `UninstallReport.complete` was `not self.failed`, so a run
+that deliberately left `~/.local/share/argos-translate` in place still ended
+with:
+
+```
+BabelFishR was completely removed.
+```
+
+with a legacy Argos folder still on the machine. The same applied when the
+cleanup raised: the exception became a note, and the run still claimed
+completion despite having no idea what was in those folders.
+
+## The correction
+
+`UninstallReport` gained two fields:
+
+- `preserved: List[Tuple[Path, str]]` — left on purpose because it may not be
+  ours. Deliberately **not** merged into `failed`: a failed item is
+  BabelFishR's and a retry or an administrator prompt is the fix, while a
+  preserved item must never be deleted at all. `leftovers()` therefore still
+  returns only `failed`, which is what `elevate_removal()` is handed — a
+  preserved path can never reach a privileged `rm`.
+- `legacy_uncertain: Optional[str]` — set when legacy cleanup raised, so the
+  outcome is simply unknown.
+
+`complete` is now `not failed and not preserved and legacy_uncertain is None`,
+and the summary's final verdict reads `self.complete` rather than re-testing
+`failed`. Two new summary sections keep the distinction visible:
+
+```
+COULD NOT BE REMOVED (n):          ✗  ours, and it did not go
+LEFT IN PLACE ON PURPOSE (n):      !  in a folder Argos shares between
+                                      installations; BabelFishR cannot prove
+                                      it wrote it, so it was not touched
+UNVERIFIED: the older Argos folders could not be checked (…)
+```
+
+`remaining()` returns everything still on the computer for either reason; the
+uninstaller window's closing line counts that instead of `leftovers()`, and
+says so plainly when the only problem is that the folders could not be checked.
+
+Behaviour that did not change: unknown content is still never touched, the
+allowlist, process detection, injected-root isolation, the Argos directory
+layout, packaging and the release workflow are all untouched, and a known-only
+legacy tree that is cleaned safely still reports complete.
+
+## Tests
+
+Six integration-level tests in `tests/test_uninstaller.py`, all through the
+full `uninstall()` rather than `clean_legacy_argos()` alone — the defect was
+never in the cleanup:
+
+- `test_unknown_legacy_content_survives_and_blocks_the_complete_claim` — a
+  stranger's `packages/translate-fr_en-1_9/model.bin` survives byte-for-byte,
+  the directory is in `preserved_paths()` and not in `leftovers()`,
+  `complete is False`, its exact path is in the summary, and
+  `"BabelFishR was completely removed"` is absent.
+- `test_a_preserved_legacy_path_is_never_offered_to_the_authorization_prompt` —
+  `elevate_removal` is never called with it.
+- `test_a_legacy_cleanup_exception_prevents_a_complete_claim` — the raise sets
+  `legacy_uncertain`, blocks the claim, prints `UNVERIFIED`, and the rest of
+  the removal still happened.
+- `test_a_known_only_legacy_tree_still_reports_complete` and
+  `test_no_legacy_directories_at_all_still_reports_complete` — honesty has not
+  become a permanent "incomplete".
+- `test_a_preserved_path_is_not_merely_a_note` — the regression guard the
+  defect needs. Recording preserved content in `notes` again would leave the
+  path visible in the summary, so a text-only assertion would keep passing;
+  this one asserts the path is on a field that blocks completion, that it is
+  *not* in `notes`, and demonstrates the difference by building the same
+  report with the entry demoted to a note and showing it claims completion.
+
+Reverting `uninstall()` to the note-only handling fails four of these,
+including the exception case.
+
+Focused: `tests/test_uninstaller.py` 51 passed ·
+`tests/test_argos_home.py` 10 passed ·
+`tests/test_uninstaller_runtime_paths.py` 5 passed.
+
+Full suite: **655 passed, 9 skipped** in 78s — the same nine skips as before.
+
+## Files changed
+
+```
+babelfishr/uninstall.py            preserved / legacy_uncertain; complete()
+babelfishr/ui/uninstall_window.py  the closing line counts what remains
+tests/test_uninstaller.py          six integration regression tests
+```
+
+## Final commit
+
+One commit on `claude/radio-decoder-translator-0oslya`, whose parent is
+`41b9e701fe3646257ed7db9744745932fa604400`. Read it with
+`git rev-parse claude/radio-decoder-translator-0oslya`. No workflow was
+dispatched for this pass, and Alpha 3 was not published.
