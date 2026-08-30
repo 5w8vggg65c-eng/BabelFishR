@@ -47,14 +47,23 @@ def test_timeline_renders_a_bubble(qt_app):
 
 
 def test_bubble_separates_original_from_translation(qt_app):
+    """Two clearly separated lines, transcript first.
+
+    The transcript no longer carries a language prefix: it is the message the
+    operator reads, and the source language is already in the header line.
+    The translation keeps its label, because that line needs saying which
+    language it is in.
+    """
     from babelfishr.ui.timeline import TimelineView
 
     timeline = TimelineView()
     bubble = timeline.add(Transmission(transcript="hola", translation="hello",
                                        source_language="es", target_language="en"))
     assert bubble.original_label.text() != bubble.translated_label.text()
-    assert "es" in bubble.original_label.text()
+    assert bubble.original_label.text() == "hola"
+    assert "es" in bubble.header.text()
     assert "en" in bubble.translated_label.text()
+    assert "hello" in bubble.translated_label.text()
 
 
 def test_failed_bubble_offers_retry_and_reassures(qt_app):
@@ -247,7 +256,8 @@ def test_digital_result_is_shown_with_decoded_playback(qt_app):
         .AnalysisArtifact(kind="decoded-audio", path="/tmp/decoded.wav"))
     tx.analysis_attempts.append(attempt)
     bubble = TimelineView().add(tx)
-    assert bubble.decoded_button.isVisibleTo(bubble)
+    # Playback moved into the ellipsis menu; the bubble itself is text.
+    assert bubble.decoded_action.isVisible()
     assert "DMR" in bubble.notes_label.text()
 
 

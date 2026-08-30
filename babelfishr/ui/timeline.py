@@ -12,7 +12,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from ..analysis.dsd import AUTO_ROTATION_SECONDS
 from ..analysis.dsd import PRESETS as DSD_PRESETS
 from ..models import ContentClass, ProcessingState, Transmission
-from .widgets import TagEditor, WaveformWidget
+from .widgets import TagEditor
 
 CONTENT_LABELS = {
     "speech": "speech",
@@ -31,6 +31,28 @@ STATE_LABELS = {
     ProcessingState.FAILED: "failed",
     ProcessingState.SKIPPED: "not speech",
 }
+
+
+#: What the bubble says while it is filling itself in.
+_IN_FLIGHT = {
+    ProcessingState.CAPTURED: "Queued...",
+    ProcessingState.TRANSCRIBING: "Transcribing...",
+    ProcessingState.TRANSCRIBED: "Transcribing...",
+    ProcessingState.TRANSLATING: "Translating...",
+}
+
+
+def _differs(source: str, target: str) -> bool:
+    """Are these two language tags actually different languages?
+
+    ``en`` and ``en-GB`` are not, and neither is ``EN`` and ``en``. Getting
+    this wrong shows the operator a translation row that repeats what they
+    have already read.
+    """
+    if not source or not target:
+        return bool(source and target)
+    return (source.strip().lower().split("-")[0]
+            != target.strip().lower().split("-")[0])
 
 
 class _Player:
@@ -152,8 +174,9 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.notes_label.hide()
         outer.addWidget(self.notes_label)
 
-        self.waveform = WaveformWidget()
-        outer.addWidget(self.waveform)
+        # No waveform here. This is a message thread: the transcript is what
+        # the operator reads. An analyser belongs to a tool that analyses, not
+        # to every line of a conversation.
 
         # Metadata chips: compact, scannable, and readable without colour.
         self.chip_row = QtWidgets.QHBoxLayout()
@@ -164,20 +187,9 @@ class TransmissionBubble(QtWidgets.QFrame):
         controls = QtWidgets.QHBoxLayout()
         controls.setSpacing(8)
 
-        self.play_button = QtWidgets.QToolButton()
-        self.play_button.setText("Play")
-        self.play_button.setToolTip("Play the original recording")
-        self.play_button.setAccessibleName("Play original recording")
-        self.play_button.clicked.connect(self._toggle_play)
-        controls.addWidget(self.play_button)
-
-        self.decoded_button = QtWidgets.QToolButton()
-        self.decoded_button.setText("Play decoded")
-        self.decoded_button.setToolTip("Play the audio decoded by DSD-neo")
-        self.decoded_button.setAccessibleName("Play decoded audio")
-        self.decoded_button.clicked.connect(self._play_decoded)
-        self.decoded_button.hide()
-        controls.addWidget(self.decoded_button)
+        # Playback lives in the ellipsis menu. A Play button on every bubble
+        # of a text thread is a button the operator almost never wants, taking
+        # the space the words should have.
 
         # Primary recovery action stays visible; everything else is in the menu.
         self.action_button = QtWidgets.QToolButton()
@@ -216,6 +228,11 @@ class TransmissionBubble(QtWidgets.QFrame):
     def _build_menu(self) -> QtWidgets.QMenu:
         """Secondary actions, out of the way but one click deep."""
         menu = QtWidgets.QMenu(self)
+        self.play_action = menu.addAction("Play original recording",
+                                          self._toggle_play)
+        self.decoded_action = menu.addAction("Play decoded audio",
+                                             self._play_decoded)
+        menu.addSeparator()
         menu.addAction("Edit transcript and translation...", self._edit)
         menu.addAction("Add or edit note...", self._edit_note)
         menu.addAction("Edit tags...", self._edit_tags)
@@ -271,25 +288,32 @@ class TransmissionBubble(QtWidgets.QFrame):
             meta.append("CLIPPED")
         self.header.setText("  ·  ".join(meta))
 
+        # The transcript is the message. It is the primary content of the
+        # bubble, in plain words, with no engine or language prefix competing
+        # with it - the language already appears in the header line.
         original = tx.display_transcript
         if original:
-            corrected = " (edited)" if tx.transcript_correction else ""
-            label = tx.source_language or "original"
+            corrected = (" <i>(edited)</i>" if tx.transcript_correction else "")
+            self.original_label.setText(f"{_escape(original)}{corrected}")
+            self.original_label.show()
+        elif tx.state in _IN_FLIGHT:
+            # Same bubble, not a separate placeholder row: the operator sees
+            # one line per transmission that fills itself in.
             self.original_label.setText(
-                f"<b>{label}{corrected}:</b> {_escape(original)}")
+                f"<i>{_IN_FLIGHT[tx.state]}</i>")
             self.original_label.show()
         else:
             self.original_label.hide()
 
+        # A translation row only when there is genuinely another language to
+        # read. "already in English" under an English transcript is a line of
+        # noise in every bubble of an English-speaking operator's thread.
         translated = tx.display_translation
-        if translated:
-            corrected = " (edited)" if tx.translation_correction else ""
+        if translated and _differs(tx.source_language, tx.target_language):
+            corrected = " <i>(edited)</i>" if tx.translation_correction else ""
             self.translated_label.setText(
-                f"<b>{tx.target_language}{corrected}:</b> {_escape(translated)}")
-            self.translated_label.show()
-        elif tx.transcript and tx.source_language == tx.target_language:
-            self.translated_label.setText(
-                f"<i>already in {tx.target_language}</i>")
+                f"<b>{_escape(tx.target_language)}:</b> "
+                f"{_escape(translated)}{corrected}")
             self.translated_label.show()
         else:
             self.translated_label.hide()
@@ -354,12 +378,11 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.analyze_action.setEnabled(bool(tx.audio_path))
         self.protocol_menu.setEnabled(bool(tx.audio_path))
 
-        decoded = tx.decoded_audio_path
-        self.decoded_button.setVisible(bool(decoded))
+        self.decoded_action.setVisible(bool(tx.decoded_audio_path))
 
-        self.play_button.setEnabled(bool(tx.audio_path))
-        if tx.audio_path and self.waveform._peaks is None:
-            self.waveform.load_file(tx.audio_path)
+        self.play_action.setEnabled(bool(tx.audio_path))
+        self.play_action.setText("Pause" if self._player.is_playing()
+                                 else "Play original recording")
 
     def _rebuild_chips(self, tx: Transmission) -> None:
         """Compact metadata chips: class, confidence, tags, digital result."""
@@ -403,15 +426,15 @@ class TransmissionBubble(QtWidgets.QFrame):
             self.provisional.hide()
 
     # -- actions ---------------------------------------------------------
-    def _toggle_play(self) -> None:
+    def _toggle_play(self) -> None:  # noqa: D401
         if not self.tx.audio_path:
             return
         if self._player.is_playing():
             self._player.pause()
-            self.play_button.setText("Play")
+            self.play_action.setText("Play original recording")
         else:
             self._player.play(self.tx.audio_path)
-            self.play_button.setText("Pause")
+            self.play_action.setText("Pause")
 
     def _edit(self) -> None:
         dialog = QtWidgets.QDialog(self)

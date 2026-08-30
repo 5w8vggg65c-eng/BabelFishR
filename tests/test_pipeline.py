@@ -103,8 +103,15 @@ def test_specified_source_language_is_honoured(config, store, fixture_wav):
     app.stop_session()
 
 
-def test_noise_is_not_sent_to_the_transcription_engine(config, store, tmp_path):
-    """Static should never cost an ASR call."""
+def test_an_operator_who_opts_out_of_noise_costs_no_asr_call(config, store,
+                                                             tmp_path):
+    """Static reaches ASR by default now; opting out must still work.
+
+    The old version of this test asserted the opposite default. It was
+    changed deliberately: a real Mac showed the classifier mislabelling
+    speech, and a transmission that is silently never transcribed is a worse
+    outcome than an ASR call spent on static.
+    """
     from babelfishr.testing import build_fixture
 
     fixture = build_fixture(
@@ -112,7 +119,7 @@ def test_noise_is_not_sent_to_the_transcription_engine(config, store, tmp_path):
          {"gap": 1.0}], sample_rate=48_000)
     path = fixture.write(str(tmp_path / "static.wav"))
 
-    config.detector.reject_noise = False
+    config.detector.auto_process_noise = False
     app = BabelFishRApp(config=config, store=store)
     engine = MockTranscriptionEngine()
     app.transcription = engine

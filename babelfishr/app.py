@@ -67,6 +67,10 @@ class BabelFishRApp:
         self.profile: Optional[RadioProfile] = None
         self.capture: Optional[CaptureService] = None
         self.pipeline: Optional[ProcessingPipeline] = None
+        # Processing a recording that is already on disk has nothing to do
+        # with monitoring. This pipeline exists so "Transcribe anyway" and
+        # Retry work after the session has stopped, and after a relaunch.
+        self.standalone_pipeline: Optional[ProcessingPipeline] = None
 
     # -- setup -----------------------------------------------------------
     def glossary_path(self) -> pathlib.Path:
@@ -271,6 +275,10 @@ class BabelFishRApp:
         self.store.save_session(session)
         self.session = session
 
+        # A standalone pipeline may be running from a "Transcribe anyway" on a
+        # saved recording. Let it finish, then retire it: two pipelines pulling
+        # the same rows would race each other.
+        self._discard_standalone_pipeline()
         self.pipeline = ProcessingPipeline(
             store=self.store, transcription=self.transcription,
             translation=self.translation, config=self.config, events=self.events,
@@ -355,6 +363,13 @@ class BabelFishRApp:
             return True
         return self.pipeline.wait_until_idle(timeout=timeout)
 
+    def _discard_standalone_pipeline(self) -> None:
+        """Two pipelines must never work the same queue at the same time."""
+        if self.standalone_pipeline is not None:
+            self.standalone_pipeline.wait_until_idle(timeout=30.0)
+            self.standalone_pipeline.stop()
+            self.standalone_pipeline = None
+
     def stop_session(self) -> Optional[Session]:
         session = self.session
         if self.capture is not None:
@@ -374,25 +389,100 @@ class BabelFishRApp:
     def resume_pending(self) -> int:
         return self.pipeline.resume_pending() if self.pipeline else 0
 
+    # -- processing recordings that are already on disk -------------------
+    def processing_problem(self, tx_id: str) -> str:
+        """Why a saved recording cannot be processed, or "" when it can.
+
+        A precise sentence naming the real obstacle. It is never "start
+        monitoring first": a WAV on disk does not need a microphone.
+        """
+        from .modes import OperatingMode
+
+        tx = self.store.get_transmission(tx_id)
+        if tx is None:
+            return "That transmission is no longer in the database."
+        if not tx.audio_path:
+            return "No audio file was recorded for this transmission."
+        if not pathlib.Path(tx.audio_path).exists():
+            return (f"The recording file is missing:\n{tx.audio_path}\n\n"
+                    f"It may have been moved or deleted outside BabelFishR.")
+        if self.mode is OperatingMode.RECORD_ONLY:
+            return ("Record Only mode has transcription switched off. Change "
+                    "the operating mode, then try again - the recording is "
+                    "kept either way.")
+        if self._processing_pipeline() is None:
+            summary = self.select_engines()
+            detail = "; ".join(summary.warnings) or "no transcription engine"
+            return (f"No transcription engine is available in "
+                    f"{self.mode.label}: {detail}")
+        return ""
+
+    def _processing_pipeline(self) -> Optional[ProcessingPipeline]:
+        """The live pipeline when monitoring, otherwise a standalone one.
+
+        Deliberately not a fake capture session: no Session row is created, no
+        audio device is opened, and nothing about the operator's monitoring
+        state changes. It publishes on the same event bus, so a bubble updates
+        exactly as it does during a live session, and it runs on its own
+        worker thread so the window never freezes.
+        """
+        if self.pipeline is not None:
+            return self.pipeline
+        if self.standalone_pipeline is not None:
+            return self.standalone_pipeline
+
+        self.select_engines()          # honours the current operating mode
+        if self.transcription is None:
+            return None
+        pipeline = ProcessingPipeline(
+            store=self.store, transcription=self.transcription,
+            translation=self.translation, config=self.config,
+            events=self.events, glossary=self.glossary)
+        pipeline.start(None)
+        self.standalone_pipeline = pipeline
+        return pipeline
+
     # -- data ------------------------------------------------------------
     def transmissions(self, session_id: Optional[str] = None,
                       limit: int = 500) -> List[Transmission]:
         target = session_id or (self.session.id if self.session else None)
         return self.store.list_transmissions(session_id=target, limit=limit)
 
+    #: How much of the thread the window restores on open. Bounded so a
+    #: long-running installation does not build thousands of widgets at
+    #: startup, and large enough that a day's traffic is all there.
+    HISTORY_LIMIT = 500
+
+    def recent_transmissions(self, limit: Optional[int] = None
+                             ) -> List[Transmission]:
+        """The message thread: the newest transmissions, oldest-first.
+
+        Across sessions, deliberately. Stopping and restarting monitoring is
+        not the end of the operator's log; it is a pause in one continuous
+        radio watch.
+        """
+        return self.store.recent_transmissions(
+            limit=self.HISTORY_LIMIT if limit is None else limit)
+
     def search(self, query: str = "", **filters) -> List[Transmission]:
         return self.store.search(query, **filters)
 
     def retry(self, tx_id: str) -> bool:
-        if self.pipeline is None:
-            return False
-        return self.pipeline.retry(tx_id)
+        """Retry a failed recording - monitoring or not."""
+        pipeline = self._processing_pipeline()
+        return pipeline.retry(tx_id) if pipeline is not None else False
 
     def transcribe_anyway(self, tx_id: str) -> bool:
-        """Force transcription of a recording the classifier routed away."""
-        if self.pipeline is None:
-            return False
-        return self.pipeline.force_transcribe(tx_id)
+        """Force transcription of a recording the classifier routed away.
+
+        The WAV is already on disk, so this needs no live session: it works
+        after monitoring stops and after the application has been quit and
+        reopened. The saved transmission carries its own session metadata,
+        source-language mode and target language, so the result is the same as
+        it would have been at capture time.
+        """
+        pipeline = self._processing_pipeline()
+        return pipeline.force_transcribe(tx_id) if pipeline is not None else False
 
     # -- digital analysis ------------------------------------------------
     def analyser(self):
@@ -478,6 +568,7 @@ class BabelFishRApp:
 
     def close(self) -> None:
         self.stop_session()
+        self._discard_standalone_pipeline()
         for engine in (self.transcription, self.translation):
             if engine is not None:
                 engine.close()

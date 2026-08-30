@@ -82,8 +82,16 @@ def test_non_speech_classes_are_persisted(app, mixed_wav, content):
         assert app.store.get_transmission(tx.id) is not None
 
 
-def test_classification_gates_asr_but_not_persistence(config, store, mixed_wav):
-    """Only speech reaches the engine; everything still reaches the disk."""
+def test_classification_does_not_gate_asr_but_still_never_gates_persistence(
+        config, store, mixed_wav):
+    """Everything reaches the disk, and almost everything reaches the engine.
+
+    This test used to assert that only SPEECH was transcribed. That was the
+    defect a real Mac exposed: ordinary voice through the MacBook microphone
+    was classified DIGITAL_SUSPECTED, so it was never transcribed and there
+    was nothing for Argos to translate. Classification is advisory now. Only a
+    steady tone - which cannot contain speech - is routed away by default.
+    """
     app = BabelFishRApp(config=config, store=store)
     engine = MockTranscriptionEngine()
     app.transcription = engine
@@ -93,11 +101,17 @@ def test_classification_gates_asr_but_not_persistence(config, store, mixed_wav):
 
     transmissions = app.transmissions()
     assert len(transmissions) == 5
-    speech = [t for t in transmissions if t.content_class is ContentClass.SPEECH]
-    others = [t for t in transmissions if t.content_class is not ContentClass.SPEECH]
+    tones = [t for t in transmissions if t.content_class is ContentClass.TONE]
+    processed = [t for t in transmissions
+                 if t.content_class is not ContentClass.TONE]
+    assert processed, "the fixture must contain something worth transcribing"
 
-    assert engine.calls == len(speech), "ASR ran on something other than speech"
-    for tx in others:
+    assert engine.calls == len(processed), (
+        "a classification other than TONE stopped speech recognition")
+    for tx in processed:
+        assert tx.state is not ProcessingState.SKIPPED
+        assert pathlib.Path(tx.audio_path).exists()
+    for tx in tones:
         assert tx.state is ProcessingState.SKIPPED
         assert not tx.auto_processed
         assert tx.skip_reason, "a skipped transmission must explain itself"
@@ -182,13 +196,15 @@ def test_settings_separate_recording_from_processing():
     """The two thresholds must be genuinely independent knobs."""
     settings = DetectorSettings()
     processing_knobs = {"auto_process_speech", "auto_process_noise",
-                        "auto_process_tone", "auto_process_digital",
-                        "auto_process_unknown"}
+                        "auto_process_tone", "auto_process_unknown"}
     recording_knobs = {"min_duration", "open_margin_db", "threshold_dbfs"}
     for name in processing_knobs | recording_knobs:
         assert hasattr(settings, name)
     # No setting may exist whose purpose is to discard a classified event.
     assert not hasattr(settings, "reject_noise")
+    # And none may exist that can cancel the transcription of a suspected
+    # digital burst: on a real Mac that classification landed on speech.
+    assert not hasattr(settings, "auto_process_digital")
 
 
 def test_digital_shaped_audio_reaches_the_digital_queue(app, mixed_wav):

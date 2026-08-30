@@ -43,8 +43,14 @@ def run(config_path: Optional[str] = None, argv: Optional[list] = None) -> int:
     if config.needs_first_run_setup or not _has_usable_assets(config):
         from .setup_assistant import SetupAssistant
 
-        QtCore.QTimer.singleShot(
-            200, lambda: SetupAssistant(app, window).exec())
+        def _first_run_setup() -> None:
+            SetupAssistant(app, window).exec()
+            # The same refresh the manually opened assistant gets. Without it
+            # the operator finished preparation and the window still showed
+            # the pre-setup mode, engines and readiness until they restarted.
+            window.refresh_after_setup()
+
+        QtCore.QTimer.singleShot(200, _first_run_setup)
     return qt_app.exec()
 
 

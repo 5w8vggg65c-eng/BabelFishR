@@ -84,18 +84,21 @@ def test_static_is_classified_but_always_retained():
     assert len(detected) == 1, "static must be recorded, not discarded"
     assert detected[0].content_class is ContentClass.NOISE
     assert detected[0].audio.size > 0
-    # Classified out of *automatic* ASR, but still on disk and analysable.
-    assert not detected[0].should_auto_transcribe(DetectorSettings())
+    # Static now goes to ASR by default. Radio static very often has a weak
+    # voice under it, and losing that transmission is worse than spending an
+    # ASR call on a burst that turns out to be nothing.
+    assert detected[0].should_auto_transcribe(DetectorSettings())
     assert detected[0].worth_digital_analysis
 
 
-def test_operator_can_opt_into_transcribing_noise():
+def test_an_operator_can_still_opt_out_of_transcribing_noise():
+    """The default changed; the knob did not disappear."""
     fixture = build_fixture(
         [{"gap": 1.0}, {"kind": "static", "duration": 4.0, "level_dbfs": -20},
          {"gap": 1.0}], sample_rate=SR)
     detected = detect_in_array(fixture.audio, SR)
-    assert detected[0].should_auto_transcribe(
-        DetectorSettings(auto_process_noise=True))
+    assert not detected[0].should_auto_transcribe(
+        DetectorSettings(auto_process_noise=False))
 
 
 def test_steady_tone_is_classified_but_retained():

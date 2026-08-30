@@ -306,6 +306,13 @@ class Store:
     def list_transmissions(self, session_id: Optional[str] = None,
                            limit: int = 500, ascending: bool = True
                            ) -> List[Transmission]:
+        """Transmissions in the requested order, capped at ``limit``.
+
+        Note what ``ascending=True`` with a limit means here: the *oldest*
+        rows. That is right for "the first N of a session" and wrong for
+        "the thread as it stands", which is why :meth:`recent_transmissions`
+        exists rather than callers passing a limit to this.
+        """
         order = "ASC" if ascending else "DESC"
         if session_id:
             rows = self._conn.execute(
@@ -316,6 +323,33 @@ class Store:
                 f"SELECT * FROM transmissions ORDER BY started_at {order} LIMIT ?",
                 (limit,)).fetchall()
         return [_from_row(r) for r in rows]
+
+    def recent_transmissions(self, limit: int = 500,
+                             session_id: Optional[str] = None
+                             ) -> List[Transmission]:
+        """The newest ``limit`` transmissions, returned oldest-first.
+
+        Two steps, and they cannot be collapsed into one. ``ORDER BY
+        started_at ASC LIMIT 500`` returns the five hundred *oldest* rows -
+        so after a few days of use the message thread would open on ancient
+        traffic and the operator's last transmission would not be in it. The
+        newest set is selected DESC, then reversed for display, so the thread
+        reads in time order and ends where the operator left off.
+        """
+        limit = max(0, int(limit))
+        if not limit:
+            return []
+        if session_id:
+            rows = self._conn.execute(
+                "SELECT * FROM transmissions WHERE session_id = ? "
+                "ORDER BY started_at DESC, rowid DESC LIMIT ?",
+                (session_id, limit)).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM transmissions "
+                "ORDER BY started_at DESC, rowid DESC LIMIT ?",
+                (limit,)).fetchall()
+        return [_from_row(r) for r in reversed(rows)]
 
     def pending_transmissions(self) -> List[Transmission]:
         """Anything not in a terminal state - used to resume after a restart."""

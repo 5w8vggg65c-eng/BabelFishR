@@ -129,10 +129,20 @@ class DetectorSettings:
 
     auto_process_speech: bool = True
     auto_process_unknown: bool = True
-    auto_process_noise: bool = False
+    auto_process_noise: bool = True
+    """Static often has a weak voice under it. Recovering it is the product."""
+
     auto_process_tone: bool = False
-    auto_process_digital: bool = False
-    """Automatic ASR on a suspected digital burst is usually pointless."""
+    """A steady single-frequency carrier or courtesy beep. The one genuinely
+    trivial class: it cannot carry speech, so it is the only classification
+    still allowed to keep an ASR call from happening by itself."""
+
+    # There is deliberately no auto_process_digital. A real Mac classified
+    # ordinary speech through the MacBook microphone as a digital burst, and
+    # the setting that used to exist here then stopped Whisper from ever
+    # seeing it - so the operator got no transcript, and Argos got nothing to
+    # translate. "Possibly digital" is advisory metadata. It may offer digital
+    # analysis; it may not take transcription away.
 
     noise_flatness: float = 0.25
     """In-band flatness above which an event *may* be static (see modulation)."""
@@ -226,16 +236,28 @@ class DetectedTransmission:
         This gates *processing*, never persistence: the recording exists on
         disk and in the database regardless of what this returns, and the
         operator can always force transcription from the timeline.
+
+        The classifier is a heuristic over a few seconds of audio, and a real
+        Mac proved it wrong in the way that costs most: ordinary speech
+        through the built-in microphone came out as DIGITAL_SUSPECTED. So a
+        classification no longer decides on its own that speech recognition
+        is not worth trying. Only a steady tone - which cannot contain
+        speech - and an event too short to hold a word are routed away, and
+        even those are kept on disk and can be forced.
         """
         if self.duration < 0.25:
             return False
+        content = self.content_class or ContentClass.UNKNOWN
+        if content is ContentClass.DIGITAL_SUSPECTED:
+            # Not a lookup, and not settings-dependent: no configuration may
+            # reintroduce the veto, including one persisted by alpha 3.
+            return True
         return {
             ContentClass.SPEECH: settings.auto_process_speech,
             ContentClass.UNKNOWN: settings.auto_process_unknown,
             ContentClass.NOISE: settings.auto_process_noise,
             ContentClass.TONE: settings.auto_process_tone,
-            ContentClass.DIGITAL_SUSPECTED: settings.auto_process_digital,
-        }.get(self.content_class or ContentClass.UNKNOWN, True)
+        }.get(content, True)
 
     @property
     def worth_digital_analysis(self) -> bool:

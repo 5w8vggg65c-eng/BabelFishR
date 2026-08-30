@@ -91,10 +91,47 @@ class ReadinessReport:
         check = self.get("Local translation smoke test")
         return check is not None and check.status is CheckStatus.PASS
 
+    def _unverified(self, smoke: str, asset: str) -> bool:
+        """The asset is there, but its smoke test was not run.
+
+        "Not tested" and "not available" are different answers, and conflating
+        them is what made alpha 3 report Record Only on a machine with a
+        working model and working language packs.
+        """
+        test = self.get(smoke)
+        present = self.get(asset)
+        return (test is not None and test.status is CheckStatus.SKIP
+                and present is not None and present.status is CheckStatus.PASS)
+
+    @property
+    def transcription_unverified(self) -> bool:
+        return self._unverified("Local transcription smoke test",
+                                "Local ASR model present")
+
+    @property
+    def translation_unverified(self) -> bool:
+        return self._unverified("Local translation smoke test",
+                                "Translation packages installed")
+
     @property
     def field_ready(self) -> bool:
         """Fully ready: record, transcribe and translate with no network."""
         return self.can_record and self.can_transcribe and self.can_translate
+
+    @property
+    def field_ready_unknown(self) -> bool:
+        """Everything needed is present, but not all of it has been tested.
+
+        Neither ready nor unready: an honest third answer, so a caller can
+        say "checking" instead of announcing a downgrade it has not
+        established.
+        """
+        if self.field_ready or not self.can_record:
+            return False
+        transcription = self.can_transcribe or self.transcription_unverified
+        translation = self.can_translate or self.translation_unverified
+        return (transcription and translation
+                and (self.transcription_unverified or self.translation_unverified))
 
     def recommended_mode(self) -> OperatingMode:
         if self.field_ready:
@@ -136,6 +173,9 @@ class ReadinessReport:
             "can_transcribe": self.can_transcribe,
             "can_translate": self.can_translate,
             "field_ready": self.field_ready,
+            "field_ready_unknown": self.field_ready_unknown,
+            "transcription_unverified": self.transcription_unverified,
+            "translation_unverified": self.translation_unverified,
             "recommended_mode": self.recommended_mode().value,
         }
 

@@ -246,6 +246,11 @@ jobs:
             GATEKEEPER=$'**UNNOTARIZED ALPHA.** This build is '"$MODE"$' signed and has *not* been notarized by Apple.\nmacOS will refuse it on first launch. To open it: right-click (Control-click) **BabelFishR** in\nApplications, choose **Open**, then click **Open** in the dialog. You only have to do this once.'
           fi
 
+          # Unquoted heredoc, because $TAG, $SHA256 and $GATEKEEPER must
+          # expand. That means every backtick in the body has to be escaped:
+          # an unescaped one is command substitution, and alpha 3 shipped
+          # notes reading "type ." because the shell ran DELETE as a command
+          # and put its (empty) output in the sentence.
           cat > release-notes.md <<NOTES
           ## BabelFishR $TAG — macOS (Apple Silicon)
 
@@ -275,7 +280,7 @@ jobs:
           Open **BabelFishR-macOS-arm64.dmg** again and double-click **Uninstall BabelFishR**.
           It runs from the disk image; there is nothing to install for it, and it needs
           neither Python nor Terminal. It shows you the exact list of paths first, and
-          deletes nothing until you tick the acknowledgement box *and* type `DELETE`.
+          deletes nothing until you tick the acknowledgement box *and* type \`DELETE\`.
 
           **Complete removal permanently deletes every recording BabelFishR has made,
           along with the transmission database, all transcripts and translations.

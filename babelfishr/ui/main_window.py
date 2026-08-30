@@ -63,8 +63,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._report_engines()
         self._refresh_mode_badge()
         self._refresh_state_badge()
-        self._refresh_readiness()
+        self._refresh_readiness(run_smoke_tests=True)
         self._refresh_sdr_label()
+        self._reload_timeline()
 
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(100)
@@ -306,7 +307,9 @@ class MainWindow(QtWidgets.QMainWindow):
         review.triggered.connect(self._show_review_queue)
         view_menu.addAction(review)
 
-        show_all = QtGui.QAction("Show current session", self)
+        show_all = QtGui.QAction("Show all transmissions", self)
+        show_all.setShortcut("Ctrl+Shift+A")
+        show_all.setToolTip("Return to the full message thread")
         show_all.triggered.connect(self._reload_timeline)
         view_menu.addAction(show_all)
 
@@ -494,7 +497,10 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Could not start monitoring", str(exc))
             self.app.stop_session()
             return
-        self.timeline.clear()
+        # The timeline is deliberately NOT cleared. Stopping and restarting
+        # monitoring is a pause in one continuous radio watch, not a new
+        # document. Clearing it here made every earlier transmission look
+        # lost, even though the WAVs and the database rows were untouched.
         self.meter.reset()
         self.start_button.setText("Stop monitoring")
         self._set_controls_enabled(False)
@@ -670,8 +676,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._report_engines()
             self._refresh_mode_badge()
 
-    def _refresh_readiness(self, run_smoke_tests: bool = False) -> None:
-        """Refresh the toolbar badge without blocking the interface."""
+    def _refresh_readiness(self, run_smoke_tests: bool = True) -> None:
+        """Refresh the toolbar badge without blocking the interface.
+
+        Smoke tests are on by default. They are the only thing that can
+        honestly distinguish "prepared and working" from "prepared but
+        untested", and they run on a worker thread, so the cost is a badge
+        that reads "Checking" for a few seconds rather than one that lies.
+        """
         from .workers import readiness_job, run_in_background
 
         self._readiness_worker = run_in_background(
@@ -685,6 +697,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._readiness = report
         if report.field_ready:
             text, tone = "\u2713 Field ready", "ok"
+        elif report.field_ready_unknown:
+            # Prepared, but the smoke tests have not run in this process yet.
+            # Alpha 3 showed "Record only" here, on a machine with a working
+            # Whisper model and working Argos routes, and it stayed wrong
+            # until the operator restarted. "Not tested" is not "unavailable".
+            text, tone = "\u2026 Checking", "working"
         elif report.can_record:
             text, tone = "\u25d1 Record only", "working"
         else:
@@ -713,12 +731,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.app.correct(tx_id, notes=note)
 
     def _on_transcribe_anyway(self, tx_id: str) -> None:
-        if not self.app.transcribe_anyway(tx_id):
-            QtWidgets.QMessageBox.information(
-                self, "Transcribe anyway",
-                "Forcing transcription needs a running session with a "
-                "transcription engine available.\n\n"
-                "The recording is safe either way.")
+        # A WAV on disk does not need a microphone. This works with monitoring
+        # stopped, and after quitting and reopening the application.
+        if self.app.transcribe_anyway(tx_id):
+            self.status.showMessage("Transcribing the saved recording...", 8000)
+            return
+        QtWidgets.QMessageBox.information(
+            self, "Transcribe anyway",
+            (self.app.processing_problem(tx_id)
+             or "The recording could not be queued for transcription.")
+            + "\n\nThe recording itself is safe.")
 
     def _on_analyze_digital(self, tx_id: str, protocol: str) -> None:
         analyser = self.app.analyser()
@@ -751,10 +773,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status.showMessage(message, 15000)
 
     def _on_retry(self, tx_id: str) -> None:
-        if not self.app.retry(tx_id):
-            QtWidgets.QMessageBox.information(
-                self, "Retry",
-                "Retry needs a running session. Start monitoring, then retry.")
+        if self.app.retry(tx_id):
+            self.status.showMessage("Retrying the saved recording...", 8000)
+            return
+        QtWidgets.QMessageBox.information(
+            self, "Retry",
+            (self.app.processing_problem(tx_id)
+             or "The recording could not be queued again.")
+            + "\n\nThe recording itself is safe.")
 
     def _on_export_clip(self, tx_id: str) -> None:
         from ..export import export_transmission_audio
@@ -771,7 +797,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # -- data views ------------------------------------------------------
     def _reload_timeline(self) -> None:
-        self.timeline.set_transmissions(self.app.transmissions())
+        """Restore the full message thread, newest traffic last."""
+        self.timeline.set_transmissions(self.app.recent_transmissions())
 
     def _search(self) -> None:
         text, ok = QtWidgets.QInputDialog.getText(
@@ -781,23 +808,38 @@ class MainWindow(QtWidgets.QMainWindow):
         results = self.app.search(text)
         self.timeline.set_transmissions(results)
         self.status.showMessage(
-            f"{len(results)} match(es) for {text!r} - View > Show current session "
-            f"to go back", 10000)
+            f"{len(results)} match(es) for {text!r} - View > Show all "
+            f"transmissions to go back", 10000)
 
     def _show_review_queue(self) -> None:
         results = self.app.review_queue()
         self.timeline.set_transmissions(results)
         self.status.showMessage(
-            f"{len(results)} transmission(s) need review", 10000)
+            f"{len(results)} transmission(s) need review - View > Show all "
+            f"transmissions to go back", 10000)
 
     def _show_assistant(self) -> None:
         from .setup_assistant import SetupAssistant
 
         SetupAssistant(self.app, self).exec()
+        self.refresh_after_setup()
+
+    def refresh_after_setup(self) -> None:
+        """Re-read everything preparation can have changed.
+
+        One method, called from both the manually opened assistant and the
+        one that opens itself on first run. The automatic path used to skip
+        this entirely, so an operator who completed preparation was left
+        looking at the pre-setup mode, engines and readiness until they quit
+        and reopened the application.
+        """
+        self.app.select_engines()
         self._refresh_devices()
         self._report_engines()
         self._refresh_mode_badge()
-        self._refresh_readiness()
+        self._refresh_state_badge()
+        self._refresh_readiness(run_smoke_tests=True)
+        self._reload_timeline()
 
     def _show_storage_location(self) -> None:
         stats = self.app.store.stats()

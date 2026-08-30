@@ -157,16 +157,20 @@ class Recorder:
 
 
 def _skip_reason(detected: DetectedTransmission) -> str:
-    """Plain-language note explaining why automatic ASR was not attempted."""
+    """Plain-language note explaining why automatic ASR was not attempted.
+
+    There is deliberately no entry for ``digital-suspected``. That
+    classification no longer routes anything away from speech recognition:
+    on a real Mac it landed on ordinary voice, and the operator got neither a
+    transcript nor a translation. It is a chip on the bubble now, not a veto.
+    """
     return {
-        "noise": "Classified as broadband noise, so speech recognition was not "
-                 "attempted automatically. The recording is kept - use "
-                 "'Transcribe anyway' to run it regardless.",
+        "noise": "Classified as broadband noise, and automatic speech "
+                 "recognition is switched off for noise in your settings. The "
+                 "recording is kept - use 'Transcribe anyway' to run it.",
         "tone": "Classified as a steady tone (courtesy beep or unmodulated "
-                "carrier). The recording is kept.",
-        "digital-suspected": "Possibly a digital burst rather than analogue "
-                             "voice. The recording is kept - try "
-                             "'Analyze as digital', or 'Transcribe anyway'.",
+                "carrier), which cannot contain speech. The recording is kept "
+                "- use 'Transcribe anyway' if you disagree.",
     }.get(detected.content_class.value,
           "Automatic speech processing was skipped. The recording is kept.")
 
@@ -203,7 +207,14 @@ class ProcessingPipeline:
         self._idle.set()
 
     # -- lifecycle -------------------------------------------------------
-    def start(self, session: Session) -> None:
+    def start(self, session: Optional[Session] = None) -> None:
+        """Start the workers. ``session`` is optional.
+
+        Processing a recording that is already on disk needs no session: every
+        value the pipeline uses - source-language mode, target language,
+        engines - comes from the transmission row or the configuration, never
+        from a live capture.
+        """
         self._session = session
         self._running = True
         for index in range(self.worker_count):

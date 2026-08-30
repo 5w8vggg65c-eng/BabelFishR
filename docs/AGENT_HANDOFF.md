@@ -1056,3 +1056,196 @@ One commit on `claude/radio-decoder-translator-0oslya`, whose parent is
 `41b9e701fe3646257ed7db9744745932fa604400`. Read it with
 `git rev-parse claude/radio-decoder-translator-0oslya`. No workflow was
 dispatched for this pass, and Alpha 3 was not published.
+
+---
+
+# Alpha 3 field-test repair pass
+
+Branch `claude/radio-decoder-translator-0oslya`, from
+`c9299e06e8731db1645441da3677cf24358243dd` (the commit `v0.3.0-alpha.3` was
+built from). No release was published, no workflow dispatched, and the
+alpha 1/2/3 tags, releases and assets were not touched.
+
+## What the operator saw, and why
+
+Five symptoms on a real Mac. Four of them were one product decision that was
+wrong, and one query that was subtly wrong.
+
+**1. Voice through the MacBook microphone was called "possibly a digital
+burst", and that stopped Whisper.** The classifier is a heuristic over a few
+seconds of audio, and on this hardware it put ordinary speech in
+`DIGITAL_SUSPECTED`. `DetectedTransmission.should_auto_transcribe()` then
+looked that class up in `settings.auto_process_digital`, which defaulted to
+`False`, so the recording was marked SKIPPED and never transcribed. No
+transcript meant Argos had nothing to translate — symptom 2 was not a separate
+bug, it was this one.
+
+The fix is not a better classifier. It is that a classification no longer gets
+to make this decision:
+
+- `DIGITAL_SUSPECTED` returns `True` from `should_auto_transcribe()`
+  unconditionally — not a settings lookup, so no configuration can put the
+  veto back.
+- `auto_process_digital` is **removed** from `DetectorSettings` and
+  `DetectorConfig`, and added to `RETIRED_OPTIONS`. That second part matters
+  as much as the first: an alpha 3 `settings.toml` carrying
+  `auto_process_digital = false` is now dropped on load, so upgrading cannot
+  reinstate the defect.
+- `auto_process_noise` now defaults to `True`. Radio static very often has a
+  weak voice under it, and a transmission that is never transcribed is a worse
+  outcome than an ASR call spent on nothing.
+- `TONE` remains the one suppressible class, still defaulting to off. A steady
+  unmodulated carrier or courtesy beep cannot contain speech. It is still
+  recorded, still in the database, and still forcible.
+- Capture-first is untouched: the WAV and the row are written before anything
+  classifies, and the original bytes are never rewritten.
+- The misleading comments went with it — `DetectorSettings`' "automatic ASR on
+  a suspected digital burst is usually pointless", the config comment, and the
+  `digital-suspected` entry in `_skip_reason` that told the operator their
+  speech was "possibly a digital burst".
+
+**3. "Transcribe anyway" claimed it needed a running session.** It did, in the
+code: `app.transcribe_anyway()` returned `False` whenever `self.pipeline` was
+`None`, and the pipeline only existed during capture. A WAV on disk does not
+need a microphone.
+
+`BabelFishRApp._processing_pipeline()` returns the live pipeline while
+monitoring and otherwise builds a standalone one on demand — same store, same
+event bus (so the same bubble updates through the ordinary
+`updated`/`state`/`error` events), its own worker thread (so the window never
+freezes), engines chosen by `select_engines()` for the current operating mode.
+It creates **no Session row and opens no audio device**: it is not a fake live
+session. `start_session()` retires it first so two pipelines never work the
+same rows. Everything the processing needs — source-language mode, target
+language, session metadata — already lives on the transmission row, which is
+why this works after a relaunch too.
+
+`app.processing_problem(tx_id)` returns the precise obstacle, and the dialog
+shows it: the transmission is gone, no audio was recorded, the file is missing
+(named), Record Only has transcription switched off, or no engine is available
+in this mode (with the engine warnings). It never says monitoring must be
+running, because that is never the reason.
+
+**4. Starting monitoring made earlier transmissions vanish.**
+`MainWindow._start_monitoring()` called `self.timeline.clear()`. The files and
+rows survived; the operator's log appeared to have been wiped. That call is
+gone, and the window now loads the thread on open.
+
+Underneath it was a second, quieter defect: `list_transmissions(limit=500)`
+orders `started_at ASC` and then limits, which returns the five hundred
+*oldest* rows. After a few days of use the thread would have opened on ancient
+traffic with the operator's most recent transmission missing. New
+`Store.recent_transmissions()` selects the newest set `DESC` and reverses it
+for display; `app.recent_transmissions()` wraps it with `HISTORY_LIMIT = 500`.
+`list_transmissions` keeps its old behaviour and now documents what its limit
+actually means.
+
+"Show current session" is now **"Show all transmissions"** (Ctrl+Shift+A), and
+search and the review queue both say to use it to get back.
+
+**5. The waveform card was not the product.** The bubble is a radio message
+now: the transcript is the primary text with no language prefix competing with
+it, "Transcribing…" appears in that same bubble while it is in flight, and the
+translation is a clearly separated second line **only when the languages
+actually differ** (`en` vs `en-GB` counts as the same, so no "already in
+English" row under an English transcript). `WaveformWidget` is not constructed
+at all, and Play is no longer a permanent button — Play original, Play decoded,
+Export audio, Analyze as digital, edit, tags, note and bookmark all live in the
+ellipsis menu. "possibly digital" stays as a small chip beside the words.
+Transcript correction, notes, tags, bookmarks and export are unchanged.
+
+**The false "Record only" badge.** `ReadinessReport.can_transcribe` required a
+`PASS` from the smoke test, and the startup check ran with
+`run_smoke_tests=False` for speed — so a machine with a working model and
+working language packs reported SKIP, which the badge rendered as "Record
+only", and it stayed wrong until a restart. "Not tested" is not "not
+available". `field_ready_unknown` is the honest third answer: assets present,
+smoke tests not run. The badge shows "… Checking" for that state, and the
+window now runs the real check with smoke tests on a worker thread at startup,
+so it resolves to "Field ready" by itself.
+
+**First-run setup did not refresh the window.** `_show_assistant()` refreshed
+four things; the automatic first-run assistant in `ui/run()` refreshed nothing.
+Both now call one shared `MainWindow.refresh_after_setup()`, which re-selects
+engines and refreshes devices, engines, mode, state, readiness and the
+timeline. No restart.
+
+**The release-notes heredoc.** `cat > release-notes.md <<NOTES` is unquoted —
+it has to be, because `$TAG`, `$SHA256` and `$GATEKEEPER` must expand — so the
+backticked `` `DELETE` `` in the *Removing BabelFishR* section was command
+substitution. The shell ran `DELETE`, logged `command not found`, and
+substituted its empty output, which is why alpha 3's notes read "type .". The
+backticks are now escaped (`` \`DELETE\` ``), as the code fences already were.
+Alpha 3's published notes were deliberately left alone.
+
+## Deliberate behaviour changes to existing tests
+
+Three tests asserted the old routing and were rewritten rather than deleted,
+each carrying the reason in its docstring:
+
+- `test_capture_invariant.py::test_classification_gates_asr_but_not_persistence`
+  → `..._does_not_gate_asr_but_still_never_gates_persistence`. It asserted
+  `engine.calls == len(speech)`. That assertion **was** the defect.
+- `test_pipeline.py::test_noise_is_not_sent_to_the_transcription_engine`
+  → `test_an_operator_who_opts_out_of_noise_costs_no_asr_call`. The default
+  flipped; the knob did not disappear, so the test now drives it.
+- `test_detect.py::test_static_is_classified_but_always_retained` and
+  `test_operator_can_opt_into_transcribing_noise` → the opt-*out* direction.
+- `test_settings_separate_recording_from_processing` now asserts
+  `auto_process_digital` does **not** exist.
+- `test_ui.py::test_bubble_separates_original_from_translation` — the
+  transcript no longer carries a language prefix.
+- `test_ui.py::test_digital_result_is_shown_with_decoded_playback` — checks the
+  menu action, not a button.
+
+## Files changed
+
+```
+babelfishr/detect.py              digital is advisory; noise default flipped
+babelfishr/config.py              field removed; RETIRED_OPTIONS migration
+babelfishr/pipeline.py            skip reasons; start(session=None)
+babelfishr/app.py                 standalone pipeline, processing_problem,
+                                  recent_transmissions, HISTORY_LIMIT
+babelfishr/storage.py             recent_transmissions (newest N, chronological)
+babelfishr/readiness.py           field_ready_unknown, *_unverified
+babelfishr/ui/main_window.py      no clear(), thread on open, honest dialogs,
+                                  Checking badge, refresh_after_setup()
+babelfishr/ui/timeline.py         text bubble: no waveform, no Play button
+babelfishr/ui/__init__.py         first-run assistant refreshes the window
+.github/workflows/macos-release.yml   escaped backticks in the heredoc
+tests/test_alpha3_repairs.py      NEW  26 regression tests
+tests/{test_capture_invariant,test_pipeline,test_detect,test_ui}.py
+                                  rewritten for the changed behaviour
+```
+
+## Test results
+
+Focused (`test_alpha3_repairs`, pipeline, capture-invariant, detect, storage,
+ui, gui_setup, offline, release_pipeline): **206 passed**.
+
+Full suite: **681 passed, 9 skipped** in 57s — the same nine environment skips
+as before (CoreAudio host, PlistBuddy, and the real-engine tests that need a
+prepared model and language pack).
+
+`test_reverting_the_routing_restores_the_alpha_3_failure` monkeypatches the old
+lookup back in and asserts the digital-suspected recordings return to SKIPPED
+with no transcript, so the fix's test is not vacuous.
+
+## Still requiring a real Mac
+
+Nothing below has been run on physical hardware:
+
+1. **Spoken English through the MacBook microphone** — that it is transcribed,
+   whatever the classifier calls it, and that the bubble shows the words.
+2. **Spoken Spanish translated to English** — that the second line appears and
+   the first does not repeat it.
+3. **Stop monitoring, then transcribe a saved item** — and again after quitting
+   and reopening the app.
+4. **Stop/start and relaunch persistence** — that the thread keeps every
+   earlier transmission and appends new ones.
+5. **The text-only bubble** — no waveform, no Play button, playback still
+   reachable from the ellipsis menu.
+
+Also unverified on hardware: that the readiness badge settles from "Checking"
+to "Field ready" on a genuinely prepared machine, and that completing first-run
+setup updates the window without a restart.

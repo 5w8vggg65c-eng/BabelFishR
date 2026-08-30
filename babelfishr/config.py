@@ -107,11 +107,14 @@ class DetectorConfig:
 
     # Automatic-processing routing. None of these can stop a recording being
     # made: they only decide whether an ASR call happens without being asked.
+    # A suspected digital burst is deliberately not on this list - see
+    # DetectedTransmission.should_auto_transcribe - because a classifier that
+    # mistakes speech for a digital burst must not be able to cancel the
+    # transcription of that speech.
     auto_process_speech: bool = True
     auto_process_unknown: bool = True
-    auto_process_noise: bool = False
+    auto_process_noise: bool = True
     auto_process_tone: bool = False
-    auto_process_digital: bool = False
 
     def to_settings(self):
         from .detect import DetectorSettings
@@ -530,6 +533,14 @@ RETIRED_OPTIONS: Dict[str, set] = {
     # explicitly chosen device is now pinned to its identity unconditionally,
     # so there is no longer a setting for it to be wrong about.
     "InputSelection": {"locked"},
+    # "auto_process_digital" decided whether a suspected digital burst was
+    # sent to speech recognition, and defaulted to false. On a real Mac the
+    # classifier called ordinary voice a digital burst, so that setting
+    # silently cancelled the transcription of speech. Dropping it on load
+    # matters as much as removing it from the code: an alpha 3 settings.toml
+    # carrying `auto_process_digital = false` would otherwise reinstate the
+    # defect on the first launch after upgrading.
+    "DetectorConfig": {"auto_process_digital"},
 }
 
 
