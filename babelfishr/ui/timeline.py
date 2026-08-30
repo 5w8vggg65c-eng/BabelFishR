@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import pathlib
 import subprocess
 import sys
@@ -276,7 +277,9 @@ class TransmissionBubble(QtWidgets.QFrame):
         if tx.channel_name:
             meta.append(tx.channel_name)
         if tx.frequency_mhz is not None:
-            # Never let a typed value read as a measurement.
+            # Never let a typed value read as a measurement. "(entered)" is
+            # kept verbatim: operators and tests have relied on that word
+            # since alpha 1.
             suffix = "" if tx.frequency_is_measured else " (entered)"
             meta.append(f"{tx.frequency_mhz:.4f} MHz{suffix}")
         if tx.source_language:
@@ -286,7 +289,13 @@ class TransmissionBubble(QtWidgets.QFrame):
             meta.append(language)
         if tx.clipped:
             meta.append("CLIPPED")
-        self.header.setText("  ·  ".join(meta))
+        # Whatever an SDR, a radio or a decoder actually supplied - and
+        # nothing else. Absent values produce no entry at all rather than a
+        # dash an operator could read as a measurement of zero, and anything
+        # typed or defaulted is marked so it cannot pass for measured.
+        meta += [entry["display"] for entry in tx.signal_summary()
+                 if entry["label"] not in ("channel", "frequency")]
+        self.header.setText("  ·  ".join(_escape(part) for part in meta))
 
         # The transcript is the message. It is the primary content of the
         # bubble, in plain words, with no engine or language prefix competing
@@ -485,8 +494,30 @@ def _escape(text: str) -> str:
     return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
+#: How many turns of the event loop an anchor is re-applied for. Enough to
+#: cover a wrapped label settling its height; small enough that it is over
+#: before a person could possibly have scrolled.
+_ANCHOR_SETTLE_PASSES = 3
+
+
 class TimelineView(QtWidgets.QScrollArea):
-    """Scrolling, chronological list of transmission bubbles."""
+    """The message thread: newest transmission at the top, older below.
+
+    Two things follow from newest-first, and the second is the one that
+    matters. New traffic is inserted *above* everything already on screen -
+    so if the operator has scrolled down to read something from twenty
+    minutes ago, an arriving transmission would push what they are reading
+    down the screen. It would also do that every time a bubble above them
+    grew: Captured to Transcribing to Translating, and again when a
+    translation line appears.
+
+    So every mutation that can change the height of anything above the
+    viewport runs inside :meth:`_anchored`, which remembers one visible
+    bubble and its exact pixel offset and puts it back afterwards. Nothing
+    scrolls on its own: there is no follow-the-newest behaviour and no jump
+    to the bottom, because both take the operator away from what they chose
+    to look at.
+    """
 
     correctionRequested = QtCore.Signal(str, str, str)
     tagsChanged = QtCore.Signal(str, list)
@@ -510,6 +541,10 @@ class TimelineView(QtWidgets.QScrollArea):
         self.setWidget(self._container)
 
         self._bubbles: Dict[str, TransmissionBubble] = {}
+        #: Newest first, so index 0 in the layout is the most recent.
+        self._order: List[str] = []
+        self._pending_anchor = None
+        self._anchor_passes = 0
         self._player = _Player()
         self.playback_backend = self._player.backend
 
@@ -528,12 +563,89 @@ class TimelineView(QtWidgets.QScrollArea):
             self._layout.removeWidget(bubble)
             bubble.deleteLater()
         self._bubbles.clear()
+        self._order.clear()
         self.empty_label.show()
 
     def count(self) -> int:
         return len(self._bubbles)
 
-    def add(self, tx: Transmission, scroll: bool = True) -> TransmissionBubble:
+    def order(self) -> List[str]:
+        """Transmission ids top to bottom. Newest first."""
+        return list(self._order)
+
+    def at_top(self) -> bool:
+        return self.verticalScrollBar().value() <= 0
+
+    # -- viewport anchoring ---------------------------------------------
+    def _anchor(self):
+        """The topmost bubble currently visible, and where it sits.
+
+        Returned as (id, offset-from-the-viewport-top). Anchoring on a widget
+        rather than a scroll value is what survives an insertion: scroll
+        positions are measured from the top of the content, and the top of
+        the content is exactly what moves when a bubble is added above.
+        """
+        if self.at_top():
+            return None
+        # The container is a child of the viewport, so its coordinates are
+        # already what the scroll bar measures: the value is the distance from
+        # the top of the content to the top of the viewport.
+        viewport_top = self.verticalScrollBar().value()
+        for tx_id in self._order:
+            bubble = self._bubbles.get(tx_id)
+            if bubble is None:
+                continue
+            bottom = bubble.y() + bubble.height()
+            if bottom > viewport_top:
+                return tx_id, bubble.y() - viewport_top
+        return None
+
+    def _restore(self, anchor) -> None:
+        if anchor is None:
+            return
+        tx_id, offset = anchor
+        bubble = self._bubbles.get(tx_id)
+        if bubble is None:
+            return
+        self._container.layout().activate()
+        bar = self.verticalScrollBar()
+        target = bubble.y() - offset
+        bar.setValue(max(bar.minimum(), min(bar.maximum(), target)))
+
+    @contextlib.contextmanager
+    def _anchored(self):
+        """Keep whatever the operator is reading exactly where it is.
+
+        Restored twice, deliberately. Qt lays a newly inserted widget out on
+        the next pass through the event loop, so the geometry read
+        immediately after the insertion is still the old one and a single
+        correction lands short. The first restore keeps the jump invisible;
+        the deferred one, on the very next turn, is the exact correction. If
+        the first already landed it, the second is a no-op.
+        """
+        anchor = self._anchor()
+        try:
+            yield
+        finally:
+            self._restore(anchor)
+            if anchor is not None:
+                # A wrapped label settles its height over a resize round-trip,
+                # so one deferred pass is not always enough. Bounded and
+                # short: three turns of the event loop, which is microseconds,
+                # then it stops for good and never fights a real scroll.
+                self._pending_anchor = anchor
+                self._anchor_passes = _ANCHOR_SETTLE_PASSES
+                QtCore.QTimer.singleShot(0, self._reapply_anchor)
+
+    def _reapply_anchor(self) -> None:
+        if self._pending_anchor is None or self._anchor_passes <= 0:
+            self._pending_anchor = None
+            return
+        self._anchor_passes -= 1
+        self._restore(self._pending_anchor)
+        QtCore.QTimer.singleShot(0, self._reapply_anchor)
+
+    def add(self, tx: Transmission, scroll: bool = False) -> TransmissionBubble:
         if tx.id in self._bubbles:
             self.update(tx)
             return self._bubbles[tx.id]
@@ -547,11 +659,26 @@ class TimelineView(QtWidgets.QScrollArea):
         bubble.noteChanged.connect(self.noteChanged)
         bubble.transcribeAnywayRequested.connect(self.transcribeAnywayRequested)
         bubble.analyzeDigitalRequested.connect(self.analyzeDigitalRequested)
-        # Keep the stretch last so bubbles stack from the top.
-        self._layout.insertWidget(self._layout.count() - 1, bubble)
-        self._bubbles[tx.id] = bubble
-        if scroll:
-            QtCore.QTimer.singleShot(0, self._scroll_to_bottom)
+
+        # Position 0: newest at the top. The stretch stays last so the older
+        # bubbles stack downwards and a short thread does not float.
+        with self._anchored():
+            self._layout.insertWidget(0, bubble)
+            self._order.insert(0, tx.id)
+            self._bubbles[tx.id] = bubble
+        return bubble
+
+    def append_older(self, tx: Transmission) -> TransmissionBubble:
+        """Add a bubble at the bottom - for loading history, not new traffic."""
+        if tx.id in self._bubbles:
+            self.update(tx)
+            return self._bubbles[tx.id]
+        bubble = self.add(tx)
+        with self._anchored():
+            self._layout.removeWidget(bubble)
+            self._layout.insertWidget(self._layout.count() - 1, bubble)
+            self._order.remove(tx.id)
+            self._order.append(tx.id)
         return bubble
 
     def update(self, tx: Transmission) -> None:
@@ -559,14 +686,27 @@ class TimelineView(QtWidgets.QScrollArea):
         if bubble is None:
             self.add(tx)
             return
-        bubble.update_from(tx)
+        # A bubble growing - Transcribing, then a translation line appearing -
+        # pushes everything below it down. If that bubble is above what the
+        # operator is reading, the text under their eyes would move.
+        with self._anchored():
+            bubble.update_from(tx)
 
     def set_transmissions(self, transmissions: List[Transmission]) -> None:
-        self.clear()
-        for tx in transmissions:
-            self.add(tx, scroll=False)
-        QtCore.QTimer.singleShot(0, self._scroll_to_bottom)
+        """Replace the thread. ``transmissions`` may be in either order.
 
-    def _scroll_to_bottom(self) -> None:
+        Sorted here rather than trusted, because the callers differ: the
+        thread wants newest-first, while search and export have their own
+        deliberate orders and must not be quietly re-sorted by a view.
+        """
+        self.clear()
+        newest_first = sorted(
+            transmissions, key=lambda t: (t.started_at, t.id), reverse=True)
+        for tx in newest_first:
+            self.append_older(tx)
+        # Open at the newest transmission, which is the top.
+        self.scroll_to_top()
+
+    def scroll_to_top(self) -> None:
         bar = self.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        bar.setValue(bar.minimum())

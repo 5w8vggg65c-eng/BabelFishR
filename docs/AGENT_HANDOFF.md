@@ -1429,3 +1429,249 @@ existing alpha 3 `~/Library/Application Support/BabelFishR/settings.toml` and
 confirm it starts, that the two retired keys are gone from the file the next
 time settings are saved, and that static and "possibly digital" transmissions
 are transcribed.
+
+---
+
+# Alpha 4 work: newest-first thread, named Sessions, honest RF metadata
+
+Branch `claude/radio-decoder-translator-0oslya`, from
+`7a42cfc1307911cf241d983857de23f04ff2fe8b`. No workflow dispatched, no tag, no
+release; alpha 1/2/3 untouched.
+
+## The candidate build was validated on a real Mac
+
+The non-publishing candidate from workflow run **33319489154**, built from
+`7a42cfc`, was installed over alpha 3 on the operator's Apple Silicon Mac.
+Confirmed **physically**, on hardware:
+
+- Existing alpha 3 assets survived the upgrade.
+- Field readiness reached **Field ready**.
+- Field Offline transcription worked through the MacBook microphone.
+- Spanish speech was transcribed and translated into English, locally.
+- One received event produced one text bubble.
+- The permanent waveform cards were gone.
+- Older transmissions remained available.
+
+That closes the outstanding items from the previous two passes. It does **not**
+touch any of the following, none of which has ever been exercised: **FalconClaw
+PTT, a USB radio interface, any radio, any SDR dongle, RF metadata from real
+hardware, or digital radio identifiers from a real decoder.** Everything in
+section C below was built and tested against deterministic fakes and the
+existing recorded-IQ reference path. There is still no tested physical SDR
+driver, and this pass did not write one.
+
+## A — the thread reads newest-first, and stays where the operator put it
+
+`TimelineView` inserts at position 0 and `set_transmissions()` sorts
+newest-first and opens at the top. Every automatic scroll is gone: there is no
+`_scroll_to_bottom` and nothing follows new traffic.
+
+The part that took the work is viewport stability. With newest-first, arriving
+traffic is inserted *above* everything on screen, so a reader scrolled into
+history would have the text under their eyes pushed down — and again every time
+a bubble above them grew through Captured → Transcribing → Translating →
+Complete, or gained a translation line.
+
+Every mutation now runs inside `TimelineView._anchored()`, which records the
+topmost visible bubble and its exact pixel offset and restores it afterwards.
+Two details are load-bearing:
+
+- The anchor is a **widget plus offset**, not a scroll value. Scroll values are
+  measured from the top of the content, and the top of the content is exactly
+  what moves.
+- The restore runs immediately **and** on the next few turns of the event loop
+  (`_ANCHOR_SETTLE_PASSES = 3`). Qt lays a newly inserted widget out on the next
+  pass, and a wrapped label settles its height over a resize round-trip, so a
+  single synchronous correction lands short. Three turns is microseconds; it is
+  over long before a person could scroll.
+
+Measured in a real `QScrollArea` with 30 bubbles overflowing a 400px viewport:
+insertion above the viewport moves the anchor by **0 px**, and so does each of
+the three state changes and the appearance of a translation.
+
+Ordering elsewhere is deliberate and documented: search and the review queue
+replace the thread and are reachable back via View ▸ Show all transmissions;
+exports are **chronological**, because an export is a record of what was
+received and when.
+
+## B — named Session tabs, over the unchanged Session row
+
+`Session` still means one monitoring run. The new `Conversation` is the named
+thread the interface calls a Session; the low-level run is never shown.
+
+- A tab bar above the thread, a permanent **General** tab, `+` to create, and
+  Rename (button or double-click).
+- Tabs, names and the last selected tab survive relaunch
+  (`config.session.conversation_id`).
+- Start Monitoring pins the destination in `app._capture_conversation_id`.
+  Switching tabs mid-watch is allowed and changes nothing about where traffic
+  is filed; the header shows "● Recording into <name>" when the viewed tab is
+  not the capture tab.
+- `MainWindow._belongs_here()` gates incoming `transmission`/`updated` events,
+  so live traffic cannot appear in a thread it does not belong to.
+- One `CaptureService` and one `ProcessingPipeline`, globally, unchanged. Tabs
+  create no receivers and no processors; a second `start_session` still raises.
+- Export was taking `store.list_sessions(1)` — the newest capture run. Both
+  bundle and text exports now cover **every run** in the selected named
+  Session, sorted chronologically.
+
+No tab deletion in this pass, deliberately: there is no need to add a
+data-loss path to make tabs useful.
+
+### Schema migration, 3 → 4
+
+Explicit, additive and idempotent. `CREATE TABLE IF NOT EXISTS` is a no-op
+against an existing table, so it is not a migration on its own:
+
+1. `_SCHEMA` creates anything absent (including the new `conversations` table).
+2. `_ADDED_COLUMNS` is applied one column at a time with `ALTER TABLE ... ADD
+   COLUMN`, guarded by `PRAGMA table_info`. SQLite fills existing rows with the
+   declared default, so nothing is rewritten:
+   `sessions.conversation_id`, and on `transmissions`: `snr_db`,
+   `snr_provenance`, `squelch_code`, `squelch_code_provenance`, `talkgroup`,
+   `talkgroup_provenance`, `unit_id`, `unit_id_provenance`, `protocol`,
+   `protocol_provenance`, `signal_metadata`.
+3. `_POST_MIGRATION_SCHEMA` adds `ix_sess_conv` — separately, because indexing
+   `conversation_id` before step 2 fails against a schema-3 database and takes
+   the whole migration with it. (That is not hypothetical: it happened during
+   development and is why the index moved.)
+4. `_backfill_default_conversation()` guarantees General exists and assigns
+   every session with no conversation to it.
+
+The migration test builds a genuine schema-3 database from **the previous
+commit's own DDL** (`git show 7a42cfc:babelfishr/storage.py`), not a
+hand-written approximation, then opens it through the new `Store` and asserts
+every audio path, transcript, translation, both corrections, notes, tags,
+bookmarks and frequency provenance survive, that all three old runs land in
+General, and that reopening three more times changes nothing.
+
+## C — RF and transmitter metadata, with provenance on every value
+
+New per-transmission fields, each with its own provenance: `snr_db`,
+`squelch_code` (CTCSS/PL or DCS), `talkgroup`, `unit_id`, `protocol`, plus
+`signal_metadata` holding raw decoder output verbatim. Existing
+frequency/channel/RSSI/modulation fields keep their provenance.
+
+`Transmission.signal_summary()` returns only values that exist — an absent
+value produces no entry at all, never a dash an operator could read as a
+measurement — and marks anything not measured (`462.5750 MHz (profile)`,
+`unit 4021 (decoded)`). `Provenance.is_measured` remains SDR and RADIO only.
+
+`has_supplied_unit_id` is True only when an SDR, a decoded protocol, a radio or
+the operator supplied it. **A squelch tone is not an identity**: CTCSS/DCS is
+channel access, shared by every radio set to it, and is labelled `squelch`.
+Nothing infers a speaker from a voice, and nothing derives frequency, tone,
+talkgroup or unit ID from microphone or line-level audio — a test drives a real
+capture and asserts every one of those fields stays empty.
+
+`babelfishr/signal_metadata.py` promotes genuinely decoded values:
+`apply_decoded_metadata()` maps DSD-neo's `talkgroup`/`source_id` onto the
+transmission with `Provenance.DSD` and keeps the whole raw dict (including
+`color_code` and `nac`, which identify a system rather than a transmitter and
+are kept but not promoted). `apply_source_metadata()` does the same for a
+signal source, and a source that states no provenance gets `UNKNOWN` — it does
+not get to claim it was measured.
+
+## D — the operating mode is a control, not a label
+
+The header's `QLabel` with a `mousePressEvent` is replaced by a
+`QToolButton` reading **"Operating mode: FIELD OFFLINE ▾"** with a checkable
+menu of all three modes, each keeping its description. It takes focus, opens
+from the keyboard, and announces itself. Field readiness stays a separate chip.
+The duplicate "Processing" combo in the collapsible panel is **removed**, so
+exactly one selector exists — asserted by walking every `QComboBox` in the
+window. The control is disabled while monitoring; the app-layer guard from
+`7a42cfc` remains the enforcement and is untouched.
+
+## E — Session Options, and a panel that collapses cleanly
+
+Renamed from "Session setup". `_toggle_setup_panel()` used to call
+`setVisible()` on everything `findChildren(QWidget)` returned — which includes
+each combo box's popup view and each scroll area's scrollbars and viewport, and
+is exactly why dropdowns and stray scrollbars appeared after a collapse. There
+is now one `setup_content` container and the toggle shows or hides that single
+widget.
+
+The regression test drives four real collapse/expand cycles on the actual
+window and asserts no combo popup and no scrollbar becomes visible and no
+control loses its value. A second test parses `_toggle_setup_panel`'s syntax
+tree and fails if `findChildren` reappears.
+
+## F — nothing regressed
+
+Capture-first persistence, WAV immutability, device pinning and ambiguous-device
+refusal, saved-recording transcription with monitoring stopped, history across
+stop/start and relaunch, noise and digital-suspected audio reaching ASR, tone
+and sub-0.25 s suppression, Field Offline privacy enforcement, mode-bound engine
+retirement, immediate refusal when saved processing is busy, Argos certificates
+and managed paths, uninstaller containment — all still covered and passing.
+
+## Files changed
+
+```
+babelfishr/models.py               Conversation; RF/transmitter fields;
+                                   signal_summary(); has_supplied_unit_id
+babelfishr/storage.py              schema 4, explicit ALTER migration,
+                                   conversation CRUD and queries
+babelfishr/config.py               session.conversation_id
+babelfishr/app.py                  conversation selection, capture destination,
+                                   conversation-scoped thread
+babelfishr/signal_metadata.py      NEW  decoded/source metadata promotion
+babelfishr/export.py               export a whole named Session
+babelfishr/ui/timeline.py          newest-first, viewport anchoring,
+                                   metadata in the bubble header
+babelfishr/ui/main_window.py       Session tabs, mode tool button, one
+                                   selector, Session Options panel fix,
+                                   Session-scoped exports
+tests/test_alpha4_thread_and_sessions.py  NEW  30 tests
+tests/{test_ui,test_alpha3_repairs}.py    updated for the new mode control
+```
+
+Two existing UI tests were rewritten rather than patched around:
+`test_mode_badge_shows_the_operating_mode` became
+`test_the_operating_mode_control_shows_the_mode`, and eight
+`TimelineView().add(...)` temporaries now hold the view. Those temporaries only
+survived before because `add()` left a `QTimer` holding a reference to the
+view; removing the auto-scroll removed that accidental lifeline, which is a
+test-hygiene fix, not a behaviour change.
+
+## Test results
+
+Focused (alpha4, alpha3 repairs, capture-invariant, detect, pipeline, offline,
+offline-integration, storage, ui, gui_setup, models, providers,
+release_pipeline, acceptance, packaging): **366 passed, 1 skipped**.
+
+Full suite: **724 passed, 9 skipped** in 70s. Exact skips:
+`test_coreaudio.py:255` needs a real macOS host with CoreAudio (1);
+`test_packaging.py:373` PlistBuddy is macOS-only (1);
+`test_real_engines.py:32` no prepared Whisper model (5);
+`test_real_engines.py:107` no Argos language pack installed (2).
+
+## Non-vacuity
+
+Each behaviour was reverted in isolation and the suite re-run:
+
+| Mutation | Failing tests |
+|---|---|
+| Restore bottom insertion | 3 |
+| Remove viewport-anchor compensation | 2 |
+| Restore recursive descendant visibility in the panel toggle | 2 |
+| Restore the second Processing selector | 1 |
+| Remove Session filtering from the thread query | 3 |
+| Remove the schema migration and backfill | 2 |
+| Present an operator/profile value as measured | 1 |
+| Treat an unprovided unit ID as identified | 1 |
+
+## Still unverified on physical hardware
+
+Never exercised, by this pass or any before it: **FalconClaw PTT, a USB radio
+interface, any radio, any SDR dongle, real RF metadata, and digital radio
+identifiers from a real decoder.** The SignalSource contract and the
+recorded-IQ reference path exist; there is no tested physical SDR driver and
+this pass deliberately did not fabricate one.
+
+Not yet seen on a Mac from this commit: the newest-first thread with real
+arriving traffic, viewport stability under a live watch, the Session tabs
+(creating, renaming, switching mid-watch, and the "Recording into" notice),
+the upgrade of a real alpha 3 database to schema 4, the new operating-mode
+button, and the repaired Session Options panel.

@@ -1134,19 +1134,16 @@ def test_the_gui_mode_controls_are_disabled_while_monitoring(qt_app, config,
     app = _mock_app(config, store)
     window = MainWindow(app)
     qt_app.processEvents()
-    assert window.mode_box.isEnabled()
-    assert window.mode_badge.isEnabled()
+    assert window.mode_button.isEnabled()
 
     window._start_monitoring(replay_path=digital_wav)
     qt_app.processEvents()
-    assert not window.mode_box.isEnabled(), (
-        "the processing-mode combo can be changed during monitoring")
-    assert not window.mode_badge.isEnabled()
+    assert not window.mode_button.isEnabled(), (
+        "the operating-mode control can be changed during monitoring")
 
     window._stop_monitoring()
     qt_app.processEvents()
-    assert window.mode_box.isEnabled()
-    assert window.mode_badge.isEnabled()
+    assert window.mode_button.isEnabled()
     window.hide()
 
 
@@ -1170,6 +1167,8 @@ def test_the_gui_refusal_leaves_the_mode_and_the_combo_consistent(
     assert window._apply_mode(OperatingMode.FIELD_OFFLINE.value) is False
     assert shown and "Stop monitoring" in shown[0]
     assert app.config.mode == OperatingMode.ONLINE_SETUP.value
-    assert window.mode_box.currentData() == OperatingMode.ONLINE_SETUP.value
+    checked = [a.data() for a in window.mode_button.menu().actions()
+               if a.isChecked()]
+    assert checked == [OperatingMode.ONLINE_SETUP.value]
     app.stop_session()
     window.hide()

@@ -214,6 +214,10 @@ class SessionConfig:
     source_language: Optional[str] = None
     auto_start: bool = False
 
+    conversation_id: str = ""
+    """The named Session tab the operator last had selected. Empty means the
+    permanent General thread."""
+
 
 @dataclasses.dataclass
 class Config:

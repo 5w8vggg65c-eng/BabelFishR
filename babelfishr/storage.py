@@ -18,13 +18,14 @@ import sqlite3
 import threading
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from .models import (ContentClass, ErrorInfo, ProcessingState, RadioProfile,
-                     Session, SourceLanguageMode, Transmission,
-                     TranscriptSegment, iso, parse_iso, utcnow)
+from .models import (ContentClass, Conversation, ErrorInfo, ProcessingState,
+                     RadioProfile, Session, SourceLanguageMode,
+                     Transmission, TranscriptSegment, iso, parse_iso,
+                     utcnow)
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -45,6 +46,15 @@ CREATE TABLE IF NOT EXISTS profiles (
     created_at              TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS conversations (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    is_default INTEGER DEFAULT 0,
+    position   INTEGER DEFAULT 0,
+    notes      TEXT DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS sessions (
     id                   TEXT PRIMARY KEY,
     name                 TEXT DEFAULT '',
@@ -60,7 +70,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     target_language      TEXT DEFAULT 'en',
     transcription_engine TEXT DEFAULT '',
     translation_engine   TEXT DEFAULT '',
-    notes                TEXT DEFAULT ''
+    notes                TEXT DEFAULT '',
+    conversation_id      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS transmissions (
@@ -88,8 +99,19 @@ CREATE TABLE IF NOT EXISTS transmissions (
     channel_provenance          TEXT DEFAULT 'unknown',
     rssi_dbm                    REAL,
     rssi_provenance             TEXT DEFAULT 'unknown',
+    snr_db                      REAL,
+    snr_provenance              TEXT DEFAULT 'unknown',
     modulation                  TEXT DEFAULT '',
     modulation_provenance       TEXT DEFAULT 'unknown',
+    squelch_code                TEXT DEFAULT '',
+    squelch_code_provenance     TEXT DEFAULT 'unknown',
+    talkgroup                   TEXT DEFAULT '',
+    talkgroup_provenance        TEXT DEFAULT 'unknown',
+    unit_id                     TEXT DEFAULT '',
+    unit_id_provenance          TEXT DEFAULT 'unknown',
+    protocol                    TEXT DEFAULT '',
+    protocol_provenance         TEXT DEFAULT 'unknown',
+    signal_metadata             TEXT DEFAULT '{}',
     analysis_attempts           TEXT DEFAULT '[]',
     source_language_mode        TEXT DEFAULT 'automatic',
     source_language             TEXT,
@@ -120,6 +142,14 @@ CREATE INDEX IF NOT EXISTS ix_tx_started ON transmissions (started_at);
 CREATE INDEX IF NOT EXISTS ix_tx_state   ON transmissions (state);
 """
 
+#: Indexes over columns that only exist after the ALTER TABLE step. Kept out
+#: of _SCHEMA because that script runs first, against a database that may
+#: still be at schema 3 - indexing a column that is not there yet fails the
+#: whole migration before it can add it.
+_POST_MIGRATION_SCHEMA = """
+CREATE INDEX IF NOT EXISTS ix_sess_conv ON sessions (conversation_id);
+"""
+
 _FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS transmissions_fts USING fts5 (
     id UNINDEXED, transcript, translation, correction, notes, tags,
@@ -127,7 +157,37 @@ CREATE VIRTUAL TABLE IF NOT EXISTS transmissions_fts USING fts5 (
 );
 """
 
+def _conversation_from_row(row) -> Conversation:
+    return Conversation(id=row["id"], name=row["name"],
+                        created_at=parse_iso(row["created_at"]) or utcnow(),
+                        is_default=bool(row["is_default"]),
+                        position=int(row["position"] or 0),
+                        notes=row["notes"] or "")
+
+
 _JSON_FIELDS = ("transcript_segments", "tags", "analysis_attempts")
+
+#: JSON columns whose empty value is an object, not a list.
+_JSON_OBJECT_FIELDS = ("signal_metadata",)
+
+#: Columns added after schema 3, as (table, column, DDL). Applied one at a
+#: time with ALTER TABLE, because CREATE TABLE IF NOT EXISTS does nothing at
+#: all to a table that already exists - an existing alpha 3 database would
+#: keep its old columns and every read of a new one would raise.
+_ADDED_COLUMNS = (
+    ("sessions", "conversation_id", "TEXT"),
+    ("transmissions", "snr_db", "REAL"),
+    ("transmissions", "snr_provenance", "TEXT DEFAULT 'unknown'"),
+    ("transmissions", "squelch_code", "TEXT DEFAULT ''"),
+    ("transmissions", "squelch_code_provenance", "TEXT DEFAULT 'unknown'"),
+    ("transmissions", "talkgroup", "TEXT DEFAULT ''"),
+    ("transmissions", "talkgroup_provenance", "TEXT DEFAULT 'unknown'"),
+    ("transmissions", "unit_id", "TEXT DEFAULT ''"),
+    ("transmissions", "unit_id_provenance", "TEXT DEFAULT 'unknown'"),
+    ("transmissions", "protocol", "TEXT DEFAULT ''"),
+    ("transmissions", "protocol_provenance", "TEXT DEFAULT 'unknown'"),
+    ("transmissions", "signal_metadata", "TEXT DEFAULT '{}'"),
+)
 _BOOL_FIELDS = ("clipped", "bookmarked", "reviewed", "auto_processed")
 
 
@@ -167,6 +227,20 @@ class Store:
         self.close()
 
     def _migrate(self) -> None:
+        """Create what is missing, add what is new, and lose nothing.
+
+        Three steps, in this order and all idempotent:
+
+        1. ``CREATE TABLE IF NOT EXISTS`` for anything absent. This alone is
+           **not** a migration - it is a no-op against a table that already
+           exists, so an alpha 3 database would keep its schema-3 columns.
+        2. ``ALTER TABLE ... ADD COLUMN`` for every column added since, guarded
+           by reading the existing column list. SQLite adds them with their
+           declared default, so existing rows keep every value they had.
+        3. Backfill: ensure the permanent General thread exists and attach
+           every session that predates conversations to it. Nothing is
+           deleted, moved on disk, or rewritten.
+        """
         with self._lock:
             self._conn.executescript(_SCHEMA)
             try:
@@ -174,10 +248,55 @@ class Store:
             except sqlite3.OperationalError as exc:  # FTS5 not compiled in
                 self.fts_enabled = False
                 log.warning("FTS5 unavailable (%s); search falls back to LIKE", exc)
+
+            for table, column, ddl in _ADDED_COLUMNS:
+                self._add_column(table, column, ddl)
+            self._conn.executescript(_POST_MIGRATION_SCHEMA)
+
+            self._backfill_default_conversation()
+
             self._conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
                 (str(SCHEMA_VERSION),))
             self._conn.commit()
+
+    def _columns(self, table: str) -> set:
+        return {row["name"] for row in
+                self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+    def _add_column(self, table: str, column: str, ddl: str) -> bool:
+        """Add one column if it is not already there. Returns True if added."""
+        if column in self._columns(table):
+            return False
+        self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        log.info("migrated %s: added column %s", table, column)
+        return True
+
+    def _backfill_default_conversation(self) -> str:
+        """Guarantee General exists, and file every orphan session under it."""
+        from .models import DEFAULT_CONVERSATION_NAME, Conversation
+
+        row = self._conn.execute(
+            "SELECT * FROM conversations WHERE is_default = 1 "
+            "ORDER BY created_at LIMIT 1").fetchone()
+        if row is None:
+            default = Conversation(name=DEFAULT_CONVERSATION_NAME,
+                                   is_default=True, position=0)
+            self._conn.execute(
+                "INSERT INTO conversations (id, name, created_at, is_default, "
+                "position, notes) VALUES (?,?,?,?,?,?)",
+                (default.id, default.name, iso(default.created_at), 1, 0, ""))
+            conversation_id = default.id
+        else:
+            conversation_id = row["id"]
+
+        # Every session written before conversations existed. Assigned, never
+        # rewritten otherwise: the run keeps its own identity and history.
+        self._conn.execute(
+            "UPDATE sessions SET conversation_id = ? "
+            "WHERE conversation_id IS NULL OR conversation_id = ''",
+            (conversation_id,))
+        return conversation_id
 
     @property
     def schema_version(self) -> int:
@@ -229,8 +348,8 @@ class Store:
                        audio_device, audio_device_id, sample_rate, profile_id,
                        profile_label, source_language_mode, source_language,
                        target_language, transcription_engine, translation_engine,
-                       notes)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       notes, conversation_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(id) DO UPDATE SET
                        name=excluded.name, ended_at=excluded.ended_at,
                        audio_device=excluded.audio_device,
@@ -243,13 +362,15 @@ class Store:
                        target_language=excluded.target_language,
                        transcription_engine=excluded.transcription_engine,
                        translation_engine=excluded.translation_engine,
-                       notes=excluded.notes""",
+                       notes=excluded.notes,
+                       conversation_id=excluded.conversation_id""",
                 (session.id, session.name, iso(session.started_at),
                  iso(session.ended_at), session.audio_device, session.audio_device_id,
                  session.sample_rate, session.profile_id, session.profile_label,
                  session.source_language_mode.value, session.source_language,
                  session.target_language, session.transcription_engine,
-                 session.translation_engine, session.notes))
+                 session.translation_engine, session.notes,
+                 session.conversation_id or None))
             self._conn.commit()
         return session
 
@@ -302,6 +423,86 @@ class Store:
         row = self._conn.execute("SELECT * FROM transmissions WHERE id = ?",
                                  (tx_id,)).fetchone()
         return _from_row(row) if row else None
+
+    # ---- conversations (the operator's named Session tabs) -------------
+    def default_conversation(self) -> Conversation:
+        """The permanent General thread. Created on demand, never deleted."""
+        with self._lock:
+            conversation_id = self._backfill_default_conversation()
+            self._conn.commit()
+        row = self._conn.execute("SELECT * FROM conversations WHERE id = ?",
+                                 (conversation_id,)).fetchone()
+        return _conversation_from_row(row)
+
+    def list_conversations(self) -> List[Conversation]:
+        self.default_conversation()      # guarantees General exists
+        rows = self._conn.execute(
+            "SELECT * FROM conversations ORDER BY is_default DESC, position, "
+            "created_at").fetchall()
+        return [_conversation_from_row(r) for r in rows]
+
+    def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
+        row = self._conn.execute("SELECT * FROM conversations WHERE id = ?",
+                                 (conversation_id,)).fetchone()
+        return _conversation_from_row(row) if row else None
+
+    def save_conversation(self, conversation: Conversation) -> Conversation:
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO conversations (id, name, created_at, is_default,
+                       position, notes)
+                   VALUES (?,?,?,?,?,?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       name=excluded.name, position=excluded.position,
+                       notes=excluded.notes""",
+                (conversation.id, conversation.name, iso(conversation.created_at),
+                 1 if conversation.is_default else 0, conversation.position,
+                 conversation.notes))
+            self._conn.commit()
+        return conversation
+
+    def create_conversation(self, name: str) -> Conversation:
+        existing = self.list_conversations()
+        conversation = Conversation(name=name.strip() or "Session",
+                                    position=len(existing))
+        return self.save_conversation(conversation)
+
+    def rename_conversation(self, conversation_id: str,
+                            name: str) -> Optional[Conversation]:
+        conversation = self.get_conversation(conversation_id)
+        if conversation is None:
+            return None
+        conversation.name = name.strip() or conversation.name
+        return self.save_conversation(conversation)
+
+    def session_ids_for_conversation(self, conversation_id: str) -> List[str]:
+        """Every low-level monitoring run filed under one named thread."""
+        rows = self._conn.execute(
+            "SELECT id FROM sessions WHERE conversation_id = ?",
+            (conversation_id,)).fetchall()
+        return [r["id"] for r in rows]
+
+    def conversation_transmissions(self, conversation_id: str,
+                                   limit: int = 500,
+                                   newest_first: bool = False
+                                   ) -> List[Transmission]:
+        """The newest ``limit`` transmissions in one named thread.
+
+        Selected DESC and reversed unless the caller wants newest-first, for
+        the same reason as :meth:`recent_transmissions`: ASC plus LIMIT would
+        return the oldest rows in the database, not the recent thread.
+        """
+        limit = max(0, int(limit))
+        if not limit:
+            return []
+        rows = self._conn.execute(
+            "SELECT t.* FROM transmissions t "
+            "JOIN sessions s ON s.id = t.session_id "
+            "WHERE s.conversation_id = ? "
+            "ORDER BY t.started_at DESC, t.rowid DESC LIMIT ?",
+            (conversation_id, limit)).fetchall()
+        ordered = rows if newest_first else list(reversed(rows))
+        return [_from_row(r) for r in ordered]
 
     def list_transmissions(self, session_id: Optional[str] = None,
                            limit: int = 500, ascending: bool = True
@@ -515,6 +716,9 @@ def _to_row(tx: Transmission) -> Dict[str, Any]:
         [s if isinstance(s, dict) else s.to_dict() for s in d["transcript_segments"]])
     d["tags"] = json.dumps(d["tags"])
     d["analysis_attempts"] = json.dumps(d.get("analysis_attempts") or [])
+    # Raw decoder metadata, stored verbatim so a later version can read a
+    # field this one does not model.
+    d["signal_metadata"] = json.dumps(d.get("signal_metadata") or {})
     d["error"] = json.dumps(d["error"]) if d["error"] else None
     for field in _BOOL_FIELDS:
         d[field] = 1 if d[field] else 0
@@ -524,7 +728,9 @@ def _to_row(tx: Transmission) -> Dict[str, Any]:
 def _from_row(row: sqlite3.Row) -> Transmission:
     d = dict(row)
     for field in _JSON_FIELDS:
-        d[field] = json.loads(d.get(field) or ("[]"))
+        d[field] = json.loads(d.get(field) or "[]")
+    for field in _JSON_OBJECT_FIELDS:
+        d[field] = json.loads(d.get(field) or "{}")
     d["error"] = json.loads(d["error"]) if d.get("error") else None
     for field in _BOOL_FIELDS:
         d[field] = bool(d.get(field))

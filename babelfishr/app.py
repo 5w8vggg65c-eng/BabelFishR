@@ -90,6 +90,11 @@ class BabelFishRApp:
         # promises it never will.
         self._standalone_mode = None
         self._session_mode = None
+        # The named thread the operator is working in. One capture service and
+        # one pipeline exist globally; this only decides which thread a run is
+        # filed under and which rows the window shows.
+        self._conversation_id: str = ""
+        self._capture_conversation_id: str = ""
 
     # -- setup -----------------------------------------------------------
     def glossary_path(self) -> pathlib.Path:
@@ -329,6 +334,11 @@ class BabelFishRApp:
         if self.transcription is None and self.translation is None:
             self.select_engines()
 
+        # The thread selected right now is this run's destination, and it is
+        # captured here rather than read later: switching tabs mid-watch must
+        # not move traffic that is already arriving.
+        self._capture_conversation_id = self.conversation_id
+
         profile_id = profile_id or self.config.session.profile_id
         profile = self.use_profile(profile_id)
 
@@ -346,6 +356,7 @@ class BabelFishRApp:
             target_language=target_language or self.config.translate.target_language,
             transcription_engine=self.transcription.name if self.transcription else "",
             translation_engine=self.translation.name if self.translation else "",
+            conversation_id=self._capture_conversation_id,
         )
         self.store.save_session(session)
         self.session = session
@@ -552,21 +563,71 @@ class BabelFishRApp:
         target = session_id or (self.session.id if self.session else None)
         return self.store.list_transmissions(session_id=target, limit=limit)
 
+    # -- named Session threads (Conversations) ---------------------------
+    def conversations(self):
+        return self.store.list_conversations()
+
+    @property
+    def conversation_id(self) -> str:
+        """The thread the operator is viewing. Defaults to General."""
+        if not self._conversation_id:
+            self._conversation_id = self.store.default_conversation().id
+        return self._conversation_id
+
+    def select_conversation(self, conversation_id: str) -> str:
+        """Change the *viewed* thread.
+
+        Deliberately does not touch capture. An operator reviewing an older
+        thread while a watch is running must not have their incoming traffic
+        silently refiled - the destination was fixed when monitoring started.
+        """
+        if self.store.get_conversation(conversation_id) is not None:
+            self._conversation_id = conversation_id
+            self.config.session.conversation_id = conversation_id
+        return self.conversation_id
+
+    def create_conversation(self, name: str):
+        conversation = self.store.create_conversation(name)
+        return conversation
+
+    def rename_conversation(self, conversation_id: str, name: str):
+        return self.store.rename_conversation(conversation_id, name)
+
+    @property
+    def capture_conversation_id(self) -> str:
+        """Where the *running* capture files its transmissions.
+
+        Fixed at Start Monitoring and untouched by tab switching, so an
+        operator who wanders off to read history cannot misfile live traffic.
+        """
+        return self._capture_conversation_id
+
+    def restore_selected_conversation(self) -> str:
+        """Re-select the thread the operator last had open, if it still exists."""
+        saved = getattr(self.config.session, "conversation_id", "") or ""
+        if saved and self.store.get_conversation(saved) is not None:
+            self._conversation_id = saved
+        return self.conversation_id
+
     #: How much of the thread the window restores on open. Bounded so a
     #: long-running installation does not build thousands of widgets at
     #: startup, and large enough that a day's traffic is all there.
     HISTORY_LIMIT = 500
 
-    def recent_transmissions(self, limit: Optional[int] = None
-                             ) -> List[Transmission]:
-        """The message thread: the newest transmissions, oldest-first.
+    def recent_transmissions(self, limit: Optional[int] = None, *,
+                             conversation_id: Optional[str] = None,
+                             newest_first: bool = False) -> List[Transmission]:
+        """The message thread for one named Session.
 
-        Across sessions, deliberately. Stopping and restarting monitoring is
-        not the end of the operator's log; it is a pause in one continuous
-        radio watch.
+        Across monitoring runs, deliberately. Stopping and restarting
+        monitoring is not the end of the operator's log; it is a pause in one
+        continuous radio watch, and every run filed under this thread belongs
+        to it.
         """
-        return self.store.recent_transmissions(
-            limit=self.HISTORY_LIMIT if limit is None else limit)
+        limit = self.HISTORY_LIMIT if limit is None else limit
+        return self.store.conversation_transmissions(
+            conversation_id or self.conversation_id, limit=limit,
+            newest_first=newest_first)
 
     def search(self, query: str = "", **filters) -> List[Transmission]:
         return self.store.search(query, **filters)
@@ -605,6 +666,7 @@ class BabelFishRApp:
         """
         from .analysis.base import AnalysisRequest
         from .analysis.dsd import DsdNeoAnalyser
+        from .signal_metadata import apply_decoded_metadata
 
         tx = self.store.get_transmission(tx_id)
         if tx is None:
@@ -614,6 +676,7 @@ class BabelFishRApp:
             transmission=tx, protocol=protocol,
             timeout=timeout or self.config.analysis.timeout))
         tx.analysis_attempts.append(attempt)
+        apply_decoded_metadata(tx, attempt)
         self.store.save_transmission(tx)
         self.events.publish("updated", tx)
         return attempt

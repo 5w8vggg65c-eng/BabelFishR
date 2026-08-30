@@ -123,6 +123,24 @@ class Provenance(str, enum.Enum):
             Provenance.UNKNOWN: "unknown origin",
         }[self]
 
+    @property
+    def short(self) -> str:
+        """A few characters for a crowded metadata line.
+
+        Measured values carry no suffix - they are the default reading. Every
+        other origin is marked, so nothing typed or defaulted can be mistaken
+        for something a receiver actually measured.
+        """
+        return {
+            Provenance.OPERATOR: "entered",
+            Provenance.PROFILE: "profile",
+            Provenance.RADIO: "radio",
+            Provenance.SDR: "SDR",
+            Provenance.INFERRED: "inferred",
+            Provenance.DSD: "decoded",
+            Provenance.UNKNOWN: "unverified",
+        }[self]
+
 
 class AnalysisOutcome(str, enum.Enum):
     """Result taxonomy for a digital-analysis attempt.
@@ -198,6 +216,45 @@ class AnalysisArtifact:
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
+
+
+DEFAULT_CONVERSATION_NAME = "General"
+
+
+@dataclasses.dataclass
+class Conversation:
+    """A named thread the operator groups monitoring runs under.
+
+    Deliberately *not* the same thing as :class:`Session`. A Session is one
+    monitoring run - one press of Start, one audio device, one set of engines
+    - and the database keeps that meaning intact. An operator who starts and
+    stops monitoring six times over an afternoon has six Sessions and expects
+    one thread. This is that thread; the interface calls it a Session because
+    that is the word an operator uses, and the low-level run is never shown.
+    """
+
+    id: str = dataclasses.field(default_factory=lambda: new_id("conv_"))
+    name: str = DEFAULT_CONVERSATION_NAME
+    created_at: _dt.datetime = dataclasses.field(default_factory=utcnow)
+    is_default: bool = False
+    """The permanent General thread. It exists in every database and is where
+    every pre-existing monitoring run is migrated to."""
+
+    position: int = 0
+    notes: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = dataclasses.asdict(self)
+        d["created_at"] = iso(self.created_at)
+        return d
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "Conversation":
+        d = dict(d)
+        d["created_at"] = parse_iso(d.get("created_at")) or utcnow()
+        d["is_default"] = bool(d.get("is_default"))
+        return cls(**{k: v for k, v in d.items()
+                      if k in {f.name for f in dataclasses.fields(cls)}})
 
 
 @dataclasses.dataclass
@@ -361,7 +418,13 @@ class RadioProfile:
 
 @dataclasses.dataclass
 class Session:
-    """One monitoring run: a start, an end, and the transmissions between."""
+    """One monitoring run: a start, an end, and the transmissions between.
+
+    Unchanged in meaning. It is *not* what the interface calls a Session -
+    that is a :class:`Conversation`, a named thread this run belongs to.
+    Keeping them separate is what lets an operator start and stop monitoring
+    all afternoon and still see one continuous log.
+    """
 
     id: str = dataclasses.field(default_factory=lambda: new_id("sess_"))
     name: str = ""
@@ -381,6 +444,10 @@ class Session:
     transcription_engine: str = ""
     translation_engine: str = ""
     notes: str = ""
+
+    conversation_id: str = ""
+    """The named thread this run belongs to. Backfilled to General for every
+    run recorded before named threads existed."""
 
     @property
     def is_open(self) -> bool:
@@ -499,8 +566,51 @@ class Transmission:
     """Only ever set by a source that genuinely measures it (an SDR)."""
 
     rssi_provenance: Provenance = Provenance.UNKNOWN
+    snr_db: Optional[float] = None
+    """Signal-to-noise as a *receiver* reports it, not the audio SNR the
+    detector computes. Only an SDR or a radio that reports it may set this."""
+
+    snr_provenance: Provenance = Provenance.UNKNOWN
     modulation: str = ""
     modulation_provenance: Provenance = Provenance.UNKNOWN
+
+    # -- channel access signalling --------------------------------------
+    squelch_code: str = ""
+    """CTCSS/PL tone or DCS code, e.g. "127.3 Hz" or "D023N".
+
+    This says which sub-channel the transmission opened, not who sent it.
+    Two radios sharing a tone are indistinguishable by it, so it must never
+    be labelled as a user, an operator or an identity.
+    """
+
+    squelch_code_provenance: Provenance = Provenance.UNKNOWN
+
+    # -- digital identifiers, only ever from something that decodes them --
+    talkgroup: str = ""
+    """Digital talkgroup, when a protocol decoder genuinely reported one."""
+
+    talkgroup_provenance: Provenance = Provenance.UNKNOWN
+    unit_id: str = ""
+    """Source radio/unit ID as supplied by an SDR, a radio protocol, a
+    signalling decoder or the operator.
+
+    A radio, not a person: one unit may be carried by anyone, and BabelFishR
+    never infers who is speaking from the sound of a voice.
+    """
+
+    unit_id_provenance: Provenance = Provenance.UNKNOWN
+    protocol: str = ""
+    """Only when genuinely decoded - never guessed from a classification."""
+
+    protocol_provenance: Provenance = Provenance.UNKNOWN
+
+    signal_metadata: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    """Raw, unmodelled metadata exactly as a decoder or source reported it.
+
+    Kept so a later version can make sense of a field this one does not model,
+    and so a claim in the interface can always be traced back to what the
+    decoder actually said.
+    """
 
     # -- digital analysis ----------------------------------------------
     analysis_attempts: List[AnalysisAttempt] = dataclasses.field(
@@ -581,6 +691,60 @@ class Transmission:
         """True when the operator may force ASR on a skipped recording."""
         return bool(self.audio_path) and not self.transcript
 
+    def signal_summary(self) -> List[Dict[str, str]]:
+        """Metadata worth showing beside a transmission, with its provenance.
+
+        Absent values produce nothing at all: an empty row would invite the
+        operator to read "-" as a measurement of zero. Every entry carries
+        where it came from, and a value whose provenance is OPERATOR or
+        PROFILE is labelled as entered, never as measured - which is the whole
+        reason each field has its own provenance in the first place.
+        """
+        fields = (
+            ("frequency", self.frequency_display(), self.frequency_provenance),
+            ("channel", self.channel_name, self.channel_provenance),
+            ("RSSI", (f"{self.rssi_dbm:.0f} dBm"
+                      if self.rssi_dbm is not None else ""),
+             self.rssi_provenance),
+            ("SNR", (f"{self.snr_db:.0f} dB" if self.snr_db is not None else ""),
+             self.snr_provenance),
+            ("modulation", self.modulation, self.modulation_provenance),
+            ("squelch", self.squelch_code, self.squelch_code_provenance),
+            ("talkgroup", self.talkgroup, self.talkgroup_provenance),
+            ("unit", self.unit_id, self.unit_id_provenance),
+            ("protocol", self.protocol, self.protocol_provenance),
+        )
+        out: List[Dict[str, str]] = []
+        for label, value, provenance in fields:
+            if not value:
+                continue
+            provenance = provenance or Provenance.UNKNOWN
+            out.append({"label": label, "value": str(value),
+                        "provenance": provenance.value,
+                        "measured": "yes" if provenance.is_measured else "no",
+                        "display": f"{label} {value}" + (
+                            "" if provenance.is_measured else
+                            f" ({provenance.short})")})
+        return out
+
+    def frequency_display(self) -> str:
+        if self.frequency_mhz is None:
+            return ""
+        return f"{self.frequency_mhz:.4f} MHz"
+
+    @property
+    def has_supplied_unit_id(self) -> bool:
+        """Was a source radio/unit ID actually supplied by something?
+
+        False for a squelch tone: CTCSS and DCS are channel access, shared by
+        every radio set to them. False for anything BabelFishR worked out for
+        itself. Only an SDR, a decoded protocol, a radio that reported it, or
+        the operator typing it counts.
+        """
+        allowed = (Provenance.SDR, Provenance.DSD, Provenance.RADIO,
+                   Provenance.OPERATOR)
+        return bool(self.unit_id) and self.unit_id_provenance in allowed
+
     @property
     def worth_digital_analysis(self) -> bool:
         return self.content_class in (ContentClass.DIGITAL_SUSPECTED,
@@ -627,7 +791,11 @@ class Transmission:
         d["source_language_mode"] = _enum_value(
             self.source_language_mode, SourceLanguageMode.AUTOMATIC)
         for field in ("frequency_provenance", "channel_provenance",
-                      "rssi_provenance", "modulation_provenance"):
+                      "rssi_provenance", "snr_provenance",
+                      "modulation_provenance",
+                      "squelch_code_provenance",
+                      "talkgroup_provenance", "unit_id_provenance",
+                      "protocol_provenance"):
             d[field] = _enum_value(getattr(self, field), Provenance.UNKNOWN)
         d["analysis_attempts"] = [a.to_dict() for a in self.analysis_attempts]
         d["frequency_is_measured"] = self.frequency_is_measured
@@ -657,7 +825,11 @@ class Transmission:
         _coerce_enum(d, "state", ProcessingState)
         _coerce_enum(d, "content_class", ContentClass)
         for field in ("frequency_provenance", "channel_provenance",
-                      "rssi_provenance", "modulation_provenance"):
+                      "rssi_provenance", "snr_provenance",
+                      "modulation_provenance",
+                      "squelch_code_provenance",
+                      "talkgroup_provenance", "unit_id_provenance",
+                      "protocol_provenance"):
             _coerce_enum(d, field, Provenance)
         d["analysis_attempts"] = [
             AnalysisAttempt.from_dict(a) if isinstance(a, dict) else a

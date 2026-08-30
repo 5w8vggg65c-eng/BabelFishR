@@ -111,12 +111,29 @@ def to_markdown(transmissions: Sequence[Transmission],
 
 
 def export_session(store: Store, session_id: str, destination: str,
-                   include_audio: bool = True, archive: bool = False) -> str:
-    """Write a self-contained bundle. Returns the path written."""
+                   include_audio: bool = True, archive: bool = False,
+                   conversation_id: Optional[str] = None) -> str:
+    """Write a self-contained bundle. Returns the path written.
+
+    ``conversation_id`` exports a whole named Session - every monitoring run
+    filed under it - rather than one run. That is what the operator means by
+    "this Session": they started and stopped monitoring several times and
+    expect one bundle, not the last fragment of it. Chronological either way,
+    because an export is a record.
+    """
     session = store.get_session(session_id)
     if session is None:
         raise KeyError(f"no such session: {session_id}")
-    transmissions = store.list_transmissions(session_id=session_id, limit=100_000)
+    if conversation_id:
+        session_ids = store.session_ids_for_conversation(conversation_id)
+        transmissions = []
+        for other in session_ids:
+            transmissions += store.list_transmissions(session_id=other,
+                                                      limit=100_000)
+        transmissions.sort(key=lambda t: (t.started_at, t.id))
+    else:
+        transmissions = store.list_transmissions(session_id=session_id,
+                                                 limit=100_000)
 
     root = pathlib.Path(destination)
     root.mkdir(parents=True, exist_ok=True)

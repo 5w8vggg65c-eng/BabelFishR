@@ -17,6 +17,11 @@ from ..models import (ProcessingState, RadioProfile, SourceLanguageMode,
 from ..modes import OperatingMode
 from ..pipeline import PipelineState
 from .input_panel import InputPanel
+
+
+def _slug(text: str) -> str:
+    safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in text.strip())
+    return safe.strip("-").lower() or "session"
 from .timeline import TimelineView
 from .widgets import LevelMeterWidget
 
@@ -65,6 +70,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_state_badge()
         self._refresh_readiness(run_smoke_tests=True)
         self._refresh_sdr_label()
+        self.app.restore_selected_conversation()
+        self._refresh_session_tabs()
         self._reload_timeline()
 
         self._timer = QtCore.QTimer(self)
@@ -117,12 +124,24 @@ class MainWindow(QtWidgets.QMainWindow):
         input_layout.addWidget(self.input_panel)
         root.addWidget(self.input_box)
 
-        self.setup_box = QtWidgets.QGroupBox("Session setup")
+        self.setup_box = QtWidgets.QGroupBox("Session Options")
         self.setup_box.setObjectName("setupPanel")
         self.setup_box.setCheckable(True)
         self.setup_box.setChecked(True)
-        self.setup_box.setToolTip("Collapse to give the timeline more room")
-        self.setup_box.setLayout(self._build_controls())
+        self.setup_box.setToolTip("Collapse Session Options to give the "
+                                  "message thread more room")
+        self.setup_box.setAccessibleName("Session Options")
+        # One child widget holds every control, and collapsing hides that one
+        # widget. The previous version walked findChildren(QWidget) and called
+        # setVisible on all of them - which reaches inside the combo boxes to
+        # their popup views and inside the scroll areas to their scrollbars,
+        # so expanding again made dropdowns and stray scrollbars appear.
+        self.setup_content = QtWidgets.QWidget(self.setup_box)
+        self.setup_content.setObjectName("setupPanelContent")
+        self.setup_content.setLayout(self._build_controls())
+        outer = QtWidgets.QVBoxLayout(self.setup_box)
+        outer.setContentsMargins(10, 6, 10, 8)
+        outer.addWidget(self.setup_content)
         self.setup_box.toggled.connect(self._toggle_setup_panel)
         root.addWidget(self.setup_box)
 
@@ -137,6 +156,42 @@ class MainWindow(QtWidgets.QMainWindow):
         self.privacy_banner.setWordWrap(True)
         self.privacy_banner.hide()
         root.addWidget(self.privacy_banner)
+
+        # Named Session threads. The database still records one Session per
+        # monitoring run; this groups those runs into the continuous log an
+        # operator actually thinks in.
+        self.session_tabs = QtWidgets.QTabBar()
+        self.session_tabs.setObjectName("sessionTabs")
+        self.session_tabs.setExpanding(False)
+        self.session_tabs.setDrawBase(True)
+        self.session_tabs.setAccessibleName("Sessions")
+        self.session_tabs.setToolTip(
+            "Named Sessions. Monitoring can be started and stopped many "
+            "times inside one Session; the thread continues.")
+        self.session_tabs.currentChanged.connect(self._on_session_tab)
+        self.session_tabs.tabBarDoubleClicked.connect(self._rename_session_tab)
+
+        tab_row = QtWidgets.QHBoxLayout()
+        tab_row.setSpacing(6)
+        tab_row.addWidget(self.session_tabs)
+        self.new_session_button = QtWidgets.QToolButton()
+        self.new_session_button.setText("+")
+        self.new_session_button.setToolTip("Create a new named Session")
+        self.new_session_button.setAccessibleName("New Session")
+        self.new_session_button.clicked.connect(self._new_session_tab)
+        tab_row.addWidget(self.new_session_button)
+        self.rename_session_button = QtWidgets.QToolButton()
+        self.rename_session_button.setText("Rename")
+        self.rename_session_button.setToolTip("Rename the selected Session")
+        self.rename_session_button.setAccessibleName("Rename Session")
+        self.rename_session_button.clicked.connect(
+            lambda: self._rename_session_tab(self.session_tabs.currentIndex()))
+        tab_row.addWidget(self.rename_session_button)
+        tab_row.addStretch(1)
+        self.capture_tab_label = QtWidgets.QLabel("")
+        self.capture_tab_label.setObjectName("sectionLabel")
+        tab_row.addWidget(self.capture_tab_label)
+        root.addLayout(tab_row)
 
         self.timeline = TimelineView()
         self.timeline.correctionRequested.connect(self._on_correction)
@@ -172,15 +227,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.state_badge.setAccessibleName("Current state")
         row.addWidget(self.state_badge)
 
-        self.mode_badge = QtWidgets.QLabel()
-        self.mode_badge.setObjectName("modeBadge")
-        self.mode_badge.setAccessibleName("Operating mode")
-        self.mode_badge.setCursor(QtCore.Qt.PointingHandCursor)
-        self.mode_badge.setToolTip("Operating mode - click to change")
-        self.mode_badge.mousePressEvent = (
-            lambda event: self._choose_mode() if self.mode_badge.isEnabled()
-            else None)
-        row.addWidget(self.mode_badge)
+        # A real control, not a label that happens to react to a click. It
+        # looks pressable, it takes focus, it opens on Space or Return, and a
+        # screen reader announces it as a button - none of which a QLabel with
+        # a mousePressEvent does.
+        self.mode_button = QtWidgets.QToolButton()
+        self.mode_button.setObjectName("modeButton")
+        self.mode_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self.mode_button.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+        self.mode_button.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.mode_button.setAccessibleName("Operating mode")
+        self.mode_menu = QtWidgets.QMenu(self.mode_button)
+        self.mode_actions = {}
+        group = QtGui.QActionGroup(self.mode_menu)
+        group.setExclusive(True)
+        for mode in OperatingMode:
+            action = self.mode_menu.addAction(mode.label)
+            action.setCheckable(True)
+            action.setToolTip(mode.describe())
+            action.setData(mode.value)
+            action.triggered.connect(
+                lambda checked=False, value=mode.value: self._apply_mode(value))
+            group.addAction(action)
+            self.mode_actions[mode.value] = action
+        self.mode_button.setMenu(self.mode_menu)
+        row.addWidget(self.mode_button)
 
         self.ready_badge = QtWidgets.QLabel()
         self.ready_badge.setObjectName("chip")
@@ -244,19 +315,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.target_language_box.setCurrentIndex(index)
         grid.addWidget(self.target_language_box, 1, 5)
 
-        grid.addWidget(QtWidgets.QLabel("Processing"), 2, 0)
-        self.mode_box = QtWidgets.QComboBox()
-        for mode in OperatingMode:
-            self.mode_box.addItem(mode.label, mode.value)
-        index = self.mode_box.findData(self.app.config.mode)
-        if index >= 0:
-            self.mode_box.setCurrentIndex(index)
-        self.mode_box.currentIndexChanged.connect(self._on_mode_box)
-        grid.addWidget(self.mode_box, 2, 1)
-
+        # The operating mode lives in the header, next to readiness, and only
+        # there. Two controls for one setting is two things to disagree.
         self.sdr_label = QtWidgets.QLabel()
         self.sdr_label.setObjectName("sectionLabel")
-        grid.addWidget(self.sdr_label, 2, 2, 1, 4)
+        grid.addWidget(self.sdr_label, 2, 0, 1, 6)
 
         self.channel_label = QtWidgets.QLabel("No profile selected")
         self.channel_label.setObjectName("sectionLabel")
@@ -265,15 +328,17 @@ class MainWindow(QtWidgets.QMainWindow):
         return grid
 
     def _toggle_setup_panel(self, expanded: bool) -> None:
-        for child in self.setup_box.findChildren(QtWidgets.QWidget):
-            child.setVisible(expanded)
+        """Collapse to the title bar by hiding exactly one widget.
 
-    def _on_mode_box(self) -> None:
-        value = self.mode_box.currentData()
-        if value and value != self.app.config.mode:
-            self._apply_mode(value)
+        Never findChildren(QWidget): that set includes each combo box's popup
+        view and each scroll area's scrollbars and viewport, and showing those
+        directly is what left dropdowns hanging open and scrollbars floating
+        after a collapse-expand cycle.
+        """
+        self.setup_content.setVisible(expanded)
+        self.setup_box.setFlat(not expanded)
 
-    def _apply_mode(self, value: str) -> bool:
+    def _apply_mode(self, value: str) -> bool:  # noqa: D401
         """Change the mode, or explain why nothing changed.
 
         The app layer is the guard: it refuses before mutating anything, so a
@@ -297,11 +362,12 @@ class MainWindow(QtWidgets.QMainWindow):
         return True
 
     def _sync_mode_box(self) -> None:
-        index = self.mode_box.findData(self.app.config.mode)
-        if index >= 0 and index != self.mode_box.currentIndex():
-            blocked = self.mode_box.blockSignals(True)
-            self.mode_box.setCurrentIndex(index)
-            self.mode_box.blockSignals(blocked)
+        """Make the control agree with the mode the application is actually in."""
+        current = self.app.config.mode
+        for value, action in self.mode_actions.items():
+            blocked = action.blockSignals(True)
+            action.setChecked(value == current)
+            action.blockSignals(blocked)
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
@@ -532,6 +598,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # document. Clearing it here made every earlier transmission look
         # lost, even though the WAVs and the database rows were untouched.
         self.meter.reset()
+        self._refresh_capture_tab_label()
         self.start_button.setText("Stop monitoring")
         self._set_controls_enabled(False)
         self.input_panel.set_monitoring(True)
@@ -574,6 +641,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.app.stop_session()
         self.start_button.setText("Start monitoring")
         self._set_controls_enabled(True)
+        self._refresh_capture_tab_label()
         # Inputs can be changed again, but only once the watch has stopped.
         self.input_panel.set_monitoring(False)
         self._set_state(PipelineState.IDLE)
@@ -588,9 +656,8 @@ class MainWindow(QtWidgets.QMainWindow):
                        # app layer anyway; greying it out means the operator
                        # is not invited to try. The guard stays: this is the
                        # courtesy, not the enforcement.
-                       self.mode_box):
+                       self.mode_button):
             widget.setEnabled(enabled)
-        self.mode_badge.setEnabled(enabled)
         self.source_language_box.setEnabled(
             enabled and self.source_mode_box.currentData() == "specified")
 
@@ -657,9 +724,14 @@ class MainWindow(QtWidgets.QMainWindow):
             elif event.kind == "state":
                 self._set_state(event.payload)
             elif event.kind == "transmission":
-                self.timeline.add(event.payload)
+                # Only into the thread it was actually filed under. An
+                # operator reviewing history must not see live traffic
+                # appear in the Session they are reading.
+                if self._belongs_here(event.payload):
+                    self.timeline.add(event.payload)
             elif event.kind == "updated":
-                self.timeline.update(event.payload)
+                if self._belongs_here(event.payload):
+                    self.timeline.update(event.payload)
             elif event.kind == "audio-status":
                 payload = event.payload or {}
                 kind = payload.get("kind", "")
@@ -678,6 +750,17 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"{payload.get('stage', 'processing')} error: "
                     f"{payload.get('message', '')}", 12000)
 
+    def _belongs_here(self, tx) -> bool:
+        """Is this transmission part of the Session currently on screen?"""
+        session_id = getattr(tx, "session_id", "")
+        if not session_id:
+            return False
+        viewing = self.app.conversation_id
+        session = self.app.store.get_session(session_id)
+        if session is None:
+            return False
+        return (session.conversation_id or viewing) == viewing
+
     def _set_state(self, state: str) -> None:
         self._state = state
         self._refresh_state_badge()
@@ -694,14 +777,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.state_badge.setAccessibleDescription(text)
 
     def _refresh_mode_badge(self) -> None:
+        """Label the operating-mode control and mark the current choice.
+
+        The word "mode" is in the button itself, so the toolbar reads
+        "Operating mode: Field Offline" next to a separate readiness chip -
+        two different things, no longer two identical-looking labels.
+        """
         mode = self.app.mode
-        self.mode_badge.setText(mode.label)
-        self.mode_badge.setToolTip(mode.describe() + "\n\nClick to change.")
-        index = self.mode_box.findData(mode.value)
-        if index >= 0 and self.mode_box.currentIndex() != index:
-            self.mode_box.blockSignals(True)
-            self.mode_box.setCurrentIndex(index)
-            self.mode_box.blockSignals(False)
+        self.mode_button.setText(f"Operating mode: {mode.label}  \u25be")
+        self.mode_button.setToolTip(
+            f"{mode.describe()}\n\nChoose the operating mode. Disabled while "
+            f"monitoring is running.")
+        self.mode_button.setAccessibleDescription(
+            f"Operating mode, currently {mode.label}")
+        self._sync_mode_box()
 
     def _choose_mode(self) -> None:
         modes = [m.label for m in OperatingMode]
@@ -841,8 +930,80 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status.showMessage(f"Exported {path}", 6000)
 
     # -- data views ------------------------------------------------------
+    # -- named Session tabs ----------------------------------------------
+    def _refresh_session_tabs(self) -> None:
+        """Rebuild the tab bar from the database, keeping the selection."""
+        conversations = self.app.conversations()
+        selected = self.app.conversation_id
+        blocked = self.session_tabs.blockSignals(True)
+        while self.session_tabs.count():
+            self.session_tabs.removeTab(0)
+        for index, conversation in enumerate(conversations):
+            self.session_tabs.addTab(conversation.name)
+            self.session_tabs.setTabData(index, conversation.id)
+            if conversation.id == selected:
+                self.session_tabs.setCurrentIndex(index)
+        self.session_tabs.blockSignals(blocked)
+        self._refresh_capture_tab_label()
+
+    def _refresh_capture_tab_label(self) -> None:
+        """Say plainly where live traffic is going when it is not here.
+
+        An operator reading an older Session while a watch runs must never be
+        left wondering why nothing is arriving, or worse, assume the traffic
+        is being filed where they are looking.
+        """
+        capture = self.app.capture_conversation_id
+        if not capture or capture == self.app.conversation_id:
+            self.capture_tab_label.setText("")
+            return
+        conversation = self.app.store.get_conversation(capture)
+        name = conversation.name if conversation else "another Session"
+        self.capture_tab_label.setText(
+            f"\u25cf Recording into \u201c{name}\u201d")
+
+    def _on_session_tab(self, index: int) -> None:
+        conversation_id = self.session_tabs.tabData(index)
+        if not conversation_id:
+            return
+        self.app.select_conversation(conversation_id)
+        self._persist_selected_session()
+        self._reload_timeline()
+        self._refresh_capture_tab_label()
+
+    def _new_session_tab(self) -> None:
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "New Session", "Name for this Session:")
+        if not ok or not name.strip():
+            return
+        conversation = self.app.create_conversation(name)
+        self.app.select_conversation(conversation.id)
+        self._persist_selected_session()
+        self._refresh_session_tabs()
+        self._reload_timeline()
+
+    def _rename_session_tab(self, index: int) -> None:
+        conversation_id = self.session_tabs.tabData(index)
+        if not conversation_id:
+            return
+        current = self.session_tabs.tabText(index)
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "Rename Session", "Name for this Session:",
+            QtWidgets.QLineEdit.Normal, current)
+        if not ok or not name.strip():
+            return
+        self.app.rename_conversation(conversation_id, name)
+        self._refresh_session_tabs()
+
+    def _persist_selected_session(self) -> None:
+        """Remember the tab, so a relaunch opens where the operator left."""
+        try:
+            self.app.config.save()
+        except OSError:  # noqa: BLE001 - a preference is never worth a crash
+            pass
+
     def _reload_timeline(self) -> None:
-        """Restore the full message thread, newest traffic last."""
+        """Restore the selected Session's thread, newest transmission first."""
         self.timeline.set_transmissions(self.app.recent_transmissions())
 
     def _search(self) -> None:
@@ -884,6 +1045,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_mode_badge()
         self._refresh_state_badge()
         self._refresh_readiness(run_smoke_tests=True)
+        self._refresh_session_tabs()
         self._reload_timeline()
 
     def _show_storage_location(self) -> None:
@@ -951,9 +1113,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # -- exports ---------------------------------------------------------
     def _export_session(self) -> None:
-        session = self.app.session or (self.app.store.list_sessions(1) or [None])[0]
+        """Export the whole named Session, not the last monitoring run.
+
+        Taking store.list_sessions(1) was the old shortcut, and it quietly
+        assumed the newest low-level capture run was what the operator meant
+        by "this Session". After a stop and a restart it would have exported
+        the tail of the thread and nothing else.
+        """
+        conversation_id = self.app.conversation_id
+        session_ids = self.app.store.session_ids_for_conversation(conversation_id)
+        session = self.app.session
         if session is None:
-            QtWidgets.QMessageBox.information(self, "Export", "No session to export.")
+            session = next((s for s in (self.app.store.get_session(i)
+                                        for i in session_ids) if s), None)
+        if session is None:
+            QtWidgets.QMessageBox.information(
+                self, "Export",
+                "This Session has no monitoring runs to export yet.")
             return
         directory = QtWidgets.QFileDialog.getExistingDirectory(
             self, "Choose a folder for the session bundle")
@@ -961,19 +1137,37 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         from ..export import export_session
 
-        target = pathlib.Path(directory) / f"babelfishr_{session.id}"
-        path = export_session(self.app.store, session.id, str(target))
+        conversation = self.app.store.get_conversation(conversation_id)
+        label = _slug(conversation.name if conversation else session.id)
+        target = pathlib.Path(directory) / f"babelfishr_{label}"
+        path = export_session(self.app.store, session.id, str(target),
+                              conversation_id=conversation_id)
         self.status.showMessage(f"Exported session bundle to {path}", 10000)
 
     def _export_text(self, fmt: str) -> None:
-        session = self.app.session or (self.app.store.list_sessions(1) or [None])[0]
+        """Export the selected named Session, in chronological order.
+
+        A transcript is a record of what was received and when, so it reads
+        oldest-first regardless of how the thread is displayed.
+        """
+        conversation_id = self.app.conversation_id
+        session_ids = self.app.store.session_ids_for_conversation(conversation_id)
+        session = self.app.session
         if session is None:
-            QtWidgets.QMessageBox.information(self, "Export", "No session to export.")
+            session = next((s for s in (self.app.store.get_session(i)
+                                        for i in session_ids) if s), None)
+        if session is None:
+            QtWidgets.QMessageBox.information(
+                self, "Export",
+                "This Session has no monitoring runs to export yet.")
             return
         from .. import export as export_module
 
-        transmissions = self.app.store.list_transmissions(
-            session_id=session.id, limit=100_000)
+        transmissions = []
+        for other in session_ids:
+            transmissions += self.app.store.list_transmissions(
+                session_id=other, limit=100_000)
+        transmissions.sort(key=lambda t: (t.started_at, t.id))
         renderers = {"md": export_module.to_markdown, "json": export_module.to_json,
                      "csv": export_module.to_csv}
         filters = {"md": "Markdown (*.md)", "json": "JSON (*.json)",

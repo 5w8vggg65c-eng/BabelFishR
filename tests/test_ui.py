@@ -71,7 +71,8 @@ def test_failed_bubble_offers_retry_and_reassures(qt_app):
 
     tx = Transmission(transcript="kept")
     tx.fail("translation", "api down")
-    bubble = TimelineView().add(tx)
+    view = TimelineView()
+    bubble = view.add(tx)
     assert bubble.retry_button.isVisibleTo(bubble)
     assert "api down" in bubble.error_label.text()
     assert "safe" in bubble.error_label.text().lower()
@@ -80,7 +81,9 @@ def test_failed_bubble_offers_retry_and_reassures(qt_app):
 def test_provisional_text_is_marked_as_such(qt_app):
     from babelfishr.ui.timeline import TimelineView
 
-    bubble = TimelineView().add(Transmission())
+    view = TimelineView()
+
+    bubble = view.add(Transmission())
     bubble.set_provisional("partial words")
     assert "<i>" in bubble.provisional.text()
     assert "partial words" in bubble.provisional.text()
@@ -173,14 +176,22 @@ def test_state_is_not_conveyed_by_colour_alone(qt_app, config, store):
     window.close()
 
 
-def test_mode_badge_shows_the_operating_mode(qt_app, config, store):
+def test_the_operating_mode_control_shows_the_mode(qt_app, config, store):
     from babelfishr.app import BabelFishRApp
     from babelfishr.modes import OperatingMode
     from babelfishr.ui.main_window import MainWindow
 
     config.mode = OperatingMode.FIELD_OFFLINE.value
     window = MainWindow(BabelFishRApp(config=config, store=store))
-    assert window.mode_badge.text() == "FIELD OFFLINE"
+    # A real control now, not a label with a click handler: it says what it
+    # is, it says what it is set to, and it opens a menu.
+    assert "FIELD OFFLINE" in window.mode_button.text()
+    assert "Operating mode" in window.mode_button.text()
+    assert window.mode_button.menu() is not None
+    labels = [a.text() for a in window.mode_button.menu().actions()]
+    assert labels == [m.label for m in OperatingMode]
+    checked = [a.text() for a in window.mode_button.menu().actions() if a.isChecked()]
+    assert checked == ["FIELD OFFLINE"]
     window.close()
 
 
@@ -211,7 +222,7 @@ def test_controls_have_accessible_names(qt_app, config, store):
     from babelfishr.ui.main_window import MainWindow
 
     window = MainWindow(BabelFishRApp(config=config, store=store))
-    for widget in (window.start_button, window.state_badge, window.mode_badge,
+    for widget in (window.start_button, window.state_badge, window.mode_button,
                    window.ready_badge):
         assert widget.accessibleName() or widget.text(), (
             f"{widget.objectName()} has no accessible label")
@@ -221,7 +232,9 @@ def test_controls_have_accessible_names(qt_app, config, store):
 def test_secondary_actions_live_in_an_overflow_menu(qt_app):
     from babelfishr.ui.timeline import TimelineView
 
-    bubble = TimelineView().add(Transmission(transcript="hi", audio_path="/x.wav"))
+    view = TimelineView()
+
+    bubble = view.add(Transmission(transcript="hi", audio_path="/x.wav"))
     labels = {a.text() for a in bubble.menu_button.menu().actions() if a.text()}
     for expected in ("Edit transcript and translation...", "Edit tags...",
                      "Bookmark", "Transcribe anyway", "Export audio..."):
@@ -238,7 +251,8 @@ def test_skipped_recording_offers_transcribe_anyway(qt_app):
     tx = Transmission(audio_path="/tmp/x.wav", state=ProcessingState.SKIPPED,
                       content_class=ContentClass.NOISE,
                       skip_reason="Classified as noise. The recording is kept.")
-    bubble = TimelineView().add(tx)
+    view = TimelineView()
+    bubble = view.add(tx)
     assert bubble.action_button.isVisibleTo(bubble)
     assert "recording is kept" in bubble.notes_label.text()
 
@@ -255,7 +269,8 @@ def test_digital_result_is_shown_with_decoded_playback(qt_app):
         __import__("babelfishr.models", fromlist=["AnalysisArtifact"])
         .AnalysisArtifact(kind="decoded-audio", path="/tmp/decoded.wav"))
     tx.analysis_attempts.append(attempt)
-    bubble = TimelineView().add(tx)
+    view = TimelineView()
+    bubble = view.add(tx)
     # Playback moved into the ellipsis menu; the bubble itself is text.
     assert bubble.decoded_action.isVisible()
     assert "DMR" in bubble.notes_label.text()
@@ -267,12 +282,14 @@ def test_operator_entered_frequency_is_labelled_in_the_ui(qt_app):
 
     tx = Transmission(frequency_mhz=462.575,
                       frequency_provenance=Provenance.PROFILE)
-    bubble = TimelineView().add(tx)
+    view = TimelineView()
+    bubble = view.add(tx)
     assert "(entered)" in bubble.header.text()
 
     measured = Transmission(frequency_mhz=462.575,
                             frequency_provenance=Provenance.SDR)
-    bubble2 = TimelineView().add(measured)
+    view2 = TimelineView()
+    bubble2 = view2.add(measured)
     assert "(entered)" not in bubble2.header.text()
 
 
