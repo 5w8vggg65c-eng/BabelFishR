@@ -562,17 +562,35 @@ class Store:
             terminal).fetchall()
         return [_from_row(r) for r in rows]
 
-    def review_queue(self, threshold: float = 0.6, limit: int = 200
+    def review_queue(self, threshold: float = 0.6, limit: int = 200,
+                     conversation_id: Optional[str] = None
                      ) -> List[Transmission]:
-        """Low-confidence or failed transmissions the operator should check."""
+        """Low-confidence or failed transmissions the operator should check.
+
+        ``conversation_id`` restricts the queue to one named Session, across
+        every monitoring run inside it. Opened from a Session tab, a review
+        queue listing another Session's traffic is not a review queue.
+        """
+        # Built in the order the placeholders appear in the statement: the
+        # scope clause sits before the two confidence thresholds, so the
+        # conversation id has to be bound first.
+        scope = ""
+        params: List[Any] = []
+        if conversation_id:
+            scope = ("AND t.session_id IN "
+                     "(SELECT id FROM sessions WHERE conversation_id = ?) ")
+            params.append(conversation_id)
+        params += [threshold, threshold, limit]
         rows = self._conn.execute(
-            """SELECT * FROM transmissions
-               WHERE reviewed = 0 AND (
-                     state = 'failed'
-                  OR (transcript_confidence IS NOT NULL AND transcript_confidence < ?)
-                  OR (language_confidence IS NOT NULL AND language_confidence < ?))
-               ORDER BY started_at DESC LIMIT ?""",
-            (threshold, threshold, limit)).fetchall()
+            f"""SELECT t.* FROM transmissions t
+               WHERE t.reviewed = 0 {scope}AND (
+                     t.state = 'failed'
+                  OR (t.transcript_confidence IS NOT NULL
+                      AND t.transcript_confidence < ?)
+                  OR (t.language_confidence IS NOT NULL
+                      AND t.language_confidence < ?))
+               ORDER BY t.started_at DESC LIMIT ?""",
+            tuple(params)).fetchall()
         return [_from_row(r) for r in rows]
 
     def delete_transmission(self, tx_id: str, delete_audio: bool = False) -> None:
@@ -590,6 +608,7 @@ class Store:
 
     # ---- search --------------------------------------------------------
     def search(self, query: str = "", *, session_id: Optional[str] = None,
+               conversation_id: Optional[str] = None,
                since: Optional[_dt.datetime] = None,
                until: Optional[_dt.datetime] = None,
                channel: Optional[str] = None,
@@ -615,6 +634,13 @@ class Store:
         if session_id:
             where.append("t.session_id = ?")
             params.append(session_id)
+        if conversation_id:
+            # Through the run to the named Session it belongs to. A named
+            # Session spans every monitoring run filed under it, so this is
+            # never the same as filtering on one session_id.
+            where.append("t.session_id IN "
+                         "(SELECT id FROM sessions WHERE conversation_id = ?)")
+            params.append(conversation_id)
         if since:
             where.append("t.started_at >= ?")
             params.append(iso(since))

@@ -52,7 +52,27 @@ class SignalMetadata:
     rssi_dbm: Optional[float] = None
     snr_db: Optional[float] = None
     modulation: str = ""
+
+    # Channel access and digital identifiers, for a source that genuinely
+    # decodes them. A source that does not leaves them empty; nothing here is
+    # ever derived from the audio.
+    squelch_code: str = ""
+    """CTCSS/PL tone or DCS code. Channel access, not an identity."""
+
+    talkgroup: str = ""
+    unit_id: str = ""
+    protocol: str = ""
+
+    source: str = ""
+    """What reported this, e.g. "rtl-sdr". Used as the key under which the
+    raw record is kept on the transmission."""
+
+    extra: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    """Anything the source reports that this contract does not model."""
+
     provenance: Provenance = Provenance.SDR
+    """Where these values came from. A source that measures says SDR; a
+    recorded replay or a radio that merely reports should say so instead."""
 
     @property
     def frequency_mhz(self) -> Optional[float]:
@@ -60,10 +80,42 @@ class SignalMetadata:
         return frequency / 1e6 if frequency is not None else None
 
     def to_dict(self) -> Dict[str, Any]:
+        """A JSON-serialisable record of exactly what the source reported.
+
+        It is stored verbatim on the transmission and goes through SQLite and
+        back, so every value in it has to survive ``json.dumps``.
+        """
         d = dataclasses.asdict(self)
-        d["provenance"] = self.provenance.value
+        d["provenance"] = _provenance_value(self.provenance)
         d["frequency_mhz"] = self.frequency_mhz
+        d["extra"] = _jsonable(self.extra)
         return d
+
+
+def _provenance_value(provenance: Any) -> str:
+    """The provenance as a plain string, whatever the source put there."""
+    if isinstance(provenance, Provenance):
+        return provenance.value
+    return str(provenance) if provenance else Provenance.UNKNOWN.value
+
+
+def _jsonable(value: Any) -> Any:
+    """Coerce a source's extra metadata into something json.dumps accepts.
+
+    A driver is free to hand back a numpy scalar or its own object; that must
+    not be the thing that stops a transmission being written to the database.
+    """
+    import json
+
+    try:
+        json.dumps(value)
+        return value
+    except (TypeError, ValueError):
+        if isinstance(value, dict):
+            return {str(k): _jsonable(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [_jsonable(v) for v in value]
+        return str(value)
 
 
 class SignalSource(AudioSource):

@@ -99,24 +99,28 @@ def test_the_thread_opens_at_the_newest_transmission(qt_app):
     view.hide()
 
 
+def _viewport_y(view, tx_id: str) -> int:
+    """Where a bubble sits relative to the top of the visible area."""
+    return view._bubbles[tx_id].y() - view.verticalScrollBar().value()
+
+
 def test_nothing_scrolls_to_the_bottom_by_itself(qt_app):
     view = overflowing_view(qt_app)
     bar = view.verticalScrollBar()
     bar.setValue(bar.maximum() // 2)
     pump(qt_app)
-    where = bar.value()
+    anchor_id, _ = view._anchor()
+    before = _viewport_y(view, anchor_id)
     for index in range(90, 95):
         view.add(tx(index, "more traffic"))
         pump(qt_app)
     assert bar.value() != bar.maximum(), "the view followed new traffic downwards"
     assert bar.value() != bar.minimum(), "the view snapped back to the top"
-    assert abs(bar.value() - where) < 4 or True  # exactness is asserted below
+    # Five arrivals in a row, and the message being read has not moved a
+    # pixel. The old version of this line ended in "or True", which asserted
+    # nothing at all.
+    assert _viewport_y(view, anchor_id) == before
     view.hide()
-
-
-def _viewport_y(view, tx_id: str) -> int:
-    """Where a bubble sits relative to the top of the visible area."""
-    return view._bubbles[tx_id].y() - view.verticalScrollBar().value()
 
 
 def test_inserting_above_the_viewport_does_not_move_what_is_being_read(qt_app):

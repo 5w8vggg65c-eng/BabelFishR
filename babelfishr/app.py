@@ -28,6 +28,10 @@ from .storage import Store
 log = logging.getLogger(__name__)
 
 
+#: Sentinel: "the caller said nothing", which is not "the caller said all".
+_UNSCOPED = object()
+
+
 class ModeChangeRefused(RuntimeError):
     """The operating mode was not changed, and nothing else changed either.
 
@@ -338,7 +342,26 @@ class BabelFishRApp:
         # captured here rather than read later: switching tabs mid-watch must
         # not move traffic that is already arriving.
         self._capture_conversation_id = self.conversation_id
+        try:
+            return self._open_session(
+                source, device, name, profile_id, target_language,
+                source_language, source_language_mode, workers)
+        except Exception:
+            # A start that did not finish leaves no capture, so it must leave
+            # no destination either: a stale one would have the window
+            # announcing "Recording into ..." with nothing recording.
+            self._capture_conversation_id = ""
+            self._session_mode = None
+            self.session = None
+            if self.pipeline is not None:
+                self.pipeline.stop(wait=False)
+                self.pipeline = None
+            raise
 
+    def _open_session(self, source, device, name, profile_id, target_language,
+                      source_language, source_language_mode,
+                      workers: int) -> Session:
+        """The rest of the start, after the destination has been pinned."""
         profile_id = profile_id or self.config.session.profile_id
         profile = self.use_profile(profile_id)
 
@@ -468,6 +491,13 @@ class BabelFishRApp:
         self._standalone_mode = None
 
     def stop_session(self) -> Optional[Session]:
+        """Stop capture and forget where it was going.
+
+        The destination is pinned for the life of a run so switching tabs
+        cannot redirect live traffic. When the run ends there is no live
+        traffic, and leaving it set made the window keep announcing
+        "Recording into ..." after monitoring had stopped.
+        """
         session = self.session
         if self.capture is not None:
             self.capture.stop()
@@ -477,6 +507,7 @@ class BabelFishRApp:
             self.pipeline.stop()
             self.pipeline = None
         self._session_mode = None
+        self._capture_conversation_id = ""
         if session is not None:
             self.store.close_session(session.id)
             session.ended_at = utcnow()
@@ -630,6 +661,14 @@ class BabelFishRApp:
             newest_first=newest_first)
 
     def search(self, query: str = "", **filters) -> List[Transmission]:
+        """Search inside the named Session being viewed.
+
+        Scoped by default rather than globally, because search is reached from
+        a Session tab and returning another Session's traffic into that tab is
+        the same misfiling the thread itself refuses. Pass
+        ``conversation_id=None`` explicitly to search everything.
+        """
+        filters.setdefault("conversation_id", self.conversation_id)
         return self.store.search(query, **filters)
 
     def retry(self, tx_id: str) -> bool:
@@ -730,8 +769,12 @@ class BabelFishRApp:
         self.events.publish("updated", tx)
         return tx
 
-    def review_queue(self) -> List[Transmission]:
-        return self.store.review_queue()
+    def review_queue(self, conversation_id: Optional[str] = _UNSCOPED
+                     ) -> List[Transmission]:
+        """The review queue for the named Session being viewed."""
+        if conversation_id is _UNSCOPED:
+            conversation_id = self.conversation_id
+        return self.store.review_queue(conversation_id=conversation_id)
 
     def close(self) -> None:
         self.stop_session()

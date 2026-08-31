@@ -10,6 +10,7 @@ field, which is at least honestly empty.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Dict, Optional
 
@@ -70,14 +71,17 @@ def apply_source_metadata(tx: Transmission, metadata: Optional[Any]) -> bool:
     """
     if metadata is None:
         return False
-    values: Dict[str, Any] = (metadata if isinstance(metadata, dict)
+    values: Dict[str, Any] = (dict(metadata) if isinstance(metadata, dict)
                               else getattr(metadata, "to_dict", dict)())
     if not values:
         return False
 
     provenance = _provenance_of(values.get("provenance"))
+    # Kept verbatim, and kept JSON-serialisable: this record goes into a TEXT
+    # column and has to come back out unchanged. A driver handing back a numpy
+    # scalar must not be what stops a transmission being written.
     raw = dict(tx.signal_metadata or {})
-    raw[str(values.get("source") or "signal-source")] = dict(values)
+    raw[str(values.get("source") or "signal-source")] = _jsonable(values)
     tx.signal_metadata = raw
 
     changed = False
@@ -98,6 +102,19 @@ def apply_source_metadata(tx: Transmission, metadata: Optional[Any]) -> bool:
         setattr(tx, provenance_field, provenance)
         changed = True
     return changed
+
+
+def _jsonable(value: Any) -> Any:
+    """Whatever a source reported, in a form json.dumps accepts."""
+    try:
+        json.dumps(value)
+        return value
+    except (TypeError, ValueError):
+        if isinstance(value, dict):
+            return {str(k): _jsonable(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [_jsonable(v) for v in value]
+        return str(value)
 
 
 def _provenance_of(value: Any) -> Provenance:

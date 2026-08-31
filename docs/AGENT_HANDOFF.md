@@ -1675,3 +1675,145 @@ arriving traffic, viewport stability under a live watch, the Session tabs
 (creating, renaming, switching mid-watch, and the "Recording into" notice),
 the upgrade of a real alpha 3 database to schema 4, the new operating-mode
 button, and the repaired Session Options panel.
+
+---
+
+# Audit repair: three integration defects in 17ffad82
+
+Branch `claude/radio-decoder-translator-0oslya`, from
+`17ffad82d5388bf62802ab00697c32fd7bed47f6`. Three defects found by a code
+audit, all reproduced against the source before anything was changed. No
+workflow dispatched, no tag, no release; alpha 1/2/3 untouched.
+
+All three share a shape worth naming: **each seam was between two pieces that
+were individually correct and individually tested.** A helper that was written
+and never called. A query that was made per-Session and reached from a global
+entry point. A value pinned for the life of a capture that nothing unpinned.
+Unit tests of each piece passed. That is why the new tests drive production
+paths — `CaptureService`, `BabelFishRApp.search`, `MainWindow._stop_monitoring`
+— rather than the helpers underneath them.
+
+## 1 — source metadata never reached the capture path
+
+`babelfishr/signal_metadata.py` had `apply_source_metadata()`, and
+`CaptureService._apply_measured_metadata()` still had its own hand-written copy
+of three fields. Against a real `CaptureService` with a source reporting
+frequency, RSSI, SNR and modulation: frequency, RSSI and modulation arrived;
+**`snr_db` stayed `None` and `signal_metadata` stayed `{}`**. The old code also
+stamped `Provenance.SDR` on everything it copied, so a recorded replay's values
+would have been labelled as measured.
+
+`_apply_measured_metadata()` now delegates to the shared helper. Metadata
+failure remains strictly non-fatal — the whole call is inside one `try`, and a
+source that raises still produces a recording with the fields empty.
+
+`SignalMetadata` gained the rest of an honest contract: `squelch_code`,
+`talkgroup`, `unit_id`, `protocol`, `source` (the key the raw record is stored
+under) and `extra`, alongside the existing frequency/RSSI/SNR/modulation and
+`provenance`. The source's stated provenance is preserved rather than
+hardcoded; a source that states none is `UNKNOWN`, and `frequency_is_measured`
+is then false.
+
+`to_dict()` and the promotion path both coerce to JSON-serialisable values, so
+a driver handing back a numpy scalar or its own object cannot be what stops a
+transmission being written. Verified through a real database round trip.
+
+Ordinary audio is unchanged: a microphone replay still produces no frequency,
+RSSI, SNR, squelch code, talkgroup, unit ID, protocol or raw record, and an
+empty `signal_summary()`.
+
+## 2 — Search and Review Queue ignored the selected Session
+
+`MainWindow._search()` called `app.search(text)` and `_show_review_queue()`
+called `app.review_queue()`; both returned every matching row in the database.
+Opened from a Session tab, they showed other Sessions' traffic — the same
+misfiling the thread itself refuses.
+
+`Store.search()` and `Store.review_queue()` both take `conversation_id`, and
+filter through `Transmission → session_id → sessions.conversation_id`, so a
+named Session spans every monitoring run inside it. `BabelFishRApp.search()`
+and `review_queue()` default to the viewed thread; passing
+`conversation_id=None` explicitly still searches everything.
+
+One thing worth recording because it nearly shipped silently: in
+`review_queue()` the scope clause sits **before** the two confidence
+thresholds in the statement, so the parameters have to be bound in that order.
+The first version appended the conversation id after the thresholds and the
+query matched nothing. The test caught it ("nothing was reviewable, so this
+proves nothing" is an assertion in the test for exactly this reason).
+
+## 3 — the capture destination survived the capture
+
+`stop_session()` left `_capture_conversation_id` populated, so
+`capture_conversation_id` kept naming a destination after capture had ended,
+and a window on another tab kept showing "● Recording into …" with nothing
+recording. (The clear had been written in the previous pass as an unasserted
+string replacement that silently did not match — a lesson about `str.replace`
+without an assertion.)
+
+It is now cleared on every stop path: normal stop, `close()` (which routes
+through `stop_session`), and failed startup. The start was split so the pinned
+destination is set and then everything after it runs inside a `try` that clears
+the pin, the session and any half-built pipeline before re-raising — the
+window between pinning and writing the Session row is real and is now covered.
+
+Pinning during capture is unchanged and deliberate: switching tabs mid-watch
+reviews history and never redirects live traffic.
+
+## Also fixed
+
+`test_nothing_scrolls_to_the_bottom_by_itself` ended in
+`assert abs(bar.value() - where) < 4 or True`, which asserts nothing. It now
+anchors on a visible bubble and asserts it has not moved a pixel after five
+consecutive arrivals. The exact viewport-anchor tests were not touched.
+
+## Files changed
+
+```
+babelfishr/sources.py             SignalMetadata: squelch/talkgroup/unit/
+                                  protocol/source/extra; JSON-safe to_dict
+babelfishr/pipeline.py            capture delegates to the shared promotion
+babelfishr/signal_metadata.py     JSON-safe raw record
+babelfishr/storage.py             conversation_id on search and review_queue
+babelfishr/app.py                 both default to the viewed Session; capture
+                                  destination cleared on every stop path
+tests/test_alpha4_integration_repairs.py  NEW  17 tests
+tests/test_alpha4_thread_and_sessions.py  the vacuous assertion replaced
+```
+
+## Test results
+
+Focused (integration repairs, alpha4 thread/sessions, storage, pipeline,
+capture-invariant, ui, offline, offline-integration, acceptance, alpha3
+repairs, models): **236 passed**.
+
+Full suite: **741 passed, 9 skipped** in 62s. Exact skips, all environmental
+and unchanged: `test_coreaudio.py:255` needs a real macOS host with CoreAudio
+(1); `test_packaging.py:373` PlistBuddy is macOS-only (1);
+`test_real_engines.py:32` no prepared Whisper model (5);
+`test_real_engines.py:107` no Argos language pack installed (2).
+
+`git diff --check` clean, `compileall` clean over `babelfishr`, `tests` and
+`packaging`, all five packaging scripts pass `bash -n`, the PyInstaller spec
+parses and the workflow YAML loads.
+
+## Non-vacuity
+
+| Mutation | Failing tests |
+|---|---|
+| Restore the old manual metadata path in `_apply_measured_metadata` | 4 |
+| Remove `conversation_id` filtering from search and review_queue | 3 |
+| Retain `_capture_conversation_id` after stop | 4 (including the UI label) |
+
+## Still unverified on physical hardware
+
+Unchanged and worth repeating plainly: **no SDR dongle, no radio, no USB radio
+interface and no FalconClaw PTT has ever been connected to this software.**
+Defect 1 is about the path a real source's metadata would travel; it is
+exercised with a source that wraps the production replay source and reports
+metadata as a driver would. That proves the plumbing, not the driver — there
+is still no tested physical SDR driver, and this pass did not write one.
+
+Not yet seen on a Mac from this commit: Session-scoped search and review from
+a tab, the "Recording into …" notice clearing on stop, and any real RF
+metadata reaching a bubble.

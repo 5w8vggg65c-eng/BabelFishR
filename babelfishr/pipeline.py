@@ -591,30 +591,29 @@ class CaptureService:
         return tx
 
     def _apply_measured_metadata(self, tx: Transmission) -> None:
-        """Overlay genuinely measured values from a signal source, if present.
+        """Overlay what a signal source genuinely reported, if there is one.
 
-        Only a source that measures may set these, and it stamps SDR
-        provenance so a measured frequency is never confused with a typed one.
+        Delegated to :func:`babelfishr.signal_metadata.apply_source_metadata`
+        rather than repeated here. The hand-written version this replaced
+        copied three fields and hardcoded SDR provenance for all of them, so
+        SNR never reached a transmission, the raw record was never kept, and a
+        recorded replay's values would have been labelled as measured.
+
+        Metadata is never allowed to cost a recording: any failure is logged
+        and capture continues.
         """
+        from .signal_metadata import apply_source_metadata
+
         source = self.source
         if not getattr(source, "measures_rf", False):
             return
         try:
             metadata = source.metadata()
+            if metadata is None:
+                return
+            apply_source_metadata(tx, metadata)
         except Exception:  # noqa: BLE001 - metadata must never break capture
             log.debug("signal source metadata failed", exc_info=True)
-            return
-        if metadata is None:
-            return
-        if metadata.frequency_mhz is not None:
-            tx.frequency_mhz = metadata.frequency_mhz
-            tx.frequency_provenance = Provenance.SDR
-        if metadata.rssi_dbm is not None:
-            tx.rssi_dbm = metadata.rssi_dbm
-            tx.rssi_provenance = Provenance.SDR
-        if metadata.modulation:
-            tx.modulation = metadata.modulation
-            tx.modulation_provenance = Provenance.SDR
 
     def _set_state(self, state: str) -> None:
         if state != self.state:
