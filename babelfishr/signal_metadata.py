@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from typing import Any, Dict, Optional
 
 from .models import AnalysisAttempt, Provenance, Transmission
@@ -85,27 +86,75 @@ def apply_source_metadata(tx: Transmission, metadata: Optional[Any]) -> bool:
     tx.signal_metadata = raw
 
     changed = False
-    for key, field, provenance_field in (
-            ("frequency_mhz", "frequency_mhz", "frequency_provenance"),
-            ("rssi_dbm", "rssi_dbm", "rssi_provenance"),
-            ("snr_db", "snr_db", "snr_provenance"),
-            ("modulation", "modulation", "modulation_provenance"),
-            ("squelch_code", "squelch_code", "squelch_code_provenance"),
-            ("talkgroup", "talkgroup", "talkgroup_provenance"),
-            ("unit_id", "unit_id", "unit_id_provenance"),
-            ("protocol", "protocol", "protocol_provenance")):
+    for key, field, provenance_field in _NUMERIC_FIELDS:
+        number = _as_measurement(values.get(key))
+        if number is None:
+            # Absent, malformed, non-numeric or non-finite. The raw report is
+            # already kept above for diagnostics; what must not happen is a
+            # value like NaN or a driver's own object being written to the
+            # column and presented as a measurement.
+            continue
+        setattr(tx, field, number)
+        setattr(tx, provenance_field, provenance)
+        changed = True
+
+    for key, field, provenance_field in _TEXT_FIELDS:
         value = values.get(key)
         if value in (None, ""):
             continue
-        setattr(tx, field, value if key.endswith(("_mhz", "_dbm", "_db"))
-                else str(value))
+        setattr(tx, field, str(value))
         setattr(tx, provenance_field, provenance)
         changed = True
     return changed
 
 
+#: Measurements, normalised to native floats before they are persisted.
+_NUMERIC_FIELDS = (
+    ("frequency_mhz", "frequency_mhz", "frequency_provenance"),
+    ("rssi_dbm", "rssi_dbm", "rssi_provenance"),
+    ("snr_db", "snr_db", "snr_provenance"),
+)
+
+_TEXT_FIELDS = (
+    ("modulation", "modulation", "modulation_provenance"),
+    ("squelch_code", "squelch_code", "squelch_code_provenance"),
+    ("talkgroup", "talkgroup", "talkgroup_provenance"),
+    ("unit_id", "unit_id", "unit_id_provenance"),
+    ("protocol", "protocol", "protocol_provenance"),
+)
+
+
+def _as_measurement(value: Any) -> Optional[float]:
+    """A native Python float, or None if this is not a usable measurement.
+
+    Normalisation belongs here, at the boundary, so every future driver gets
+    the same protection without knowing it needs it. A NumPy ``float32`` binds
+    to SQLite as a **blob**: the row is written, the value comes back as
+    ``bytes``, and the first attempt to format it for the interface raises
+    ``TypeError: unsupported format string passed to bytes.__format__``. The
+    recording is fine; the metadata quietly ruins the bubble that displays it.
+
+    Rejected outright: booleans (``True`` is not -73 dBm), anything without a
+    numeric conversion, and NaN or infinity - none of which is a measurement,
+    and all of which would render as one.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if not hasattr(value, "__float__"):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _jsonable(value: Any) -> Any:
-    """Whatever a source reported, in a form json.dumps accepts."""
+    """Whatever a source reported, in a form json.dumps accepts.
+
+    A numeric scalar is converted to a real number rather than stringified,
+    so the raw diagnostic record stays faithful to what the driver reported.
+    """
     try:
         json.dumps(value)
         return value
@@ -114,7 +163,8 @@ def _jsonable(value: Any) -> Any:
             return {str(k): _jsonable(v) for k, v in value.items()}
         if isinstance(value, (list, tuple, set)):
             return [_jsonable(v) for v in value]
-        return str(value)
+        number = _as_measurement(value)
+        return number if number is not None else str(value)
 
 
 def _provenance_of(value: Any) -> Provenance:

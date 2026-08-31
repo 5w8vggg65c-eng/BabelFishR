@@ -70,9 +70,17 @@ class SignalMetadata:
     extra: Dict[str, Any] = dataclasses.field(default_factory=dict)
     """Anything the source reports that this contract does not model."""
 
-    provenance: Provenance = Provenance.SDR
-    """Where these values came from. A source that measures says SDR; a
-    recorded replay or a radio that merely reports should say so instead."""
+    provenance: Provenance = Provenance.UNKNOWN
+    """Where these values came from, and it must be claimed, not assumed.
+
+    The default used to be ``SDR``, so a source that said nothing about
+    provenance had its values presented as *measured* - a recorded replay, a
+    configured constant or a half-written driver would all have read as a
+    live receiver's measurements. Measured status now requires an affirmative
+    claim: a genuine live SDR passes ``Provenance.SDR``, a radio reporting its
+    own tuning passes ``RADIO``, and anything that says nothing stays
+    ``UNKNOWN`` and is rendered as unverified.
+    """
 
     @property
     def frequency_mhz(self) -> Optional[float]:
@@ -102,20 +110,13 @@ def _provenance_value(provenance: Any) -> str:
 def _jsonable(value: Any) -> Any:
     """Coerce a source's extra metadata into something json.dumps accepts.
 
-    A driver is free to hand back a numpy scalar or its own object; that must
+    A driver is free to hand back a NumPy scalar or its own object; that must
     not be the thing that stops a transmission being written to the database.
+    Shared with the promotion path so both agree on what a number is.
     """
-    import json
+    from .signal_metadata import _jsonable as coerce
 
-    try:
-        json.dumps(value)
-        return value
-    except (TypeError, ValueError):
-        if isinstance(value, dict):
-            return {str(k): _jsonable(v) for k, v in value.items()}
-        if isinstance(value, (list, tuple, set)):
-            return [_jsonable(v) for v in value]
-        return str(value)
+    return coerce(value)
 
 
 class SignalSource(AudioSource):
@@ -155,6 +156,8 @@ class RecordedIQSource(SignalSource):
                  block_size: int = 2048, name: str = "recorded-iq"):
         self._samples = np.asarray(samples, dtype=np.float64).ravel()
         self.sample_rate = int(sample_rate)
+        # No provenance: a recording being replayed is not a measurement
+        # being taken, and the caller can say otherwise if it genuinely is.
         self._metadata = metadata or SignalMetadata(
             sample_rate_hz=float(sample_rate))
         self.block_size = int(block_size)

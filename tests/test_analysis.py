@@ -341,7 +341,17 @@ def test_recorded_iq_source_satisfies_the_signal_interface(tmp_path):
     assert sum(b.samples.size for b in blocks) == samples.size
     metadata = source.metadata()
     assert metadata.frequency_mhz == pytest.approx(462.575)
-    assert metadata.provenance is Provenance.SDR
+    # This test used to assert SDR here, on a SignalMetadata that never
+    # claimed it: the field defaulted to SDR, so a source that said nothing
+    # about provenance had its values presented as measured. Measured status
+    # now requires an affirmative claim, and this source makes none.
+    assert metadata.provenance is Provenance.UNKNOWN
+
+    measuring = RecordedIQSource(
+        samples, 8000,
+        metadata=SignalMetadata(tuned_frequency_hz=462_575_000.0,
+                                rssi_dbm=-80.0, provenance=Provenance.SDR))
+    assert measuring.metadata().provenance is Provenance.SDR
 
 
 def test_signal_source_metadata_reaches_the_transmission(config, store, tmp_path):
@@ -353,10 +363,13 @@ def test_signal_source_metadata_reaches_the_transmission(config, store, tmp_path
     fixture = build_fixture(
         [{"gap": 1.0}, {"kind": "voice", "duration": 2.0, "level_dbfs": -14},
          {"gap": 1.0}], sample_rate=48_000)
+    # Explicit now, because it is the point of the test: this stands for a
+    # genuinely measuring receiver, and only a source that says so gets to
+    # have its values read as measurements.
     source = RecordedIQSource(
         fixture.audio, 48_000,
         metadata=SignalMetadata(tuned_frequency_hz=462_575_000.0, rssi_dbm=-75.0,
-                                modulation="NFM"))
+                                modulation="NFM", provenance=Provenance.SDR))
 
     app = BabelFishRApp(config=config, store=store)
     app.select_engines()

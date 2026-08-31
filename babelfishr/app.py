@@ -346,17 +346,56 @@ class BabelFishRApp:
             return self._open_session(
                 source, device, name, profile_id, target_language,
                 source_language, source_language_mode, workers)
-        except Exception:
-            # A start that did not finish leaves no capture, so it must leave
-            # no destination either: a stale one would have the window
-            # announcing "Recording into ..." with nothing recording.
-            self._capture_conversation_id = ""
-            self._session_mode = None
-            self.session = None
-            if self.pipeline is not None:
-                self.pipeline.stop(wait=False)
-                self.pipeline = None
+        except Exception as exc:
+            self._abandon_failed_start(exc)
             raise
+
+    def _abandon_failed_start(self, exc: BaseException) -> None:
+        """Undo a start that did not finish, without hiding why it failed.
+
+        Every step here is inside its own guard. A cleanup that raises would
+        replace the operator's real error - "the interface is not connected" -
+        with whatever went wrong while tidying up, which is the less useful of
+        the two and not the one they can act on.
+
+        The row is the subtle part. ``_open_session`` writes the Session
+        before it starts the workers, so a failure after that point leaves a
+        run in the database with ``ended_at`` NULL, and by then ``self.session``
+        has been cleared - so the caller's later ``stop_session()`` has nothing
+        to close it with, and it stays open forever. A monitoring run that
+        never began must not read as one still in progress.
+        """
+        session = self.session
+        self._capture_conversation_id = ""
+        self._session_mode = None
+        self.session = None
+        self.capture = None
+
+        if self.pipeline is not None:
+            try:
+                # Workers may already be running: stop them rather than leave
+                # threads behind on a session that does not exist.
+                self.pipeline.stop(wait=True, timeout=5.0)
+            except Exception:  # noqa: BLE001 - never mask the real failure
+                log.debug("failed-start pipeline cleanup failed", exc_info=True)
+            self.pipeline = None
+
+        if session is not None:
+            # Closed, not deleted. An implementation choice, not a stated
+            # requirement: the row records that a start was attempted and
+            # failed, which is worth keeping, and deleting rows on an error
+            # path is how audit history and - if the model ever changes -
+            # real data get lost. It holds no transmissions, so it is
+            # invisible in the thread; the note says what happened to it.
+            try:
+                session.notes = (
+                    f"Monitoring failed to start: "
+                    f"{type(exc).__name__}: {exc}".strip())[:500]
+                session.ended_at = utcnow()
+                self.store.save_session(session)
+                self.store.close_session(session.id, ended_at=session.ended_at)
+            except Exception:  # noqa: BLE001 - never mask the real failure
+                log.debug("failed-start session cleanup failed", exc_info=True)
 
     def _open_session(self, source, device, name, profile_id, target_language,
                       source_language, source_language_mode,

@@ -1817,3 +1817,145 @@ is still no tested physical SDR driver, and this pass did not write one.
 Not yet seen on a Mac from this commit: Session-scoped search and review from
 a tab, the "Recording into …" notice clearing on stop, and any real RF
 metadata reaching a bubble.
+
+---
+
+# Audit repair: provenance defaults, source scalars, abandoned runs
+
+Branch `claude/radio-decoder-translator-0oslya`, from
+`d323ccc3c4909f9c40861a92b4b76f240ac7e5b2`. Three defects, all reproduced
+against that commit before anything changed. No workflow dispatched, no tag,
+no release; alpha 1/2/3 tags unmoved.
+
+## 1 — an omitted provenance was read as measured
+
+`SignalMetadata.provenance` defaulted to `Provenance.SDR`. Reproduced:
+`SignalMetadata(tuned_frequency_hz=462_562_500.0)` with no provenance argument
+gave `provenance: sdr-measured`, and after promotion
+`frequency_provenance: sdr-measured` with `frequency_is_measured: True`. A
+recorded replay, a configured constant, or a driver that had not got round to
+saying where its numbers came from would all have read as a live receiver's
+measurements — directly against the rule that RF metadata must not be
+represented as measured when it was not genuinely supplied.
+
+The default is now `Provenance.UNKNOWN`. Measured status requires an
+affirmative claim: a live SDR passes `Provenance.SDR`, a radio reporting its
+own tuning passes `RADIO`, and anything silent or invalid stays `UNKNOWN` and
+renders as *unverified*. `RecordedIQSource`'s fallback metadata makes no claim,
+because replaying a recording is not taking a measurement. No existing
+`Provenance` member changed meaning; only the default did.
+
+**Existing tests changed (both in `tests/test_analysis.py`), and why:**
+
+- `test_recorded_iq_source_satisfies_the_signal_interface` asserted
+  `metadata.provenance is Provenance.SDR` on a `SignalMetadata` that never
+  claimed it — it was asserting the defect. It now asserts `UNKNOWN` for the
+  silent source and adds a second source that passes `Provenance.SDR`
+  explicitly, so the measured arm stays covered.
+- `test_signal_source_metadata_reaches_the_transmission` stands for a genuinely
+  measuring receiver, so it now supplies `provenance=Provenance.SDR`
+  explicitly. Its assertions are unchanged.
+
+## 2 — a NumPy scalar reached the column and broke the bubble
+
+Reproduced through the production capture path with `numpy.float32` RSSI and
+SNR: capture completed, SQLite stored both as **blobs**
+(`typeof(rssi_dbm) = 'blob'`), reload returned `bytes`, and `signal_summary()`
+raised `TypeError: unsupported format string passed to bytes.__format__`. The
+raw JSON record was being coerced; the promoted `Transmission` fields were not.
+
+`_as_measurement()` now normalises at the boundary — in
+`apply_source_metadata`, so every future driver is protected without knowing it
+needs to be. It returns a native `float` for ordinary numbers and NumPy
+scalars, and `None` for anything that is not a measurement: booleans (`True` is
+not −73 dBm), non-numeric values, and NaN or ±infinity. Rejected values are not
+promoted, and the raw report is still kept in JSON-safe `signal_metadata` for
+diagnostics. `_jsonable` now converts numeric scalars to real numbers rather
+than stringifying them, so the diagnostic record stays faithful.
+
+Nothing about this can cost a recording: an invalid measurement leaves the WAV,
+the row and the rest of the metadata intact.
+
+## 3 — a failed start left a run open forever
+
+Reproduced: `save_session()` succeeds, `ProcessingPipeline.start()` raises,
+`start_session()` clears `app.session` and the capture destination — and the
+database keeps the run with `ended_at` NULL, with nothing left that can close
+it, because the caller's later `stop_session()` has no session to work on. A
+monitoring run that never began read as one still in progress.
+
+`_abandon_failed_start()` now runs on any failure after the pin. Invariants
+after it: `capture_conversation_id == ""`, `session`, `capture` and `pipeline`
+all `None`, partially started workers stopped (`pipeline.stop(wait=True)`), and
+no run left open. Every cleanup step is inside its own guard so a cleanup
+failure cannot replace the operator's real error with a less useful one — the
+original exception is always what propagates.
+
+**Implementation choice — closed, not deleted.** This was explicitly not an
+Eric-stated decision and is not presented as one. The abandoned run is closed
+(`ended_at` set) with a note recording why: *"Monitoring failed to start:
+<error>"*. Reasons: it keeps the audit history of an attempt that happened;
+deleting rows on an error path is how data gets lost if the model later changes
+and such a row is no longer guaranteed empty; and closing is the smaller change.
+The row holds no transmissions, so it never appears in a thread and cannot be
+mistaken for a successful operator Session. If a future decision prefers
+removal, the change is confined to that one method.
+
+## Files changed
+
+```
+babelfishr/sources.py                       provenance defaults to UNKNOWN;
+                                            _jsonable shares the promotion path
+babelfishr/signal_metadata.py               _as_measurement(); numeric fields
+                                            normalised before persistence
+babelfishr/app.py                           _abandon_failed_start()
+tests/test_alpha4_metadata_and_startup.py   NEW  30 tests
+tests/test_analysis.py                      two tests updated (see above)
+```
+
+No schema change was needed.
+
+## Test results
+
+Focused (this file, alpha4 integration repairs, alpha4 thread/sessions,
+analysis/source metadata, storage, pipeline, capture-invariant, ui, models,
+offline-integration, acceptance): **234 passed** after the two `test_analysis`
+updates.
+
+Full suite: **771 passed, 9 skipped** in 92s. Exact skips, unchanged and all
+environmental: `test_coreaudio.py:255` needs a real macOS host with CoreAudio
+(1); `test_packaging.py:373` PlistBuddy is macOS-only (1);
+`test_real_engines.py:32` no prepared Whisper model (5);
+`test_real_engines.py:107` no Argos language pack installed (2).
+
+`git diff --check` clean; `compileall` clean over `babelfishr`, `tests` and
+`packaging`; all five packaging scripts pass `bash -n`; the spec parses and the
+workflow YAML loads.
+
+## Non-vacuity
+
+| Mutation | Failing tests |
+|---|---|
+| Restore `SignalMetadata`'s `SDR` default | 2 |
+| Remove numeric normalisation | 9 |
+| Restore the `d323ccc` partial-start cleanup | 3 |
+
+The d323ccc repairs are re-asserted here too — helper wiring, Session-scoped
+search and review, capture-destination clearing — and ordinary replay audio
+still invents no RF metadata.
+
+## Limitations carried forward, unchanged
+
+**No SDR dongle, radio, USB radio interface or FalconClaw PTT has ever been
+connected to this software.** These repairs concern the path a real driver's
+metadata would travel; the tests use a wrapper around the production replay
+source that reports metadata the way a driver would. That proves the plumbing,
+not a driver. There is still no physical SDR driver and this pass did not write
+one — and a NumPy scalar reaching SQLite as a blob is exactly the class of
+problem that only appears once real hardware is attached, which is why the
+normalisation sits at the boundary rather than in any one caller.
+
+Still not seen on a Mac from any commit on this branch: Session-scoped search
+and review from a tab, the "Recording into …" notice clearing on stop, real RF
+metadata reaching a bubble, and the newest-first viewport behaviour under live
+traffic.
