@@ -3,8 +3,10 @@
 The scrolling tests drive a real QScrollArea with enough bubbles to overflow
 its viewport and measure pixel positions, because list order alone says
 nothing about whether the text under the operator's eyes moved. The migration
-test builds a genuine schema-3 database from the DDL of the previous commit
-rather than a hand-written approximation of it.
+tests build a genuine schema-3 database from the real schema-3 DDL, checked in
+at tests/fixtures/schema_3.sql, rather than a hand-written approximation of it.
+That fixture is a file, not a Git lookup: these tests must run from a source
+tree alone - a shallow clone, an exported archive, a directory with no .git.
 """
 
 from __future__ import annotations
@@ -14,7 +16,6 @@ import json
 import os
 import pathlib
 import sqlite3
-import subprocess
 
 import pytest
 
@@ -397,14 +398,42 @@ def test_exporting_a_session_covers_every_run_inside_it(config, store, wav,
 # ---- B. migration from the deployed schema 3 ----------------------------
 
 
+#: The real schema-3 DDL, checked in rather than read out of Git.
+#:
+#: This used to be `git show 7a42cfc:babelfishr/storage.py` at run time, which
+#: made the migration tests depend on repository history they cannot count on
+#: having: actions/checkout leaves a one-commit shallow clone, so `git show`
+#: exited 128 and both tests errored before their bodies ran. The file carries
+#: its own provenance - it is byte-identical to the `_SCHEMA` literal at both
+#: v0.3.0-alpha.3 (c9299e0) and the final schema-3 commit 7a42cfc.
+SCHEMA_3_DDL = ROOT / "tests" / "fixtures" / "schema_3.sql"
+
+
+def schema_3_ddl() -> str:
+    """The DDL out of the fixture, with its provenance header removed.
+
+    The header is the leading run of "--" lines and nothing else, so what this
+    returns is the deployed DDL byte for byte - which is what lets the digest
+    below pin it.
+    """
+    lines = SCHEMA_3_DDL.read_text().split("\n")
+    first = next(i for i, line in enumerate(lines)
+                 if not line.startswith("--"))
+    return "\n".join(lines[first:])
+
+
 def schema_3_database(path: str) -> None:
-    """A real alpha 3 database, built from the previous commit's own DDL."""
-    source = subprocess.run(
-        ["git", "show", "7a42cfc:babelfishr/storage.py"],
-        cwd=ROOT, capture_output=True, text=True, check=True).stdout
-    assert "SCHEMA_VERSION = 3" in source, "the baseline is not schema 3"
-    ddl = source[source.index('_SCHEMA = """') + len('_SCHEMA = """'):
-                 source.index('"""\n\n_FTS_SCHEMA')]
+    """A real alpha 3 database, built from the deployed schema-3 DDL.
+
+    Reads a file, runs no subprocess and needs no Git: a migration has to be
+    testable from a source tree alone, which is exactly the situation the
+    packaging runner is in.
+    """
+    ddl = schema_3_ddl()
+    # The migration is only meaningful against the schema it has to open, so
+    # fail loudly rather than quietly upgrading an already-current database.
+    assert "conversation_id" not in ddl, (
+        "the fixture is not schema 3 - it already has the schema-4 columns")
     conn = sqlite3.connect(path)
     conn.executescript(ddl)
     conn.execute("INSERT OR REPLACE INTO meta (key, value) "
@@ -494,6 +523,58 @@ def test_the_migration_is_idempotent(tmp_path):
                 ) == counts, "reopening the database changed it"
         assert again.default_conversation().id == general.id
         again.close()
+
+
+def test_the_schema_3_baseline_is_the_real_deployed_ddl():
+    """The fixture is the shipped schema 3, not a reconstruction from schema 4.
+
+    Pinned by digest because a migration tested against a hand-written
+    approximation of its own starting point proves nothing. This is the exact
+    `_SCHEMA` literal from babelfishr/storage.py at v0.3.0-alpha.3 (c9299e0)
+    and at the final schema-3 commit 7a42cfc, where it is byte-identical.
+    """
+    import hashlib
+
+    ddl = schema_3_ddl()
+    assert hashlib.sha256(ddl.encode()).hexdigest() == (
+        "af7dc8a1b94a78cdeace5f4a7519d32ed32a945dece44d7de39a1a6b0522d4da"), (
+        "the schema-3 baseline has been altered; it must stay the DDL that "
+        "was actually deployed")
+    assert len(ddl) == 3787
+    # Schema 3's shape, positively: the tables exist, and the schema-4
+    # additions the migration is supposed to make do not.
+    for table in ("meta", "profiles", "sessions", "transmissions"):
+        assert f"CREATE TABLE IF NOT EXISTS {table}" in ddl
+    assert "conversation_id" not in ddl
+    assert "conversations" not in ddl
+
+
+def test_the_migration_tests_do_not_depend_on_repository_history():
+    """No Git, no subprocess: these must run from a source tree alone.
+
+    They did not. `git show 7a42cfc:babelfishr/storage.py` at run time worked
+    in a full clone and exited 128 in the one-commit shallow clone
+    actions/checkout leaves, so both migration tests errored before their
+    bodies ran and the packaging build never started.
+    """
+    import ast
+
+    tree = ast.parse(pathlib.Path(__file__).read_text())
+    imported = {alias.name.split(".")[0]
+                for node in ast.walk(tree) if isinstance(node, ast.Import)
+                for alias in node.names}
+    imported |= {node.module.split(".")[0]
+                 for node in ast.walk(tree)
+                 if isinstance(node, ast.ImportFrom) and node.module}
+    assert "subprocess" not in imported, (
+        "this module shells out again; the migration baseline must be a file")
+    assert "git" not in imported
+
+    assert SCHEMA_3_DDL.is_file(), "the baseline fixture is not checked in"
+    # Resolved from this file, so it works in any tree the tests are run from.
+    assert SCHEMA_3_DDL.parent.parent == pathlib.Path(__file__).resolve().parent
+    # And it really is loadable without a database engine's help or a clone.
+    assert schema_3_ddl().lstrip().startswith("CREATE TABLE")
 
 
 # ---- C. honest RF and transmitter metadata ------------------------------

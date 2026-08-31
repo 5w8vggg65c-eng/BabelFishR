@@ -2122,3 +2122,182 @@ metadata reaching a bubble, and the newest-first viewport behaviour under live
 traffic. **A macOS candidate build remains undispatched** — it is blocked on
 nothing now that these two defects are repaired, but dispatching one was
 outside this pass.
+
+---
+
+# Build repair: the migration baseline no longer reads Git at run time
+
+Branch `claude/radio-decoder-translator-0oslya`, from `41a2c09`. A test-harness
+repair only. No production code, workflow, packaging, schema or release-notes
+change; Alpha 1/2/3 tags unmoved; no Alpha 4 tag or release.
+
+## The failure
+
+Run **33445974543** (run #18, attempt 1) of `.github/workflows/macos-release.yml`
+on `41a2c09`, dispatched non-publishing with `runner_label: macos-26`,
+`publish_prerelease: false`, empty `release_tag`, **failed** at step 6 — *Build,
+test, verify, sign and package* — at the pre-packaging test gate. Result on the
+runner: **2 failed, 787 passed, 9 skipped**.
+
+```
+tests/test_alpha4_thread_and_sessions.py:402: in schema_3_database
+    source = subprocess.run(
+E   subprocess.CalledProcessError: Command '['git', 'show', '7a42cfc:babelfishr/storage.py']'
+    returned non-zero exit status 128.
+```
+
+Both `test_an_alpha_3_database_upgrades_without_losing_anything` and
+`test_the_migration_is_idempotent` error in the helper, before either test body
+runs.
+
+**Root cause.** `schema_3_database()` built its schema-3 starting point by
+reading the DDL out of Git at run time. The workflow's checkout is a bare
+`actions/checkout@v5` with no `fetch-depth`, so the runner has a one-commit
+shallow clone containing only the head commit. `7a42cfc` is not in it, `git show`
+exits 128, and the tests cannot construct their baseline. This is deterministic,
+not a flake: it reproduces on every run of that workflow, and passes locally only
+because a development clone happens to have full history. Nothing about the two
+repairs in `41a2c09` is involved — those tests are green on the runner.
+
+Because the gate is *before* packaging, no bundle, DMG, signing report or
+verification report was produced. Every report printed `(not produced)`.
+
+## The repair, and why this one
+
+The fix is **not** to deepen the checkout. Fetching history would make the
+symptom go away while leaving the test dependent on something a test has no
+business needing: a migration test must be able to build its own starting point
+from a source tree alone — a shallow clone, an exported archive, a directory
+with no `.git` at all. Deepening the clone hides the dependency; removing it
+removes the whole class of failure. So the workflow is untouched.
+
+The schema-3 DDL is now checked in at **`tests/fixtures/schema_3.sql`**.
+
+**Provenance, verified in this pass rather than assumed.** The file is the exact
+contents of the `_SCHEMA` string literal in `babelfishr/storage.py` at the final
+schema-3 revision. Extracted independently from both revisions with the same
+slice the helper used to use, the two are byte-for-byte equal:
+
+| Revision | Length | SHA-256 of the DDL |
+|---|---|---|
+| `v0.3.0-alpha.3` = `c9299e06e8731db1645441da3677cf24358243dd` | 3787 | `af7dc8a1b94a78cdeace5f4a7519d32ed32a945dece44d7de39a1a6b0522d4da` |
+| final schema-3 = `7a42cfc1307911cf241d983857de23f04ff2fe8b` | 3787 | `af7dc8a1b94a78cdeace5f4a7519d32ed32a945dece44d7de39a1a6b0522d4da` |
+
+`7a42cfc` really is the last schema-3 revision: it is the final commit where
+`storage.py` carried `SCHEMA_VERSION = 3`, and the next commit to touch that
+file, `17ffad8`, raised it to 4. Both facts were checked directly, not taken on
+report.
+
+The fixture carries that provenance in its own header comment, including the
+instruction not to regenerate it from the current schema — it is schema 3 on
+purpose, because a migration validated against a reconstruction of its own
+output validates nothing.
+
+## What changed in the test module
+
+- `schema_3_ddl()` — new. Reads the fixture and strips the leading run of `--`
+  lines, which is the whole header and nothing else, so what it returns is the
+  deployed DDL byte for byte. That exactness is what lets the digest pin it.
+- `schema_3_database()` — reads the fixture instead of shelling out. Retains a
+  guard that the baseline really is schema 3 (`conversation_id`, the schema-4
+  addition, must be absent).
+- `import subprocess` removed; it is now unused.
+- The module docstring no longer claims to read the previous commit's DDL from
+  Git, because it no longer does.
+- **Neither migration test was weakened.** Their bodies, and every preservation
+  and idempotence assertion in them, are unchanged.
+
+Two new regressions guard the repair:
+
+- `test_the_schema_3_baseline_is_the_real_deployed_ddl` — pins the fixture by
+  SHA-256 and length, and asserts schema 3's shape positively (the four tables
+  present; no `conversation_id`, no `conversations`).
+- `test_the_migration_tests_do_not_depend_on_repository_history` — parses this
+  module with `ast` and asserts `subprocess` is not imported, and that the
+  fixture resolves relative to the test file. The AST check rather than a text
+  search, because a test that greps its own source for `import subprocess`
+  matches its own assertion and can never pass.
+
+## History-free validation
+
+The point of the repair is that these tests work without a repository, so that
+is what was measured — a copy of the source tree with `.git` excluded entirely,
+run on a `PATH` containing no `git` binary at all:
+
+```
+tar --exclude=.git --exclude=__pycache__ -cf - . | (cd "$TREE" && tar -xf -)
+cd "$TREE" && PATH="$BIN" QT_QPA_PLATFORM=offscreen python3 -m pytest \
+  tests/test_alpha4_thread_and_sessions.py::test_an_alpha_3_database_upgrades_without_losing_anything \
+  tests/test_alpha4_thread_and_sessions.py::test_the_migration_is_idempotent \
+  tests/test_alpha4_thread_and_sessions.py::test_the_schema_3_baseline_is_the_real_deployed_ddl \
+  tests/test_alpha4_thread_and_sessions.py::test_the_migration_tests_do_not_depend_on_repository_history \
+  -v
+```
+
+Result: **4 passed in 0.16s**, with `git rev-parse --git-dir` reporting *"not a
+git repository"* in that tree and `command -v git` finding nothing on that PATH.
+
+**Directional proof, same tree.** Restoring `41a2c09`'s version of the test file
+into that identical `.git`-free tree and running the two migration tests:
+**2 failed**, `FileNotFoundError: [Errno 2] No such file or directory: 'git'`.
+Old code fails, new code passes, everything else held constant.
+
+## Files changed
+
+```
+tests/fixtures/schema_3.sql                NEW  the deployed schema-3 DDL + provenance
+tests/test_alpha4_thread_and_sessions.py   fixture loader; subprocess import and the
+                                           Git claim removed; 2 regressions added
+docs/AGENT_HANDOFF.md                      this section
+```
+
+Nothing under `babelfishr/`, `.github/` or `packaging/` was touched — verified
+with `git diff --name-only` over those three paths, which is empty.
+`SCHEMA_VERSION` is still 4 and no migration behaviour changed.
+
+## Test results
+
+Focused (alpha4 thread/Sessions, alpha4 cleanup/labels, alpha4
+metadata/startup, alpha4 integration repairs, storage, packaging, release
+pipeline, models, acceptance): **240 passed, 1 skipped**.
+
+`tests/test_alpha4_thread_and_sessions.py` alone: **32 passed** (30 before,
+plus the two new guards).
+
+Full suite: **791 passed, 9 skipped** in 51s — the 789 from `41a2c09` plus the
+two new tests. Exact skips, unchanged and all environmental:
+
+- `tests/test_coreaudio.py:255` — needs a real macOS host with CoreAudio (1)
+- `tests/test_packaging.py:373` — PlistBuddy is macOS-only (1)
+- `tests/test_real_engines.py:32` — no prepared Whisper model (5)
+- `tests/test_real_engines.py:107` — no Argos language pack installed (2)
+
+Note for whoever reads the next runner log: the hosted macOS skip set is a
+different *composition* of the same total. There `test_coreaudio.py:76` and
+`:148` skip because the host **has** CoreAudio, while `:255` and
+`test_packaging.py:373` run.
+
+`git diff --check` clean; `compileall` clean over `babelfishr`, `tests` and
+`packaging`; all five packaging scripts pass `bash -n`;
+`packaging/babelfishr.spec` parses; `.github/workflows/macos-release.yml` loads
+as YAML. The fixture also executes standalone into an in-memory SQLite database,
+producing exactly `meta`, `profiles`, `sessions`, `transmissions`.
+
+## What this pass does not change
+
+A downloadable macOS candidate still does not exist. This repair removes the
+reason the last attempt never reached packaging; it does not itself prove the
+build succeeds, because no workflow was dispatched in this pass. The next
+dispatch is the thing that would establish that.
+
+## Limitations carried forward, verbatim
+
+"No SDR dongle, radio, USB radio interface or FalconClaw PTT has ever been
+connected to this software. This run would not have validated any of that
+regardless; a hosted runner has no audio or RF hardware.
+
+Still not seen on a Mac from any commit on this branch: Session-scoped search
+and review from a tab, the 'Recording into …' notice clearing on stop, real RF
+metadata reaching a bubble, and the newest-first viewport behaviour under live
+traffic. A downloadable candidate build still does not exist — this run produced
+no DMG."
