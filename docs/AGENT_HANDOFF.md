@@ -1959,3 +1959,166 @@ Still not seen on a Mac from any commit on this branch: Session-scoped search
 and review from a tab, the "Recording into …" notice clearing on stop, real RF
 metadata reaching a bubble, and the newest-first viewport behaviour under live
 traffic.
+
+---
+
+# Audit repair: independent cleanup guards, honest frequency labels
+
+Branch `claude/radio-decoder-translator-0oslya`, from
+`122ae9ed05d21abc0f42ad03c90970151d16da44`. Two defects, both reproduced
+against that commit before anything changed. No workflow dispatched, no tag,
+no release; Alpha 1/2/3 tags unmoved. No schema change.
+
+Both defects share a shape worth naming for whoever picks this up: each is a
+**claim that outran the code**. One was a docstring promising per-step guards
+over two operations sharing a single `try`. The other was a data model that
+had learned six kinds of provenance paired with a UI that still asked it one
+boolean question. Neither is visible from inside the function that got it
+wrong, which is why the new tests drive `start_session()` and
+`TransmissionBubble` rather than the helpers underneath them.
+
+## 1 — the cleanup steps were not independent
+
+`_abandon_failed_start()` said "every cleanup step is inside its own guard",
+but `store.save_session(session)` and `store.close_session(session.id, …)`
+sat in one `try` block. Reproduced against `122ae9e`:
+
+1. the initial `save_session()` succeeds and the run is written;
+2. `ProcessingPipeline.start()` raises *"worker startup failed"*;
+3. the cleanup `save_session()` — the explanatory note — is made to raise;
+4. `close_session()` is **never attempted**;
+5. the original worker error propagates correctly, as designed, so nothing
+   looks wrong from the caller's side;
+6. and the row stays open with `ended_at` NULL, with `self.session` already
+   cleared, so the operator's later `stop_session()` has nothing to close it
+   with.
+
+That is the same "a run that never began reads as one still in progress"
+failure the previous pass fixed — reintroduced through the one path the
+previous pass's own docstring claimed was safe.
+
+**The repair.** The note and the closure are now two separate `try` blocks,
+**closing first**. Priority is deliberate: the note is a nicety, the open row
+is the defect. `session.ended_at` is set before either, so both carry it.
+
+**Behaviour when either operation fails:**
+
+| Failure | Result |
+|---|---|
+| Note persistence fails | `close_session()` still runs; row closed; note lost |
+| `close_session()` fails | `save_session()` still runs and writes `ended_at`; row closed; note kept |
+| Both fail | The row may stay open — nothing else can be done from here — but the **original startup exception still propagates**, and `session`, `capture`, `pipeline` are `None` and `capture_conversation_id` is empty |
+
+In no case does a cleanup failure replace the operator's real error. The
+storage layer was not redesigned; the change is confined to that one method.
+
+**Implementation choice, restated — closed, not deleted.** Unchanged from the
+previous pass and still explicitly **not an Eric-stated requirement**. The
+abandoned run is closed with the note *"Monitoring failed to start: <error>"*
+rather than removed: it keeps the audit history of an attempt that happened,
+and deleting rows on an error path is how real data gets lost if the model
+later changes and such a row is no longer guaranteed empty. It holds no
+transmissions, so it never appears in a thread.
+
+## 2 — the bubble called every unmeasured frequency "entered"
+
+`Transmission.signal_summary()` renders `UNKNOWN` correctly as *unverified*.
+`TransmissionBubble.update_from()` never called it — it built its own label
+from `suffix = "" if tx.frequency_is_measured else " (entered)"`. Since
+`is_measured` is true only for `SDR` and `RADIO`, every other origin became
+"entered": a value an SDR supplied without stating its provenance, one the
+software inferred, and one DSD-neo decoded were all labelled as something the
+operator typed. All three claims were false, and the actual UI disagreed with
+the data model that had been carefully taught the distinction.
+
+The bubble now maps provenance to a label through one table:
+
+| Provenance | Suffix |
+|---|---|
+| `SDR`, `RADIO` | *(none)* |
+| `OPERATOR`, `PROFILE` | `(entered)` |
+| `INFERRED` | `(inferred)` |
+| `DSD` | `(decoded)` |
+| `UNKNOWN`, or anything unrecognised | `(unverified)` |
+
+`OPERATOR` and `PROFILE` keep "(entered)" for compatibility with what
+operators already read. The fallback is deliberately `(unverified)` rather
+than blank: a provenance the table does not know must not be silently promoted
+to looking like a measurement. No `Provenance` member changed meaning and no
+other metadata layout changed.
+
+The end-to-end test for this drives the production source-metadata path with a
+source that reports `SignalMetadata(tuned_frequency_hz=462_562_500.0,
+source="mystery-driver")` and no provenance, and asserts the bubble it
+eventually produces reads *unverified* — the omitted-provenance default from
+the previous pass and this label repair, checked together.
+
+## Files changed
+
+```
+babelfishr/app.py                          _abandon_failed_start(): the note
+                                           and the closure split into two
+                                           independent try blocks, closing first
+babelfishr/ui/timeline.py                  _FREQUENCY_SUFFIX table and
+                                           _frequency_suffix(); update_from()
+                                           uses it instead of the boolean
+tests/test_alpha4_cleanup_and_labels.py    NEW  18 tests
+```
+
+**No existing test was changed in this pass**, and no schema changed.
+
+## Test results
+
+Focused (this new file, alpha4 metadata/startup, alpha4 integration repairs,
+alpha4 thread/Sessions, analysis, storage, pipeline, capture-invariant, ui,
+models, offline-integration, acceptance): **252 passed** in 143s.
+
+Full suite: **789 passed, 9 skipped** in 92s. Exact skips, unchanged from the
+previous pass and all environmental:
+
+- `tests/test_coreaudio.py:255` — needs a real macOS host with CoreAudio (1)
+- `tests/test_packaging.py:373` — PlistBuddy is macOS-only (1)
+- `tests/test_real_engines.py:32` — no prepared Whisper model (5)
+- `tests/test_real_engines.py:107` — no Argos language pack installed (2)
+
+`git diff --check` clean; `compileall` clean over `babelfishr`, `tests` and
+`packaging`; all five packaging scripts pass `bash -n`; `packaging/babelfishr.spec`
+parses; `.github/workflows/macos-release.yml` loads as YAML.
+
+## Non-vacuity
+
+Both mutations were applied to the repaired code and reverted after measuring.
+
+| Mutation | Failing tests |
+|---|---|
+| Recombine the note and the closure into one `try` block | **3** — `test_a_failed_note_still_closes_the_abandoned_run`, `test_a_valid_run_works_after_a_cleanup_whose_note_failed`, `test_the_two_cleanup_operations_are_in_separate_guards` |
+| Restore `suffix = "" if tx.frequency_is_measured else " (entered)"` | **6** — the `inferred`, `dsd` and `unknown` parametrisations, `test_unknown_inferred_and_decoded_are_never_called_entered`, `test_the_bubble_agrees_with_the_data_model`, `test_a_source_with_no_provenance_ends_up_labelled_unverified` |
+
+The first mutation fails behavioural tests, not only the AST check, which is
+the point: the AST test names the cause, but the guarantee is that the run is
+closed. One subtlety worth recording for whoever writes the next such test —
+the harness must break only the **cleanup** `save_session` (conditional on
+`session.ended_at is not None`). Breaking it unconditionally makes the
+*initial* save fail before `ProcessingPipeline.start()` is ever reached, and
+the test then proves nothing about cleanup at all. The first draft of
+`test_both_cleanup_operations_failing_still_reraises_the_real_error` had
+exactly that bug and failed with `sqlite3.OperationalError` instead of the
+expected `RuntimeError`.
+
+## Limitations carried forward, unchanged
+
+**No SDR dongle, radio, USB radio interface or FalconClaw PTT has ever been
+connected to this software.** These repairs concern the path a real driver's
+metadata would travel; the tests wrap the production replay source and report
+metadata the way a driver would. That proves the plumbing, not a driver —
+there is still no physical SDR driver and this pass did not write one. Worth
+noting plainly: a NumPy scalar reaching SQLite as a blob is exactly the class
+of problem that surfaces only once real hardware is attached, which is why the
+normalisation sits at the boundary rather than in any one caller.
+
+Still not seen on a Mac from any commit on this branch: Session-scoped search
+and review from a tab, the "Recording into …" notice clearing on stop, real RF
+metadata reaching a bubble, and the newest-first viewport behaviour under live
+traffic. **A macOS candidate build remains undispatched** — it is blocked on
+nothing now that these two defects are repaired, but dispatching one was
+outside this pass.

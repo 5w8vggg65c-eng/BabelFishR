@@ -12,7 +12,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..analysis.dsd import AUTO_ROTATION_SECONDS
 from ..analysis.dsd import PRESETS as DSD_PRESETS
-from ..models import ContentClass, ProcessingState, Transmission
+from ..models import (ContentClass, ProcessingState, Provenance,
+                      Transmission)
 from .widgets import TagEditor
 
 CONTENT_LABELS = {
@@ -41,6 +42,34 @@ _IN_FLIGHT = {
     ProcessingState.TRANSCRIBED: "Transcribing...",
     ProcessingState.TRANSLATING: "Translating...",
 }
+
+
+#: How the bubble labels a frequency, by where it came from.
+#:
+#: This used to be one boolean - measured, or "(entered)" - which made every
+#: non-measured origin read as something the operator typed. A value an SDR
+#: supplied without stating its provenance, one the software inferred, and one
+#: DSD-neo decoded were all labelled "entered", which is a claim about who put
+#: it there and was untrue in all three cases.
+_FREQUENCY_SUFFIX = {
+    Provenance.SDR: "",
+    Provenance.RADIO: "",
+    Provenance.OPERATOR: " (entered)",
+    Provenance.PROFILE: " (entered)",
+    Provenance.INFERRED: " (inferred)",
+    Provenance.DSD: " (decoded)",
+    Provenance.UNKNOWN: " (unverified)",
+}
+
+
+def _frequency_suffix(provenance) -> str:
+    """The label for one frequency. An unrecognised origin is unverified.
+
+    Never blank by default: a missing entry must not silently promote a value
+    to looking like a measurement.
+    """
+    return _FREQUENCY_SUFFIX.get(provenance or Provenance.UNKNOWN,
+                                 " (unverified)")
 
 
 def _differs(source: str, target: str) -> bool:
@@ -277,11 +306,8 @@ class TransmissionBubble(QtWidgets.QFrame):
         if tx.channel_name:
             meta.append(tx.channel_name)
         if tx.frequency_mhz is not None:
-            # Never let a typed value read as a measurement. "(entered)" is
-            # kept verbatim: operators and tests have relied on that word
-            # since alpha 1.
-            suffix = "" if tx.frequency_is_measured else " (entered)"
-            meta.append(f"{tx.frequency_mhz:.4f} MHz{suffix}")
+            meta.append(f"{tx.frequency_mhz:.4f} MHz"
+                        f"{_frequency_suffix(tx.frequency_provenance)}")
         if tx.source_language:
             language = tx.source_language
             if tx.language_confidence is not None:

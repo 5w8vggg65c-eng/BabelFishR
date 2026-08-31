@@ -353,7 +353,8 @@ class BabelFishRApp:
     def _abandon_failed_start(self, exc: BaseException) -> None:
         """Undo a start that did not finish, without hiding why it failed.
 
-        Every step here is inside its own guard. A cleanup that raises would
+        Every step here is in a guard of its own - genuinely its own, one
+        try block per operation. A cleanup that raises would
         replace the operator's real error - "the interface is not connected" -
         with whatever went wrong while tidying up, which is the less useful of
         the two and not the one they can act on.
@@ -380,22 +381,35 @@ class BabelFishRApp:
                 log.debug("failed-start pipeline cleanup failed", exc_info=True)
             self.pipeline = None
 
-        if session is not None:
-            # Closed, not deleted. An implementation choice, not a stated
-            # requirement: the row records that a start was attempted and
-            # failed, which is worth keeping, and deleting rows on an error
-            # path is how audit history and - if the model ever changes -
-            # real data get lost. It holds no transmissions, so it is
-            # invisible in the thread; the note says what happened to it.
-            try:
-                session.notes = (
-                    f"Monitoring failed to start: "
-                    f"{type(exc).__name__}: {exc}".strip())[:500]
-                session.ended_at = utcnow()
-                self.store.save_session(session)
-                self.store.close_session(session.id, ended_at=session.ended_at)
-            except Exception:  # noqa: BLE001 - never mask the real failure
-                log.debug("failed-start session cleanup failed", exc_info=True)
+        if session is None:
+            return
+
+        # Closed, not deleted. An implementation choice, not a stated
+        # requirement: the row records that a start was attempted and failed,
+        # which is worth keeping, and deleting rows on an error path is how
+        # audit history and - if the model ever changes - real data get lost.
+        # It holds no transmissions, so it is invisible in the thread.
+        #
+        # Two independent operations, closing first. An earlier version put
+        # both in one try block and claimed they were independently guarded:
+        # they were not, so a failure writing the explanatory note skipped
+        # close_session() entirely and left the run open with nothing able to
+        # close it. The note is a nicety; the open row is the defect.
+        session.ended_at = utcnow()
+        try:
+            self.store.close_session(session.id, ended_at=session.ended_at)
+        except Exception:  # noqa: BLE001 - never mask the real failure
+            log.debug("failed-start close_session failed", exc_info=True)
+
+        try:
+            session.notes = (
+                f"Monitoring failed to start: "
+                f"{type(exc).__name__}: {exc}".strip())[:500]
+            # save_session writes ended_at too, so this is also the fallback
+            # if close_session above did not get through.
+            self.store.save_session(session)
+        except Exception:  # noqa: BLE001 - never mask the real failure
+            log.debug("failed-start note could not be saved", exc_info=True)
 
     def _open_session(self, source, device, name, profile_id, target_language,
                       source_language, source_language_mode,
