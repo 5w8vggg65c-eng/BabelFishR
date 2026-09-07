@@ -2781,3 +2781,201 @@ not find the View menu; the checklist now explains where it is), the
 *Recording into …* notice clearing on stop, real RF metadata reaching a bubble,
 the newest-first viewport under live traffic, quit-and-reopen persistence of
 Session tabs, and every repair in the last two sections.
+
+---
+
+# Menu access: the menus move inside the window; Eric's radio-audio results
+
+Branch `claude/radio-decoder-translator-0oslya`, from `ec4c302`. Access
+repair only. No workflow dispatched, no tag, no release; Alpha 1/2/3 unmoved,
+no Alpha 4. No schema change.
+
+## Eric's results on the run-20 candidate — recorded under his own labels
+
+Eric installed the run-20 candidate (built from `ec4c302`) and reported, for
+the A–G list he was given in conversation:
+
+    A: GOOD, B: GOOD, C: GOOD, D: GOOD, E: NEGATIVE, F: GOOD, G: GOOD.
+
+For E he said the menus he had been told to use were desktop menus, and that
+BabelFishR offered none of those settings or options through the instructed
+route. **His E is the menu-dependent Search / Review check** — by his own
+explanation, not by inference. `docs/MAC_BENCH_CHECKLIST.md` letters its
+sections A–H, so his letters and the document's do not line up (his E is the
+document's F). His labels are preserved as given; the document now says so.
+Which document sections his other letters correspond to is not on file, so
+per-feature coverage from A–D, F, G is not asserted beyond his words.
+
+He also confirmed that the application distinguished conversation breaks and
+transcribed and translated during use, and clarified the path:
+
+> "live translation & transcription still came from my laptop's microphone,
+> but i held my work radio up to it"
+
+**Tested path, precisely:** work radio speaker → acoustic sound → laptop
+microphone → BabelFishR. This is the first time real radio audio has reached
+the software; it did so acoustically. Direct electrical radio, USB radio
+interface, FalconClaw PTT, SDR, RF metadata and transmitter identification
+remain untested.
+
+## The access failure, and what is and is not known about it
+
+Independently inspected source at `ec4c302` (Codex): `_build_menu()` created
+File, View, Tools and Help through `self.menuBar()`; View held Search
+transmissions, Review queue and Show all transmissions; Tools held readiness,
+setup, Copy Diagnostic Report and Reveal Logs in Finder; nothing requested an
+in-window menu bar. The one existing window test for search and review called
+`app.search()` / `app.review_queue()` and filled the timeline directly — it
+never touched a menu, so menu accessibility was untested.
+
+**Root cause on Eric's Mac: not established.** It has not been reproduced on
+a physical Mac, and it is not attributed here to activation, Finder focus,
+Cocoa, packaging or the operator. What is established is an access-testing gap
+and an operator who could not reach the commands where he was told to look.
+
+## The repair — Codex's proposed design, adopted; smallest change
+
+`_build_menu()` now calls `bar.setNativeMenuBar(False)` on the window's menu
+bar. Qt documents this property as the switch that keeps a menu bar in its
+parent window rather than handing it to the system:
+https://doc.qt.io/qt-6/qmenubar.html#nativeMenuBar-prop. Same actions, same
+handlers, same business logic — nothing duplicated, no Settings subsystem.
+The View and Tools actions are kept as attributes (`search_action`,
+`review_action`, `show_all_action`, `readiness_action`, `assistant_action`) and
+the menus carry object names, so a test can aim a click at them.
+
+Known consequence on macOS: the system's own application menu (BabelFishR ▸
+Quit) still appears in the top strip; File/View/Tools/Help are drawn inside
+the window under its title bar. No technical objection was found to the
+placement.
+
+## Tests — clicks on the visible bar, never a direct call
+
+`tests/test_alpha4_menu_access.py`, 8 tests. Every command is reached by two
+real `QTest.mouseClick`s: one on the bar at the menu title's geometry, then
+one on the popup at the item's geometry, asserting in between that the popup
+actually opened and afterwards that it closed. No `.trigger()`, no `_search()`.
+
+- **Bar inside the window (this platform):** shown window; bar visible,
+  enabled, non-zero size, contained in the window rect; central content
+  starts below it; titles exactly File / View / Tools / Help, each non-empty.
+- **Request made (wiring):** an `ast` walk of `_build_menu` finds
+  `setNativeMenuBar(False)`. Stated plainly in the test: Qt returns
+  `isNativeMenuBar() == False` on Linux regardless, so the property is not
+  evidence here; the request is. Whether macOS honours it is untested.
+- **Session Options collapse/expand** leaves the bar visible, enabled, same
+  geometry, all top-level actions enabled.
+- **Search:** Alpha holds the unique phrase "purple giraffe seventeen"; Bravo
+  holds ordinary traffic. View ▸ Search "giraffe" on Alpha narrows the thread
+  to exactly that one transmission and the status bar says 1 match; View ▸
+  Show all restores Alpha's full thread; switching the tab to Bravo and
+  searching again gives 0 bubbles and "0 match"; Show all restores Bravo.
+- **Review queue:** one Alpha transmission has confidence 0.2, every other is
+  0.95. View ▸ Review queue shows exactly that one (count asserted 1, so a
+  perpetually empty queue cannot pass); Show all restores; on Bravo the queue
+  is honestly empty.
+- **Cancelled search** changes nothing.
+- **Tools:** Field readiness and Setup assistant open their dialogs (their
+  `exec` patched on the Python subclasses); Copy Diagnostic Report writes the
+  report file to the logs directory; Reveal Logs is present.
+- **Help:** Where are my recordings? opens its Storage dialog.
+
+### Mutations (repaired code restored after each)
+
+| Mutation | Failing tests |
+|---|---|
+| Search item not wired to `_search` | 1 |
+| Review queue item not wired | 1 |
+| Show all item not wired | 2 (search and review tests both rely on it) |
+| Field readiness item not wired | 1 |
+| `setNativeMenuBar(False)` removed | **1 — the source check only.** The geometry tests still pass on Linux, where the bar is in-window regardless. This is the platform limit stated above, measured. |
+
+No existing test was changed. `test_alpha3_repairs.py` and
+`test_input_panel.py` already read `menuBar().actions()` and still pass.
+
+## Checklist
+
+`docs/MAC_BENCH_CHECKLIST.md`: the menu explanation now describes the menu
+row inside the window (File View Tools Help under the title bar), notes that
+the Mac's top strip still shows BabelFishR ▸ Quit, records Eric's A–G results
+and that his E is the document's F, and tells him only the menu check needs
+retesting on the next candidate. Every "menu bar at the top of the screen"
+instruction for View and Tools was replaced.
+
+## Replacement check for Eric (click-only, next candidate)
+
+1. Open BabelFishR. Look directly under the window's title bar for the four
+   words **File  View  Tools  Help**. Good: they are there, inside the window.
+2. Click a Session tab that has messages. Click **View**, then **Search
+   transmissions…**. Type a word from one of that tab's messages, press
+   Return. Good: the thread shrinks to the matching message(s) and the bottom
+   line says how many matched.
+3. Click **View**, then **Show all transmissions**. Good: the full thread is
+   back.
+4. Click **View**, then **Review queue**. Good: the thread shows only
+   low-confidence messages, possibly none; the bottom line says how many.
+   Then **View ▸ Show all transmissions**.
+5. Click **Tools**. Good: Field readiness…, Setup assistant…, Copy Diagnostic
+   Report and Reveal Logs in Finder are listed.
+Nothing else from A–G needs repeating.
+
+## Files changed
+
+```
+babelfishr/ui/main_window.py       setNativeMenuBar(False); actions as attributes;
+                                   menu object names
+tests/test_alpha4_menu_access.py   NEW  8 tests
+docs/MAC_BENCH_CHECKLIST.md        in-window menu row; Eric's labels recorded
+docs/AGENT_HANDOFF.md              this section
+```
+
+## Test results
+
+New file: **8 passed**. Focused GUI set (menu access, operator feedback, ui,
+alpha3 repairs, alpha4 thread/Sessions, alpha4 integration repairs, input
+panel, gui setup, acceptance): **225 passed**. Full suite: **832 passed,
+9 skipped** in 106s — the 824 from `ec4c302` plus the 8 new tests. Skips
+unchanged and environmental: `test_coreaudio.py:255` (1),
+`test_packaging.py:373` (1), `test_real_engines.py:32` (5),
+`test_real_engines.py:107` (2). Linux, Python 3.11,
+`QT_QPA_PLATFORM=offscreen`. These are this session's results, not an
+independent rerun, and not Cocoa or a physical Mac.
+
+`git diff --check` clean; `compileall` clean over `babelfishr`, `tests`,
+`packaging`; all five packaging scripts pass `bash -n`; the spec parses; the
+workflow YAML loads.
+
+## Unresolved ledger, updated
+
+- Whether the in-window menu bar appears on Eric's Mac: **untested**. The
+  next candidate build is what would show it.
+- Root cause of the missing native menu access on his Mac: unknown, not
+  reproduced, not attributed.
+- Search / Review behaviour on his Mac: unconfirmed (his E was blocked before
+  the commands could be reached).
+- Session tab deletion: Eric's decision (keep or erase; General's treatment).
+  Not implemented.
+- The earlier Rename interaction problem and the Terminal checksum attempt:
+  unexplained.
+- Newest-first scroll anchoring under live arrivals and the "Recording into …"
+  notice clearing on stop: no specifically identified operator result.
+
+## Limitations carried forward
+
+No SDR dongle, radio, USB radio interface or FalconClaw PTT has been
+electrically connected to this software. The hosted runner has no audio or RF
+hardware.
+
+Eric installed the run-19 candidate (from `ae962cc`) and reported steps 1–8
+of that earlier checklist good; the exact step-to-feature mapping is not on
+file, so specific coverage from that test is unconfirmed rather than absent.
+
+**Current status, superseding "never exercised":** Eric installed the run-20
+candidate (from `ec4c302`) and reports A–D, F and G good and E — the
+menu-dependent Search / Review check — negative, blocked by menu access. Real
+radio audio has now reached the software acoustically: work radio speaker →
+laptop microphone → BabelFishR, with conversation breaks distinguished and
+transcription and translation working. Direct electrical radio/PTT/USB
+connections, SDR operation, RF metadata and transmitter identification remain
+unverified. No candidate has been built from this commit; the in-window menu
+bar has not been seen on a Mac.

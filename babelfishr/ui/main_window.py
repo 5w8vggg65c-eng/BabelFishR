@@ -386,7 +386,28 @@ class MainWindow(QtWidgets.QMainWindow):
             action.blockSignals(blocked)
 
     def _build_menu(self) -> None:
-        file_menu = self.menuBar().addMenu("&File")
+        bar = self.menuBar()
+        # Keep the menus inside the BabelFishR window, on every platform.
+        #
+        # On macOS a QMenuBar is normally handed to the system and drawn in
+        # the bar along the top edge of the screen. On the first live bench
+        # test the operator could not find Search or the Review queue there:
+        # what he saw were desktop menus, and the application itself appeared
+        # to offer none of these commands. Whether that was Cocoa activation,
+        # the frozen bundle, or something else is not established - it has
+        # not been reproduced on a physical Mac. What can be established is
+        # that a menu drawn inside the window is where the operator is already
+        # looking, and cannot depend on which application the system thinks
+        # is frontmost. Qt documents this property as exactly that switch.
+        # The same actions, the same handlers; only where they are drawn.
+        # (Qt reports isNativeMenuBar() False on platforms with no native bar
+        # regardless of this call, so a test of the property alone proves the
+        # request was made, not that the Mac honours it.)
+        bar.setNativeMenuBar(False)
+        bar.setObjectName("mainMenuBar")
+
+        file_menu = bar.addMenu("&File")
+        file_menu.setObjectName("fileMenu")
 
         replay = QtGui.QAction("Replay WAV file...", self)
         replay.triggered.connect(self._replay_file)
@@ -409,31 +430,36 @@ class MainWindow(QtWidgets.QMainWindow):
         export_csv.triggered.connect(lambda: self._export_text("csv"))
         file_menu.addAction(export_csv)
 
-        view_menu = self.menuBar().addMenu("&View")
-        search = QtGui.QAction("Search transmissions...", self)
-        search.setShortcut("Ctrl+F")
-        search.triggered.connect(self._search)
-        view_menu.addAction(search)
+        # The View and Tools actions are kept as attributes: they are the
+        # commands the operator reaches through the visible menu, and a test
+        # that clicks the menu needs to know which item it is aiming at.
+        view_menu = bar.addMenu("&View")
+        view_menu.setObjectName("viewMenu")
+        self.search_action = QtGui.QAction("Search transmissions...", self)
+        self.search_action.setShortcut("Ctrl+F")
+        self.search_action.triggered.connect(self._search)
+        view_menu.addAction(self.search_action)
 
-        review = QtGui.QAction("Review queue", self)
-        review.triggered.connect(self._show_review_queue)
-        view_menu.addAction(review)
+        self.review_action = QtGui.QAction("Review queue", self)
+        self.review_action.triggered.connect(self._show_review_queue)
+        view_menu.addAction(self.review_action)
 
-        show_all = QtGui.QAction("Show all transmissions", self)
-        show_all.setShortcut("Ctrl+Shift+A")
-        show_all.setToolTip("Return to the full message thread")
-        show_all.triggered.connect(self._reload_timeline)
-        view_menu.addAction(show_all)
+        self.show_all_action = QtGui.QAction("Show all transmissions", self)
+        self.show_all_action.setShortcut("Ctrl+Shift+A")
+        self.show_all_action.setToolTip("Return to the full message thread")
+        self.show_all_action.triggered.connect(self._reload_timeline)
+        view_menu.addAction(self.show_all_action)
 
-        tools_menu = self.menuBar().addMenu("&Tools")
-        readiness = QtGui.QAction("Field readiness...", self)
-        readiness.setShortcut("Ctrl+Shift+R")
-        readiness.triggered.connect(self._show_readiness)
-        tools_menu.addAction(readiness)
+        tools_menu = bar.addMenu("&Tools")
+        tools_menu.setObjectName("toolsMenu")
+        self.readiness_action = QtGui.QAction("Field readiness...", self)
+        self.readiness_action.setShortcut("Ctrl+Shift+R")
+        self.readiness_action.triggered.connect(self._show_readiness)
+        tools_menu.addAction(self.readiness_action)
 
-        assistant = QtGui.QAction("Setup assistant...", self)
-        assistant.triggered.connect(self._show_assistant)
-        tools_menu.addAction(assistant)
+        self.assistant_action = QtGui.QAction("Setup assistant...", self)
+        self.assistant_action.triggered.connect(self._show_assistant)
+        tools_menu.addAction(self.assistant_action)
 
         # Diagnostics live on the main window, not only inside the setup
         # assistant. An operator whose first run failed has already closed that
@@ -456,7 +482,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reveal_logs_action.triggered.connect(self._reveal_logs)
         tools_menu.addAction(self.reveal_logs_action)
 
-        help_menu = self.menuBar().addMenu("&Help")
+        help_menu = bar.addMenu("&Help")
+        help_menu.setObjectName("helpMenu")
         where = QtGui.QAction("Where are my recordings?", self)
         where.triggered.connect(self._show_storage_location)
         help_menu.addAction(where)

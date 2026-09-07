@@ -9,17 +9,20 @@ This is written for someone who has never used Terminal and does not want to.
 Everything below is done by clicking. Where a step says to type, it is typing
 into an ordinary box inside BabelFishR, never a command.
 
-Two things you will see a lot:
+Three things you will see a lot:
 
-- **The menu bar** is the strip along the *very top edge of the screen* — above
-  the BabelFishR window, on the same line as the Apple logo in the top-left
-  corner and the clock in the top-right. When BabelFishR is the active
-  application, that strip reads **BabelFishR · File · View · Tools · Help**. It
-  is *not* inside the BabelFishR window, which is why it is easy to miss. If
-  you do not see "View" up there, click once anywhere on the BabelFishR window
-  to make it the active application, then look again.
-- **The badge row** is the row of small coloured labels just under the toolbar
-  inside the BabelFishR window: the **Operating mode** button, the readiness
+- **The menu row** is a row of four words — **File  View  Tools  Help** —
+  drawn *inside the BabelFishR window*, directly under the window's own title
+  bar and above everything else in the window. Every command in this list that
+  says "View ▸ …" or "Tools ▸ …" is reached by clicking one of those four words
+  and then the item in the small menu that drops down. (Earlier builds put
+  these menus in the Mac's strip at the very top of the screen. You reported
+  that the menus you found there were the desktop's, and that BabelFishR
+  offered none of these commands that way. They now live in the window. The
+  Mac's top strip still shows a **BabelFishR** menu with **Quit**; that part is
+  the system's and is unchanged.)
+- **The badge row** is the row of small coloured labels under the menu row
+  and the toolbar: the **Operating mode** button, the readiness
   chip (**Ready**, **Partly ready**, **Not ready** or **Checking**) and the
   activity indicator (**Idle**, **Listening**, **Receiving**, **Transcribing**,
   **Translating**).
@@ -36,14 +39,22 @@ You reported steps 1–8 of the earlier checklist good on the previous
 candidate (install, launch, microphone permission, transcription and
 translation). Those are not repeated here.
 
+**About section letters.** The list you were given in conversation for the
+run-20 candidate used letters A–G, and your results ("A: GOOD, B: GOOD,
+C: GOOD, D: GOOD, E: NEGATIVE, F: GOOD, G: GOOD") are recorded under *those*
+letters. Your E, by your own description, was the menu-dependent Search and
+Review check — which is section **F** in this document. Those results stand;
+you do not need to redo them. The only thing to retest on the next candidate
+is the menu check, now in section F below.
+
 ---
 
 ## A. Install the new candidate over the old one
 
 1. If BabelFishR is open: make sure the big button reads **Start monitoring**
    (if it reads **Stop monitoring**, click it once and wait for it to change).
-   Then quit BabelFishR: click **BabelFishR** in the menu bar and choose **Quit
-   BabelFishR**, or press ⌘Q. Nothing is lost by quitting; recordings and
+   Then quit BabelFishR: press ⌘Q, or click **BabelFishR** in the Mac's strip
+   at the top of the screen and choose **Quit BabelFishR**. Nothing is lost by quitting; recordings and
    Sessions are already saved.
 2. Download the new `BabelFishR-macOS-arm64.dmg` from the link you are given.
    It lands in **Downloads**.
@@ -126,18 +137,19 @@ another and note which ones worked.
 > possible. Nothing will be built until you say which. Whether the **General**
 > tab should be deletable at all is part of the same decision.
 
-## F. Search and Review live in the View menu
+## F. Search and Review live in the View menu — inside the window
 
-Search and Review both work **inside the thread you are looking at**: they
-filter the current tab's messages in place, and **View ▸ Show all
-transmissions** brings the full thread back. No separate window opens.
+**View** is the second word in the menu row inside the BabelFishR window,
+under its title bar. Search and Review both work **inside the thread you are
+looking at**: they filter the current tab's messages in place, and **View ▸
+Show all transmissions** brings the full thread back. No separate window opens.
 
 14. First, make a phrase that exists in exactly one Session. Click a Session
     tab, press **Start monitoring**, and say clearly: *"purple giraffe
     seventeen"*. Wait for the bubble to show those words (or close to them),
     then press **Stop monitoring**. Note which tab this is — call it Tab A.
-15. Stay on Tab A. In the **menu bar at the very top of the screen**, click
-    **View**, then **Search transmissions…**. A box titled **Search** opens.
+15. Stay on Tab A. Click **View** in the menu row inside the window, then
+    **Search transmissions…**. A box titled **Search** opens.
     Type `giraffe` and press Return.
     *Good:* the thread shrinks to only the matching message(s), and the
     message at the bottom of the window says how many matched and that
@@ -179,7 +191,8 @@ where the indicator *ends up*.
 
 ## H. Quit and reopen
 
-22. Quit BabelFishR (**BabelFishR ▸ Quit BabelFishR** in the menu bar, or ⌘Q).
+22. Quit BabelFishR (⌘Q, or **BabelFishR ▸ Quit BabelFishR** in the Mac's top
+    strip).
     Open it again from Applications.
     *Good:* the same Session tabs are there with the same names, the tab you
     had selected is selected again, and the messages are all present with
@@ -189,8 +202,9 @@ where the indicator *ends up*.
 
 ## If something goes wrong
 
-- Menu bar: **Tools ▸ Copy Diagnostic Report**. Paste the result into a message
-  to whoever is helping you. BabelFishR itself sends nothing anywhere.
+- In the menu row inside the window: **Tools ▸ Copy Diagnostic Report**. Paste
+  the result into a message to whoever is helping you. BabelFishR itself sends
+  nothing anywhere.
 - **Tools ▸ Reveal Logs in Finder** opens the folder with the log file.
 
 ## What this checklist cannot test
