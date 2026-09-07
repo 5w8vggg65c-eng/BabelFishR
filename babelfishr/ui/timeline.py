@@ -110,6 +110,8 @@ class TransmissionBubble(QtWidgets.QFrame):
     noteChanged = QtCore.Signal(str, str)
     transcribeAnywayRequested = QtCore.Signal(str)
     analyzeDigitalRequested = QtCore.Signal(str, str)   # tx_id, protocol
+    removeRequested = QtCore.Signal(str)                # tx_id
+    restoreRequested = QtCore.Signal(str)               # tx_id
 
     def __init__(self, tx: Transmission, player: PlaybackController,
                  parent: Optional[QtWidgets.QWidget] = None):
@@ -298,6 +300,15 @@ class TransmissionBubble(QtWidgets.QFrame):
         menu.addAction("Retry processing",
                        lambda: self.retryRequested.emit(self.tx.id))
         menu.addAction("Export audio...", self._export)
+        menu.addSeparator()
+        # Two different things, named as two different things. Removing
+        # keeps the data and can be undone from View > Show removed
+        # messages; deleting is confirmed separately and cannot.
+        self.remove_action = menu.addAction(
+            "Remove message\u2026", lambda: self.removeRequested.emit(self.tx.id))
+        self.restore_action = menu.addAction(
+            "Restore to thread", lambda: self.restoreRequested.emit(self.tx.id))
+        self.restore_action.setVisible(False)
         return menu
 
     # -- rendering -------------------------------------------------------
@@ -421,6 +432,13 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.decoded_action.setVisible(bool(tx.decoded_audio_path))
 
         self.play_action.setEnabled(bool(tx.audio_path))
+        # A removed message, when shown at all, says so and offers only the
+        # way back; an ordinary one offers removal.
+        self.remove_action.setVisible(not tx.hidden)
+        self.restore_action.setVisible(bool(tx.hidden))
+        self.setProperty("removed", bool(tx.hidden))
+        if tx.hidden:
+            self.status_label.setText("Removed from thread \u2014 data kept")
         # The menu's Play/Pause label, the buttons and the bar are all drawn
         # from the controller in one place.
         self._render_playback()
@@ -626,6 +644,8 @@ class TimelineView(QtWidgets.QScrollArea):
     noteChanged = QtCore.Signal(str, str)
     transcribeAnywayRequested = QtCore.Signal(str)
     analyzeDigitalRequested = QtCore.Signal(str, str)
+    removeRequested = QtCore.Signal(str)
+    restoreRequested = QtCore.Signal(str)
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
@@ -789,6 +809,8 @@ class TimelineView(QtWidgets.QScrollArea):
         bubble.noteChanged.connect(self.noteChanged)
         bubble.transcribeAnywayRequested.connect(self.transcribeAnywayRequested)
         bubble.analyzeDigitalRequested.connect(self.analyzeDigitalRequested)
+        bubble.removeRequested.connect(self.removeRequested)
+        bubble.restoreRequested.connect(self.restoreRequested)
 
         # Position 0: newest at the top. The stretch stays last so the older
         # bubbles stack downwards and a short thread does not float.

@@ -203,6 +203,9 @@ class ProcessingPipeline:
         self._active_lock = threading.Lock()
         self._idle = threading.Event()
         self._idle.set()
+        #: Ids submitted and not yet finished. Lets the application refuse to
+        #: delete a message a worker is still writing, and say so.
+        self._in_flight: set = set()
 
     # -- lifecycle -------------------------------------------------------
     def start(self, session: Optional[Session] = None) -> None:
@@ -249,7 +252,13 @@ class ProcessingPipeline:
 
     def submit(self, tx_id: str) -> None:
         self._idle.clear()
+        with self._active_lock:
+            self._in_flight.add(tx_id)
         self._queue.put(tx_id)
+
+    def is_in_flight(self, tx_id: str) -> bool:
+        with self._active_lock:
+            return tx_id in self._in_flight
 
     def resume_pending(self) -> int:
         """Re-queue anything left unfinished by a previous run."""
@@ -307,6 +316,7 @@ class ProcessingPipeline:
             finally:
                 with self._active_lock:
                     self._active -= 1
+                    self._in_flight.discard(tx_id)
                     if self._active == 0 and self._queue.empty():
                         self._idle.set()
 

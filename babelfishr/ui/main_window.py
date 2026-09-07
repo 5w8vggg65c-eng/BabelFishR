@@ -233,6 +233,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timeline.noteChanged.connect(self._on_note)
         self.timeline.transcribeAnywayRequested.connect(self._on_transcribe_anyway)
         self.timeline.analyzeDigitalRequested.connect(self._on_analyze_digital)
+        self.timeline.removeRequested.connect(self._on_remove_message)
+        self.timeline.restoreRequested.connect(self._on_restore_message)
         root.addWidget(self.timeline, 1)
 
         self.status = self.statusBar()
@@ -465,6 +467,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.show_all_action.triggered.connect(self._reload_timeline)
         view_menu.addAction(self.show_all_action)
 
+        view_menu.addSeparator()
+        # Where a removed-but-kept message can be found again. Without this
+        # a message removed from view would be stranded in storage.
+        self.show_removed_action = QtGui.QAction("Show removed messages", self)
+        self.show_removed_action.setCheckable(True)
+        self.show_removed_action.setToolTip(
+            "Also show messages removed from this thread, so they can be "
+            "restored. Their data was kept.")
+        self.show_removed_action.toggled.connect(lambda _: self._reload_timeline())
+        view_menu.addAction(self.show_removed_action)
+
         tools_menu = bar.addMenu("&Tools")
         tools_menu.setObjectName("toolsMenu")
         self.readiness_action = QtGui.QAction("Field readiness...", self)
@@ -490,6 +503,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.copy_diagnostics_action.triggered.connect(
             self._copy_diagnostic_report)
         tools_menu.addAction(self.copy_diagnostics_action)
+
+        self.finish_deletions_action = QtGui.QAction(
+            "Finish unfinished deletions\u2026", self)
+        self.finish_deletions_action.setToolTip(
+            "Try again to remove recording files a permanent deletion could "
+            "not delete the first time.")
+        self.finish_deletions_action.triggered.connect(
+            self._finish_unfinished_deletions)
+        tools_menu.addAction(self.finish_deletions_action)
 
         self.reveal_logs_action = QtGui.QAction("Reveal Logs in Finder", self)
         self.reveal_logs_action.setToolTip("Open the folder containing the "
@@ -853,9 +875,18 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"{payload.get('message', '')}", 12000)
 
     def _belongs_here(self, tx) -> bool:
-        """Is this transmission part of the Session currently on screen?"""
+        """Is this transmission part of the Session currently on screen?
+
+        Also: not deleted (a worker's late result for a deleted message must
+        not draw it back), and not removed from view unless removed messages
+        are being shown.
+        """
         session_id = getattr(tx, "session_id", "")
         if not session_id:
+            return False
+        if self.app.store.is_deleted(tx.id):
+            return False
+        if getattr(tx, "hidden", False) and not self._showing_removed():
             return False
         viewing = self.app.conversation_id
         session = self.app.store.get_session(session_id)
@@ -1271,7 +1302,161 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _reload_timeline(self) -> None:
         """Restore the selected Session's thread, newest transmission first."""
-        self.timeline.set_transmissions(self.app.recent_transmissions())
+        self.timeline.set_transmissions(self.app.recent_transmissions(
+            include_hidden=self._showing_removed()))
+
+    def _showing_removed(self) -> bool:
+        action = getattr(self, "show_removed_action", None)
+        return bool(action is not None and action.isChecked())
+
+    # -- removing messages ---------------------------------------------------
+    def _choose(self, title: str, text: str, informative: str,
+                options: List[str], destructive: Optional[str] = None,
+                default: Optional[str] = None) -> str:
+        """Ask the operator to pick one of *options*; "" means cancelled.
+
+        One modal question, built here so every removal dialog reads the
+        same way. Tests substitute this method: a modal box waits for a
+        person, and what they need to prove is what each answer does.
+        """
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Question)
+        box.setWindowTitle(title)
+        box.setText(text)
+        box.setInformativeText(informative)
+        buttons = {}
+        for label in options:
+            role = (QtWidgets.QMessageBox.DestructiveRole
+                    if label == destructive else QtWidgets.QMessageBox.ActionRole)
+            buttons[box.addButton(label, role)] = label
+        cancel = box.addButton(QtWidgets.QMessageBox.Cancel)
+        box.setDefaultButton(cancel if default is None else next(
+            b for b, label in buttons.items() if label == default))
+        box.setEscapeButton(cancel)
+        box.exec()
+        return buttons.get(box.clickedButton(), "")
+
+    REMOVE_KEEP = "Remove from thread (keep the recording and data)"
+    DELETE_FOREVER = "Delete permanently\u2026"
+    CONFIRM_DELETE = "Delete permanently"
+
+    def _on_remove_message(self, tx_id: str) -> None:
+        """The operator asked to remove one message. Two very different
+        outcomes are offered by name; Cancel changes nothing."""
+        problem = self.app.removal_problem(tx_id)
+        if problem:
+            QtWidgets.QMessageBox.information(
+                self, "This message cannot be removed yet", problem)
+            return
+        tx = self.app.store.get_transmission(tx_id)
+        if tx is None:
+            return
+        when = tx.started_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        choice = self._choose(
+            "Remove message",
+            f"Remove the message from {when}?",
+            "Remove from thread keeps the recording and everything about "
+            "the message; it disappears from this thread, search, review "
+            "and exports, and can be brought back from View \u203a Show "
+            "removed messages.\n\nDelete permanently asks again, lists "
+            "exactly what will be deleted, and cannot be undone.",
+            [self.REMOVE_KEEP, self.DELETE_FOREVER],
+            destructive=self.DELETE_FOREVER, default=self.REMOVE_KEEP)
+        if choice == self.REMOVE_KEEP:
+            self.app.remove_from_thread(tx_id)
+            if not self._showing_removed():
+                self.timeline.remove(tx_id)
+            else:
+                refreshed = self.app.store.get_transmission(tx_id)
+                if refreshed is not None:
+                    self.timeline.update(refreshed)
+            self.status.showMessage(
+                "Message removed from the thread. Its recording and data are "
+                "kept - View \u203a Show removed messages to restore it.", 10000)
+        elif choice == self.DELETE_FOREVER:
+            self._confirm_and_delete(tx)
+
+    def _confirm_and_delete(self, tx) -> None:
+        inventory = self.app.deletion_inventory(tx.id)
+        if inventory is None:
+            return
+        lines = ["This will permanently delete:",
+                 "\u2022 the message, its transcript, translation, notes, tags "
+                 "and search entry"]
+        if inventory.owned:
+            lines.append(f"\u2022 {len(inventory.owned)} file(s) in BabelFishR's "
+                         f"Recordings folder:")
+            lines += [f"    {p}" for p in inventory.owned]
+        else:
+            lines.append("\u2022 no recording files (none of its files are in "
+                         "BabelFishR's Recordings folder)")
+        if inventory.shared:
+            lines.append(f"\u2022 NOT deleted: {len(inventory.shared)} file(s) "
+                         f"another message still uses")
+        if inventory.external:
+            lines.append(f"\u2022 NOT deleted: {len(inventory.external)} file(s) "
+                         f"outside BabelFishR's Recordings folder (your own "
+                         f"WAV files, exports, backups)")
+        lines.append("")
+        lines.append("Copies you exported or shared elsewhere are not touched. "
+                     "This cannot be undone.")
+        choice = self._choose("Delete permanently?",
+                              "Delete this message and its recording for good?",
+                              "\n".join(lines), [self.CONFIRM_DELETE],
+                              destructive=self.CONFIRM_DELETE)
+        if choice != self.CONFIRM_DELETE:
+            return
+        # Nothing may be playing the file while it is unlinked.
+        if self.timeline.playback.owner == tx.id:
+            self.timeline.playback.stop()
+        problem = self.app.removal_problem(tx.id)
+        if problem:
+            QtWidgets.QMessageBox.information(
+                self, "This message cannot be deleted yet", problem)
+            return
+        report = self.app.delete_permanently(tx.id)
+        self.timeline.remove(tx.id)
+        if report is None:
+            self.status.showMessage("That message was already gone.", 6000)
+            return
+        if report.complete:
+            self.status.showMessage(
+                f"Message deleted. {len(report.removed)} file(s) removed.", 8000)
+        else:
+            failed = "\n".join(f"{p}\n    {why}" for p, why in report.failed)
+            QtWidgets.QMessageBox.warning(
+                self, "Deletion not finished",
+                f"The message is deleted, but {len(report.failed)} file(s) "
+                f"could not be removed:\n\n{failed}\n\nThey are recorded so "
+                f"you can try again from Tools \u203a Finish unfinished "
+                f"deletions.")
+            self.status.showMessage(
+                f"Message deleted; {len(report.failed)} file(s) still on disk.",
+                10000)
+
+    def _on_restore_message(self, tx_id: str) -> None:
+        restored = self.app.restore_to_thread(tx_id)
+        if restored is None:
+            return
+        self.timeline.update(restored)
+        self.status.showMessage("Message restored to the thread.", 6000)
+
+    def _finish_unfinished_deletions(self) -> None:
+        before = self.app.leftover_deletions()
+        if not before:
+            QtWidgets.QMessageBox.information(
+                self, "Unfinished deletions", "Nothing is left to delete.")
+            return
+        still = self.app.retry_leftover_deletions()
+        done = sum(len(v) for v in before.values()) - sum(len(v) for v in still.values())
+        if still:
+            remaining = "\n".join(p for files in still.values() for p in files)
+            QtWidgets.QMessageBox.warning(
+                self, "Unfinished deletions",
+                f"Removed {done} file(s). Still could not remove:\n\n{remaining}")
+        else:
+            QtWidgets.QMessageBox.information(
+                self, "Unfinished deletions", f"Removed {done} file(s). All done.")
 
     def _search(self) -> None:
         text, ok = QtWidgets.QInputDialog.getText(

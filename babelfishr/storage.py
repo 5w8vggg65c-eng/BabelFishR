@@ -9,14 +9,16 @@ from __future__ import annotations
 
 import contextlib
 import csv
+import dataclasses
 import datetime as _dt
 import json
 import logging
+import os
 import pathlib
 import shutil
 import sqlite3
 import threading
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .models import (ContentClass, Conversation, ErrorInfo, ProcessingState,
                      RadioProfile, Session, SourceLanguageMode,
@@ -135,7 +137,21 @@ CREATE TABLE IF NOT EXISTS transmissions (
     tags                        TEXT DEFAULT '[]',
     bookmarked                  INTEGER DEFAULT 0,
     reviewed                    INTEGER DEFAULT 0,
+    hidden                      INTEGER DEFAULT 0,
     FOREIGN KEY (session_id) REFERENCES sessions (id)
+);
+
+-- A permanently deleted message leaves a tombstone. save_transmission()
+-- refuses to write a row whose id is here, so a processing worker that was
+-- still holding the transmission when the operator deleted it cannot bring it
+-- back with its late result. leftover_files records anything the deletion
+-- could not remove from disk, so it can be identified and retried rather
+-- than reported as gone.
+CREATE TABLE IF NOT EXISTS deleted_transmissions (
+    id             TEXT PRIMARY KEY,
+    deleted_at     TEXT NOT NULL,
+    session_id     TEXT,
+    leftover_files TEXT DEFAULT '[]'
 );
 
 CREATE INDEX IF NOT EXISTS ix_tx_session ON transmissions (session_id);
@@ -190,10 +206,12 @@ _ADDED_COLUMNS = (
     ("transmissions", "protocol", "TEXT DEFAULT ''"),
     ("transmissions", "protocol_provenance", "TEXT DEFAULT 'unknown'"),
     ("transmissions", "signal_metadata", "TEXT DEFAULT '{}'"),
-    # Schema 5: an operator-chosen tab colour per named Session.
+    # Schema 5: an operator-chosen tab colour per named Session, and a
+    # message removed from view with its data kept.
     ("conversations", "color", "TEXT DEFAULT ''"),
+    ("transmissions", "hidden", "INTEGER DEFAULT 0"),
 )
-_BOOL_FIELDS = ("clipped", "bookmarked", "reviewed", "auto_processed")
+_BOOL_FIELDS = ("clipped", "bookmarked", "reviewed", "auto_processed", "hidden")
 
 
 class Store:
@@ -404,6 +422,11 @@ class Store:
         placeholders = ", ".join("?" for _ in payload)
         updates = ", ".join(f"{k}=excluded.{k}" for k in payload if k != "id")
         with self._lock:
+            if self._is_tombstoned(tx.id):
+                # The operator deleted this message; a late result from a
+                # worker that still held it must not recreate the row.
+                log.info("refusing to save deleted transmission %s", tx.id)
+                return tx
             self._conn.execute(
                 f"INSERT INTO transmissions ({columns}) VALUES ({placeholders}) "
                 f"ON CONFLICT(id) DO UPDATE SET {updates}",
@@ -506,44 +529,52 @@ class Store:
 
     def conversation_transmissions(self, conversation_id: str,
                                    limit: int = 500,
-                                   newest_first: bool = False
+                                   newest_first: bool = False,
+                                   include_hidden: bool = False
                                    ) -> List[Transmission]:
         """The newest ``limit`` transmissions in one named thread.
 
         Selected DESC and reversed unless the caller wants newest-first, for
         the same reason as :meth:`recent_transmissions`: ASC plus LIMIT would
         return the oldest rows in the database, not the recent thread.
+        Messages the operator removed from view are left out unless asked for.
         """
         limit = max(0, int(limit))
         if not limit:
             return []
+        hidden = "" if include_hidden else "AND t.hidden = 0 "
         rows = self._conn.execute(
             "SELECT t.* FROM transmissions t "
             "JOIN sessions s ON s.id = t.session_id "
-            "WHERE s.conversation_id = ? "
+            f"WHERE s.conversation_id = ? {hidden}"
             "ORDER BY t.started_at DESC, t.rowid DESC LIMIT ?",
             (conversation_id, limit)).fetchall()
         ordered = rows if newest_first else list(reversed(rows))
         return [_from_row(r) for r in ordered]
 
     def list_transmissions(self, session_id: Optional[str] = None,
-                           limit: int = 500, ascending: bool = True
+                           limit: int = 500, ascending: bool = True,
+                           include_hidden: bool = False
                            ) -> List[Transmission]:
         """Transmissions in the requested order, capped at ``limit``.
 
         Note what ``ascending=True`` with a limit means here: the *oldest*
         rows. That is right for "the first N of a session" and wrong for
         "the thread as it stands", which is why :meth:`recent_transmissions`
-        exists rather than callers passing a limit to this.
+        exists rather than callers passing a limit to this. Removed messages
+        are left out unless asked for, so an export agrees with the thread.
         """
         order = "ASC" if ascending else "DESC"
+        hidden = "" if include_hidden else "hidden = 0"
         if session_id:
+            where = "WHERE session_id = ?" + (f" AND {hidden}" if hidden else "")
             rows = self._conn.execute(
-                f"SELECT * FROM transmissions WHERE session_id = ? "
+                f"SELECT * FROM transmissions {where} "
                 f"ORDER BY started_at {order} LIMIT ?", (session_id, limit)).fetchall()
         else:
+            where = f"WHERE {hidden}" if hidden else ""
             rows = self._conn.execute(
-                f"SELECT * FROM transmissions ORDER BY started_at {order} LIMIT ?",
+                f"SELECT * FROM transmissions {where} ORDER BY started_at {order} LIMIT ?",
                 (limit,)).fetchall()
         return [_from_row(r) for r in rows]
 
@@ -564,12 +595,12 @@ class Store:
             return []
         if session_id:
             rows = self._conn.execute(
-                "SELECT * FROM transmissions WHERE session_id = ? "
+                "SELECT * FROM transmissions WHERE session_id = ? AND hidden = 0 "
                 "ORDER BY started_at DESC, rowid DESC LIMIT ?",
                 (session_id, limit)).fetchall()
         else:
             rows = self._conn.execute(
-                "SELECT * FROM transmissions "
+                "SELECT * FROM transmissions WHERE hidden = 0 "
                 "ORDER BY started_at DESC, rowid DESC LIMIT ?",
                 (limit,)).fetchall()
         return [_from_row(r) for r in reversed(rows)]
@@ -605,7 +636,7 @@ class Store:
         params += [threshold, threshold, limit]
         rows = self._conn.execute(
             f"""SELECT t.* FROM transmissions t
-               WHERE t.reviewed = 0 {scope}AND (
+               WHERE t.reviewed = 0 AND t.hidden = 0 {scope}AND (
                      t.state = 'failed'
                   OR (t.transcript_confidence IS NOT NULL
                       AND t.transcript_confidence < ?)
@@ -616,8 +647,11 @@ class Store:
         return [_from_row(r) for r in rows]
 
     def delete_transmission(self, tx_id: str, delete_audio: bool = False) -> None:
+        """Retention pruning. Row, index and (optionally) the two audio
+        files; errors suppressed. Leaves a tombstone like every deletion."""
         tx = self.get_transmission(tx_id)
         with self._lock:
+            self._tombstone(tx_id, tx.session_id if tx else None, [])
             self._conn.execute("DELETE FROM transmissions WHERE id = ?", (tx_id,))
             if self.fts_enabled:
                 self._conn.execute("DELETE FROM transmissions_fts WHERE id = ?", (tx_id,))
@@ -627,6 +661,189 @@ class Store:
                 if path:
                     with contextlib.suppress(OSError):
                         pathlib.Path(path).unlink()
+
+    # ---- operator removal ------------------------------------------------
+    def hide_transmission(self, tx_id: str, hidden: bool = True
+                          ) -> Optional[Transmission]:
+        """Remove a message from view (or put it back). Nothing else moves."""
+        tx = self.get_transmission(tx_id)
+        if tx is None:
+            return None
+        tx.hidden = bool(hidden)
+        return self.save_transmission(tx)
+
+    def hidden_transmissions(self, conversation_id: str,
+                             limit: int = 500) -> List[Transmission]:
+        rows = self._conn.execute(
+            "SELECT t.* FROM transmissions t "
+            "JOIN sessions s ON s.id = t.session_id "
+            "WHERE s.conversation_id = ? AND t.hidden = 1 "
+            "ORDER BY t.started_at DESC LIMIT ?",
+            (conversation_id, max(0, int(limit)))).fetchall()
+        return [_from_row(r) for r in rows]
+
+    def deletion_inventory(self, tx: Transmission,
+                           owned_roots: Sequence[str]) -> "DeletionInventory":
+        """Everything a permanent deletion would touch, and what it would not.
+
+        Files are sorted into three piles before anything is removed:
+
+        * ``owned`` - inside one of the application's own roots (the
+          Recordings folder), a regular file, not a symlink, and referenced by
+          no other retained transmission. These are deleted.
+        * ``external`` - anywhere else: a WAV the operator replayed from their
+          own folder, an export, a backup. Never touched; named in the report.
+        * ``shared`` - inside an owned root but also referenced by another
+          transmission that is being kept. Never touched.
+
+        Paths come from the message's own fields and every analysis attempt's
+        artifacts and derived input; nothing is expanded, globbed or walked.
+        """
+        roots = [pathlib.Path(os.path.realpath(r)) for r in owned_roots if r]
+        candidates: List[str] = []
+        for path in (tx.audio_path, tx.processed_audio_path):
+            if path:
+                candidates.append(path)
+        for attempt in tx.analysis_attempts:
+            if attempt.input_is_derived and attempt.input_path:
+                candidates.append(attempt.input_path)
+            for artifact in attempt.artifacts:
+                if artifact.path:
+                    candidates.append(artifact.path)
+        seen: List[str] = []
+        for path in candidates:
+            if path not in seen:
+                seen.append(path)
+
+        inventory = DeletionInventory(transmission_id=tx.id)
+        for path in seen:
+            p = pathlib.Path(path)
+            if p.is_symlink():
+                inventory.external.append(path)         # never follow a link
+                continue
+            real = pathlib.Path(os.path.realpath(path))
+            inside = any(_is_within(real, root) for root in roots)
+            if not inside:
+                inventory.external.append(path)
+                continue
+            if self._referenced_elsewhere(path, tx.id):
+                inventory.shared.append(path)
+                continue
+            inventory.owned.append(path)
+        return inventory
+
+    def _referenced_elsewhere(self, path: str, except_id: str) -> bool:
+        like = f"%{path}%"
+        row = self._conn.execute(
+            """SELECT 1 FROM transmissions
+               WHERE id != ? AND (audio_path = ? OR processed_audio_path = ?
+                                  OR analysis_attempts LIKE ?) LIMIT 1""",
+            (except_id, path, path, like)).fetchone()
+        return row is not None
+
+    def delete_transmission_permanently(self, tx_id: str,
+                                        owned_roots: Sequence[str]
+                                        ) -> Optional["DeletionReport"]:
+        """Delete one message and the files that are its alone.
+
+        Order: the tombstone and the row go first, in one transaction, so a
+        late worker cannot recreate the message and a crash mid-way leaves a
+        record rather than a half-deleted row. Then each owned file is
+        unlinked individually - never a directory. A file that will not go is
+        recorded on the tombstone as a leftover and reported; the deletion is
+        not called complete while one remains.
+        """
+        tx = self.get_transmission(tx_id)
+        if tx is None:
+            return None
+        inventory = self.deletion_inventory(tx, owned_roots)
+        with self._lock:
+            self._tombstone(tx_id, tx.session_id, inventory.owned)
+            self._conn.execute("DELETE FROM transmissions WHERE id = ?", (tx_id,))
+            if self.fts_enabled:
+                self._conn.execute("DELETE FROM transmissions_fts WHERE id = ?",
+                                   (tx_id,))
+            self._conn.commit()
+        report = DeletionReport(transmission_id=tx_id, inventory=inventory)
+        self._unlink_owned(report)
+        return report
+
+    def _unlink_owned(self, report: "DeletionReport") -> None:
+        leftovers: List[str] = []
+        for path in report.inventory.owned:
+            p = pathlib.Path(path)
+            try:
+                if p.is_symlink() or p.is_dir():
+                    raise IsADirectoryError(f"not a regular file: {path}")
+                p.unlink()
+                report.removed.append(path)
+            except FileNotFoundError:
+                report.already_gone.append(path)
+            except OSError as exc:
+                report.failed.append((path, f"{type(exc).__name__}: {exc}"))
+                leftovers.append(path)
+        with self._lock:
+            self._conn.execute(
+                "UPDATE deleted_transmissions SET leftover_files = ? WHERE id = ?",
+                (json.dumps(leftovers), report.transmission_id))
+            self._conn.commit()
+
+    def _tombstone(self, tx_id: str, session_id: Optional[str],
+                   leftovers: Sequence[str]) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO deleted_transmissions "
+            "(id, deleted_at, session_id, leftover_files) VALUES (?,?,?,?)",
+            (tx_id, iso(utcnow()), session_id, json.dumps(list(leftovers))))
+
+    def _is_tombstoned(self, tx_id: str) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM deleted_transmissions WHERE id = ?",
+            (tx_id,)).fetchone() is not None
+
+    def is_deleted(self, tx_id: str) -> bool:
+        return self._is_tombstoned(tx_id)
+
+    def leftover_deletions(self) -> Dict[str, List[str]]:
+        """Deleted messages whose files could not all be removed, by id."""
+        rows = self._conn.execute(
+            "SELECT id, leftover_files FROM deleted_transmissions "
+            "WHERE leftover_files != '[]'").fetchall()
+        out: Dict[str, List[str]] = {}
+        for row in rows:
+            files = json.loads(row["leftover_files"] or "[]")
+            if files:
+                out[row["id"]] = files
+        return out
+
+    def retry_leftover_deletions(self, owned_roots: Sequence[str]
+                                 ) -> Dict[str, List[str]]:
+        """Try again for every leftover. Returns what is *still* left."""
+        roots = [pathlib.Path(os.path.realpath(r)) for r in owned_roots if r]
+        still: Dict[str, List[str]] = {}
+        for tx_id, files in self.leftover_deletions().items():
+            remaining: List[str] = []
+            for path in files:
+                p = pathlib.Path(path)
+                real = pathlib.Path(os.path.realpath(path))
+                if not any(_is_within(real, root) for root in roots) or p.is_symlink():
+                    remaining.append(path)     # no longer ours to remove
+                    continue
+                try:
+                    if p.is_dir():
+                        raise IsADirectoryError(path)
+                    p.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    remaining.append(path)
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE deleted_transmissions SET leftover_files = ? WHERE id = ?",
+                    (json.dumps(remaining), tx_id))
+                self._conn.commit()
+            if remaining:
+                still[tx_id] = remaining
+        return still
 
     # ---- search --------------------------------------------------------
     def search(self, query: str = "", *, session_id: Optional[str] = None,
@@ -697,6 +914,7 @@ class Store:
             where.append("COALESCE(t.transcript_confidence, 1) <= ?")
             params.append(max_confidence)
 
+        where.append("t.hidden = 0")
         clause = f"WHERE {' AND '.join(where)}" if where else ""
         rows = self._conn.execute(
             f"SELECT t.* FROM transmissions t {clause} "
@@ -747,6 +965,40 @@ class Store:
             "recordings_dir": str(self.recordings_dir),
             "fts_enabled": self.fts_enabled,
         }
+
+
+@dataclasses.dataclass
+class DeletionInventory:
+    """What a permanent deletion would touch on disk, sorted by ownership."""
+
+    transmission_id: str
+    owned: List[str] = dataclasses.field(default_factory=list)
+    external: List[str] = dataclasses.field(default_factory=list)
+    shared: List[str] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass
+class DeletionReport:
+    """What a permanent deletion actually did."""
+
+    transmission_id: str
+    inventory: DeletionInventory
+    removed: List[str] = dataclasses.field(default_factory=list)
+    already_gone: List[str] = dataclasses.field(default_factory=list)
+    failed: List[Tuple[str, str]] = dataclasses.field(default_factory=list)
+
+    @property
+    def complete(self) -> bool:
+        """Every owned file is gone. False while any remains."""
+        return not self.failed
+
+
+def _is_within(path: pathlib.Path, root: pathlib.Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 def _is_hex_color(value: str) -> bool:

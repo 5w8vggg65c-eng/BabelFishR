@@ -681,6 +681,52 @@ class BabelFishRApp:
         """Colour one Session's tab. "" restores the default."""
         return self.store.set_conversation_color(conversation_id, color)
 
+    # -- removing messages -------------------------------------------------
+    def owned_roots(self) -> List[str]:
+        """Directories whose files BabelFishR created and may delete.
+
+        The Recordings folder only. A WAV the operator replayed from their own
+        folder, an export, a backup, a shared copy - none of those are ours.
+        """
+        return [str(pathlib.Path(self.config.recording.directory).expanduser())]
+
+    def removal_problem(self, tx_id: str) -> str:
+        """Why this message cannot be removed right now, or "" when it can."""
+        tx = self.store.get_transmission(tx_id)
+        if tx is None:
+            return "That message is no longer in the database."
+        for pipeline in (self.pipeline, self.standalone_pipeline):
+            if pipeline is not None and pipeline.is_in_flight(tx_id):
+                return ("This message is still being processed. Wait for the "
+                        "transcript to finish, then try again.")
+        return ""
+
+    def remove_from_thread(self, tx_id: str):
+        """Take a message out of view; keep its data. Restorable."""
+        return self.store.hide_transmission(tx_id, hidden=True)
+
+    def restore_to_thread(self, tx_id: str):
+        return self.store.hide_transmission(tx_id, hidden=False)
+
+    def deletion_inventory(self, tx_id: str):
+        tx = self.store.get_transmission(tx_id)
+        return None if tx is None else self.store.deletion_inventory(
+            tx, self.owned_roots())
+
+    def delete_permanently(self, tx_id: str):
+        """Delete the message and the files that are its alone.
+
+        Playback of it is the window's to stop first; processing is refused
+        via removal_problem(). Returns the report, or None if already gone.
+        """
+        return self.store.delete_transmission_permanently(tx_id, self.owned_roots())
+
+    def leftover_deletions(self):
+        return self.store.leftover_deletions()
+
+    def retry_leftover_deletions(self):
+        return self.store.retry_leftover_deletions(self.owned_roots())
+
     @property
     def capture_conversation_id(self) -> str:
         """Where the *running* capture files its transmissions.
@@ -704,7 +750,8 @@ class BabelFishRApp:
 
     def recent_transmissions(self, limit: Optional[int] = None, *,
                              conversation_id: Optional[str] = None,
-                             newest_first: bool = False) -> List[Transmission]:
+                             newest_first: bool = False,
+                             include_hidden: bool = False) -> List[Transmission]:
         """The message thread for one named Session.
 
         Across monitoring runs, deliberately. Stopping and restarting
@@ -715,7 +762,7 @@ class BabelFishRApp:
         limit = self.HISTORY_LIMIT if limit is None else limit
         return self.store.conversation_transmissions(
             conversation_id or self.conversation_id, limit=limit,
-            newest_first=newest_first)
+            newest_first=newest_first, include_hidden=include_hidden)
 
     def search(self, query: str = "", **filters) -> List[Transmission]:
         """Search inside the named Session being viewed.

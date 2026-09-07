@@ -657,6 +657,14 @@ class Transmission:
     error: Optional[ErrorInfo] = None
 
     # -- operator annotations ------------------------------------------
+    hidden: bool = False
+    """Removed from the visible thread by the operator, data kept.
+
+    Not shown in the thread, search, review or ordinary exports; still in the
+    database and still on disk; restorable. Distinct from deletion, which
+    leaves nothing to restore.
+    """
+
     notes: str = ""
     tags: List[str] = dataclasses.field(default_factory=list)
     bookmarked: bool = False
