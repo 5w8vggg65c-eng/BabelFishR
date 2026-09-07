@@ -62,6 +62,16 @@ _FREQUENCY_SUFFIX = {
 }
 
 
+def _local_stamp(when) -> str:
+    """``2026-09-07 10:41:20``: the local date and time of one transmission.
+
+    The header used to show only the time, which is enough while reading
+    today's traffic and misleading for anything older - a bubble from last
+    week looked exactly like one from an hour ago.
+    """
+    return when.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _frequency_suffix(provenance) -> str:
     """The label for one frequency. An unrecognised origin is unverified.
 
@@ -301,8 +311,11 @@ class TransmissionBubble(QtWidgets.QFrame):
     # -- rendering -------------------------------------------------------
     def update_from(self, tx: Transmission) -> None:
         self.tx = tx
-        meta: List[str] = [tx.started_at.astimezone().strftime("%H:%M:%S"),
-                           f"{tx.duration:.1f}s"]
+        # Date and time, from the transmission's own started_at converted to
+        # this computer's local zone - never the clock at render time, and
+        # never a network time source. Reprocessing a recording from last
+        # month must still say last month.
+        meta: List[str] = [_local_stamp(tx.started_at), f"{tx.duration:.1f}s"]
         if tx.channel_name:
             meta.append(tx.channel_name)
         if tx.frequency_mhz is not None:

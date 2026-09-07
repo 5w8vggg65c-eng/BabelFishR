@@ -699,7 +699,9 @@ def test_the_badge_shows_checking_while_the_check_is_still_running(qt_app,
                  "Local translation smoke test"):
         ready.add(Check(name, CheckStatus.PASS, ""))
     window._render_readiness(ready)
-    assert "Field ready" in window.ready_badge.text()
+    # "Ready", at the operator's request - and only for a report that is.
+    assert "Ready" in window.ready_badge.text()
+    assert "Field ready" not in window.ready_badge.text()
 
     broken = ReadinessReport()
     broken.add(Check("Audio backend", CheckStatus.FAIL, "no backend"))

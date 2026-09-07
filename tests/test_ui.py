@@ -170,7 +170,12 @@ def test_state_is_not_conveyed_by_colour_alone(qt_app, config, store):
         assert text and symbol, f"{state} lacks a text or symbol cue"
 
     window = MainWindow(BabelFishRApp(config=config, store=store))
-    window._set_state(PipelineState.RECEIVING)
+    # Render the state directly. _set_state now reconciles a capture state
+    # with whether a capture exists (there is none here, so Receiving would
+    # honestly become Idle); that behaviour has its own tests. This one is
+    # about how a state is drawn once it is the state.
+    window._state = PipelineState.RECEIVING
+    window._refresh_state_badge()
     assert "Receiving" in window.state_badge.text()
     assert window.state_badge.text() != "Receiving"  # symbol present too
     window.close()

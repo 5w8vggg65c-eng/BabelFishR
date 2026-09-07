@@ -324,7 +324,13 @@ class ProcessingPipeline:
             tx.state = ProcessingState.COMPLETE
         self.store.save_transmission(tx)
         self.events.publish("updated", tx)
-        self.events.publish("state", PipelineState.LISTENING)
+        # Finished - and that is all this pipeline can honestly say. It used
+        # to publish LISTENING here, a claim about the microphone it has no
+        # way of checking: processing a saved recording with no monitoring
+        # running ended by announcing Listening. The window resolves COMPLETE
+        # against the actual capture: back to Listening or Receiving when one
+        # is open, Idle when none is.
+        self.events.publish("state", PipelineState.COMPLETE)
 
     def _load_audio(self, tx: Transmission):
         from .audio.wavefile import read_wav

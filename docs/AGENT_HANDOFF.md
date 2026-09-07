@@ -2301,3 +2301,251 @@ and review from a tab, the 'Recording into …' notice clearing on stop, real RF
 metadata reaching a bubble, and the newest-first viewport behaviour under live
 traffic. A downloadable candidate build still does not exist — this run produced
 no DMG."
+
+---
+
+# Operator feedback pass: five things the first live Mac test surfaced
+
+Branch `claude/radio-decoder-translator-0oslya`, from `ae962cc`. Repair and
+review only: no workflow dispatched, no tag, no release; Alpha 1/2/3 unmoved,
+no Alpha 4. No schema change.
+
+## Historical record, updated
+
+The previous section ended: *"A downloadable candidate build now exists … but
+it has not yet been installed or exercised on Eric's Mac."* **That is
+superseded.** Eric installed the run-19 candidate (`BabelFishR-macOS-arm64.dmg`,
+SHA-256 `b9c92ce2…9050e6`) and reports bench steps 1–8 good: install over the
+existing app, launch, microphone, Field Offline transcription and translation.
+His photographs show working transcript and translation bubbles.
+
+Three tiers, kept apart on purpose:
+
+- **Eric reported:** steps 1–8 good. Step 9 (Session-scoped search) was
+  blocked because he could not find the View menu — the instructions never
+  explained that macOS puts it at the top of the screen, outside the window.
+  The Terminal checksum step showed no result; its cause is unknown and is not
+  guessed at here. He could not rename tabs; the reason is unknown.
+- **Automated coverage:** everything in this section, offscreen, on Linux and
+  the hosted Mac runner. It drives the same controls but is not a Mac.
+- **Unavailable hardware:** no radio, USB radio interface, SDR dongle or
+  FalconClaw PTT has ever been connected. Unchanged.
+
+Eric's screenshots do not identify his installed binary's exact digest, since
+the checksum step produced nothing. That is noted, not resolved.
+
+## What Eric asked for, and what was done
+
+### 1. The Record Only warning stayed after leaving Record Only — fixed
+
+Reproduced through `MainWindow._apply_mode()`, the method the mode menu calls:
+enter Record Only, the banner explains it; leave for Field Offline, the banner
+still says Record Only. Cause, as Codex found: `_report_engines()` wrote
+`summary.warnings` to the banner when present and never touched it otherwise,
+and nothing anywhere ever hid the banner after startup.
+
+Repair: the banner now holds **one warning per source** — `audio-input`,
+`audio-backend`, `engines`, `general` — rendered together. `_report_engines()`
+sets or clears the `engines` slot on every call; a device dropping out sets
+`audio-input` and a `connected`/`reconnected` status clears it;
+`_refresh_devices()` sets or clears `audio-backend`. Clearing one cannot hide
+another that is still true, which is the constraint Codex flagged: the banner
+also carries audio-input trouble, and hiding the whole label to fix the stale
+text would have hidden that. A genuine Record Only selection is still
+explained. Offline enforcement is untouched: Field Offline on placeholder
+engines still warns, with the right warning.
+
+### 2. Tabs could not be edited — investigated; no failure reproduced
+
+"Edit" is read as **rename**, per Codex's recommendation; no other editable
+property was named. Exercised through the real controls, offscreen:
+
+- a `QTest.mouseClick` on the **Rename…** button → dialog opens pre-filled with
+  the current name → tab text changes → the change is in the database when a
+  fresh `Store` opens the same file;
+- a `QTest.mouseDClick` on the tab itself → same;
+- a right-click context menu on the tab (new) → same.
+
+All three work here. **That does not prove Eric's button works on his Mac**, and
+this section does not claim it does. The reason he could not rename remains
+unknown. What was changed, as clarity improvements that are also honest about
+outcomes:
+
+- a **right-click menu on the tab** offering *Rename Session…*, because a
+  double-click on a trackpad is easy to miss and a small toolbar button is easy
+  to overlook;
+- the button reads **Rename…** and its tooltip, and the tab bar's, say how;
+- **every outcome is visible**: cancel or a blank name → status bar says
+  *Session name unchanged*; a save that raises or returns nothing → a warning
+  dialog saying it was not renamed and the data is untouched; success → status
+  bar says *Renamed "old" to "new"*. A rename that silently did nothing is
+  indistinguishable, to the operator, from a button that does not work.
+
+Invariants proven: same conversation id after rename; messages and monitoring
+runs still filed under it; a capture pinned to that Session mid-run keeps its
+pin and the *Recording into "…"* notice shows the new name; renaming the
+default General Session does not create a second General (it is found by flag,
+not by name).
+
+**Deletion is not implemented.** It is an open decision for Eric — see below.
+
+### 3. "Field ready" → "Ready" — done, wording only
+
+`_render_readiness()` now shows **✓ Ready** for `report.field_ready`, and only
+there. The branch logic is untouched; a test renders four report shapes,
+asserts each lands where its own properties say, and asserts the report is
+unchanged after rendering. A skipped smoke test is still *Checking*, never
+Ready. Accessible description and tooltip now carry a sentence, not the chip
+text.
+
+**Design choice, mine:** the `can_record`-only branch used to read **Record
+only**. That chip describes what is installed and working; *Record Only* is an
+operating mode the operator selects, and the same two words in a readiness chip
+read as though they had selected it. It now reads **◑ Partly ready**, which is
+what the readiness dialog already calls that state, with an accessible
+description that says it describes what is installed, not the operating mode.
+The setup assistant's *Record only for now* button is a genuine mode choice and
+is unchanged.
+
+### 4. A date with every timestamp — done, from the stored value
+
+Bubble headers now open with `2026-09-07 10:41:20`: the transmission's own
+`started_at`, converted to the computer's local zone by `astimezone()`. No
+network time source, no render-time clock. Tests pin a historical transmission
+(2025-03-15 23:30 UTC) and show it renders as `2025-03-15 23:30:00` under
+`TZ=UTC` and as `2025-03-16 12:30:00` under `TZ=Pacific/Auckland` — the date
+crosses the local boundary with the zone. Updating the transcript leaves the
+date alone; the stored timestamp and newest-first order are unchanged.
+
+Format is a single field `YYYY-MM-DD HH:MM:SS`. Codex suggested
+`2026-09-07 · 10:41:20`; the header already uses ` · ` between fields, so a
+second dot inside one field would read as two fields. Not Eric's specified
+format — he did not specify one.
+
+### 5. "Listening" with nothing listening — fixed at both ends
+
+Reproduced through the real window and event queue, two ways: (a) *Transcribe
+anyway* on a saved recording with monitoring stopped ends with the badge on
+**Listening** and the button on *Start monitoring*; (b) stop monitoring, and
+the events the run left in the queue are drained on the next timer tick and
+overwrite the *Idle* that `_stop_monitoring()` had just set.
+
+Cause: `ProcessingPipeline._process()` published `LISTENING` unconditionally
+when it finished, a claim about the microphone it has no way to check.
+
+Repair, two layers:
+
+- **Pipeline:** publishes `COMPLETE` when finished. That is all it can honestly
+  say.
+- **Window:** `_set_state()` reconciles through `_truthful_state()`. `COMPLETE`
+  becomes the capture's own current state if a capture exists, else `IDLE`.
+  `LISTENING`/`RECEIVING` with no capture become `IDLE`. Everything else passes
+  through — *Transcribing* and *Translating* are shown whether or not a
+  microphone is open, because they are true either way.
+
+The event queue is **not** discarded: stale state events are reconciled, while
+`updated`/`transmission` events still reach their bubbles. Tests cover saved
+processing with no capture, completion after Stop, injected stale states from
+an earlier run alongside a late transcript update (the update lands, the badge
+stays Idle), and a live run (Listening and Receiving still display; COMPLETE
+mid-run returns to what the capture is doing).
+
+## Open decision for Eric — Session tab deletion
+
+Not built. Two concrete behaviours are possible and they are not
+interchangeable:
+
+- **Keep:** the tab disappears from the row; its Sessions, messages and WAV
+  recordings stay in the database and on disk, reachable again (for example by
+  a "Show hidden Sessions" control that does not yet exist). Nothing is lost.
+- **Erase:** the tab, every monitoring run under it, every message, and every
+  recording file under it are permanently deleted. Not recoverable.
+
+General, the default Session, would be exempt either way. Nothing in between
+(archive, move-to-General, orphaned history) is proposed unless Eric asks for
+it. Which one is Eric's call.
+
+## Files changed
+
+```
+babelfishr/ui/main_window.py           warnings per source; Ready / Partly ready
+                                       wording; _truthful_state(); tab context
+                                       menu; rename outcomes visible
+babelfishr/ui/timeline.py              _local_stamp(): local date and time
+babelfishr/pipeline.py                 _process() publishes COMPLETE, not LISTENING
+tests/test_alpha4_operator_feedback.py NEW  24 tests
+tests/test_ui.py                       one test updated (below)
+tests/test_alpha3_repairs.py           one assertion updated (below)
+docs/MAC_BENCH_CHECKLIST.md            NEW  operator checklist, no Terminal
+docs/AGENT_HANDOFF.md                  this section
+```
+
+**Existing tests changed, and why:**
+
+- `tests/test_ui.py::test_state_is_not_conveyed_by_colour_alone` called
+  `_set_state(RECEIVING)` on a window with no capture. That now honestly renders
+  Idle. The test is about how a state is *drawn*, so it sets `_state` and calls
+  `_refresh_state_badge()` directly; the reconciliation has its own tests.
+- `tests/test_alpha3_repairs.py::test_the_badge_shows_checking_while_the_check_is_still_running`
+  asserted `"Field ready"`; it now asserts `"Ready"` and that `"Field ready"` is
+  gone. Eric's request.
+
+Preserved and re-run green: capture-first recording, offline enforcement,
+pinned Session ownership, scoped search and review, persistent history,
+viewport anchoring, and the history-independent schema-3 fixture with its
+migration checks.
+
+## Test results
+
+New file alone: **24 passed**. Focused (new file, ui, alpha3 repairs, all four
+alpha4 files, pipeline, acceptance, offline, offline-integration, storage,
+capture-invariant, models, gui-setup, input-panel): **355 passed**.
+
+Full suite: **815 passed, 9 skipped** in 88s — the 791 from `ae962cc` plus the
+24 new tests. Exact skips, unchanged and environmental: `test_coreaudio.py:255`
+needs a real macOS host with CoreAudio (1); `test_packaging.py:373` PlistBuddy
+is macOS-only (1); `test_real_engines.py:32` no prepared Whisper model (5);
+`test_real_engines.py:107` no Argos language pack (2). Linux, Python 3.11,
+`QT_QPA_PLATFORM=offscreen`.
+
+`git diff --check` clean; `compileall` clean over `babelfishr`, `tests`,
+`packaging`; all five packaging scripts pass `bash -n`; the spec parses; the
+workflow YAML loads.
+
+## Non-vacuity
+
+Each repair mutated back, the new file re-run, repaired code restored:
+
+| Mutation | Failing tests |
+|---|---|
+| Never clear the `engines` warning | 2 |
+| "Field ready" and "Record only" restored | 3 |
+| Header time-only again | 3 |
+| Window accepts every state as-is | 4 |
+| Pipeline publishes LISTENING again | 1 |
+| Failed rename shows nothing | 1 |
+
+## Two things worth knowing about the tests
+
+`QMenu.exec` cannot be monkeypatched on the PySide6 class — the first draft of
+the context-menu test did that, the real menu opened offscreen, and the test
+hung until the timeout. The menu is now built by `_build_session_tab_menu()`
+and shown by `_session_tab_menu()`, so the test drives the built menu's action.
+And `QInputDialog.getText` is patched as a `staticmethod`; its positional
+arguments are `(parent, title, label, echo, text)`, so the pre-filled name is
+argument 4, not 3 — the first draft asserted on the echo mode.
+
+## Limitations carried forward
+
+No SDR dongle, radio, USB radio interface or FalconClaw PTT has ever been
+connected to this software. The hosted runner has no audio or RF hardware, and
+Eric's bench test used the MacBook microphone and saved recordings.
+
+**Superseding the earlier statement:** the run-19 candidate *has* been
+installed and exercised on Eric's Mac — steps 1–8 reported good. Still not
+exercised there from any commit on this branch: Session-scoped search and
+review from a tab (blocked on finding the View menu, now explained in
+`docs/MAC_BENCH_CHECKLIST.md`), the *Recording into …* notice clearing on
+stop, real RF metadata reaching a bubble, the newest-first viewport behaviour
+under live traffic, quit-and-reopen persistence of Session tabs, and every
+repair in this section. No candidate has been built from this commit.

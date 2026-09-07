@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import pathlib
 from typing import Dict, List, Optional
 
@@ -24,6 +25,8 @@ def _slug(text: str) -> str:
     return safe.strip("-").lower() or "session"
 from .timeline import TimelineView
 from .widgets import LevelMeterWidget
+
+log = logging.getLogger(__name__)
 
 #: State labels paired with a semantic colour NAME (resolved per appearance),
 #: plus a symbol, so state never depends on colour alone.
@@ -62,6 +65,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._theming = False
         self._readiness_worker = None
         self._analysis_worker = None
+        # One entry per thing that can be wrong, so clearing one cannot hide
+        # another that is still true. See _warn.
+        self._warnings: Dict[str, str] = {}
         self._build_ui()
         self._refresh_devices()
         self._refresh_profiles()
@@ -167,9 +173,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session_tabs.setAccessibleName("Sessions")
         self.session_tabs.setToolTip(
             "Named Sessions. Monitoring can be started and stopped many "
-            "times inside one Session; the thread continues.")
+            "times inside one Session; the thread continues.\n\n"
+            "To rename a Session: double-click its tab, right-click its tab, "
+            "or select it and press Rename.")
         self.session_tabs.currentChanged.connect(self._on_session_tab)
         self.session_tabs.tabBarDoubleClicked.connect(self._rename_session_tab)
+        # A right-click menu as well. Double-click on a trackpad is easy to
+        # miss, and a small toolbar button is easy to overlook; a menu on the
+        # tab itself is where a Mac user expects to find "rename".
+        self.session_tabs.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.session_tabs.customContextMenuRequested.connect(
+            self._session_tab_menu)
 
         tab_row = QtWidgets.QHBoxLayout()
         tab_row.setSpacing(6)
@@ -181,8 +195,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.new_session_button.clicked.connect(self._new_session_tab)
         tab_row.addWidget(self.new_session_button)
         self.rename_session_button = QtWidgets.QToolButton()
-        self.rename_session_button.setText("Rename")
-        self.rename_session_button.setToolTip("Rename the selected Session")
+        self.rename_session_button.setText("Rename\u2026")
+        self.rename_session_button.setToolTip(
+            "Rename the selected Session. Its messages and recordings are "
+            "kept; only the name changes.")
         self.rename_session_button.setAccessibleName("Rename Session")
         self.rename_session_button.clicked.connect(
             lambda: self._rename_session_tab(self.session_tabs.currentIndex()))
@@ -456,7 +472,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not backend_available():
             self._warn("No audio backend. Install the audio extra "
                        "(pip install 'babelfishr[audio]') to capture live "
-                       "audio. Replaying a WAV file still works.")
+                       "audio. Replaying a WAV file still works.",
+                       source="audio-backend")
+        else:
+            self._clear_warning("audio-backend")
 
     def _on_input_selection(self) -> None:
         self.status.showMessage(self.input_panel.status_label.text(), 6000)
@@ -485,7 +504,12 @@ class MainWindow(QtWidgets.QMainWindow):
         summary = self.app.select_engines()
         messages = list(summary.warnings)
         if messages:
-            self._warn("\n".join(messages))
+            self._warn("\n".join(messages), source="engines")
+        else:
+            # The previous summary's warning is not this summary's warning.
+            # Leaving it up is how the Record Only explanation stayed on
+            # screen after the operator had gone back to Field Offline.
+            self._clear_warning("engines")
         if summary.privacy_notices:
             self.privacy_banner.setText(
                 "⬆ Data leaves this computer: " + "  ".join(summary.privacy_notices))
@@ -552,8 +576,39 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"The log folder could not be opened automatically.\n\n"
                 f"It is at:\n{directory}")
 
-    def _warn(self, text: str) -> None:
-        self.warning_banner.setText("⚠ " + text)
+    #: Display order for the banner. Audio problems first: they decide whether
+    #: anything is being recorded at all.
+    _WARNING_SOURCES = ("audio-input", "audio-backend", "engines", "general")
+
+    def _warn(self, text: str, source: str = "general") -> None:
+        """Show a warning, remembering what it is about.
+
+        Warnings are kept per source - the engines, the audio backend, the
+        selected audio input - and the banner shows every current one. That
+        is what lets one be cleared without hiding another that is still
+        true. The banner used to be a single label that was only ever written
+        to and never cleared, so the explanation of Record Only mode stayed on
+        screen after the operator had left Record Only: the next engine
+        summary had no warnings, and therefore never touched it.
+        """
+        self._warnings[source] = text
+        self._render_warnings()
+
+    def _clear_warning(self, source: str) -> None:
+        """Retract one warning. Others stay exactly as they were."""
+        if self._warnings.pop(source, None) is not None:
+            self._render_warnings()
+
+    def _render_warnings(self) -> None:
+        ordered = [self._warnings[k] for k in self._WARNING_SOURCES
+                   if self._warnings.get(k)]
+        ordered += [v for k, v in self._warnings.items()
+                    if k not in self._WARNING_SOURCES and v]
+        if not ordered:
+            self.warning_banner.clear()
+            self.warning_banner.hide()
+            return
+        self.warning_banner.setText("\n".join("⚠ " + t for t in ordered))
         self.warning_banner.show()
 
     # -- monitoring ------------------------------------------------------
@@ -743,7 +798,12 @@ class MainWindow(QtWidgets.QMainWindow):
                         "The selected audio input stopped responding. "
                         "BabelFishR is waiting for that same device and will "
                         "not record from anything else. Transmissions already "
-                        "captured are safe.")
+                        "captured are safe.", source="audio-input")
+                elif kind in ("connected", "reconnected"):
+                    # The device is back, or a fresh run opened it. The
+                    # warning about it was true and is not any more; nothing
+                    # else on the banner is touched.
+                    self._clear_warning("audio-input")
             elif event.kind == "error":
                 payload = event.payload or {}
                 self.status.showMessage(
@@ -762,8 +822,34 @@ class MainWindow(QtWidgets.QMainWindow):
         return (session.conversation_id or viewing) == viewing
 
     def _set_state(self, state: str) -> None:
-        self._state = state
+        self._state = self._truthful_state(state)
         self._refresh_state_badge()
+
+    def _truthful_state(self, state: str) -> str:
+        """Reconcile a reported state with whether anything is being captured.
+
+        "Listening" is a claim about the microphone: that a capture is open
+        and waiting for the next transmission. Two things used to make that
+        claim when it was false. Processing a saved recording with no
+        monitoring running ended by announcing Listening; and the last events
+        of a run that had already been stopped were drained after the badge
+        had been set to Idle, and overwrote it. The events themselves are
+        still delivered - a transcript arriving late must still reach its
+        bubble - but a capture state only lands when there is a capture.
+
+        COMPLETE is how the processing pipeline says "finished": it does not
+        know whether a microphone is open and does not pretend to. Finished
+        means back to whatever the capture is doing, or Idle if there is none.
+        """
+        capture = self.app.capture
+        if state == PipelineState.COMPLETE:
+            if capture is None:
+                return PipelineState.IDLE
+            return capture.state
+        if state in (PipelineState.LISTENING, PipelineState.RECEIVING):
+            if capture is None:
+                return PipelineState.IDLE
+        return state
 
     def _refresh_state_badge(self) -> None:
         from . import theme
@@ -829,21 +915,41 @@ class MainWindow(QtWidgets.QMainWindow):
         from . import theme
 
         self._readiness = report
+        # Wording only. The decision - which branch a report lands in - is the
+        # report's, and is unchanged: a skipped or failed check is never
+        # rendered as success.
         if report.field_ready:
-            text, tone = "\u2713 Field ready", "ok"
+            # The operator asked for "Ready", shown only when actually ready.
+            # This branch is the only one that is.
+            text, tone = "\u2713 Ready", "ok"
+            detail = ("Ready: recording, local transcription and local "
+                      "translation all work on this computer.")
         elif report.field_ready_unknown:
             # Prepared, but the smoke tests have not run in this process yet.
             # Alpha 3 showed "Record only" here, on a machine with a working
             # Whisper model and working Argos routes, and it stayed wrong
             # until the operator restarted. "Not tested" is not "unavailable".
             text, tone = "\u2026 Checking", "working"
+            detail = "Checking field readiness."
         elif report.can_record:
-            text, tone = "\u25d1 Record only", "working"
+            # "Partly ready", not "Record only". The badge describes what is
+            # installed and working; Record Only is an operating mode the
+            # operator chooses, and the same words in this chip read as
+            # though they had chosen it. The readiness dialog already calls
+            # this state "Partly ready - recording works", so the chip now
+            # agrees with it.
+            text, tone = "\u25d1 Partly ready", "working"
+            detail = ("Partly ready: recording works, but transcription or "
+                      "translation is not available yet. This describes what "
+                      "is installed, not the operating mode.")
         else:
             text, tone = "\u26a0 Not ready", "error"
+            detail = "Not ready: audio capture is not working."
         self.ready_badge.setText(text)
         self.ready_badge.setStyleSheet(f"color: {theme.status_color(tone, self)};")
-        self.ready_badge.setAccessibleDescription(text)
+        self.ready_badge.setAccessibleDescription(detail)
+        self.ready_badge.setToolTip(
+            f"{detail}\n\nField readiness - click for the full report.")
 
     def _show_readiness(self) -> None:
         from .readiness_dialog import ReadinessDialog
@@ -982,7 +1088,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_session_tabs()
         self._reload_timeline()
 
+    def _session_tab_menu(self, position) -> None:
+        index = self.session_tabs.tabAt(position)
+        if index < 0:
+            return
+        self._build_session_tab_menu(index).exec(
+            self.session_tabs.mapToGlobal(position))
+
+    def _build_session_tab_menu(self, index: int) -> QtWidgets.QMenu:
+        """The right-click menu for one tab. Built apart from being shown,
+        so its contents can be checked without a blocking popup."""
+        menu = QtWidgets.QMenu(self)
+        rename = menu.addAction("Rename Session\u2026")
+        rename.triggered.connect(lambda: self._rename_session_tab(index))
+        return menu
+
     def _rename_session_tab(self, index: int) -> None:
+        """Rename one Session. The Session itself is untouched.
+
+        Only the name changes: same id, same messages, same recordings, and
+        a capture pinned to this Session keeps filing into it. Every outcome
+        is visible - cancel and a blank name say "unchanged", a save that did
+        not happen says so - because a rename that silently did nothing is
+        indistinguishable, to the operator, from a button that does not work.
+        """
         conversation_id = self.session_tabs.tabData(index)
         if not conversation_id:
             return
@@ -990,10 +1119,30 @@ class MainWindow(QtWidgets.QMainWindow):
         name, ok = QtWidgets.QInputDialog.getText(
             self, "Rename Session", "Name for this Session:",
             QtWidgets.QLineEdit.Normal, current)
-        if not ok or not name.strip():
+        name = (name or "").strip()
+        if not ok or not name or name == current:
+            self.status.showMessage(
+                f"Session name unchanged: \u201c{current}\u201d", 6000)
             return
-        self.app.rename_conversation(conversation_id, name)
+        try:
+            renamed = self.app.rename_conversation(conversation_id, name)
+        except Exception as exc:  # noqa: BLE001 - report it, do not crash
+            log.exception("renaming Session %s failed", conversation_id)
+            renamed = None
+            failure = str(exc)
+        else:
+            failure = "" if renamed is not None else "it no longer exists"
+        if renamed is None or renamed.name != name:
+            QtWidgets.QMessageBox.warning(
+                self, "Rename Session",
+                f"\u201c{current}\u201d was not renamed"
+                f"{': ' + failure if failure else ''}.\n\n"
+                f"Its messages and recordings are untouched.")
+            self._refresh_session_tabs()
+            return
         self._refresh_session_tabs()
+        self.status.showMessage(
+            f"Renamed \u201c{current}\u201d to \u201c{name}\u201d", 6000)
 
     def _persist_selected_session(self) -> None:
         """Remember the tab, so a relaunch opens where the operator left."""
