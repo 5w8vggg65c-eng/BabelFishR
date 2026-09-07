@@ -478,6 +478,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.show_removed_action.toggled.connect(lambda _: self._reload_timeline())
         view_menu.addAction(self.show_removed_action)
 
+        self.show_hidden_sessions_action = QtGui.QAction("Show hidden Sessions", self)
+        self.show_hidden_sessions_action.setCheckable(True)
+        self.show_hidden_sessions_action.setToolTip(
+            "Also show Session tabs that were hidden, so they can be restored. "
+            "Everything in them was kept.")
+        self.show_hidden_sessions_action.toggled.connect(
+            lambda _: self._refresh_session_tabs())
+        view_menu.addAction(self.show_hidden_sessions_action)
+
         tools_menu = bar.addMenu("&Tools")
         tools_menu.setObjectName("toolsMenu")
         self.readiness_action = QtGui.QAction("Field readiness...", self)
@@ -1133,13 +1142,22 @@ class MainWindow(QtWidgets.QMainWindow):
     # -- named Session tabs ----------------------------------------------
     def _refresh_session_tabs(self) -> None:
         """Rebuild the tab bar from the database, keeping the selection."""
-        conversations = self.app.conversations()
+        conversations = self.app.conversations(
+            include_hidden=self._showing_hidden_sessions())
         selected = self.app.conversation_id
+        if selected not in {c.id for c in conversations}:
+            # Viewing a Session whose tab is not shown (it was hidden while
+            # selected, or on relaunch): fall back to General rather than
+            # show a thread with no tab.
+            selected = self.app.select_conversation(
+                self.app.store.default_conversation().id)
+            self._reload_timeline()
         blocked = self.session_tabs.blockSignals(True)
         while self.session_tabs.count():
             self.session_tabs.removeTab(0)
         for index, conversation in enumerate(conversations):
-            self.session_tabs.addTab(conversation.name)
+            label = conversation.name + (" (hidden)" if conversation.hidden else "")
+            self.session_tabs.addTab(label)
             self.session_tabs.setTabData(index, conversation.id)
             # The operator's colour, as a swatch beside the name. A swatch
             # rather than a recoloured label: the name stays in the theme's
@@ -1211,7 +1229,113 @@ class MainWindow(QtWidgets.QMainWindow):
         reset = menu.addAction("Default tab colour")
         reset.setEnabled(bool(conversation and conversation.color))
         reset.triggered.connect(lambda: self._color_session_tab(index, reset=True))
+        menu.addSeparator()
+        if conversation is not None and conversation.hidden:
+            restore = menu.addAction("Restore Session")
+            restore.triggered.connect(lambda: self._restore_session_tab(index))
+        else:
+            remove = menu.addAction("Remove Session\u2026")
+            if conversation is not None and conversation.is_default:
+                # Not a decision made here: the default thread stays until
+                # the operator decides what removing it should mean.
+                remove.setEnabled(False)
+                remove.setToolTip(self.app.GENERAL_REMOVAL_PENDING)
+            remove.triggered.connect(lambda: self._remove_session_tab(index))
         return menu
+
+    HIDE_SESSION = "Hide this Session (keep everything)"
+    DELETE_SESSION = "Delete permanently\u2026"
+    CONFIRM_DELETE_SESSION = "Delete this Session permanently"
+
+    def _remove_session_tab(self, index: int) -> None:
+        conversation_id = self.session_tabs.tabData(index)
+        if not conversation_id:
+            return
+        problem = self.app.conversation_removal_problem(conversation_id)
+        if problem:
+            QtWidgets.QMessageBox.information(
+                self, "This Session cannot be removed yet", problem)
+            return
+        conversation = self.app.store.get_conversation(conversation_id)
+        if conversation is None:
+            return
+        inventory = self.app.conversation_removal_inventory(conversation_id)
+        runs, messages = len(inventory.session_ids), len(inventory.transmission_ids)
+        choice = self._choose(
+            "Remove Session",
+            f"Remove the Session \u201c{conversation.name}\u201d?",
+            f"It holds {runs} monitoring run(s) and {messages} message(s).\n\n"
+            "Hide this Session keeps all of it - the tab disappears and can "
+            "be brought back from View \u203a Show hidden Sessions.\n\n"
+            "Delete permanently asks again, lists exactly what will be "
+            "deleted, and cannot be undone.",
+            [self.HIDE_SESSION, self.DELETE_SESSION],
+            destructive=self.DELETE_SESSION, default=self.HIDE_SESSION)
+        if choice == self.HIDE_SESSION:
+            self.app.hide_conversation(conversation_id)
+            self._refresh_session_tabs()
+            self._reload_timeline()
+            self.status.showMessage(
+                f"\u201c{conversation.name}\u201d hidden. Everything in it is "
+                f"kept - View \u203a Show hidden Sessions to restore it.", 10000)
+        elif choice == self.DELETE_SESSION:
+            lines = [f"This will permanently delete \u201c{conversation.name}\u201d:",
+                     f"\u2022 {runs} monitoring run(s)",
+                     f"\u2022 {messages} message(s) with their transcripts, "
+                     f"translations, notes, tags and search entries",
+                     f"\u2022 {len(inventory.owned)} recording file(s) in "
+                     f"BabelFishR's Recordings folder"]
+            if inventory.shared:
+                lines.append(f"\u2022 NOT deleted: {len(inventory.shared)} file(s) "
+                             f"another Session's message still uses")
+            if inventory.external:
+                lines.append(f"\u2022 NOT deleted: {len(inventory.external)} file(s) "
+                             f"outside BabelFishR's Recordings folder")
+            lines += ["", "Other Sessions are not touched. Copies you exported or "
+                          "shared elsewhere are not touched. This cannot be undone."]
+            confirm = self._choose(
+                "Delete Session permanently?",
+                f"Delete \u201c{conversation.name}\u201d and everything in it?",
+                "\n".join(lines), [self.CONFIRM_DELETE_SESSION],
+                destructive=self.CONFIRM_DELETE_SESSION)
+            if confirm != self.CONFIRM_DELETE_SESSION:
+                return
+            if (self.timeline.playback.owner
+                    and self.timeline.playback.owner in inventory.transmission_ids):
+                self.timeline.playback.stop()
+            problem = self.app.conversation_removal_problem(conversation_id)
+            if problem:
+                QtWidgets.QMessageBox.information(
+                    self, "This Session cannot be removed yet", problem)
+                return
+            report = self.app.delete_conversation_permanently(conversation_id)
+            self._refresh_session_tabs()
+            self._reload_timeline()
+            if report is None:
+                return
+            if report.complete:
+                self.status.showMessage(
+                    f"\u201c{report.name}\u201d deleted: {len(report.session_ids)} "
+                    f"run(s), {len(report.messages)} message(s), "
+                    f"{len(report.removed_files)} file(s).", 10000)
+            else:
+                failed = "\n".join(f"{p}\n    {why}" for p, why in report.failed)
+                QtWidgets.QMessageBox.warning(
+                    self, "Deletion not finished",
+                    f"\u201c{report.name}\u201d is deleted, but {len(report.failed)} "
+                    f"file(s) could not be removed:\n\n{failed}\n\nThey are "
+                    f"recorded so you can try again from Tools \u203a Finish "
+                    f"unfinished deletions.")
+
+    def _restore_session_tab(self, index: int) -> None:
+        conversation_id = self.session_tabs.tabData(index)
+        if not conversation_id:
+            return
+        restored = self.app.restore_conversation(conversation_id)
+        if restored is None:
+            return
+        self._refresh_session_tabs()
+        self.status.showMessage(f"\u201c{restored.name}\u201d restored.", 6000)
 
     def _color_session_tab(self, index: int, reset: bool = False) -> None:
         """Let the operator pick a colour for one tab, or clear it.
@@ -1307,6 +1431,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _showing_removed(self) -> bool:
         action = getattr(self, "show_removed_action", None)
+        return bool(action is not None and action.isChecked())
+
+    def _showing_hidden_sessions(self) -> bool:
+        action = getattr(self, "show_hidden_sessions_action", None)
         return bool(action is not None and action.isChecked())
 
     # -- removing messages ---------------------------------------------------

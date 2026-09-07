@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     is_default INTEGER DEFAULT 0,
     position   INTEGER DEFAULT 0,
     notes      TEXT DEFAULT '',
-    color      TEXT DEFAULT ''
+    color      TEXT DEFAULT '',
+    hidden     INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -181,7 +182,8 @@ def _conversation_from_row(row) -> Conversation:
                         is_default=bool(row["is_default"]),
                         position=int(row["position"] or 0),
                         notes=row["notes"] or "",
-                        color=(row["color"] or "") if "color" in keys else "")
+                        color=(row["color"] or "") if "color" in keys else "",
+                        hidden=bool(row["hidden"]) if "hidden" in keys else False)
 
 
 _JSON_FIELDS = ("transcript_segments", "tags", "analysis_attempts")
@@ -210,6 +212,7 @@ _ADDED_COLUMNS = (
     # message removed from view with its data kept.
     ("conversations", "color", "TEXT DEFAULT ''"),
     ("transmissions", "hidden", "INTEGER DEFAULT 0"),
+    ("conversations", "hidden", "INTEGER DEFAULT 0"),
 )
 _BOOL_FIELDS = ("clipped", "bookmarked", "reviewed", "auto_processed", "hidden")
 
@@ -462,11 +465,13 @@ class Store:
                                  (conversation_id,)).fetchone()
         return _conversation_from_row(row)
 
-    def list_conversations(self) -> List[Conversation]:
+    def list_conversations(self, include_hidden: bool = False
+                           ) -> List[Conversation]:
         self.default_conversation()      # guarantees General exists
+        where = "" if include_hidden else "WHERE hidden = 0 "
         rows = self._conn.execute(
-            "SELECT * FROM conversations ORDER BY is_default DESC, position, "
-            "created_at").fetchall()
+            f"SELECT * FROM conversations {where}ORDER BY is_default DESC, "
+            "position, created_at").fetchall()
         return [_conversation_from_row(r) for r in rows]
 
     def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
@@ -478,14 +483,16 @@ class Store:
         with self._lock:
             self._conn.execute(
                 """INSERT INTO conversations (id, name, created_at, is_default,
-                       position, notes, color)
-                   VALUES (?,?,?,?,?,?,?)
+                       position, notes, color, hidden)
+                   VALUES (?,?,?,?,?,?,?,?)
                    ON CONFLICT(id) DO UPDATE SET
                        name=excluded.name, position=excluded.position,
-                       notes=excluded.notes, color=excluded.color""",
+                       notes=excluded.notes, color=excluded.color,
+                       hidden=excluded.hidden""",
                 (conversation.id, conversation.name, iso(conversation.created_at),
                  1 if conversation.is_default else 0, conversation.position,
-                 conversation.notes, conversation.color or ""))
+                 conversation.notes, conversation.color or "",
+                 1 if conversation.hidden else 0))
             self._conn.commit()
         return conversation
 
@@ -519,6 +526,77 @@ class Store:
             raise ValueError(f"not a #rrggbb colour: {color!r}")
         conversation.color = value.lower()
         return self.save_conversation(conversation)
+
+    # ---- removing a whole Session ------------------------------------------
+    def hide_conversation(self, conversation_id: str, hidden: bool = True
+                          ) -> Optional[Conversation]:
+        """Take a Session's tab away (or bring it back). Everything is kept.
+
+        General is refused: it is the default thread every orphaned run is
+        filed under, and whether it may ever be removed is a decision that has
+        not been made - so this keeps the existing guarantee rather than
+        deciding it here.
+        """
+        conversation = self.get_conversation(conversation_id)
+        if conversation is None:
+            return None
+        if conversation.is_default and hidden:
+            raise ValueError("the default General Session cannot be hidden")
+        conversation.hidden = bool(hidden)
+        return self.save_conversation(conversation)
+
+    def conversation_removal_inventory(self, conversation_id: str,
+                                       owned_roots: Sequence[str]
+                                       ) -> "ConversationInventory":
+        """What deleting a whole Session would touch: its runs, every message
+        in them (removed-from-view ones included), and those messages' files
+        sorted the same way a single deletion sorts them."""
+        inventory = ConversationInventory(conversation_id=conversation_id)
+        for session_id in self.session_ids_for_conversation(conversation_id):
+            inventory.session_ids.append(session_id)
+            for tx in self.list_transmissions(session_id=session_id,
+                                              limit=1_000_000,
+                                              include_hidden=True):
+                inventory.transmission_ids.append(tx.id)
+                files = self.deletion_inventory(tx, owned_roots)
+                inventory.owned += files.owned
+                inventory.external += files.external
+                inventory.shared += files.shared
+        return inventory
+
+    def delete_conversation_permanently(self, conversation_id: str,
+                                        owned_roots: Sequence[str]
+                                        ) -> Optional["ConversationReport"]:
+        """Delete a Session: every run under it, every message, their owned
+        files, then the runs and the Session itself. Other Sessions are not
+        touched; a file another Session's message still uses is kept.
+
+        Messages go one at a time through the single-message path, so each
+        gets a tombstone and each file the same ownership and sharing checks.
+        """
+        conversation = self.get_conversation(conversation_id)
+        if conversation is None:
+            return None
+        if conversation.is_default:
+            raise ValueError("the default General Session cannot be deleted")
+        report = ConversationReport(conversation_id=conversation_id,
+                                    name=conversation.name)
+        for session_id in self.session_ids_for_conversation(conversation_id):
+            for tx in self.list_transmissions(session_id=session_id,
+                                              limit=1_000_000,
+                                              include_hidden=True):
+                one = self.delete_transmission_permanently(tx.id, owned_roots)
+                if one is not None:
+                    report.messages.append(one)
+            with self._lock:
+                self._conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+                self._conn.commit()
+            report.session_ids.append(session_id)
+        with self._lock:
+            self._conn.execute("DELETE FROM conversations WHERE id = ?",
+                               (conversation_id,))
+            self._conn.commit()
+        return report
 
     def session_ids_for_conversation(self, conversation_id: str) -> List[str]:
         """Every low-level monitoring run filed under one named thread."""
@@ -990,6 +1068,36 @@ class DeletionReport:
     @property
     def complete(self) -> bool:
         """Every owned file is gone. False while any remains."""
+        return not self.failed
+
+
+@dataclasses.dataclass
+class ConversationInventory:
+    conversation_id: str
+    session_ids: List[str] = dataclasses.field(default_factory=list)
+    transmission_ids: List[str] = dataclasses.field(default_factory=list)
+    owned: List[str] = dataclasses.field(default_factory=list)
+    external: List[str] = dataclasses.field(default_factory=list)
+    shared: List[str] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass
+class ConversationReport:
+    conversation_id: str
+    name: str
+    session_ids: List[str] = dataclasses.field(default_factory=list)
+    messages: List[DeletionReport] = dataclasses.field(default_factory=list)
+
+    @property
+    def removed_files(self) -> List[str]:
+        return [p for m in self.messages for p in m.removed]
+
+    @property
+    def failed(self) -> List[Tuple[str, str]]:
+        return [f for m in self.messages for f in m.failed]
+
+    @property
+    def complete(self) -> bool:
         return not self.failed
 
 

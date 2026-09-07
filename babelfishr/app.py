@@ -648,8 +648,8 @@ class BabelFishRApp:
         return self.store.list_transmissions(session_id=target, limit=limit)
 
     # -- named Session threads (Conversations) ---------------------------
-    def conversations(self):
-        return self.store.list_conversations()
+    def conversations(self, include_hidden: bool = False):
+        return self.store.list_conversations(include_hidden=include_hidden)
 
     @property
     def conversation_id(self) -> str:
@@ -723,6 +723,50 @@ class BabelFishRApp:
 
     def leftover_deletions(self):
         return self.store.leftover_deletions()
+
+    # -- removing whole Sessions ---------------------------------------------
+    GENERAL_REMOVAL_PENDING = (
+        "General is the default Session and is kept for now. Whether it can be "
+        "removed or cleared is a decision that has not been made yet.")
+
+    def conversation_removal_problem(self, conversation_id: str) -> str:
+        """Why this Session cannot be removed right now, or "" when it can."""
+        conversation = self.store.get_conversation(conversation_id)
+        if conversation is None:
+            return "That Session no longer exists."
+        if conversation.is_default:
+            return self.GENERAL_REMOVAL_PENDING
+        if self.capture is not None and self._capture_conversation_id == conversation_id:
+            return ("Monitoring is recording into this Session. Stop monitoring "
+                    "first, then remove it.")
+        for session_id in self.store.session_ids_for_conversation(conversation_id):
+            for tx in self.store.list_transmissions(session_id=session_id,
+                                                    limit=1_000_000,
+                                                    include_hidden=True):
+                if self.removal_problem(tx.id).startswith("This message is still"):
+                    return ("A message in this Session is still being processed. "
+                            "Wait for it to finish, then try again.")
+        return ""
+
+    def hide_conversation(self, conversation_id: str):
+        hidden = self.store.hide_conversation(conversation_id, hidden=True)
+        if hidden is not None and self._conversation_id == conversation_id:
+            self.select_conversation(self.store.default_conversation().id)
+        return hidden
+
+    def restore_conversation(self, conversation_id: str):
+        return self.store.hide_conversation(conversation_id, hidden=False)
+
+    def conversation_removal_inventory(self, conversation_id: str):
+        return self.store.conversation_removal_inventory(conversation_id,
+                                                         self.owned_roots())
+
+    def delete_conversation_permanently(self, conversation_id: str):
+        report = self.store.delete_conversation_permanently(conversation_id,
+                                                            self.owned_roots())
+        if report is not None and self._conversation_id == conversation_id:
+            self.select_conversation(self.store.default_conversation().id)
+        return report
 
     def retry_leftover_deletions(self):
         return self.store.retry_leftover_deletions(self.owned_roots())

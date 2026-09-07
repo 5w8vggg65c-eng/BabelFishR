@@ -243,6 +243,14 @@ class Conversation:
     position: int = 0
     notes: str = ""
 
+    hidden: bool = False
+    """Removed from the tab row by the operator, everything kept.
+
+    Its monitoring runs, messages and recordings stay in the database and on
+    disk; View > Show hidden Sessions brings the tab back. Distinct from
+    permanent deletion. The default General thread is never hidden.
+    """
+
     color: str = ""
     """An operator-chosen tab colour as ``#rrggbb``, or "" for the default.
 
