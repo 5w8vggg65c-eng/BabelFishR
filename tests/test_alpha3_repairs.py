@@ -449,27 +449,33 @@ def test_the_menu_offers_a_route_back_to_the_whole_thread(qt_app, config,
 
 
 def _bubble(**kwargs):
-    from babelfishr.ui.timeline import TransmissionBubble, _Player
+    from babelfishr.ui.playback import PlaybackController, SystemOpenBackend
+    from babelfishr.ui.timeline import TransmissionBubble
 
     defaults = dict(session_id="s", started_at=dt.datetime.now(dt.timezone.utc),
                     duration=2.0, state=ProcessingState.COMPLETE,
                     target_language="en")
     defaults.update(kwargs)
-    return TransmissionBubble(Transmission(**defaults), _Player())
+    return TransmissionBubble(Transmission(**defaults),
+                              PlaybackController(SystemOpenBackend()))
 
 
-def test_the_default_bubble_has_no_waveform_and_no_play_button(qt_app):
-    """10. Neither exists on the widget at all - not merely hidden."""
+def test_the_default_bubble_has_no_waveform(qt_app):
+    """10. No waveform exists on the widget at all - not merely hidden.
+
+    Alpha 3 also asserted there was no Play button. The operator has since
+    asked for a compact Play on each bubble (with a control bar for longer
+    recordings), so that half of the assertion is deliberately gone; the
+    playback tests cover the button. The waveform stays gone.
+    """
     from babelfishr.ui.widgets import WaveformWidget
 
     bubble = _bubble(transcript="all units, stand by")
     assert not hasattr(bubble, "waveform")
-    assert not hasattr(bubble, "play_button")
     assert not bubble.findChildren(WaveformWidget)
-    visible = [b.text() for b in bubble.findChildren(QtWidgetsToolButton())
-               if not b.isHidden()]
-    assert not any("Play" in text for text in visible), visible
-    # Playback did not disappear; it moved into the ellipsis menu.
+    # A bubble with no recording offers no Play either - nothing to play.
+    assert bubble.play_button.isHidden()
+    # Playback is also still reachable from the ellipsis menu.
     menu_labels = [a.text() for a in bubble.menu_button.menu().actions()]
     assert "Play original recording" in menu_labels
     assert "Play decoded audio" in menu_labels

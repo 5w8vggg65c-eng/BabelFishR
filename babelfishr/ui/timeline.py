@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import pathlib
-import subprocess
-import sys
 from typing import Dict, List, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -14,6 +12,8 @@ from ..analysis.dsd import AUTO_ROTATION_SECONDS
 from ..analysis.dsd import PRESETS as DSD_PRESETS
 from ..models import (ContentClass, ProcessingState, Provenance,
                       Transmission)
+from .playback import (LONG_RECORDING_SECONDS, PAUSED, PLAYING, SKIP_MS,
+                       PlaybackController, format_clock)
 from .widgets import TagEditor
 
 CONTENT_LABELS = {
@@ -95,61 +95,6 @@ def _differs(source: str, target: str) -> bool:
             != target.strip().lower().split("-")[0])
 
 
-class _Player:
-    """Audio playback via QtMultimedia, falling back to the system player.
-
-    QtMultimedia ships in PySide6-Addons; on a minimal install it is absent, and
-    handing the file to the OS is better than a dead button.
-    """
-
-    def __init__(self):
-        self._player = None
-        self._output = None
-        self.backend = "system"
-        try:
-            from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-
-            self._player = QMediaPlayer()
-            self._output = QAudioOutput()
-            self._player.setAudioOutput(self._output)
-            self.backend = "qtmultimedia"
-        except Exception:  # noqa: BLE001
-            self._player = None
-
-    @property
-    def available(self) -> bool:
-        return True  # one path or the other always works
-
-    def play(self, path: str) -> None:
-        if self._player is not None:
-            self._player.setSource(QtCore.QUrl.fromLocalFile(str(path)))
-            self._player.play()
-            return
-        opener = {"darwin": "open", "win32": "start"}.get(sys.platform, "xdg-open")
-        try:
-            subprocess.Popen([opener, str(path)], shell=(sys.platform == "win32"))
-        except OSError:
-            pass
-
-    def pause(self) -> None:
-        if self._player is not None:
-            self._player.pause()
-
-    def stop(self) -> None:
-        if self._player is not None:
-            self._player.stop()
-
-    def is_playing(self) -> bool:
-        if self._player is None:
-            return False
-        try:
-            from PySide6.QtMultimedia import QMediaPlayer
-
-            return self._player.playbackState() == QMediaPlayer.PlayingState
-        except Exception:  # noqa: BLE001
-            return False
-
-
 class TransmissionBubble(QtWidgets.QFrame):
     """One received transmission, rendered as a chat bubble.
 
@@ -166,11 +111,13 @@ class TransmissionBubble(QtWidgets.QFrame):
     transcribeAnywayRequested = QtCore.Signal(str)
     analyzeDigitalRequested = QtCore.Signal(str, str)   # tx_id, protocol
 
-    def __init__(self, tx: Transmission, player: _Player,
+    def __init__(self, tx: Transmission, player: PlaybackController,
                  parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
         self.tx = tx
         self._player = player
+        self._player.changed.connect(self._render_playback)
+        self._player.positionChanged.connect(self._on_playback_position)
         self.setObjectName("bubble")
         self.setFrameShape(QtWidgets.QFrame.StyledPanel)
 
@@ -227,9 +174,16 @@ class TransmissionBubble(QtWidgets.QFrame):
         controls = QtWidgets.QHBoxLayout()
         controls.setSpacing(8)
 
-        # Playback lives in the ellipsis menu. A Play button on every bubble
-        # of a text thread is a button the operator almost never wants, taking
-        # the space the words should have.
+        # A compact Play on every bubble that has a recording - the operator
+        # asked for it. Longer recordings expand a control bar across the
+        # bottom of this bubble while they play; short ones play straight
+        # through. Still a text chat bubble: no waveform, no analyser.
+        self.play_button = QtWidgets.QToolButton()
+        self.play_button.setText("\u25b6 Play")
+        self.play_button.setToolTip("Play this recording")
+        self.play_button.setAccessibleName("Play recording")
+        self.play_button.clicked.connect(self._on_play_clicked)
+        controls.addWidget(self.play_button)
 
         # Primary recovery action stays visible; everything else is in the menu.
         self.action_button = QtWidgets.QToolButton()
@@ -262,6 +216,44 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.menu_button.setMenu(self._build_menu())
         controls.addWidget(self.menu_button)
         outer.addLayout(controls)
+
+        # The expanded bar: Play/Pause, Stop, rewind, fast-forward, position.
+        # Hidden until a longer recording is playing; Stop hides it again.
+        self.playback_bar = QtWidgets.QWidget()
+        self.playback_bar.setObjectName("playbackBar")
+        bar = QtWidgets.QHBoxLayout(self.playback_bar)
+        bar.setContentsMargins(0, 2, 0, 0)
+        bar.setSpacing(6)
+        skip_seconds = SKIP_MS // 1000
+        self.rewind_button = QtWidgets.QToolButton()
+        self.rewind_button.setText(f"\u23ea {skip_seconds} s")
+        self.rewind_button.setToolTip(f"Back {skip_seconds} seconds")
+        self.rewind_button.setAccessibleName(f"Rewind {skip_seconds} seconds")
+        self.rewind_button.clicked.connect(self._on_rewind_clicked)
+        bar.addWidget(self.rewind_button)
+        self.pause_button = QtWidgets.QToolButton()
+        self.pause_button.setText("\u23f8 Pause")
+        self.pause_button.setAccessibleName("Pause or resume")
+        self.pause_button.clicked.connect(self._on_pause_clicked)
+        bar.addWidget(self.pause_button)
+        self.stop_button = QtWidgets.QToolButton()
+        self.stop_button.setText("\u23f9 Stop")
+        self.stop_button.setToolTip("Stop playback and hide these controls")
+        self.stop_button.setAccessibleName("Stop playback")
+        self.stop_button.clicked.connect(self._on_stop_clicked)
+        bar.addWidget(self.stop_button)
+        self.forward_button = QtWidgets.QToolButton()
+        self.forward_button.setText(f"\u23e9 {skip_seconds} s")
+        self.forward_button.setToolTip(f"Forward {skip_seconds} seconds")
+        self.forward_button.setAccessibleName(f"Fast forward {skip_seconds} seconds")
+        self.forward_button.clicked.connect(self._on_forward_clicked)
+        bar.addWidget(self.forward_button)
+        self.position_label = QtWidgets.QLabel("")
+        self.position_label.setObjectName("statusText")
+        bar.addWidget(self.position_label)
+        bar.addStretch(1)
+        self.playback_bar.hide()
+        outer.addWidget(self.playback_bar)
 
         self.update_from(tx)
 
@@ -429,8 +421,9 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.decoded_action.setVisible(bool(tx.decoded_audio_path))
 
         self.play_action.setEnabled(bool(tx.audio_path))
-        self.play_action.setText("Pause" if self._player.is_playing()
-                                 else "Play original recording")
+        # The menu's Play/Pause label, the buttons and the bar are all drawn
+        # from the controller in one place.
+        self._render_playback()
 
     def _rebuild_chips(self, tx: Transmission) -> None:
         """Compact metadata chips: class, confidence, tags, digital result."""
@@ -473,16 +466,83 @@ class TransmissionBubble(QtWidgets.QFrame):
         else:
             self.provisional.hide()
 
-    # -- actions ---------------------------------------------------------
-    def _toggle_play(self) -> None:  # noqa: D401
-        if not self.tx.audio_path:
+    # -- playback ----------------------------------------------------------
+    @property
+    def is_long_recording(self) -> bool:
+        return float(self.tx.duration or 0.0) > LONG_RECORDING_SECONDS
+
+    def _on_play_clicked(self) -> None:
+        self._player.play(self.tx.id, self.tx.audio_path)
+
+    def _on_pause_clicked(self) -> None:
+        self._player.toggle(self.tx.id, self.tx.audio_path)
+
+    def _on_stop_clicked(self) -> None:
+        if self._player.owner == self.tx.id:
+            self._player.stop()
+
+    def _on_rewind_clicked(self) -> None:
+        if self._player.owner == self.tx.id:
+            self._player.rewind()
+
+    def _on_forward_clicked(self) -> None:
+        if self._player.owner == self.tx.id:
+            self._player.forward()
+
+    def _toggle_play(self) -> None:  # noqa: D401 - the menu's Play / Pause
+        self._player.toggle(self.tx.id, self.tx.audio_path)
+
+    def _on_playback_position(self, owner: str, position_ms: int,
+                              duration_ms: int) -> None:
+        if owner == self.tx.id:
+            self.position_label.setText(format_clock(position_ms, duration_ms))
+
+    def _render_playback(self) -> None:
+        """Draw this bubble's playback controls from the controller's truth.
+
+        Idempotent and cheap: called after every transcript update and after
+        every controller change. It reads state; it never changes it, so a
+        translation arriving mid-playback cannot reset the recording.
+        """
+        has_audio = bool(self.tx.audio_path)
+        state = self._player.state_for(self.tx.id)
+        error = self._player.last_error.get(self.tx.id, "")
+        if not has_audio:
+            self.play_button.hide()
+            self.playback_bar.hide()
             return
-        if self._player.is_playing():
-            self._player.pause()
-            self.play_action.setText("Play original recording")
+        if state == PLAYING or state == PAUSED:
+            if self.is_long_recording and self._player.controllable:
+                self.play_button.hide()
+                self.pause_button.setText(
+                    "\u23f8 Pause" if state == PLAYING else "\u25b6 Play")
+                self.pause_button.setToolTip(
+                    "Pause" if state == PLAYING else "Resume from here")
+                if not self.playback_bar.isVisible():
+                    position, duration = self._player.position_for(self.tx.id)
+                    self.position_label.setText(format_clock(position, duration))
+                self.playback_bar.show()
+            else:
+                # Short: plays through, no extra controls, Play comes back
+                # when it finishes. Uncontrollable backend: same shape,
+                # because a Pause that pauses nothing must not be offered.
+                self.playback_bar.hide()
+                self.play_button.setText("Playing\u2026")
+                self.play_button.setEnabled(False)
+                self.play_button.show()
+            self.play_action.setText("Pause" if state == PLAYING
+                                     else "Play original recording")
         else:
-            self._player.play(self.tx.audio_path)
-            self.play_action.setText("Pause")
+            self.playback_bar.hide()
+            self.play_button.setText("\u25b6 Play")
+            self.play_button.setEnabled(True)
+            self.play_button.show()
+            self.play_action.setText("Play original recording")
+        if error:
+            self.status_label.setText(f"Could not play: {error}")
+            self.status_label.setToolTip(error)
+
+    # -- actions ---------------------------------------------------------
 
     def _edit(self) -> None:
         dialog = QtWidgets.QDialog(self)
@@ -526,7 +586,7 @@ class TransmissionBubble(QtWidgets.QFrame):
     def _play_decoded(self) -> None:
         decoded = self.tx.decoded_audio_path
         if decoded:
-            self._player.play(decoded)
+            self._player.play(self.tx.id, decoded)
 
 
 def _escape(text: str) -> str:
@@ -584,8 +644,13 @@ class TimelineView(QtWidgets.QScrollArea):
         self._order: List[str] = []
         self._pending_anchor = None
         self._anchor_passes = 0
-        self._player = _Player()
-        self.playback_backend = self._player.backend
+        self.playback = PlaybackController(parent=self)
+        self._player = self.playback          # what bubbles are handed
+        self.playback_backend = self.playback.backend_name
+        # Expanding or collapsing a control bar changes a bubble's height, so
+        # it happens inside the same anchoring every other growth does: the
+        # operator's reading position does not move.
+        self.playback.changed.connect(self._on_playback_changed)
 
         self.empty_label = QtWidgets.QLabel(
             "No transmissions yet.\n\n"
@@ -598,12 +663,38 @@ class TimelineView(QtWidgets.QScrollArea):
         self._layout.insertWidget(0, self.empty_label)
 
     def clear(self) -> None:
+        # Leaving a thread stops its audio: nothing keeps playing with its
+        # controls out of sight.
+        self.playback.stop()
         for bubble in list(self._bubbles.values()):
             self._layout.removeWidget(bubble)
             bubble.deleteLater()
         self._bubbles.clear()
         self._order.clear()
         self.empty_label.show()
+
+    def remove(self, tx_id: str) -> bool:
+        """Take one bubble out of the thread. Its audio stops first."""
+        bubble = self._bubbles.get(tx_id)
+        if bubble is None:
+            return False
+        if self.playback.owner == tx_id:
+            self.playback.stop()
+        with self._anchored():
+            self._layout.removeWidget(bubble)
+            bubble.hide()
+            bubble.deleteLater()
+            self._bubbles.pop(tx_id, None)
+            if tx_id in self._order:
+                self._order.remove(tx_id)
+        if not self._bubbles:
+            self.empty_label.show()
+        return True
+
+    def _on_playback_changed(self) -> None:
+        with self._anchored():
+            for bubble in self._bubbles.values():
+                bubble._render_playback()
 
     def count(self) -> int:
         return len(self._bubbles)
