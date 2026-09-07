@@ -2979,3 +2979,206 @@ transcription and translation working. Direct electrical radio/PTT/USB
 connections, SDR operation, RF metadata and transmitter identification remain
 unverified. No candidate has been built from this commit; the in-window menu
 bar has not been seen on a Mac.
+
+---
+
+# Playback controls, Session colours, message and Session removal
+
+Branch `claude/radio-decoder-translator-0oslya`, from `8cb2df5`. Four
+reviewable commits, one per portion. No workflow dispatched, no tag, no
+release; Alpha 1/2/3 unmoved, no Alpha 4. Schema **5** (two columns on
+`conversations`, one on `transmissions`, one new tombstone table; all added
+with the guarded `ALTER TABLE` path; the schema-3 fixture and every migration
+test still run from a source tree alone).
+
+## Eric's run-21 results, recorded as given
+
+Run-21 checks: **1 GOOD, 2 GOOD, 3 N/A, 4 N/A, 5 GOOD, 6 GOOD.** So the menu
+row inside the window, Search from that menu, the cross-Session search check
+and the listed Tools commands now have his physical-Mac observation. Checks 3
+(Show all restores the thread) and 4 (Review queue) are **untested** - he
+explained them by the absence of deletion controls, which neither check needs;
+they are not recorded as passed or failed. The radio-audio path stands as
+before: work radio speaker → acoustic sound → laptop microphone → BabelFishR,
+with conversation breaks, transcription and translation working.
+
+## What is complete, what is decided, what is Eric's to decide
+
+| Portion | Commit | Status |
+|---|---|---|
+| B. Session tab colours | `d69a0ba` | **Complete.** No open decision. |
+| A. Playback on the bubble | `c749b5c` | **Complete and working**, with three behaviours implemented on Codex's recommendation pending Eric's word (below). |
+| C. Message removal | `b987b55` | **Complete and working.** The retained-content path (hidden flag + View › Show removed messages) is Codex's recommended shape, implemented so the requirement is met; Eric can change it. |
+| D. Session removal | `9ed8640` | **Complete for every Session except General.** Keep-or-erase is offered to the operator by name at removal time rather than decided in code. General is refused with the reason: a pending decision, not an approved exemption. |
+
+Nothing here is a placeholder. Every control does what its label says.
+
+### A. Playback — `babelfishr/ui/playback.py`, `babelfishr/ui/timeline.py`
+
+Each bubble with a recording has a compact **▶ Play**. Recordings longer than
+five seconds expand a bar across the bubble's bottom: **⏪ 5 s · ⏸ Pause /
+▶ Play · ⏹ Stop · ⏩ 5 s · 0:03 / 0:09**. Stop collapses it. Shorter ones play
+through (button reads *Playing…*, disabled) and re-arm Play when done.
+
+The old `_Player` had no notion of which recording it was playing; each bubble
+asked "is the player playing?", so bubble B offered Pause because A's recording
+was playing. A `PlaybackController` now owns the recording's id and state and
+every bubble renders from it. One recording at a time; starting another retires
+the previous bubble's controls. Pause keeps the position; Play resumes the same
+file without reloading. Completion, Stop, a missing file and a backend error
+all leave Play usable with the reason in the status line. Leaving a thread
+stops its audio. Expansion and collapse run inside the view's existing
+anchoring (reader's bubble within 1 px, tested). A transcript update touches
+neither the player nor the bar.
+
+Backend seam: `QtMultimediaBackend` maps QMediaPlayer's own
+`playbackStateChanged`, `positionChanged`, `durationChanged`,
+`mediaStatusChanged` (EndOfMedia → finished; InvalidMedia → error) and
+`errorOccurred`. Completion comes from the player, never a timer.
+`SystemOpenBackend` (QtMultimedia absent) hands the file to the OS player and
+reports `controllable = False`; the bubble then shows only Play, never a
+Pause/Stop/seek it could not honour. **This development environment has
+PySide6 Essentials only - no QtMultimedia** - so the two QtMultimedia tests
+skip here with that reason and run in the packaged app's environment. No test
+here or on the runner puts sound through a speaker.
+
+Implemented on recommendation, **awaiting Eric** (one constant each in
+`playback.py`):
+- exactly 5.000 s counts as *short* (`LONG_RECORDING_SECONDS`);
+- rewind/fast-forward are fixed 5-second skips, labelled as such (`SKIP_MS`),
+  not held seeking;
+- natural completion of a long recording collapses its bar.
+
+### B. Colours — `storage.py`, `models.py`, `main_window.py`
+
+`conversations.color` (`#rrggbb` or ""). Tab menu: **Tab colour…** (Qt colour
+dialog, opens on the current colour) and **Default tab colour** (enabled only
+when set). Drawn as a swatch beside the name - design choice: the name stays
+in the theme's text colour and stays readable; selection is Qt's own marking,
+unchanged. Bound to the Session id: survives rename, reorder, switching,
+relaunch; never touches another tab. Only a real hex value is stored.
+
+### C. Message removal — `storage.py`, `pipeline.py`, `app.py`, `timeline.py`, `main_window.py`
+
+Bubble **⋯ → Remove message…** asks one question with two named answers and
+Cancel:
+
+- **Remove from thread (keep the recording and data)** — sets
+  `transmissions.hidden`. Out of the thread, search, review queue and ordinary
+  exports; row, recording and every field kept. **View › Show removed
+  messages** shows them marked *Removed from thread — data kept* with **Restore
+  to thread** in the menu. Nothing is stranded.
+- **Delete permanently…** — asks again with the exact scope, then deletes.
+
+**Exact deletion semantics.** Files are inventoried before anything is removed
+and sorted: *owned* (inside the Recordings folder by realpath, a regular file,
+not a symlink, referenced by no other kept message) are deleted; *external*
+(a replayed WAV from the operator's folder, an export, a backup, anything
+outside) are named as not deleted and never touched; *shared* (still used by
+another message) are kept. Paths come only from the message's own fields and
+every analysis attempt's artifacts and derived input - nothing is globbed,
+walked or recursively removed; a symlink is never followed. Order: tombstone
++ row + index in one transaction, then files one by one. `save_transmission()`
+refuses a tombstoned id, so a worker still holding the message cannot recreate
+it. A file that will not unlink is recorded on the tombstone by path and
+reason, shown to the operator, and the deletion is **not** called complete;
+**Tools › Finish unfinished deletions…** retries. Refused with the reason: a
+message still in flight (`ProcessingPipeline.is_in_flight`). Playback of the
+file is stopped first. The capture's pinned destination is untouched. Not
+promised: secure erasure, or removal of copies exported or shared elsewhere.
+
+### D. Session removal — same files
+
+Tab menu **Remove Session…** states the run and message counts and offers
+**Hide this Session (keep everything)** or **Delete permanently…**. Hiding sets
+`conversations.hidden`; **View › Show hidden Sessions** shows the tab as
+*Name (hidden)* with **Restore Session**; viewing a hidden Session falls back to
+General. Deleting lists runs, messages, owned files, and what will not be
+deleted (shared, external), then runs each message through the single-message
+path (tombstone and checks each), then deletes the runs, then the Session.
+Other Sessions untouched. Refused with the reason: General (item disabled;
+tooltip explains the pending decision), a Session monitoring is recording
+into, a Session with an in-flight message.
+
+## Open questions for Eric — recommendations beside each
+
+1. **Exactly five seconds:** simple play-through or expandable controls?
+   *Implemented: simple (≤ 5.000 s is short). Recommendation: keep.*
+2. **Forward/rewind:** fixed skips or held seeking; how much? *Implemented:
+   fixed 5-second skips, labelled. Recommendation: keep unless you want a
+   scrub bar.*
+3. **Natural completion of a long recording:** collapse the bar? *Implemented:
+   yes. Recommendation: keep.*
+4. **Retained content after removing a message or Session from view:**
+   *Implemented: kept in place, shown via View › Show removed messages / Show
+   hidden Sessions, restorable in one click. Recommendation: keep; the
+   alternative is a separate "Removed items" screen.*
+5. **General:** removable, clearable, or kept as the default tab?
+   *Implemented: kept and refused with that reason. Recommendation: allow
+   "Clear General (delete its messages)" but never remove the tab, since every
+   orphaned run is filed under it. Not built until you say.*
+
+## Tests
+
+Four new files, 50 tests; all in disposable temporary homes. Modal dialogs
+are substituted through one seam (`MainWindow._choose`, `QColorDialog.getColor`);
+what each answer does is what is asserted. Real clicks drive the compact Play,
+the bar's buttons, the tab menu items, and the ⋯ menu (the instant popup runs a
+nested loop, so the item click is scheduled to fire inside it).
+
+| File | Tests | Mutations (each reverted) → failing tests |
+|---|---|---|
+| `test_alpha5_session_colors.py` | 9 | swatch never drawn → 4; colour not persisted → 7 |
+| `test_alpha5_playback.py` | 16 + 2 skip here | owner-agnostic state → 2; bar for every recording → 2; resume reloads → 1; completion never retires → 1 (the scripted backend also emits *stopped*, which the controller retires on; both paths removed would be needed to break completion - stated); no anchoring → 1 |
+| `test_alpha5_message_removal.py` | 15 | no tombstone check → 1; everything owned → 2; hidden ignored by search/review → 1; no in-flight check → 1 |
+| `test_alpha5_session_removal.py` | 10 | General unprotected → 1; hidden still listed → 2; no capture-pin refusal → 1; runs left behind → 1 |
+
+Known non-empty cases precede every removal or filtering assertion (search
+index holds the phrase before deletion; three owned files present before
+deletion; two runs and messages per Session before hiding).
+
+**Existing tests changed:** `test_alpha3_repairs.py::test_the_default_bubble_has_no_waveform_and_no_play_button`
+→ renamed `…_has_no_waveform`; the "no Play button" half is gone at Eric's
+request, the waveform half stays, and it now asserts a bubble *without* a
+recording offers no Play. `test_alpha4_thread_and_sessions.py` asserts schema
+version 5. Nothing weakened or skipped to pass.
+
+## Test results
+
+Full suite: **882 passed, 11 skipped** in 107s — the 832 from `8cb2df5` plus
+50 new. Skips: the nine environmental ones as before (`test_coreaudio.py:255`,
+`test_packaging.py:373`, `test_real_engines.py:32` ×5, `test_real_engines.py:107`
+×2) plus **two new**: `test_alpha5_playback.py:516` and `:531`, *"QtMultimedia
+is not installed here; the packaged app has it"*. Those two exercise
+`QtMultimediaBackend` directly (a missing-file error; reading a 9-second WAV's
+duration from the player's own signal) and will run on the Mac runner, where
+PySide6 Addons is installed; the duration test skips there too if the host
+has no decoder, saying so. Linux, Python 3.11, `QT_QPA_PLATFORM=offscreen`,
+mock engines. This session's results, not an independent rerun.
+
+`git diff --check` clean; `compileall` clean over `babelfishr`, `tests`,
+`packaging`; all five packaging scripts pass `bash -n`; the spec parses; the
+workflow YAML loads.
+
+## Checklist
+
+`docs/MAC_BENCH_CHECKLIST.md` gained sections **I** (playback), **J** (tab
+colours), **K** (removing a message) and **L** (removing a Session), all
+GUI-only and marked as not present in run 21. K and L instruct Eric to create
+throwaway messages and a throwaway Session first and to act only on those.
+
+## Unresolved ledger
+
+- The five open questions above; recommendations given; nothing built on
+  General until Eric decides.
+- Run-21 checks 3 and 4 (Show all; Review queue): untested, not failed.
+- Playback: no test here or on the hosted runner puts sound through a speaker;
+  Eric's Mac is the first place that happens.
+- None of playback, colours or removal has been run on Eric's Mac; no candidate
+  has been built from these commits.
+- Original native-menu failure and the earlier Terminal checksum attempt:
+  unexplained.
+- Live scroll anchoring under arrivals and the "Recording into …" notice
+  clearing on stop: no specifically identified operator result.
+- Direct electrical radio/PTT/USB connections, SDR, RF metadata, transmitter
+  identification: unverified.

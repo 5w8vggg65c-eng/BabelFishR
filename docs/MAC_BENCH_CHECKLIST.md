@@ -1,7 +1,7 @@
 # BabelFishR — Mac bench checklist (no Terminal needed)
 
 **This checklist is for the next candidate build — one made from a commit that
-includes these repairs.** Do not run it against the candidate you already have
+includes these features (sections I–L are new and are not in run 21).** Do not run it against the candidate you already have
 installed: several steps below describe behaviour that build does not contain,
 so they would fail for the wrong reason. Wait for a new download link.
 
@@ -197,6 +197,107 @@ where the indicator *ends up*.
     *Good:* the same Session tabs are there with the same names, the tab you
     had selected is selected again, and the messages are all present with
     their dates.
+
+## I. Playback on a message bubble (new)
+
+Every bubble that has a recording now has a small **▶ Play** button on its
+bottom row, to the left of the other buttons.
+
+23. Find a bubble whose recording is **shorter than five seconds** (the grey
+    header line shows the length, e.g. `2.3s`). Click its **▶ Play**.
+    *Good:* the recording plays; while it plays the button reads
+    **Playing…** and is greyed out; no extra controls appear; when it ends the
+    button reads **▶ Play** again and works again.
+24. Find a bubble whose recording is **longer than five seconds** (e.g.
+    `7.8s`). Click its **▶ Play**.
+    *Good:* a row of controls opens across the bottom of *that bubble only*:
+    **⏪ 5 s**, **⏸ Pause**, **⏹ Stop**, **⏩ 5 s**, and a time such as
+    `0:03 / 0:07`.
+25. Click **⏸ Pause**. *Good:* sound stops, the time stops counting, the
+    button now reads **▶ Play**. Click **▶ Play** in that row. *Good:* sound
+    continues from where it paused, not from the start.
+26. Click **⏩ 5 s** and **⏪ 5 s**. *Good:* the time jumps forward and back
+    by about five seconds and never goes past the end or before the start.
+27. Click **⏹ Stop**. *Good:* sound stops, the control row disappears, and the
+    bubble shows the small **▶ Play** again.
+28. Click **▶ Play** on the long recording again and let it run to the end.
+    *Good:* when it finishes, the control row disappears by itself and **▶
+    Play** is back.
+29. Start playing one long recording, then click **▶ Play** on a different
+    bubble. *Good:* the first bubble's controls disappear and the second
+    bubble's open; only one recording plays at a time.
+30. While a long recording is playing, click a different Session tab.
+    *Good:* the sound stops.
+
+## J. Tab colours (new)
+
+31. Right-click a Session tab and choose **Tab colour…**. Pick a colour and
+    click **OK**.
+    *Good:* a small coloured square appears beside that tab's name; the name
+    itself is unchanged and readable; no other tab changes; the line at the
+    bottom of the window says the colour was set.
+32. Right-click the same tab and choose **Default tab colour**.
+    *Good:* the square disappears. Right-click again: **Default tab colour**
+    is greyed out because there is no colour to reset.
+33. Set a colour again, rename the tab (right-click → **Rename Session…**),
+    then quit and reopen BabelFishR.
+    *Good:* the renamed tab still has its colour.
+
+## K. Removing a message (new) — use a throwaway message
+
+**Do this on a message you do not care about.** Make one first: press **Start
+monitoring**, say "throwaway test one", wait for the bubble, press **Stop
+monitoring**.
+
+34. Click the **⋯** button on that bubble and choose **Remove message…**. A box
+    offers two buttons and Cancel. Click **Cancel**.
+    *Good:* nothing changes.
+35. **⋯ → Remove message…** again, then click **Remove from thread (keep the
+    recording and data)**.
+    *Good:* the bubble disappears; the bottom line says it was removed and its
+    data kept. Click **View → Search transmissions…**, type `throwaway`,
+    Return. *Good:* 0 matches. **View → Show all transmissions**.
+36. Click **View → Show removed messages** (a tick appears beside it).
+    *Good:* the bubble is back, marked **Removed from thread — data kept**.
+    Click its **⋯** and choose **Restore to thread**. Click **View → Show
+    removed messages** again to turn it off. *Good:* the bubble is in the
+    thread as normal.
+37. Make a second throwaway message ("throwaway test two"). **⋯ → Remove
+    message…**, then click **Delete permanently…**.
+    *Good:* a second box lists exactly what will be deleted: the message, and
+    the recording file(s) in BabelFishR's Recordings folder, by name. Click
+    **Cancel**. *Good:* nothing changes. Repeat and this time click **Delete
+    permanently**.
+    *Good:* the bubble is gone; the bottom line says how many files were
+    removed; **View → Show removed messages** does *not* bring it back; a
+    search for `two` finds nothing. Quit and reopen: still gone.
+    (If the box ever says some file could not be removed, note the wording,
+    then use **Tools → Finish unfinished deletions…** and report what it
+    says.)
+
+## L. Removing a Session tab (new) — use a throwaway Session
+
+**Do this on a Session you create for the purpose.** Click **+** beside the
+tabs, name it `Throwaway`, and record one short message into it.
+
+38. Right-click the **General** tab. *Good:* **Remove Session…** is greyed out;
+    hovering it explains that General is kept for now.
+39. Right-click the **Throwaway** tab and choose **Remove Session…**. The box
+    says how many runs and messages it holds and offers **Hide this Session
+    (keep everything)** or **Delete permanently…**. Click **Cancel**. *Good:*
+    nothing changes.
+40. Repeat and click **Hide this Session (keep everything)**.
+    *Good:* the tab disappears; General is selected; the bottom line says it
+    was hidden and everything kept.
+41. Click **View → Show hidden Sessions**. *Good:* the tab reappears as
+    **Throwaway (hidden)**. Right-click it → **Restore Session**. Turn **View
+    → Show hidden Sessions** off. *Good:* the tab is back to normal with its
+    message.
+42. Right-click **Throwaway** → **Remove Session…** → **Delete permanently…**.
+    *Good:* the second box lists the runs, messages and recording files by
+    count. Click **Delete this Session permanently**.
+    *Good:* the tab is gone; General is selected and unchanged; **View → Show
+    hidden Sessions** does not show it. Quit and reopen: still gone.
 
 ---
 
