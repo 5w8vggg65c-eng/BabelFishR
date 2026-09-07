@@ -25,7 +25,7 @@ from .models import (ContentClass, Conversation, ErrorInfo, ProcessingState,
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     created_at TEXT NOT NULL,
     is_default INTEGER DEFAULT 0,
     position   INTEGER DEFAULT 0,
-    notes      TEXT DEFAULT ''
+    notes      TEXT DEFAULT '',
+    color      TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -158,11 +159,13 @@ CREATE VIRTUAL TABLE IF NOT EXISTS transmissions_fts USING fts5 (
 """
 
 def _conversation_from_row(row) -> Conversation:
+    keys = row.keys()
     return Conversation(id=row["id"], name=row["name"],
                         created_at=parse_iso(row["created_at"]) or utcnow(),
                         is_default=bool(row["is_default"]),
                         position=int(row["position"] or 0),
-                        notes=row["notes"] or "")
+                        notes=row["notes"] or "",
+                        color=(row["color"] or "") if "color" in keys else "")
 
 
 _JSON_FIELDS = ("transcript_segments", "tags", "analysis_attempts")
@@ -187,6 +190,8 @@ _ADDED_COLUMNS = (
     ("transmissions", "protocol", "TEXT DEFAULT ''"),
     ("transmissions", "protocol_provenance", "TEXT DEFAULT 'unknown'"),
     ("transmissions", "signal_metadata", "TEXT DEFAULT '{}'"),
+    # Schema 5: an operator-chosen tab colour per named Session.
+    ("conversations", "color", "TEXT DEFAULT ''"),
 )
 _BOOL_FIELDS = ("clipped", "bookmarked", "reviewed", "auto_processed")
 
@@ -450,14 +455,14 @@ class Store:
         with self._lock:
             self._conn.execute(
                 """INSERT INTO conversations (id, name, created_at, is_default,
-                       position, notes)
-                   VALUES (?,?,?,?,?,?)
+                       position, notes, color)
+                   VALUES (?,?,?,?,?,?,?)
                    ON CONFLICT(id) DO UPDATE SET
                        name=excluded.name, position=excluded.position,
-                       notes=excluded.notes""",
+                       notes=excluded.notes, color=excluded.color""",
                 (conversation.id, conversation.name, iso(conversation.created_at),
                  1 if conversation.is_default else 0, conversation.position,
-                 conversation.notes))
+                 conversation.notes, conversation.color or ""))
             self._conn.commit()
         return conversation
 
@@ -473,6 +478,23 @@ class Store:
         if conversation is None:
             return None
         conversation.name = name.strip() or conversation.name
+        return self.save_conversation(conversation)
+
+    def set_conversation_color(self, conversation_id: str,
+                               color: str) -> Optional[Conversation]:
+        """Record an operator's tab colour, or clear it with "".
+
+        Only a ``#rrggbb`` value or the empty string is stored: the colour is
+        rendered into a stylesheet and an icon, and anything else is refused
+        rather than written and later misread.
+        """
+        conversation = self.get_conversation(conversation_id)
+        if conversation is None:
+            return None
+        value = (color or "").strip()
+        if value and not _is_hex_color(value):
+            raise ValueError(f"not a #rrggbb colour: {color!r}")
+        conversation.color = value.lower()
         return self.save_conversation(conversation)
 
     def session_ids_for_conversation(self, conversation_id: str) -> List[str]:
@@ -725,6 +747,11 @@ class Store:
             "recordings_dir": str(self.recordings_dir),
             "fts_enabled": self.fts_enabled,
         }
+
+
+def _is_hex_color(value: str) -> bool:
+    return (len(value) == 7 and value[0] == "#"
+            and all(c in "0123456789abcdefABCDEF" for c in value[1:]))
 
 
 def _fts_query(query: str) -> str:

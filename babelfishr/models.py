@@ -243,6 +243,13 @@ class Conversation:
     position: int = 0
     notes: str = ""
 
+    color: str = ""
+    """An operator-chosen tab colour as ``#rrggbb``, or "" for the default.
+
+    Bound to this id, not to the tab's position or name, so renaming or
+    reordering never moves a colour onto a different Session.
+    """
+
     def to_dict(self) -> Dict[str, Any]:
         d = dataclasses.asdict(self)
         d["created_at"] = iso(self.created_at)

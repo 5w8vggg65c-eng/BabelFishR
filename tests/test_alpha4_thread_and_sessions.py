@@ -475,7 +475,7 @@ def test_an_alpha_3_database_upgrades_without_losing_anything(tmp_path):
     before.close()
 
     store = Store(database, recordings_dir=str(tmp_path))
-    assert store.schema_version == 4
+    assert store.schema_version == 5
 
     conversations = store.list_conversations()
     assert [c.name for c in conversations] == [DEFAULT_CONVERSATION_NAME]

@@ -49,6 +49,21 @@ COMMON_LANGUAGES = [
 ]
 
 
+def _color_swatch(color: str, size: int = 12) -> QtGui.QIcon:
+    """A small rounded square in the operator's colour; empty when unset."""
+    if not color:
+        return QtGui.QIcon()
+    pixmap = QtGui.QPixmap(size, size)
+    pixmap.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(pixmap)
+    painter.setRenderHint(QtGui.QPainter.Antialiasing)
+    painter.setBrush(QtGui.QColor(color))
+    painter.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 60), 1))
+    painter.drawRoundedRect(0.5, 0.5, size - 1, size - 1, 3, 3)
+    painter.end()
+    return QtGui.QIcon(pixmap)
+
+
 class MainWindow(QtWidgets.QMainWindow):
     """Session header, input controls, live meter and the timeline."""
 
@@ -1095,6 +1110,14 @@ class MainWindow(QtWidgets.QMainWindow):
         for index, conversation in enumerate(conversations):
             self.session_tabs.addTab(conversation.name)
             self.session_tabs.setTabData(index, conversation.id)
+            # The operator's colour, as a swatch beside the name. A swatch
+            # rather than a recoloured label: the name stays in the theme's
+            # text colour and so stays readable, and the selected tab is
+            # still marked the way every other selected tab is.
+            self.session_tabs.setTabIcon(index, _color_swatch(conversation.color))
+            self.session_tabs.setTabToolTip(
+                index, f"Tab colour {conversation.color}"
+                if conversation.color else "")
             if conversation.id == selected:
                 self.session_tabs.setCurrentIndex(index)
         self.session_tabs.blockSignals(blocked)
@@ -1149,7 +1172,54 @@ class MainWindow(QtWidgets.QMainWindow):
         menu = QtWidgets.QMenu(self)
         rename = menu.addAction("Rename Session\u2026")
         rename.triggered.connect(lambda: self._rename_session_tab(index))
+        color = menu.addAction("Tab colour\u2026")
+        color.triggered.connect(lambda: self._color_session_tab(index))
+        conversation_id = self.session_tabs.tabData(index)
+        conversation = (self.app.store.get_conversation(conversation_id)
+                        if conversation_id else None)
+        reset = menu.addAction("Default tab colour")
+        reset.setEnabled(bool(conversation and conversation.color))
+        reset.triggered.connect(lambda: self._color_session_tab(index, reset=True))
         return menu
+
+    def _color_session_tab(self, index: int, reset: bool = False) -> None:
+        """Let the operator pick a colour for one tab, or clear it.
+
+        Saved against the Session's id: renaming, reordering and relaunching
+        leave it where it was put. Cancel changes nothing.
+        """
+        conversation_id = self.session_tabs.tabData(index)
+        if not conversation_id:
+            return
+        conversation = self.app.store.get_conversation(conversation_id)
+        if conversation is None:
+            return
+        if reset:
+            chosen = ""
+        else:
+            initial = QtGui.QColor(conversation.color) if conversation.color \
+                else QtGui.QColor(self.palette().highlight().color())
+            picked = QtWidgets.QColorDialog.getColor(
+                initial, self, f"Tab colour for \u201c{conversation.name}\u201d")
+            if not picked.isValid():
+                self.status.showMessage(
+                    f"Tab colour unchanged for \u201c{conversation.name}\u201d",
+                    6000)
+                return
+            chosen = picked.name()          # #rrggbb
+        try:
+            self.app.set_conversation_color(conversation_id, chosen)
+        except Exception as exc:  # noqa: BLE001 - report, do not crash
+            log.exception("colouring Session %s failed", conversation_id)
+            QtWidgets.QMessageBox.warning(
+                self, "Tab colour",
+                f"The colour for \u201c{conversation.name}\u201d was not "
+                f"saved: {exc}")
+            return
+        self._refresh_session_tabs()
+        self.status.showMessage(
+            f"Tab colour for \u201c{conversation.name}\u201d "
+            f"{'reset to default' if reset else 'set to ' + chosen}", 6000)
 
     def _rename_session_tab(self, index: int) -> None:
         """Rename one Session. The Session itself is untouched.

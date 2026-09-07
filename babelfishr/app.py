@@ -677,6 +677,10 @@ class BabelFishRApp:
     def rename_conversation(self, conversation_id: str, name: str):
         return self.store.rename_conversation(conversation_id, name)
 
+    def set_conversation_color(self, conversation_id: str, color: str):
+        """Colour one Session's tab. "" restores the default."""
+        return self.store.set_conversation_color(conversation_id, color)
+
     @property
     def capture_conversation_id(self) -> str:
         """Where the *running* capture files its transmissions.
