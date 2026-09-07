@@ -1,155 +1,196 @@
 # BabelFishR — Mac bench checklist (no Terminal needed)
 
-This is written for someone who has never used Terminal and does not want to.
-Everything below is done by clicking. If a step tells you to type, it is typing
-into a normal box inside BabelFishR, not a command.
+**This checklist is for the next candidate build — one made from a commit that
+includes these repairs.** Do not run it against the candidate you already have
+installed: several steps below describe behaviour that build does not contain,
+so they would fail for the wrong reason. Wait for a new download link.
 
-Two words you will see a lot:
+This is written for someone who has never used Terminal and does not want to.
+Everything below is done by clicking. Where a step says to type, it is typing
+into an ordinary box inside BabelFishR, never a command.
+
+Two things you will see a lot:
 
 - **The menu bar** is the strip along the *very top edge of the screen* — above
   the BabelFishR window, on the same line as the Apple logo in the top-left
   corner and the clock in the top-right. When BabelFishR is the active
   application, that strip reads **BabelFishR · File · View · Tools · Help**. It
-  is *not* inside the BabelFishR window itself, which is why it is easy to miss.
-  If you do not see "View" up there, click once anywhere on the BabelFishR
-  window to make it the active application, then look again.
+  is *not* inside the BabelFishR window, which is why it is easy to miss. If
+  you do not see "View" up there, click once anywhere on the BabelFishR window
+  to make it the active application, then look again.
 - **The badge row** is the row of small coloured labels just under the toolbar
-  inside the BabelFishR window. It shows the operating mode, the readiness chip
-  and the activity indicator (Idle / Listening / Receiving / Transcribing).
+  inside the BabelFishR window: the **Operating mode** button, the readiness
+  chip (**Ready**, **Partly ready**, **Not ready** or **Checking**) and the
+  activity indicator (**Idle**, **Listening**, **Receiving**, **Transcribing**,
+  **Translating**).
+- **The ⋯ button** is the small three-dots button at the right-hand end of each
+  message bubble. Every action on a message — play, edit, retry, transcribe
+  anyway, export — is in the menu that opens from it. There is no right-click
+  menu on a bubble.
 
 Work through the steps in order. Each one says what to do, then what "good"
 looks like. If something does not match, note the step number and what you saw
-instead, and carry on to the next step unless it says to stop.
+instead, and carry on unless the step says to stop.
 
-You already confirmed steps 1–8 of the previous checklist (install, launch,
-microphone, transcription and translation). This list does not repeat them.
+You reported steps 1–8 of the earlier checklist good on the previous
+candidate (install, launch, microphone permission, transcription and
+translation). Those are not repeated here.
 
 ---
 
 ## A. Install the new candidate over the old one
 
-1. Download `BabelFishR-macOS-arm64.dmg` from the link you were given. It lands
-   in your **Downloads** folder.
-2. Double-click the downloaded file. A small window opens showing **BabelFishR**,
-   **Uninstall BabelFishR** and a shortcut to **Applications**.
-3. Drag **BabelFishR** onto the **Applications** shortcut in that same window.
-   When macOS asks whether to **Replace** the existing one, choose **Replace**.
-   *Good:* the copy finishes with no error. Your recordings and Sessions are
-   kept — they live in a separate folder that this does not touch.
-4. Open **Applications** (in Finder, choose Go ▸ Applications from the menu
-   bar), find **BabelFishR**, then **right-click it and choose Open**. If macOS
-   says it cannot check the developer, click **Open** again in that dialog.
-   This is needed once per new build because the build is not notarized.
+1. If BabelFishR is open: make sure the big button reads **Start monitoring**
+   (if it reads **Stop monitoring**, click it once and wait for it to change).
+   Then quit BabelFishR: click **BabelFishR** in the menu bar and choose **Quit
+   BabelFishR**, or press ⌘Q. Nothing is lost by quitting; recordings and
+   Sessions are already saved.
+2. Download the new `BabelFishR-macOS-arm64.dmg` from the link you are given.
+   It lands in **Downloads**.
+3. Double-click the downloaded file. A small window opens showing
+   **BabelFishR**, **Uninstall BabelFishR** and a shortcut to **Applications**.
+4. Drag **BabelFishR** onto the **Applications** shortcut in that window. When
+   macOS asks whether to **Replace** the existing one, choose **Replace**.
+   *Good:* the copy finishes with no error. Your recordings and Sessions live
+   in a separate folder and are untouched.
+5. Open **Applications** (in Finder: **Go ▸ Applications** in the menu bar) and
+   double-click **BabelFishR**.
+   - *If it opens*, continue to section B.
+   - *If macOS says it cannot verify the developer, or that the app cannot be
+     opened*, this is expected: the build is not notarized. Close that message.
+     Then open **System Settings** (Apple menu ▸ System Settings), choose
+     **Privacy & Security** in the left column, scroll down to the
+     **Security** section, and click **Open Anyway** next to the note about
+     BabelFishR. Confirm if asked. This is needed once per new build. Apple's
+     own description of this is at https://support.apple.com/en-us/102445.
+   - Do **not** change any setting that allows all apps from anywhere.
    *Good:* the BabelFishR window appears and your previous Sessions are listed
    as tabs.
 
-> The checksum step from the earlier instructions is dropped from this list.
-> It needed Terminal and it did not show you a result. It is not required to
-> use the application.
+> The checksum step from the earlier instructions is dropped. It needed
+> Terminal and it did not show you a result. It is not required to use the
+> application. Whether the earlier download was intact is therefore still
+> unknown; nothing in this list changes that.
 
 ## B. The readiness chip says "Ready"
 
-5. Look at the **badge row**. For a few seconds after launch the readiness chip
+6. Look at the **badge row**. For a few seconds after launch the readiness chip
    reads **… Checking**.
    *Good:* it then changes to **✓ Ready**. (Older builds said "Field ready".)
-   If it says **◑ Partly ready** or **⚠ Not ready** instead, click the chip: a
-   window opens listing every check and what failed. Note what it says and
-   continue.
+   If it reads **◑ Partly ready** or **⚠ Not ready**, click the chip: a window
+   opens listing every check and what failed. Note what it says and continue.
 
 ## C. The Record Only warning goes away when you leave Record Only
 
-6. In the badge row, click the button that reads **Operating mode: …**. A menu
-   appears. Choose **Record Only**.
-   *Good:* a yellow warning line appears near the top of the window explaining
-   that in Record Only, transmissions are recorded but not transcribed.
-7. Click **Operating mode: …** again and choose **Field Offline**.
-   *Good:* the Record Only warning line disappears. If the machine has a
-   different problem (for example an audio input that stopped responding), that
-   warning stays — only the Record Only one goes.
+7. In the badge row, click the button that reads **Operating mode: …**. Choose
+   **Record Only** from the menu.
+   *Good:* a yellow warning line appears near the top of the window saying that
+   in Record Only, transmissions are recorded but not transcribed.
+8. Click **Operating mode: …** again and choose **Field Offline**.
+   *Good:* the Record Only warning disappears. If the machine has a different
+   problem at the same time (for example an audio input that stopped
+   responding), that other warning stays — only the Record Only one goes.
 
 ## D. Messages show a date as well as a time
 
-8. Look at any message bubble in the thread. The first item in its small grey
-   header line used to be just a time like `14:32:07`.
-   *Good:* it now reads `2026-09-07 14:32:07` — the date, then the time, both in
-   your Mac's own time zone. Scroll down to an older message from a previous
-   day. *Good:* it shows that earlier date, not today's.
+9. Look at any message bubble. The first item in its small grey header line
+   used to be only a time like `14:32:07`.
+   *Good:* it now reads `2026-09-07 14:32:07` — date, then time, in your Mac's
+   own time zone. Scroll to a message from an earlier day. *Good:* it shows
+   that earlier date, not today's.
 
 ## E. Rename a Session tab
 
-There are now three ways. Try whichever is comfortable; try a second one if the
-first does nothing.
+There are three ways. Try whichever is comfortable; if it does nothing, try
+another and note which ones worked.
 
-9. **Right-click the tab** (or hold Control and click it). A small menu appears
-   with **Rename Session…**. Choose it.
-10. **Or** click the tab once to select it, then click the **Rename…** button to
-    the right of the tabs.
-11. **Or** double-click the tab.
+10. **Right-click the tab** (or hold Control and click it). A small menu
+    appears with **Rename Session…**. Choose it.
+11. **Or** click the tab once to select it, then click the **Rename…** button
+    to the right of the tabs.
+12. **Or** double-click the tab.
 
     In every case: a box opens with the current name already filled in. Type a
     new name and press **Return**.
-    *Good:* the tab now shows the new name; a short message at the bottom of
+    *Good:* the tab shows the new name; a short message at the bottom edge of
     the window reads *Renamed "old" to "new"*; the messages in that tab are
-    exactly the ones that were there before. If a run is being recorded into
-    that Session, the notice that says *Recording into "…"* shows the new
-    name too.
-12. Try it once more and press **Escape** (or click **Cancel**) instead.
+    exactly the ones that were there before. If monitoring is recording into
+    that Session, the notice *Recording into "…"* shows the new name.
+13. Try once more and press **Escape** (or click **Cancel**) instead.
     *Good:* nothing changes, and the message at the bottom reads *Session name
     unchanged*.
 
-> **Deleting a tab is not in this build.** It is waiting on a decision from
-> you: when a Session tab is removed, should its messages and recordings be
-> **kept** somewhere you can still open them, or **permanently erased**? Either
-> is possible. Nothing will be built until you say which.
+> **Deleting a tab is not in this build.** It is waiting on your decision:
+> when a Session tab is removed, should its messages and recordings be **kept**
+> somewhere you can still open them, or **permanently erased**? Both are
+> possible. Nothing will be built until you say which. Whether the **General**
+> tab should be deletable at all is part of the same decision.
 
 ## F. Search and Review live in the View menu
 
-13. Click a Session tab that has messages in it.
-14. Go to the **menu bar at the very top of the screen** and click **View**.
-    The menu lists **Search transmissions…**, **Review queue** and **Show all
-    transmissions**.
-15. Choose **Search transmissions…**. A box titled **Search** opens. Type a word
-    you know appears in one of *this* Session's messages and press Return.
-    *Good:* only messages from the Session whose tab is selected are shown, and
-    at least one matches. Messages from other Sessions do not appear.
-16. Go to **View ▸ Show all transmissions**.
-    *Good:* the full thread for that Session is back, newest at the top.
-17. Go to **View ▸ Review queue**.
-    *Good:* a list opens of messages from this Session that BabelFishR is unsure
-    about (low confidence). It may be empty; empty is a valid result. Close it.
-18. Click a *different* Session tab and repeat step 15 with a word from the
-    first Session.
-    *Good:* it is **not** found, because search stays inside the tab you are on.
+Search and Review both work **inside the thread you are looking at**: they
+filter the current tab's messages in place, and **View ▸ Show all
+transmissions** brings the full thread back. No separate window opens.
 
-## G. Activity indicator is truthful when nothing is being monitored
+14. First, make a phrase that exists in exactly one Session. Click a Session
+    tab, press **Start monitoring**, and say clearly: *"purple giraffe
+    seventeen"*. Wait for the bubble to show those words (or close to them),
+    then press **Stop monitoring**. Note which tab this is — call it Tab A.
+15. Stay on Tab A. In the **menu bar at the very top of the screen**, click
+    **View**, then **Search transmissions…**. A box titled **Search** opens.
+    Type `giraffe` and press Return.
+    *Good:* the thread shrinks to only the matching message(s), and the
+    message at the bottom of the window says how many matched and that
+    *View › Show all transmissions* goes back.
+16. Go to **View ▸ Show all transmissions**.
+    *Good:* the full thread for Tab A is back, newest at the top.
+17. Go to **View ▸ Review queue**.
+    *Good:* the thread shrinks to the messages in Tab A that BabelFishR is
+    unsure about (low confidence). It may be empty; empty is a valid result.
+    The message at the bottom says how many need review. Then **View ▸ Show
+    all transmissions** to restore the thread.
+18. Click a **different** Session tab (Tab B) and repeat step 15 with
+    `giraffe`.
+    *Good:* **0 matches** — search stays inside the tab you are on, and
+    "giraffe" was only ever said in Tab A. Then **View ▸ Show all
+    transmissions**.
+
+## G. The activity indicator is truthful when nothing is being monitored
+
+You do not need to catch the brief **Transcribing** flash. What matters is
+where the indicator *ends up*.
 
 19. With monitoring **stopped** (the big button reads **Start monitoring**),
-    right-click any message bubble and choose **Transcribe anyway** (or
-    **Retry processing**).
-    *Good:* the activity indicator in the badge row briefly shows
-    **Transcribing** and then returns to **○ Idle**. It must **not** say
-    **Listening** — nothing is listening. The big button still reads **Start
-    monitoring**.
-20. Press **Start monitoring**, speak once so a message is captured, then press
-    **Stop monitoring** while the message is still being transcribed.
-    *Good:* the transcript still appears in the bubble a moment later, and the
-    indicator ends on **○ Idle**, not **Listening**.
+    click the **⋯** button on any message bubble and choose **Transcribe
+    anyway** (if that item is not offered, choose **Retry processing**). Wait
+    about ten seconds.
+    *Good:* the activity indicator ends on **○ Idle**. It must **not** read
+    **Listening** — nothing is listening — and it must not stay on
+    **Transcribing**. The big button still reads **Start monitoring**. The
+    bubble's text may have changed; that is fine.
+20. Press **Start monitoring**, say one short sentence, and press **Stop
+    monitoring** straight away, before the words appear in the bubble.
+    *Good:* within about ten seconds the transcript appears in the bubble, and
+    the indicator ends on **○ Idle**, not **Listening**.
+21. Press **Start monitoring** and leave it running for a moment without
+    speaking.
+    *Good:* the indicator reads **◉ Listening** while the button reads **Stop
+    monitoring**. Press **Stop monitoring**. *Good:* it returns to **○ Idle**.
 
 ## H. Quit and reopen
 
-21. Quit BabelFishR (BabelFishR ▸ Quit BabelFishR in the menu bar, or ⌘Q).
+22. Quit BabelFishR (**BabelFishR ▸ Quit BabelFishR** in the menu bar, or ⌘Q).
     Open it again from Applications.
-    *Good:* the same Session tabs are there with the same names, the tab you had
-    selected is selected again, and the messages are all present with their
-    dates.
+    *Good:* the same Session tabs are there with the same names, the tab you
+    had selected is selected again, and the messages are all present with
+    their dates.
 
 ---
 
 ## If something goes wrong
 
-- Go to the menu bar, **Tools ▸ Copy Diagnostic Report**. Paste the result
-  into a message to whoever is helping you. Nothing is sent anywhere by
-  BabelFishR itself.
+- Menu bar: **Tools ▸ Copy Diagnostic Report**. Paste the result into a message
+  to whoever is helping you. BabelFishR itself sends nothing anywhere.
 - **Tools ▸ Reveal Logs in Finder** opens the folder with the log file.
 
 ## What this checklist cannot test

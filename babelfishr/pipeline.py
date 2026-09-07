@@ -316,21 +316,27 @@ class ProcessingPipeline:
             log.warning("transmission %s vanished before processing", tx_id)
             return
 
-        if not self._transcribe(tx):
-            return
-        self._translate(tx)
+        try:
+            if not self._transcribe(tx):
+                return
+            self._translate(tx)
 
-        if tx.state is not ProcessingState.FAILED:
-            tx.state = ProcessingState.COMPLETE
-        self.store.save_transmission(tx)
-        self.events.publish("updated", tx)
-        # Finished - and that is all this pipeline can honestly say. It used
-        # to publish LISTENING here, a claim about the microphone it has no
-        # way of checking: processing a saved recording with no monitoring
-        # running ended by announcing Listening. The window resolves COMPLETE
-        # against the actual capture: back to Listening or Receiving when one
-        # is open, Idle when none is.
-        self.events.publish("state", PipelineState.COMPLETE)
+            if tx.state is not ProcessingState.FAILED:
+                tx.state = ProcessingState.COMPLETE
+            self.store.save_transmission(tx)
+            self.events.publish("updated", tx)
+        finally:
+            # Finished - on every path out, and that is all this pipeline can
+            # honestly say. It used to publish LISTENING here, a claim about
+            # the microphone it has no way of checking. Then it published
+            # COMPLETE, but only after a *successful* transcription: an empty
+            # result, a handled engine error and a missing recording all
+            # returned before this line, and the window stayed on
+            # Transcribing with nothing left to transcribe. The transmission's
+            # own outcome - COMPLETE with no words, FAILED with its error - is
+            # already saved and published above; this is only the activity
+            # signal. The window resolves it against the actual capture.
+            self.events.publish("state", PipelineState.COMPLETE)
 
     def _load_audio(self, tx: Transmission):
         from .audio.wavefile import read_wav

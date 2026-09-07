@@ -840,16 +840,37 @@ class MainWindow(QtWidgets.QMainWindow):
         COMPLETE is how the processing pipeline says "finished": it does not
         know whether a microphone is open and does not pretend to. Finished
         means back to whatever the capture is doing, or Idle if there is none.
+
+        The capture's *current* state is the reference, not the existence of
+        a capture object. A capture that has been created but not started, or
+        one whose run has ended, is Idle by its own account; and a stale
+        Receiving from an earlier moment must not overwrite a run that is
+        Listening now.
         """
         capture = self.app.capture
-        if state == PipelineState.COMPLETE:
-            if capture is None:
-                return PipelineState.IDLE
-            return capture.state
-        if state in (PipelineState.LISTENING, PipelineState.RECEIVING):
-            if capture is None:
-                return PipelineState.IDLE
+        # What the capture is doing right now - Idle when there is none, and
+        # Idle for one that exists but has not started or has stopped, since
+        # the service sets its own state on both. This is the truth a queued
+        # capture event is checked against, rather than the event itself: an
+        # event describes the moment it was published, which may be a run
+        # that has since stopped, or a state the capture has since left.
+        baseline = capture.state if capture is not None else PipelineState.IDLE
+        if state in (PipelineState.LISTENING, PipelineState.RECEIVING,
+                     PipelineState.COMPLETE):
+            return baseline
+        if state in (PipelineState.TRANSCRIBING, PipelineState.TRANSLATING):
+            # Processing activity is shown whether or not a microphone is
+            # open - but only while there is processing. A Transcribing that
+            # arrives after the work has finished describes nothing current.
+            return state if self._processing_active() else baseline
         return state
+
+    def _processing_active(self) -> bool:
+        """Is any processing pipeline holding queued or in-flight work?"""
+        for pipeline in (self.app.pipeline, self.app.standalone_pipeline):
+            if pipeline is not None and pipeline.pending:
+                return True
+        return False
 
     def _refresh_state_badge(self) -> None:
         from . import theme

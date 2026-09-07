@@ -2549,3 +2549,235 @@ review from a tab (blocked on finding the View menu, now explained in
 stop, real RF metadata reaching a bubble, the newest-first viewport behaviour
 under live traffic, quit-and-reopen persistence of Session tabs, and every
 repair in this section. No candidate has been built from this commit.
+
+---
+
+# Completing the activity-state repair, and a checklist that matches the app
+
+Branch `claude/radio-decoder-translator-0oslya`, from `a1263bf`. Bounded
+follow-up to the previous section: the Listening repair was incomplete in two
+ways Codex found by driving the real app, worker, store and event queue, and
+the operator checklist described controls that do not exist. No workflow
+dispatched, no tag, no release; Alpha 1/2/3 unmoved, no Alpha 4. No schema
+change.
+
+## Reporting preference — Eric's requirement, carried forward
+
+Final reports for BabelFishR handoffs go to Eric as **one fenced plain-text
+block** containing everything: SHA, HEAD/origin/worktree, files, reproductions,
+fixes, test results and environment, changed tests, unresolved decisions,
+limitations, and workflow/tag/release status. No nested fences, no fragments,
+no qualifications outside the block, no link in place of the report. Whoever
+picks this up next should do the same.
+
+## Repair A — activity recovers on every path, and only a current capture counts
+
+### What was wrong, reproduced before editing
+
+Through the real `BabelFishRApp`, the production engine factory, the standalone
+worker, SQLite, the event queue and the actual `MainWindow` (offscreen):
+
+| Path | Transmission after | Pending | Badge (before) | Badge (after) |
+|---|---|---|---|---|
+| ordinary transcript | COMPLETE | 0 | Idle | Idle |
+| empty output (no speech) | COMPLETE, no error | 0 | **Transcribing** | Idle |
+| ASR exception | FAILED, error kept | 0 | **Transcribing** | Idle |
+| missing WAV | FAILED, engine never called | 0 | **Transcribing** | Idle |
+| capture created, not started; LISTENING injected | — | — | **Listening** | Idle |
+| capture running and LISTENING; stale RECEIVING injected | — | — | **Receiving** | Listening |
+| same, stale TRANSCRIBING injected, nothing pending | — | — | **Transcribing** | Listening |
+
+Cause 1: `ProcessingPipeline._process()` published COMPLETE only after
+`_transcribe()` returned True. The empty result, the handled engine error and
+the missing recording all return False before that line — with their own
+transmission outcome correctly saved and published — so no "finished" signal
+ever followed the TRANSCRIBING one.
+
+Cause 2: `_truthful_state()` accepted LISTENING/RECEIVING whenever
+`app.capture` was not None. The existence of a capture object says nothing
+about what it is doing now.
+
+### The repair — design choice, stated
+
+Smallest change that handles every demonstrated case:
+
+- **Pipeline:** the body of `_process()` is wrapped in `try/finally`, and the
+  `finally` publishes `COMPLETE`. Every path out — success, empty, handled
+  error, missing audio, even an unexpected exception re-raised to the worker —
+  ends with the activity signal. The transmission's own state and error are
+  saved and published *before* it, unchanged.
+- **Window:** `_truthful_state()` now reconciles against **what the capture is
+  doing now**, not whether it exists. Baseline = `capture.state` when a capture
+  exists (the service sets that itself: IDLE before `start()` and after
+  `stop()`, LISTENING/RECEIVING while running), else IDLE. Any
+  LISTENING/RECEIVING/COMPLETE event resolves to the baseline. TRANSCRIBING and
+  TRANSLATING are shown only while a processing pipeline actually holds queued
+  or in-flight work (`_processing_active()`, which reads `pending` on the live
+  and standalone pipelines); otherwise they too resolve to the baseline.
+
+So a queued event is treated as a *prompt to look*, not as the truth. The
+truth is read from the objects at drain time. The event queue is not discarded:
+`updated` and `transmission` events still reach their bubbles, and still only
+in the Session they belong to.
+
+Why not deeper: no event versioning, no per-run tokens, no new event kinds.
+The state the badge needs is already held by the capture service and the
+pipelines; reading it is smaller than inventing a protocol to reconstruct it.
+
+### Tests, and how they avoid proving nothing
+
+- **Engines through the production factory.** A fixture registers
+  `test-empty`, `test-failing`, `test-blocking` and `test-blocking-empty` with
+  `providers._transcription_factories`, records every instance it constructs,
+  and the tests select them through `config.asr.engine` exactly as a real
+  engine is selected. Each test then asserts the standalone pipeline's engine
+  *is* one of the recorded instances with the expected id, and that `calls`
+  is 1 (or 0 for the missing-WAV case, where the engine must never be
+  reached). This matters because `_processing_pipeline()` calls
+  `select_engines()`, which **replaces** any preassigned `app.transcription`
+  with the factory's choice — a test that handed the app an engine object
+  would be testing an engine the pipeline never used.
+- **Blocking engines.** `test-blocking` holds `transcribe()` on an Event, so
+  the window is observed *committed* to Transcribing (pending == 1) before the
+  release, and back at Idle after. `test-blocking-empty` does the same and
+  then returns no speech: this is the test that catches the pipeline mutation
+  at the window level. With fast engines the worker finishes before the GUI
+  timer drains, and the in-flight check alone would make the badge right even
+  with no COMPLETE — which is exactly what the first round of mutation testing
+  showed (1 failing test, source-level only) and why this test exists.
+- **Stale events are asserted immediately.** The earlier "events from an
+  earlier run" test published LISTENING, RECEIVING, then COMPLETE, and asserted
+  once — the COMPLETE could conceal a wrong intermediate display. It now
+  drains and asserts after *each* stale event (LISTENING, RECEIVING,
+  TRANSCRIBING, TRANSLATING), then delivers a late update and asserts it
+  landed.
+- **A genuinely running capture.** `CallbackAudioSource` + `begin_capture()`,
+  waiting until `capture.state == LISTENING` and asserting `_running`. A stale
+  RECEIVING and a stale TRANSCRIBING are injected and asserted at once: the
+  badge stays Listening. The run's own transition to RECEIVING (via the
+  service's `_set_state`) still shows.
+- **A created-but-unstarted capture.** `start_session()` without
+  `begin_capture()`: LISTENING and RECEIVING injected, badge stays Idle.
+- **Correct Session.** A late update for a transmission owned by another
+  Session is not drawn into the viewed one; switching to its Session and
+  draining the same update lands it there, with the badge Idle throughout.
+- **Source level.** With `test-empty` and `test-failing`, the last state event
+  the pipeline publishes is COMPLETE, LISTENING never appears, and the last
+  `updated` carries COMPLETE or FAILED respectively.
+
+### Existing tests changed, and why
+
+- `test_live_capture_states_still_display_while_monitoring` used a replay
+  session that was never started and called `_set_state(LISTENING)` directly.
+  Under the repair that capture is honestly Idle, so the test now runs a real
+  `CallbackAudioSource` capture, drives transitions through the service's own
+  `_set_state`, and checks COMPLETE mid-run returns to the run's state. It no
+  longer tests Transcribing with a bare `_set_state`, since the blocking-engine
+  tests cover that against real pending work.
+- `test_stale_capture_states_from_an_earlier_run_are_ignored_but_updates_land`
+  — asserts after every stale event; the masking COMPLETE is gone.
+
+Nothing weakened, nothing skipped.
+
+### Mutation results (repaired code restored after each)
+
+| Mutation | Failing tests |
+|---|---|
+| COMPLETE only after a successful transcription (no `finally`) | 2 — the blocking-empty window test and the source-level test |
+| Capture *existence* is enough for LISTENING/RECEIVING (a1263bf behaviour) | 2 — unstarted capture; stale RECEIVING over a listening run |
+| TRANSCRIBING/TRANSLATING accepted unconditionally | 3 — earlier-run stale states; in-flight-only; stale over a listening run |
+
+## Repair B — the checklist now describes the application that exists
+
+`docs/MAC_BENCH_CHECKLIST.md` was walked against the source, item by item, and
+rewritten where it did not match:
+
+- **Wrong control:** it said to right-click a bubble for *Transcribe anyway*.
+  There is no bubble context menu; every message action is in the menu from
+  the **⋯** button at the bubble's right edge (`TransmissionBubble._build_menu`).
+  Fixed, and the ⋯ button is introduced up front with the menu bar and badge row.
+- **Wrong model of Review:** it said a list opens and to close it.
+  `_show_review_queue()` and `_search()` both replace the *current thread in
+  place* and the status bar says *View › Show all transmissions to go back*.
+  The checklist now says so and returns through that menu item after both.
+- **Non-unique search phrase:** the negative cross-Session check used "a word
+  from the first Session", which may exist in the second. The operator now
+  speaks *"purple giraffe seventeen"* into one Session first and searches for
+  `giraffe`, so 0 matches elsewhere is meaningful.
+- **Unobservable success:** it asked the operator to catch the Transcribing
+  flash. Success is now defined by where the indicator *ends up* — Idle, not
+  Listening, not stuck on Transcribing — after about ten seconds.
+- **Install order:** stop monitoring and quit BabelFishR before replacing the
+  application; previously unstated.
+- **Which candidate:** the list opens by saying it is for the *next* build,
+  from a commit containing these repairs, and not to run it against the
+  installed one, where several steps would fail for the wrong reason.
+- **Launch block:** it promised an *Open* button in the first dialog. Apple's
+  documented path for an unidentified-developer block is: try to open, then
+  System Settings ▸ Privacy & Security ▸ Open Anyway
+  (https://support.apple.com/en-us/102445). The step now describes that
+  conditionally — *if* macOS blocks it — and says not to change any setting
+  that allows all apps from anywhere.
+- **Preserved:** the explanation of where the macOS menu bar is (top edge of
+  the screen, same line as the Apple logo and clock, outside the window); no
+  Terminal anywhere; the note that the earlier checksum step is dropped and
+  that the earlier download's integrity is therefore still unknown; the
+  tab-deletion note now also says the General question is part of Eric's
+  decision.
+
+Reviewed against source and offscreen tests. **Not** a physical Mac
+validation, and not presented as one.
+
+## Open decisions and unknowns, unchanged
+
+- **Tab deletion:** not implemented. Keep-or-erase is Eric's decision;
+  whether General is deletable is part of it, not a settled exemption. No
+  archiving, erasure, moving of recordings or orphaning has been introduced.
+- Why Eric could not rename, and why the checksum attempt showed nothing,
+  remain unknown.
+
+## Files changed
+
+```
+babelfishr/pipeline.py                  _process(): COMPLETE in a finally
+babelfishr/ui/main_window.py            _truthful_state() reads capture.state and
+                                        pending work; _processing_active()
+tests/test_alpha4_operator_feedback.py  +9 tests (24 -> 33); 2 existing updated
+docs/MAC_BENCH_CHECKLIST.md             rewritten against the actual controls
+docs/AGENT_HANDOFF.md                   this section
+```
+
+## Test results
+
+New-file total: **33 passed** (24 before, 9 added). Focused (the same sixteen
+files as the previous section): **364 passed**. Full suite: **824 passed,
+9 skipped** in 96s — the 815 from `a1263bf` plus the 9 new tests. Skips
+unchanged and environmental: `test_coreaudio.py:255` (1),
+`test_packaging.py:373` (1), `test_real_engines.py:32` (5),
+`test_real_engines.py:107` (2). Environment: Linux, Python 3.11,
+`QT_QPA_PLATFORM=offscreen`, mock and test engines only. These are this
+session's results, not an independent rerun.
+
+`git diff --check` clean; `compileall` clean over `babelfishr`, `tests`,
+`packaging`; all five packaging scripts pass `bash -n`; the spec parses; the
+workflow YAML loads. The history-independent schema-3 fixture and its
+migration checks are untouched and green; capture-first recording and offline
+enforcement tests are in the focused set and green.
+
+## Limitations carried forward
+
+No SDR dongle, radio, USB radio interface or FalconClaw PTT has ever been
+connected to this software. The hosted runner has no audio or RF hardware, and
+Eric's bench test used the MacBook microphone and saved recordings.
+
+Eric installed the run-19 candidate (built from `ae962cc`) and reports steps
+1–8 of that earlier checklist good. That report stands. The exact mapping from
+those eight steps to individual features is not on file here, so coverage of
+any specific behaviour by that test is **unconfirmed** rather than absent.
+Separately: **nothing from `a1263bf` or this commit has been run on his Mac**,
+and no candidate has been built from either. Still unexercised there in any
+form that is confirmed: Session-scoped search and review from a tab (he could
+not find the View menu; the checklist now explains where it is), the
+*Recording into …* notice clearing on stop, real RF metadata reaching a bubble,
+the newest-first viewport under live traffic, quit-and-reopen persistence of
+Session tabs, and every repair in the last two sections.

@@ -692,17 +692,20 @@ def test_stale_capture_states_from_an_earlier_run_are_ignored_but_updates_land(
     pump(qt_app, 40)
     tx = app.recent_transmissions()[0]
 
-    # What a slow worker from the finished run might still emit.
-    app.events.publish("state", PipelineState.LISTENING)
-    app.events.publish("state", PipelineState.RECEIVING)
+    # What a slow worker from the finished run might still emit. Asserted
+    # after each one, so no later event can paper over a wrong display.
+    for stale in (PipelineState.LISTENING, PipelineState.RECEIVING,
+                  PipelineState.TRANSCRIBING, PipelineState.TRANSLATING):
+        app.events.publish("state", stale)
+        window._drain_events()
+        assert "Idle" in window.state_badge.text(), (
+            f"stale {stale} was displayed: {window.state_badge.text()!r}")
     tx.transcript = "late words"
     app.events.publish("updated", tx)
-    app.events.publish("state", PipelineState.COMPLETE)
     window._drain_events()
-
-    assert "Idle" in window.state_badge.text(), window.state_badge.text()
     assert window.timeline._bubbles[tx.id].tx.transcript == "late words", (
         "suppressing stale states also suppressed the message update")
+    assert "Idle" in window.state_badge.text()
     window.close()
 
 
@@ -711,27 +714,29 @@ def test_live_capture_states_still_display_while_monitoring(qt_app, config,
     """The gate must not flatten a genuine run to Idle."""
     from babelfishr.ui.main_window import MainWindow
 
+    from babelfishr.audio.source import CallbackAudioSource
+
     app = mock_app(config, store)
     window = MainWindow(app)
     pump(qt_app)
-    app.start_session(replay_path=wav, name="live")
-    assert app.capture is not None
+    app.start_session(source=CallbackAudioSource(SR), name="live")
+    app.begin_capture()                      # a real capture thread, listening
+    assert pump_until(qt_app, lambda: app.capture.state == PipelineState.LISTENING)
     window._drain_events()
-    window._set_state(PipelineState.LISTENING)
     assert "Listening" in window.state_badge.text()
-    window._set_state(PipelineState.RECEIVING)
+    # The detector opening: the service sets its state and publishes it.
+    app.capture._set_state(PipelineState.RECEIVING)
+    window._drain_events()
     assert "Receiving" in window.state_badge.text()
     # Processing finished mid-run: back to what the capture is doing.
-    app.capture.state = PipelineState.RECEIVING
     window._set_state(PipelineState.COMPLETE)
     assert "Receiving" in window.state_badge.text()
-    app.capture.state = PipelineState.LISTENING
+    app.capture._set_state(PipelineState.LISTENING)
+    window._drain_events()
     window._set_state(PipelineState.COMPLETE)
     assert "Listening" in window.state_badge.text()
-    # Processing activity is shown whether or not a microphone is open.
     app.stop_session()
-    window._set_state(PipelineState.TRANSCRIBING)
-    assert "Transcribing" in window.state_badge.text()
+    window._drain_events()
     window._set_state(PipelineState.COMPLETE)
     assert "Idle" in window.state_badge.text()
     window.close()
@@ -755,3 +760,351 @@ def test_the_pipeline_reports_finished_not_listening(config, store, wav):
     assert PipelineState.LISTENING not in states, (
         "a pipeline with no capture claimed to be listening")
     assert PipelineState.TRANSCRIBING in states
+
+
+# ---- 6. every completion path recovers; only a *current* capture counts --
+
+
+class _EmptyEngine(MockTranscriptionEngine):
+    """An engine that hears nothing: the no-speech result."""
+
+    id = "test-empty"
+    name = "Test empty transcription"
+
+    def transcribe(self, audio, sample_rate, *, language=None, vocabulary=None):
+        from babelfishr.providers.base import TranscriptionResult
+
+        self.calls += 1
+        return TranscriptionResult(engine=self.id, engine_version="1",
+                                   no_speech=True)
+
+
+class _FailingEngine(MockTranscriptionEngine):
+    id = "test-failing"
+    name = "Test failing transcription"
+
+    def __init__(self):
+        super().__init__(fail=True, fail_message="asr blew up")
+
+
+class _BlockingEngine(MockTranscriptionEngine):
+    """Holds transcription until released, so processing is observably
+    in flight."""
+
+    id = "test-blocking"
+    name = "Test blocking transcription"
+
+    def __init__(self):
+        import threading
+
+        super().__init__()
+        self.release = threading.Event()
+        self.started = threading.Event()
+
+    def transcribe(self, audio, sample_rate, *, language=None, vocabulary=None):
+        self.started.set()
+        assert self.release.wait(30.0), "the test never released the engine"
+        return super().transcribe(audio, sample_rate, language=language,
+                                  vocabulary=vocabulary)
+
+
+class _BlockingEmptyEngine(_BlockingEngine):
+    """Blocks, then hears nothing - the empty path while it is observable."""
+
+    id = "test-blocking-empty"
+    name = "Test blocking empty transcription"
+
+    def transcribe(self, audio, sample_rate, *, language=None, vocabulary=None):
+        from babelfishr.providers.base import TranscriptionResult
+
+        self.started.set()
+        assert self.release.wait(30.0), "the test never released the engine"
+        self.calls += 1
+        return TranscriptionResult(engine=self.id, engine_version="1",
+                                   no_speech=True)
+
+
+@pytest.fixture
+def test_engines(monkeypatch):
+    """Register the test engines with the production factory.
+
+    Selecting them goes through config.asr.engine and
+    build_transcription_engine like any real engine, so the engine the
+    pipeline ends up holding is the factory's choice - not a reference the
+    test handed it. Each construction is recorded so identity can be checked.
+    """
+    import babelfishr.providers as providers
+
+    created = []
+    real = providers._transcription_factories
+
+    def factories(config=None, mode=None):
+        table = real(config, mode)
+        for cls in (_EmptyEngine, _FailingEngine, _BlockingEngine,
+                    _BlockingEmptyEngine):
+            def make(cls=cls):
+                engine = cls()
+                created.append(engine)
+                return engine
+            table[cls.id] = make
+        return table
+
+    monkeypatch.setattr(providers, "_transcription_factories", factories)
+    return created
+
+
+def _captured_then_stopped(qt_app, config, store, wav):
+    """A window, one captured transmission, monitoring stopped, badge Idle."""
+    from babelfishr.ui.main_window import MainWindow
+
+    app = BabelFishRApp(config=config, store=store)   # engines from the factory
+    window = MainWindow(app)
+    pump(qt_app)
+    app.start_session(replay_path=wav, name="run")
+    app.run_replay()
+    window._stop_monitoring()
+    pump(qt_app, 40)
+    assert "Idle" in window.state_badge.text()
+    assert app.standalone_pipeline is None, "a standalone processor already exists"
+    return app, window, app.recent_transmissions()[0]
+
+
+def _reprocess_with(app, window, qt_app, tx, engine_id, test_engines):
+    """Switch the configured engine, reprocess, and prove that engine ran."""
+    app.config.asr.engine = engine_id
+    before = len(test_engines)
+    assert app.transcribe_anyway(tx.id)
+    assert app.standalone_pipeline.wait_until_idle(30.0)
+    pump(qt_app, 60)
+    used = app.standalone_pipeline.transcription
+    assert used.id == engine_id, f"the pipeline holds {used.id!r}, not {engine_id!r}"
+    assert used in test_engines[before:], (
+        "the pipeline's engine is not one the factory built for this test")
+    assert app.standalone_pipeline.pending == 0
+    return used
+
+
+def test_an_empty_transcription_returns_the_display_to_idle(
+        qt_app, config, store, wav, test_engines):
+    app, window, tx = _captured_then_stopped(qt_app, config, store, wav)
+    used = _reprocess_with(app, window, qt_app, tx, "test-empty", test_engines)
+    assert used.calls == 1, "the empty engine was never actually asked"
+
+    after = store.get_transmission(tx.id)
+    assert after.state is ProcessingState.COMPLETE, "an empty result is complete"
+    assert after.transcript == ""
+    assert after.error is None
+    assert "Transcribing" not in window.state_badge.text(), (
+        f"nothing is left to transcribe, badge says {window.state_badge.text()!r}")
+    assert "Idle" in window.state_badge.text()
+    assert window.timeline._bubbles[tx.id].tx.state is ProcessingState.COMPLETE
+    window.close()
+
+
+def test_a_transcription_error_returns_the_display_to_idle(
+        qt_app, config, store, wav, test_engines):
+    app, window, tx = _captured_then_stopped(qt_app, config, store, wav)
+    used = _reprocess_with(app, window, qt_app, tx, "test-failing", test_engines)
+    assert used.calls == 1
+
+    after = store.get_transmission(tx.id)
+    assert after.state is ProcessingState.FAILED, "the failure must be kept"
+    assert after.error is not None and "asr blew up" in after.error.message
+    assert pathlib.Path(after.audio_path).exists(), "the recording must survive"
+    assert "Idle" in window.state_badge.text(), window.state_badge.text()
+    assert window.timeline._bubbles[tx.id].tx.state is ProcessingState.FAILED
+    window.close()
+
+
+def test_a_missing_recording_returns_the_display_to_idle(
+        qt_app, config, store, wav, test_engines):
+    app, window, tx = _captured_then_stopped(qt_app, config, store, wav)
+    pathlib.Path(tx.audio_path).unlink()
+    used = _reprocess_with(app, window, qt_app, tx, "test-empty", test_engines)
+    assert used.calls == 0, "the engine ran with no audio to give it"
+
+    after = store.get_transmission(tx.id)
+    assert after.state is ProcessingState.FAILED
+    assert after.error is not None and "missing" in after.error.message
+    assert "Idle" in window.state_badge.text(), window.state_badge.text()
+    window.close()
+
+
+def test_processing_activity_shows_only_while_work_is_in_flight(
+        qt_app, config, store, wav, test_engines):
+    """Transcribing is shown with no microphone open - while it is true."""
+    app, window, tx = _captured_then_stopped(qt_app, config, store, wav)
+    app.config.asr.engine = "test-blocking"
+    assert app.transcribe_anyway(tx.id)
+    engine = app.standalone_pipeline.transcription
+    assert engine.id == "test-blocking" and engine in test_engines
+    assert engine.started.wait(10.0), "processing never began"
+    assert app.standalone_pipeline.pending == 1
+    pump(qt_app, 20)
+    assert "Transcribing" in window.state_badge.text(), window.state_badge.text()
+
+    engine.release.set()
+    assert app.standalone_pipeline.wait_until_idle(30.0)
+    pump(qt_app, 60)
+    assert "Idle" in window.state_badge.text(), window.state_badge.text()
+    assert store.get_transmission(tx.id).state is ProcessingState.COMPLETE
+
+    # And a Transcribing that arrives with nothing in flight describes
+    # nothing current.
+    app.events.publish("state", PipelineState.TRANSCRIBING)
+    window._drain_events()
+    assert "Idle" in window.state_badge.text()
+    window.close()
+
+
+def test_an_empty_result_after_a_visible_transcribing_returns_to_idle(
+        qt_app, config, store, wav, test_engines):
+    """The empty path with the display genuinely showing Transcribing first.
+
+    With a fast engine the work finishes before the window drains, and the
+    in-flight check alone would make the badge right even if the pipeline
+    never said "finished". Holding the engine open makes the window commit to
+    Transcribing, so only a real completion signal can bring it back.
+    """
+    app, window, tx = _captured_then_stopped(qt_app, config, store, wav)
+    app.config.asr.engine = "test-blocking-empty"
+    assert app.transcribe_anyway(tx.id)
+    engine = app.standalone_pipeline.transcription
+    assert engine.id == "test-blocking-empty" and engine in test_engines
+    assert engine.started.wait(10.0)
+    pump(qt_app, 20)
+    assert "Transcribing" in window.state_badge.text()
+
+    engine.release.set()
+    assert app.standalone_pipeline.wait_until_idle(30.0)
+    assert engine.calls == 1
+    # Drain exactly what the pipeline published; no synthetic events.
+    window._drain_events()
+    assert "Idle" in window.state_badge.text(), window.state_badge.text()
+    after = store.get_transmission(tx.id)
+    assert after.state is ProcessingState.COMPLETE and after.transcript == ""
+    window.close()
+
+
+def test_the_pipeline_says_finished_on_every_path_out(config, store, wav,
+                                                      test_engines):
+    """At the source: COMPLETE follows the last update whether the
+    transmission ended complete, empty or failed."""
+    app = BabelFishRApp(config=config, store=store)
+    app.start_session(replay_path=wav, name="run")
+    app.run_replay()
+    app.stop_session()
+    tx = app.recent_transmissions()[0]
+
+    for engine_id, expected in (("test-empty", ProcessingState.COMPLETE),
+                                ("test-failing", ProcessingState.FAILED)):
+        app.config.asr.engine = engine_id
+        if app.standalone_pipeline is not None:
+            app.standalone_pipeline.stop(wait=True)
+            app.standalone_pipeline = None
+        seen = []
+        app.events.subscribe(lambda e, seen=seen: seen.append(e))
+        assert app.transcribe_anyway(tx.id)
+        assert app.standalone_pipeline.wait_until_idle(30.0)
+        states = [e.payload for e in seen if e.kind == "state"]
+        assert states and states[-1] == PipelineState.COMPLETE, (engine_id, states)
+        assert PipelineState.LISTENING not in states
+        updates = [e.payload for e in seen if e.kind == "updated"]
+        assert updates[-1].state is expected
+        assert store.get_transmission(tx.id).state is expected
+    app.close()
+
+
+def test_a_created_but_unstarted_capture_does_not_make_listening_true(
+        qt_app, config, store):
+    from babelfishr.audio.source import CallbackAudioSource
+    from babelfishr.ui.main_window import MainWindow
+
+    app = mock_app(config, store)
+    window = MainWindow(app)
+    pump(qt_app)
+    app.start_session(source=CallbackAudioSource(SR), name="unstarted")
+    assert app.capture is not None and app.capture.state == PipelineState.IDLE
+    window._drain_events()
+    for stale in (PipelineState.LISTENING, PipelineState.RECEIVING):
+        app.events.publish("state", stale)
+        window._drain_events()
+        assert "Idle" in window.state_badge.text(), (
+            f"an unstarted capture displayed {window.state_badge.text()!r}")
+    app.stop_session()
+    window.close()
+
+
+def test_an_obsolete_receiving_does_not_overwrite_a_listening_run(
+        qt_app, config, store):
+    """A new capture is genuinely running and listening; a stale Receiving
+    from earlier must not be believed over it."""
+    from babelfishr.audio.source import CallbackAudioSource
+    from babelfishr.ui.main_window import MainWindow
+
+    app = mock_app(config, store)
+    window = MainWindow(app)
+    pump(qt_app)
+    app.start_session(source=CallbackAudioSource(SR), name="live")
+    app.begin_capture()
+    assert pump_until(qt_app, lambda: app.capture.state == PipelineState.LISTENING)
+    assert app.capture._running
+    window._drain_events()
+    assert "Listening" in window.state_badge.text()
+
+    app.events.publish("state", PipelineState.RECEIVING)
+    window._drain_events()
+    assert "Listening" in window.state_badge.text(), (
+        f"a stale Receiving was displayed: {window.state_badge.text()!r}")
+    app.events.publish("state", PipelineState.TRANSCRIBING)
+    window._drain_events()
+    assert "Listening" in window.state_badge.text()
+
+    # The run's own transitions still show.
+    app.capture._set_state(PipelineState.RECEIVING)
+    window._drain_events()
+    assert "Receiving" in window.state_badge.text()
+    app.stop_session()
+    window.close()
+
+
+def test_late_updates_reach_their_own_session_only(qt_app, config, store, wav):
+    from babelfishr.ui.main_window import MainWindow
+
+    app = mock_app(config, store)
+    other = app.create_conversation("Other")
+    window = MainWindow(app)
+    pump(qt_app)
+    general = store.default_conversation()
+    app.select_conversation(general.id)
+    window._refresh_session_tabs()
+
+    # Traffic filed under Other while General is on screen.
+    app.select_conversation(other.id)
+    app.start_session(replay_path=wav, name="other-run")
+    app.run_replay()
+    app.stop_session()
+    app.select_conversation(general.id)
+    window._reload_timeline()
+    window._drain_events()
+    theirs = app.recent_transmissions(conversation_id=other.id)
+    assert theirs
+    stale = theirs[0]
+    stale.transcript = "late words for Other"
+    app.events.publish("state", PipelineState.LISTENING)
+    app.events.publish("updated", stale)
+    window._drain_events()
+    assert "Idle" in window.state_badge.text()
+    assert stale.id not in window.timeline._bubbles, (
+        "Other's late update was drawn into General")
+
+    # Now looking at Other: the same late update lands in its own thread.
+    app.select_conversation(other.id)
+    window._reload_timeline()
+    assert stale.id in window.timeline._bubbles
+    app.events.publish("state", PipelineState.RECEIVING)
+    app.events.publish("updated", stale)
+    window._drain_events()
+    assert window.timeline._bubbles[stale.id].tx.transcript == "late words for Other"
+    assert "Idle" in window.state_badge.text()
+    window.close()
