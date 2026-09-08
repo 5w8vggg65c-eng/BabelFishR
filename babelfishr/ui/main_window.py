@@ -79,6 +79,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Set once the application has actually closed - engines and store
         # included. From then on no timer callback touches the store.
         self._shutdown_complete = False
+        self._shutdown_error = ""
         self._readiness = None
         self._theming = False
         self._readiness_worker = None
@@ -787,7 +788,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.input_panel.set_monitoring(False)
         outstanding = self.app.outstanding_work()
         if outstanding:
-            self._set_state(PipelineState.TRANSCRIBING)
+            # Counts work still being processed and, as one, a capture that
+            # is still finishing its last recording off this thread.
+            self._set_state(PipelineState.TRANSCRIBING if self._processing_active()
+                            else PipelineState.IDLE)
             self.status.showMessage(
                 f"Monitoring stopped. Still finishing {outstanding} "
                 f"transmission(s) - each appears in its bubble as it "
@@ -1117,6 +1121,10 @@ class MainWindow(QtWidgets.QMainWindow):
             + "\n\nThe recording itself is safe.")
 
     def _on_analyze_digital(self, tx_id: str, protocol: str) -> None:
+        if self.app.closing:
+            self.status.showMessage(
+                "Quitting - digital analysis is not started.", 8000)
+            return
         analyser = self.app.analyser()
         if analyser is None:
             from .analysis_dialog import show_dsd_missing
@@ -1803,34 +1811,53 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._shutdown_complete or self._finish_shutdown():
             super().closeEvent(event)
             return
-        # Work is still outstanding, or a worker has not returned. The window
+        # Work is still outstanding, a capture is still finishing, an
+        # analysis is still saving, or the close itself failed. The window
         # stays, the event loop keeps turning, and the close is retried from
         # a timer until the application reports that nothing can still use
         # its engines or its store. A repeated Quit lands here again and
         # changes nothing.
-        outstanding = self.app.outstanding_work()
-        self.status.showMessage(
-            f"Quitting once {outstanding} transmission(s) finish processing "
-            f"- the window stays responsive meanwhile." if outstanding else
-            "Quitting once the previous run has finished shutting down.", 0)
+        self._announce_quit_pending()
         self.start_button.setEnabled(False)
         if not self._quit_timer.isActive():
             self._quit_timer.start()
         event.ignore()
 
+    def _announce_quit_pending(self) -> None:
+        if self._shutdown_error:
+            text = (f"Could not finish quitting: {self._shutdown_error}. "
+                    f"Retrying - nothing still in use has been closed.")
+        else:
+            parts = []
+            outstanding = self.app.outstanding_work()
+            if outstanding:
+                parts.append(f"{outstanding} transmission(s) finish processing")
+            for name in self.app.active_operations():
+                parts.append(f"the {name} finishes")
+            text = ("Quitting once " + (" and ".join(parts) if parts else
+                    "the previous run has finished shutting down")
+                    + " - the window stays responsive meanwhile.")
+        self.status.showMessage(text, 0)
+
     def _finish_shutdown(self) -> bool:
         """Close the application if nothing can still use it. True when done.
 
         Closing never blocks this thread: the application either closes in
-        order now - workers ended, engines closed, store closed - or reports
-        that it cannot yet. Once it has, the event drain stops for good, so
-        no timer callback can reach the closed store.
+        order now - capture settled, workers ended, analyses saved, engines
+        closed, store closed - or reports that it cannot yet. Once it has, the
+        event drain stops for good, so no timer callback can reach the closed
+        store. A close that *fails* is not success: nothing is marked
+        complete, the timers keep running so it is retried, and the operator
+        is told what failed. The application closes each resource once, and
+        only at the very end, so a retry cannot close something still in use.
         """
         try:
             done = self.app.close(wait=False)
-        except Exception:  # noqa: BLE001 - never leave the window unclosable
+        except Exception as exc:  # noqa: BLE001 - report, keep, retry
             log.exception("closing the application failed")
-            done = True
+            self._shutdown_error = f"{type(exc).__name__}: {exc}"
+            return False
+        self._shutdown_error = ""
         if done:
             self._quit_timer.stop()
             self._timer.stop()
@@ -1840,6 +1867,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _quit_tick(self) -> None:
         if self._finish_shutdown():
             self.close()
+        else:
+            self._announce_quit_pending()
 
 
 class ProfileDialog(QtWidgets.QDialog):

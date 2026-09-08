@@ -593,6 +593,12 @@ class CaptureService:
         # there first: stop() or the audio thread on its way out.
         self._finish_lock = threading.Lock()
         self._finished = False
+        #: The thread stop_async() hands the waiting to. None until then.
+        self._stopper: Optional[threading.Thread] = None
+        #: Transmissions saved here that no processor accepted. Nothing is
+        #: lost - the WAV and the row exist - but they are pending, and the
+        #: application must not report them finished.
+        self.unprocessed: List[str] = []
         self.state = PipelineState.IDLE
         self.transmissions_captured = 0
         self._level_divisor = max(1, int(0.1 * source.sample_rate
@@ -614,26 +620,50 @@ class CaptureService:
         self._thread.start()
 
     def stop(self, timeout: Optional[float] = None) -> bool:
-        """Stop the audio thread and finish the run. True once it has.
+        """Stop the audio thread and finish the run, blocking. True once it has.
 
-        The last detected transmission and its recording are written by
-        whichever side gets there first - this call, or the audio thread on
-        its way out - and only once (:meth:`_finish_once`). A thread that has
-        not returned by the timeout is *not* forgotten: it stays referenced
-        (:attr:`alive`), this returns False, and the thread completes the
-        finish itself when it does return. An earlier version dropped the
-        reference after a timed join and flushed the detector from the
-        caller while the thread might still be feeding it.
+        For callers that may block - the command line, tests. The window uses
+        :meth:`stop_async`. The last detected transmission and its recording
+        are written by whichever side gets there first - the stopping side, or
+        the audio thread on its way out - and only once (:meth:`_finish_once`).
+        A thread that has not returned by the timeout is *not* forgotten: it
+        stays referenced (:attr:`alive`), this returns False, and the thread
+        completes the finish itself when it does return.
         """
         timeout = self.stop_timeout if timeout is None else timeout
         self._running = False
+        return self._stop_blocking(timeout)
+
+    def stop_async(self) -> None:
+        """Begin stopping without blocking the caller.
+
+        Everything that can wait - joining the audio thread, closing the
+        source, the final flush - runs on a small stopper thread, so the GUI
+        thread that pressed Stop never waits on audio. Until :attr:`settled`
+        the capture stays a producer that can still hand over its final
+        transmission, and whoever owns it must treat it as one. When the audio
+        thread has already returned (a replay that reached its end) there is
+        nothing to wait for and the finish happens here, at once.
+        """
+        self._running = False
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            self._thread = None
+            self._stop_source()
+            self._finish_once()
+            return
+        if self._stopper is not None and self._stopper.is_alive():
+            return                     # a stop is already under way
+        self._stopper = threading.Thread(
+            target=self._stop_blocking, args=(self.stop_timeout,),
+            name="babelfishr-capture-stop", daemon=True)
+        self._stopper.start()
+
+    def _stop_blocking(self, timeout: float) -> bool:
         thread = self._thread
         if thread is not None:
             thread.join(timeout=timeout)
-        try:
-            self.source.stop()
-        except Exception:  # noqa: BLE001
-            log.debug("error stopping source", exc_info=True)
+        self._stop_source()
         if thread is not None and thread.is_alive():
             # Stopping the source is what frees a read that was blocking.
             thread.join(timeout=0.5)
@@ -645,10 +675,43 @@ class CaptureService:
         self._finish_once()
         return True
 
+    def _stop_source(self) -> None:
+        try:
+            self.source.stop()
+        except Exception:  # noqa: BLE001
+            log.debug("error stopping source", exc_info=True)
+
     @property
     def alive(self) -> bool:
         """The audio thread is still running."""
         return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def stopping(self) -> bool:
+        """A stopper thread is still waiting on the audio thread or source."""
+        return self._stopper is not None and self._stopper.is_alive()
+
+    @property
+    def settled(self) -> bool:
+        """The run is over: audio thread and stopper ended, finish done.
+
+        Only then has the last transmission been handed over (or recorded
+        in :attr:`unprocessed`), so only then may the processor it feeds be
+        retired.
+        """
+        return self._finished and not self.alive and not self.stopping
+
+    def wait_settled(self, timeout: Optional[float] = None) -> bool:
+        """Block until settled, or until ``timeout``. For blocking callers."""
+        import time
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        for thread in (self._stopper, self._thread):
+            if thread is None or thread is threading.current_thread():
+                continue
+            left = None if deadline is None else max(0.0, deadline - time.monotonic())
+            thread.join(timeout=left)
+        return self.settled
 
     def _finish_once(self) -> None:
         with self._finish_lock:
@@ -767,9 +830,11 @@ class CaptureService:
                 self.pipeline.submit(tx.id)
             except ProcessingStopped:
                 # The recording and the row are already safe. The message
-                # stays Captured - honestly pending - and is picked up by the
-                # next processor that resumes unfinished work.
+                # stays Captured - honestly pending - and is recorded here so
+                # the application can hand it to a processor rather than
+                # report the run finished.
                 log.warning("processor already stopped; %s stays pending", tx.id)
+                self.unprocessed.append(tx.id)
             return tx
 
         tx.auto_processed = False

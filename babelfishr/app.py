@@ -6,9 +6,11 @@ neither front-end has to know how they fit together.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import logging
 import pathlib
+import threading
 from typing import Any, Dict, List, Optional
 
 from .audio.devices import (AmbiguousInputDevice, AudioDevice, DeviceIdentity,
@@ -103,6 +105,17 @@ class BabelFishRApp:
         #: A capture whose audio thread outlived its stop, for the same reason.
         self._lingering_capture: Optional[CaptureService] = None
         self._closed = False
+        #: Set by close(): Quit is pending. Nothing new starts - no session,
+        #: no saved-recording processing, no analysis - while accepted work
+        #: and the final capture hand-off finish.
+        self._closing = False
+        self._close_in_progress = False
+        #: Other users of the store that shutdown must wait for, by name: a
+        #: digital analysis that will save its result, say. See activity().
+        self._activities: Dict[str, int] = {}
+        self._activity_lock = threading.Lock()
+        #: Transmissions a capture saved that no processor accepted.
+        self._unprocessed: List[str] = []
         # The named thread the operator is working in. One capture service and
         # one pipeline exist globally; this only decides which thread a run is
         # filed under and which rows the window shows.
@@ -159,8 +172,46 @@ class BabelFishRApp:
             self.standalone_pipeline = None
             self._standalone_mode = None
         if (self._lingering_capture is not None
-                and not self._lingering_capture.alive):
+                and self._lingering_capture.settled):
+            self._unprocessed.extend(self._lingering_capture.unprocessed)
+            self._lingering_capture.unprocessed.clear()
             self._lingering_capture = None
+
+    @property
+    def closing(self) -> bool:
+        """Quit is pending: accepted work finishes, nothing new starts."""
+        return self._closing
+
+    @contextlib.contextmanager
+    def activity(self, name: str):
+        """Register a user of the store that shutdown must wait for.
+
+        The digital analysis runs on a worker thread and saves its result at
+        the end; without this, close() could not see it and closed the
+        database under it. Refused once Quit is pending, so that nothing
+        new can begin using resources that are about to close.
+        """
+        with self._activity_lock:
+            if self._closing:
+                raise ProcessingBusy(
+                    "BabelFishR is quitting; nothing new is started.")
+            self._activities[name] = self._activities.get(name, 0) + 1
+        try:
+            yield
+        finally:
+            with self._activity_lock:
+                self._activities[name] -= 1
+                if self._activities[name] <= 0:
+                    del self._activities[name]
+
+    def active_operations(self) -> Dict[str, int]:
+        with self._activity_lock:
+            return dict(self._activities)
+
+    def capture_finishing(self) -> bool:
+        """A stopped capture has not settled: it may still hand over a job."""
+        self._reap()
+        return self._lingering_capture is not None
 
     def _track_retired(self, pipeline: ProcessingPipeline) -> None:
         if pipeline not in self._retired:
@@ -187,12 +238,42 @@ class BabelFishRApp:
         return ""
 
     def outstanding_work(self) -> int:
-        """Accepted, unfinished jobs across every processor, live or retiring."""
-        total = 0
+        """Unfinished jobs, plus anything that can still become one.
+
+        Counts every processor's pending work, transmissions a capture saved
+        that no processor accepted, and - as one - a stopped capture that has
+        not settled, since its final flush may still produce a transmission.
+        Zero therefore means nothing can still be waiting to be processed.
+        """
+        self._reap()
+        total = len(self._unprocessed)
         for pipeline in (self.pipeline, self.standalone_pipeline, *self._retired):
             if pipeline is not None:
                 total += pipeline.pending
+        if self._lingering_capture is not None:
+            total += 1 + len(self._lingering_capture.unprocessed)
         return total
+
+    def _adopt_unprocessed(self) -> None:
+        """Hand a processor whatever a capture saved but nothing accepted.
+
+        Only reached with a settled capture. If no processor can be built
+        (no engine in this mode) the ids stay recorded and are logged, never
+        silently dropped and never reported as processed.
+        """
+        if not self._unprocessed:
+            return
+        pipeline = self._processing_pipeline(for_shutdown=True)
+        if pipeline is None:
+            log.warning("no processor for %d unprocessed transmission(s): %s",
+                        len(self._unprocessed), ", ".join(self._unprocessed))
+            return
+        for tx_id in list(self._unprocessed):
+            try:
+                pipeline.submit(tx_id)
+            except ProcessingStopped:
+                break
+            self._unprocessed.remove(tx_id)
 
     def _retire_processing(self) -> None:
         """Drop every engine and pipeline built under the outgoing mode.
@@ -402,9 +483,12 @@ class BabelFishRApp:
             source = self._build_source(device, replay_path, realtime_replay,
                                         identity)
 
-        # Before anything is written: a previous run still shutting down, or
-        # a busy standalone processor, refuses the start outright rather than
-        # being waited on or started alongside.
+        # Before anything is written: a pending Quit, a previous run still
+        # shutting down, or a busy standalone processor refuses the start
+        # outright rather than being waited on or started alongside.
+        if self._closing:
+            raise ProcessingBusy("BabelFishR is quitting; monitoring cannot "
+                                 "start now.")
         problem = self.shutdown_problem()
         if problem:
             raise ProcessingBusy(problem)
@@ -636,10 +720,17 @@ class BabelFishRApp:
         session = self.session
         if self.capture is not None:
             capture, self.capture = self.capture, None
-            if not capture.stop():
-                # The audio thread has not returned. It still holds the
-                # detector, the recorder and the processor, so it stays in
-                # view until it has, and finishes the run itself.
+            # Nothing here waits on audio. The join, the source close and the
+            # final flush run on the capture's own stopper thread (or at once,
+            # when the audio thread has already returned). Until it has
+            # settled the capture stays in view as a producer that can still
+            # hand over its last transmission; the processor below stays
+            # accepting for exactly that reason.
+            capture.stop_async()
+            if capture.settled:
+                self._unprocessed.extend(capture.unprocessed)
+                capture.unprocessed.clear()
+            else:
                 self._lingering_capture = capture
         if self.pipeline is not None:
             pipeline, self.pipeline = self.pipeline, None
@@ -691,6 +782,8 @@ class BabelFishRApp:
             return ("Record Only mode has transcription switched off. Change "
                     "the operating mode, then try again - the recording is "
                     "kept either way.")
+        if self._closing:
+            return "BabelFishR is quitting; nothing new is started."
         problem = self.shutdown_problem()
         if problem:
             return problem
@@ -706,8 +799,13 @@ class BabelFishRApp:
                     f"{self.mode.label}: {detail}")
         return ""
 
-    def _processing_pipeline(self) -> Optional[ProcessingPipeline]:
+    def _processing_pipeline(self, for_shutdown: bool = False
+                             ) -> Optional[ProcessingPipeline]:
         """The live pipeline when monitoring, otherwise a standalone one.
+
+        ``for_shutdown`` is close()'s own route in: once Quit is pending no
+        new saved-recording work is taken from anyone else, but a
+        transmission the capture saved on its way out still gets a processor.
 
         Deliberately not a fake capture session: no Session row is created, no
         audio device is opened, and nothing about the operator's monitoring
@@ -716,6 +814,8 @@ class BabelFishRApp:
         worker thread so the window never freezes.
         """
         self._reap()
+        if self._closing and not for_shutdown:
+            return None
         if self.pipeline is not None:
             # A live pipeline cannot outlive its mode through set_mode, which
             # refuses while monitoring. This covers the other route in: a
@@ -965,18 +1065,26 @@ class BabelFishRApp:
         from .analysis.dsd import DsdNeoAnalyser
         from .signal_metadata import apply_decoded_metadata
 
-        tx = self.store.get_transmission(tx_id)
-        if tx is None:
+        try:
+            # Registered for the whole run, result save included: this is a
+            # store user shutdown has to wait for. Refused once Quit is
+            # pending - returns None rather than start work that could not
+            # be saved.
+            with self.activity("digital analysis"):
+                tx = self.store.get_transmission(tx_id)
+                if tx is None:
+                    return None
+                engine = DsdNeoAnalyser.from_config(self.config)
+                attempt = engine.analyse(AnalysisRequest(
+                    transmission=tx, protocol=protocol,
+                    timeout=timeout or self.config.analysis.timeout))
+                tx.analysis_attempts.append(attempt)
+                apply_decoded_metadata(tx, attempt)
+                self.store.save_transmission(tx)
+                self.events.publish("updated", tx)
+                return attempt
+        except ProcessingBusy:
             return None
-        engine = DsdNeoAnalyser.from_config(self.config)
-        attempt = engine.analyse(AnalysisRequest(
-            transmission=tx, protocol=protocol,
-            timeout=timeout or self.config.analysis.timeout))
-        tx.analysis_attempts.append(attempt)
-        apply_decoded_metadata(tx, attempt)
-        self.store.save_transmission(tx)
-        self.events.publish("updated", tx)
-        return attempt
 
     def signal_metadata(self):
         """Measured RF metadata, when a signal source is supplying it."""
@@ -1038,37 +1146,70 @@ class BabelFishRApp:
         """Shut down in order, closing engines and the store last - and only
         when nothing can still use them.
 
-        The order: the capture stops (bounded), any processor finishes what
-        it accepted, its workers end, then the engines close, then the store.
-        Each step waits for the one before it to be *complete*, not merely
-        timed out. A worker that has not returned keeps its engines and the
-        database open, and this returns False so the caller can try again
-        later rather than close a store a thread is still writing to. That is
-        what happened before: a 30-second wait, a 10-second join, and then
-        the store was closed under whatever was still running.
+        Order: the capture settles first (its stopper thread has joined the
+        audio thread, closed the source and run the final flush, so the last
+        transmission has been handed over); anything it saved that no
+        processor accepted is handed to one; the processor finishes what it
+        accepted and its workers end; stragglers end; other store users - a
+        digital analysis saving its result - finish; then the engines close,
+        then the store. Each step waits for the previous to be *complete*,
+        never merely timed out, and returns False with nothing closed if it
+        is not.
 
-        ``wait=True`` (the command line, tests) blocks until the outstanding
-        work is done, or until ``timeout`` if one is given, returning False
-        with nothing closed if that runs out. ``wait=False`` (the window)
-        never blocks: it closes if it can, and otherwise says not yet.
+        Once called, Quit is pending (:attr:`closing`): nothing new starts,
+        accepted work and the final capture hand-off finish. ``wait=True``
+        (the command line, tests) blocks until done or until ``timeout``;
+        ``wait=False`` (the window) never blocks. A second call while one is
+        still running returns False rather than overlap it, and every
+        resource is closed exactly once - engines are dropped as they close,
+        so a failure part-way is retried from where it stopped.
         """
-        from time import monotonic
-
         if self._closed:
             return True
+        if self._close_in_progress:
+            return False
+        self._close_in_progress = True
+        try:
+            return self._close(wait, timeout)
+        finally:
+            self._close_in_progress = False
+
+    def _close(self, wait: bool, timeout: Optional[float]) -> bool:
+        from time import monotonic, sleep
+
+        self._closing = True
         self.stop_session()
         deadline = None if timeout is None else monotonic() + timeout
 
         def remaining() -> Optional[float]:
             return None if deadline is None else max(0.0, deadline - monotonic())
 
+        def out_of_time() -> bool:
+            left = remaining()
+            return left is not None and left <= 0
+
+        # 1. The capture, first: until it has settled it can still produce
+        #    the final transmission, and the processor must still be there
+        #    to take it.
+        capture = self._lingering_capture
+        if capture is not None:
+            if wait:
+                capture.wait_settled(timeout=remaining())
+            self._reap()
+            if self._lingering_capture is not None:
+                return False
+
+        # 2. Whatever a capture saved that nothing accepted.
+        self._adopt_unprocessed()
+
+        # 3. The processor finishes what it accepted, then its workers end.
         pipeline = self.standalone_pipeline
         if pipeline is not None:
             if wait:
                 while pipeline.pending:
-                    left = remaining()
-                    if left is not None and left <= 0:
+                    if out_of_time():
                         return False
+                    left = remaining()
                     pipeline.wait_until_idle(
                         timeout=1.0 if left is None else min(1.0, left))
             if not pipeline.stop_if_idle(timeout=10.0 if wait else 1.0):
@@ -1078,19 +1219,33 @@ class BabelFishRApp:
             self.standalone_pipeline = None
             self._standalone_mode = None
 
+        # 4. Stragglers.
         if wait:
             for straggler in list(self._retired):
                 for thread in straggler.worker_threads():
                     thread.join(timeout=remaining())
-            if self._lingering_capture is not None and self._lingering_capture._thread:
-                self._lingering_capture._thread.join(timeout=remaining())
         self._reap()
-        if self._retired or self._lingering_capture is not None:
+        if self._retired:
             return False               # a thread can still reach the engines
 
-        for engine in (self.transcription, self.translation):
+        # 5. Every other user of the store.
+        if wait:
+            while self.active_operations():
+                if out_of_time():
+                    return False
+                sleep(0.05)
+        with self._activity_lock:
+            if self._activities:
+                return False
+            # Nothing can register from here: closing is set and the check
+            # above happened under the same lock.
+
+        # 6. Engines, each exactly once, then the store.
+        for name in ("transcription", "translation"):
+            engine = getattr(self, name)
             if engine is not None:
                 engine.close()
+                setattr(self, name, None)
         self.store.close()
         self._closed = True
         return True

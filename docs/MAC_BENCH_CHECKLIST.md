@@ -301,9 +301,10 @@ tabs, name it `Throwaway`, and record one short message into it.
 
 ## M. Stopping and quitting while a transcription is still running (new)
 
-BabelFishR no longer freezes while it waits for a transcription to finish.
-This needs a message long enough to still be transcribing when you act, so
-speak for ten to fifteen seconds without a pause, then act immediately.
+This behaviour is new and has only been exercised by automated tests on a
+Linux machine; nothing here has been seen working on a Mac yet. It needs a
+message long enough to still be transcribing when you act, so speak for ten
+to fifteen seconds without a pause, then act immediately.
 
 43. Start monitoring, speak for about fifteen seconds, stop speaking, and the
     moment the bubble shows **Transcribing…** click **Stop monitoring**.
@@ -322,6 +323,11 @@ speak for ten to fifteen seconds without a pause, then act immediately.
 45. Repeat step 43, and while the indicator still says **Transcribing** click
     **Start monitoring** again. *Good:* a box explains that a saved
     recording is still being transcribed and to wait; nothing else changes.
+46. Start monitoring, speak once for a few seconds and keep speaking, and
+    press **⌘Q** while you are still talking. *Good:* the window stays open
+    and responsive, then quits by itself. Reopen: the transmission that was
+    still open when you quit is there, recorded and transcribed. *Bad:* a
+    message that shows as captured but never transcribed, or no message.
 
 ---
 

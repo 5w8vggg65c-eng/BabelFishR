@@ -3381,3 +3381,156 @@ rerun.
 - A worker that never returns is now *visible* (Quit waits and says why,
   Start and mode change refuse); there is still no forced-cancellation or
   forced-exit policy — deliberately, per the directive.
+
+---
+
+# Finishing the shutdown repair — Codex's four counterexamples
+
+Codex re-read `c004ff5` and exercised the production core in isolation
+(Linux, Python 3.12.13, no Qt, no pytest): (A) Stop still blocked its caller
+for 5.5 s on a held source, because `CaptureService.stop()` joined the audio
+thread on the GUI thread; (B) Quit retired the processor before a lingering
+capture had handed over its final transmission, which was then left
+Captured while `outstanding_work()` said zero and the next close succeeded;
+(C) a digital analysis running on the window's worker saved into a store
+`close()` had already closed; (D) `_finish_shutdown()` treated an exception
+from `app.close()` as success. All four confirmed here and repaired. The
+earlier claim that `close(wait=False)` "never blocks" was wrong for (A) and
+is withdrawn: polling a function from a timer does not make blocking calls
+inside it asynchronous.
+
+## Identifiers
+
+| | |
+|---|---|
+| Base | `c004ff5` — verified equal to the remote tip at the start, worktree clean |
+| Commit | the commit carrying this section (the branch tip) |
+| Branch | `claude/radio-decoder-translator-0oslya` |
+| Workflow / tag / release | none dispatched, retried, created, moved or published |
+
+## The rule, and the order
+
+Shutdown accounts for every producer and every user of the store, and closes
+in this order, each step *complete* before the next, never merely timed out:
+
+1. **Capture settles.** `stop_session()` calls `CaptureService.stop_async()`:
+   the join, the source close and the final flush run on the capture's own
+   stopper thread (`babelfishr-capture-stop`); when the audio thread has
+   already returned there is nothing to wait for and the finish runs at once.
+   Until `settled` (audio thread ended, stopper ended, finish run) the capture
+   is `_lingering_capture`: a producer that can still hand over its final
+   transmission, counted as one in `outstanding_work()`, and the live
+   pipeline is kept accepting as the standalone processor for exactly that.
+   `CaptureService.stop()` stays as the blocking form for the command line.
+2. **Nothing accepted is stranded.** A transmission the capture saved that
+   no processor accepted is recorded (`CaptureService.unprocessed`), counted
+   in `outstanding_work()`, and handed to a processor by `close()`
+   (`_adopt_unprocessed`, through `_processing_pipeline(for_shutdown=True)`)
+   before that processor is retired. If no processor can be built it is
+   logged by id, never reported as processed.
+3. **The processor finishes what it accepted**, then its workers end;
+   stragglers end.
+4. **Every other store user finishes.** `app.activity(name)` registers one
+   (the digital analysis is wrapped for its whole run, result save included);
+   `close()` waits for `active_operations()` to empty, and the final check and
+   the refusal of new registrations happen under the same lock.
+5. **Engines close, each once and dropped as they close; then the store.**
+   A failure part-way is retried from where it stopped, never re-closing.
+
+**Quit pending.** The first `close()` sets `closing`. From then on
+`start_session` raises `ProcessingBusy("BabelFishR is quitting…")`,
+`_processing_pipeline()` returns None to everyone but the shutdown path (so
+Retry / Transcribe anyway return False and `processing_problem` says why),
+`analyze_digital` returns None and the window's analysis action says it was
+not started. Accepted work and the final capture hand-off finish. Stop
+without Quit sets nothing: saved-recording processing remains available.
+
+**Failure is failure.** `_finish_shutdown()` catches an exception from
+`app.close()`, records it, keeps both timers running, does not set
+`_shutdown_complete`, and the status line says "Could not finish quitting:
+… Retrying - nothing still in use has been closed." `close()` refuses to
+overlap itself (`_close_in_progress`).
+
+## Reproductions, before → after (real Qt window, offscreen)
+
+- **A** held source, production `stop_timeout` 5.0 unchanged, asserted:
+  Stop returned in < 1 s (was 5.5 s), a 20 ms heartbeat kept ticking through
+  Stop and through the pending Quit; `capture_finishing()` True;
+  `outstanding_work() ≥ 1`; the processor still accepting; repeated Quit
+  gives the same answer.
+- **B** open voice transmission + held capture + Quit: before release the
+  store is open and the ASR uncalled; after release the WAV exists, the ASR
+  is called once, the transmission is saved COMPLETE *before*
+  `store.close`, and the window closes by itself. Stop-only control case
+  kept: the final transmission is processed, the badge returns to Idle, and
+  `retry()` still works afterwards. Two transmissions (one held inside the
+  engine, one open in the detector): both COMPLETE, none Captured, the
+  holding engine closed exactly once.
+- **C** analysis held inside `analyse()` through the real window path
+  (`_on_analyze_digital` → thread pool → `app.analyze_digital`): Quit is
+  refused while it runs, the status names the analysis, the store stays
+  open, and on release the attempt is saved before `store.close`.
+- **D** `store.close` made to raise through the real Qt close: `window.close()`
+  False, `_shutdown_complete` False, both timers alive, status names the
+  error, engines closed once; retries keep failing without re-closing the
+  engine; when the fault is removed the window closes on the next tick.
+- New work while Quit is pending is refused through app methods (start,
+  transcribe anyway, retry, processing_problem, analyze_digital) and the
+  window's analysis action.
+
+## Tests
+
+`tests/test_alpha5_shutdown.py` (7, all real Qt offscreen) and one lifecycle
+test rewritten to the production timeout
+(`test_a_capture_thread_that_ignores_its_stop_is_kept_in_view`); one
+lifecycle test now waits for the capture to settle before looking for the
+final transmission (`test_capture_shutdown_keeps_the_final_transmission…`),
+since Stop no longer blocks — same intent. Substitutions: a
+`CallbackAudioSource` subclass whose read blocks ignoring its timeout once
+held; a fake analyser at the `DsdNeoAnalyser.from_config` seam; a holding
+transcription engine installed on the app; `store.close` replaced only to
+fail once. Nothing lowers `stop_timeout`.
+
+### Fail-before (production files restored from `c004ff5`, tests unchanged)
+
+All seven shutdown tests FAIL on `c004ff5` (one also errors at teardown, the
+window it left open closing over a store the fixture had closed); the two
+rewritten lifecycle tests fail (the lingering-capture test on the blocking
+Stop, the final-transmission test on the missing `capture_finishing`); the
+ten unchanged lifecycle tests pass there as they did before. On the repaired
+tree: 19 of 19 pass in 12.8 s.
+
+### Mutations (repaired code restored after each; byte-compared)
+
+| # | Mutation | Caught by |
+|---|---|---|
+| N1 | `stop_session` blocks on `capture.stop()` again | `test_stop_and_quit_keep_the_gui_alive_with_a_held_source` |
+| N2 | `close()` retires the processor before the capture settled | same |
+| N3 | `outstanding_work()` ignores a capture that can still produce | same |
+| N4 | `close()` ignores other store users | `test_a_running_digital_analysis_saves_before_the_store_closes` |
+| N5 | a close exception is treated as done | `test_a_failed_close_is_not_reported_complete_and_retries_safely` |
+| N6 | `start_session` does not refuse while quitting | `test_new_work_is_refused_while_quit_is_pending` |
+| N7 | saved-recording processing ignores a pending Quit | same |
+| N8 | engines closed again on a retried close | `test_a_failed_close_is_not_reported_complete_and_retries_safely` |
+
+All eight caught.
+
+### Test results
+
+Focused first: the eight nearest existing suites after the patches (183
+passed); the two new-pass files (19 passed). Full suite: **912 passed, 11 skipped** in 160.00 s (905 before this pass plus the 7 new tests); the eleven skips are unchanged (`test_alpha5_playback.py:516`, `:531`, `test_coreaudio.py:255`, `test_packaging.py:373`, `test_real_engines.py:32` ×5, `:107` ×2). `git diff --check`
+and `compileall` over `babelfishr`, `tests`, `packaging`: clean. Linux,
+Python 3.11, PySide6 Essentials, `QT_QPA_PLATFORM=offscreen`, mock and
+stand-in engines. This session's results, not an independent rerun; no Mac.
+
+## Unresolved ledger, updated
+
+- A thread that never returns is visible and waited for; there is still no
+  forced cancellation or forced exit — Eric's decision, not taken here.
+- CLI `close()` without a timeout waits indefinitely (Ctrl-C works).
+- Immediately after Stop on a live device, Start and mode change are
+  refused for the fraction of a second the capture takes to settle, with the
+  message "The previous run has not released the audio input yet".
+- F3, F4 deferred; F6/F7, F8/F9 outside; playback, removal semantics and
+  General unresolved; no Mac validation of any of this (checklist M,
+  steps 43–46, says so now).

@@ -611,6 +611,12 @@ def test_capture_shutdown_keeps_the_final_transmission_and_its_recording(config,
     assert app.capture.detector.open, "the detector never opened on the voice"
 
     app.stop_session()
+    # Stop no longer waits for the audio thread: the final flush runs on the
+    # capture's stopper thread. Wait for it to settle, then look.
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and app.capture_finishing():
+        time.sleep(0.02)
+    assert not app.capture_finishing(), "the capture never settled"
     txs = store.recent_transmissions()
     assert len(txs) == 1, "the transmission still open at Stop was lost"
     assert pathlib.Path(txs[0].audio_path).is_file()
@@ -632,12 +638,13 @@ class StuckSource(CallbackAudioSource):
         return super().read(timeout=0.05)
 
 
-def test_a_capture_thread_that_ignores_its_stop_is_kept_in_view(config, store, wav,
-                                                                monkeypatch):
+def test_a_capture_thread_that_ignores_its_stop_is_kept_in_view(config, store, wav):
+    """Production stop timeout, unchanged. The wait for the audio thread
+    happens on the capture's own stopper thread, never on the caller's."""
     from babelfishr.providers.mock import (MockTranscriptionEngine,
                                            MockTranslationEngine)
 
-    monkeypatch.setattr(CaptureService, "stop_timeout", 0.2)
+    assert CaptureService.stop_timeout == 5.0
     app = BabelFishRApp(config=config, store=store)
     app.transcription = MockTranscriptionEngine()
     app.translation = MockTranslationEngine()
@@ -649,19 +656,22 @@ def test_a_capture_thread_that_ignores_its_stop_is_kept_in_view(config, store, w
 
     started = time.monotonic()
     app.stop_session()
-    assert time.monotonic() - started < 2.0
+    assert time.monotonic() - started < 1.0, "Stop waited on the audio thread"
     assert app.session is None and app.capture is None
-    assert app._lingering_capture is capture and capture.alive
+    assert app._lingering_capture is capture and capture.alive and capture.stopping
+    assert not capture.settled
     assert not capture._finished, "the run was finished under a thread still feeding it"
     assert "audio input" in app.shutdown_problem()
     with pytest.raises(ProcessingBusy):
         app.start_session(replay_path=wav, name="beside-it")
     assert app.close(wait=False) is False
     assert store.recent_transmissions() == []
+    assert app.standalone_pipeline is not None and app.standalone_pipeline.accepting, (
+        "the processor was retired while its capture could still feed it")
 
     source.released.set()
-    capture._thread.join(10.0)
-    assert not capture.alive and capture._finished
+    assert capture.wait_settled(10.0)
+    assert not capture.alive and not capture.stopping and capture._finished
     assert capture.state == PipelineState.IDLE
     assert app.shutdown_problem() == ""
     assert app.close(wait=True) is True
