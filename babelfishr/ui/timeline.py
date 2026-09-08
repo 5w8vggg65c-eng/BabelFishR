@@ -820,6 +820,34 @@ class TimelineView(QtWidgets.QScrollArea):
             self._bubbles[tx.id] = bubble
         return bubble
 
+    def place(self, tx: Transmission) -> TransmissionBubble:
+        """Show this transmission where its time puts it.
+
+        Present: updated in place. Absent: inserted in newest-first order by
+        (started_at, id) - the order set_transmissions uses - under the same
+        anchoring every other growth gets. For a filtered view, where a
+        record that has just come to qualify is not necessarily the newest
+        thing on screen; add() is for live traffic, which always is.
+        """
+        if tx.id in self._bubbles:
+            self.update(tx)
+            return self._bubbles[tx.id]
+        bubble = self.add(tx)
+        key = (tx.started_at, tx.id)
+        index = len(self._order) - 1                 # add() put it at 0
+        for position, other_id in enumerate(self._order[1:]):
+            other = self._bubbles[other_id].tx
+            if key > (other.started_at, other.id):
+                index = position
+                break
+        if index != 0:
+            with self._anchored():
+                self._layout.removeWidget(bubble)
+                self._order.remove(tx.id)
+                self._layout.insertWidget(index, bubble)
+                self._order.insert(index, tx.id)
+        return bubble
+
     def append_older(self, tx: Transmission) -> TransmissionBubble:
         """Add a bubble at the bottom - for loading history, not new traffic."""
         if tx.id in self._bubbles:

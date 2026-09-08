@@ -204,7 +204,11 @@ def test_menus_and_shortcuts_cannot_reach_the_store_during_final_cleanup(
     assert len(searches) == 1, "Ctrl+F did not reach Search before quitting"
     opened = click_menu_item(qt_app, window, "&View", window.review_action)
     assert opened, "the View menu did not open before quitting"
-    assert "match" in window.status.currentMessage().lower() or window.timeline.count() >= 0
+    # A known result, not a tautology: the Review queue view shows exactly
+    # what the store's review queue holds (here: nothing needs review), and
+    # says so.
+    assert window.timeline.order() == [t.id for t in app.review_queue()]
+    assert "need review" in window.status.currentMessage()
 
     # Quit, with the real Store.close run and then held: the interval Codex
     # found, after the database is closed and before cleanup returns.

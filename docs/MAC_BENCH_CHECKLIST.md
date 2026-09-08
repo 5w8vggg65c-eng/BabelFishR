@@ -1,7 +1,7 @@
 # BabelFishR — Mac bench checklist (no Terminal needed)
 
 **This checklist is for the next candidate build — one made from a commit that
-includes these features (sections I–M are new and are not in run 21).** Do not run it against the candidate you already have
+includes these features (sections I–N are new and are not in run 21).** Do not run it against the candidate you already have
 installed: several steps below describe behaviour that build does not contain,
 so they would fail for the wrong reason. Wait for a new download link.
 
@@ -328,6 +328,23 @@ to fifteen seconds without a pause, then act immediately.
     and responsive, then quits by itself. Reopen: the transmission that was
     still open when you quit is there, recorded and transcribed. *Bad:* a
     message that shows as captured but never transcribed, or no message.
+
+## N. Search and Review stay true while monitoring (new)
+
+Not in run 21 or any later build yet; needs a future candidate. Automated
+tests cover it on Linux only.
+
+47. Start monitoring and say a distinctive word - for example "pineapple" -
+    once, clearly. Wait for its transcript. Then choose **View → Search…**,
+    type `pineapple`, press Return. *Good:* only the message with that word
+    is shown and the bottom line says "1 match(es)".
+48. Still monitoring, say a sentence *without* the word. Wait for its
+    transcript. *Good:* it does not appear in the search view and the bottom
+    line still says "1 match(es)". Now say a sentence *with* the word.
+    *Good:* it appears at the top and the bottom line says "2 match(es)".
+    *Bad:* messages without the word appearing in the list.
+49. Choose **View → Show all transmissions**. *Good:* every message is back,
+    newest first, and new messages keep arriving at the top.
 
 ---
 

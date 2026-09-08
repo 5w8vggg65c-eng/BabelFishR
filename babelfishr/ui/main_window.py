@@ -85,6 +85,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # timer callback or control here may read it.
         self._store_off_limits = False
         self._waiting_for_dialog = False
+        # What the thread is showing: the Session's thread, a Search result
+        # or the Review queue. Live events are admitted through the same
+        # store query that opened the view, so what arrives cannot widen it.
+        self._view_kind = "thread"
+        self._view_query = ""
         self._readiness = None
         self._theming = False
         self._readiness_worker = None
@@ -883,15 +888,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"⚠ clipping ({reading.clip_count})" if reading.clip_count else "")
             elif event.kind == "state":
                 self._set_state(event.payload)
-            elif event.kind == "transmission":
+            elif event.kind in ("transmission", "updated"):
                 # Only into the thread it was actually filed under. An
                 # operator reviewing history must not see live traffic
-                # appear in the Session they are reading.
+                # appear in the Session they are reading - and a Search or
+                # Review view admits only what its own query admits.
                 if self._belongs_here(event.payload):
-                    self.timeline.add(event.payload)
-            elif event.kind == "updated":
-                if self._belongs_here(event.payload):
-                    self.timeline.update(event.payload)
+                    self._admit(event.payload, arrival=event.kind == "transmission")
             elif event.kind == "audio-status":
                 payload = event.payload or {}
                 kind = payload.get("kind", "")
@@ -914,6 +917,52 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.status.showMessage(
                     f"{payload.get('stage', 'processing')} error: "
                     f"{payload.get('message', '')}", 12000)
+
+    def _admit(self, tx, arrival: bool) -> None:
+        """Show a live transmission or update as the current view allows.
+
+        The Session's own thread takes every arrival at the top and every
+        update in place, as before. A Search or Review view is different: it
+        is the answer to a question, so the question is asked again - the
+        very store query that opened the view, with its scope and limit -
+        and the view is reconciled to the answer. A record that qualifies is
+        placed where its time puts it (updated in place if already shown); one
+        that does not, or has stopped qualifying, leaves; nothing else on
+        screen moves, and the count in the status line stays truthful. An
+        earlier version added every same-Session arrival to whatever was on
+        screen, so a Search for one word filled up with unrelated traffic.
+        """
+        if self._view_kind == "thread":
+            if arrival:
+                self.timeline.add(tx)
+            else:
+                self.timeline.update(tx)
+            return
+        results = self._view_results()
+        wanted = {t.id: t for t in results}
+        if tx.id in wanted:
+            self.timeline.place(wanted[tx.id])     # the row as the store has it
+        for shown in self.timeline.order():
+            if shown not in wanted:
+                self.timeline.remove(shown)        # stopped qualifying, or beyond the limit
+        self._announce_view(len(results))
+
+    def _view_results(self):
+        if self._view_kind == "search":
+            return self.app.search(self._view_query)
+        if self._view_kind == "review":
+            return self.app.review_queue()
+        return []
+
+    def _announce_view(self, count: int) -> None:
+        if self._view_kind == "search":
+            self.status.showMessage(
+                f"{count} match(es) for {self._view_query!r} - View > Show all "
+                f"transmissions to go back", 10000)
+        elif self._view_kind == "review":
+            self.status.showMessage(
+                f"{count} transmission(s) need review - View > Show all "
+                f"transmissions to go back", 10000)
 
     def _belongs_here(self, tx) -> bool:
         """Is this transmission part of the Session currently on screen?
@@ -1478,6 +1527,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Restore the selected Session's thread, newest transmission first."""
         if self._store_gone():
             return
+        self._view_kind, self._view_query = "thread", ""
         self.timeline.set_transmissions(self.app.recent_transmissions(
             include_hidden=self._showing_removed()))
 
@@ -1653,19 +1703,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if not ok or self._store_gone():
             return
         results = self.app.search(text)
+        self._view_kind, self._view_query = "search", text
         self.timeline.set_transmissions(results)
-        self.status.showMessage(
-            f"{len(results)} match(es) for {text!r} - View > Show all "
-            f"transmissions to go back", 10000)
+        self._announce_view(len(results))
 
     def _show_review_queue(self) -> None:
         if self._store_gone():
             return
         results = self.app.review_queue()
+        self._view_kind, self._view_query = "review", ""
         self.timeline.set_transmissions(results)
-        self.status.showMessage(
-            f"{len(results)} transmission(s) need review - View > Show all "
-            f"transmissions to go back", 10000)
+        self._announce_view(len(results))
 
     def _show_assistant(self) -> None:
         from .setup_assistant import SetupAssistant
