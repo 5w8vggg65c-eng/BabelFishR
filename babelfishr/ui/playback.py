@@ -251,7 +251,18 @@ class PlaybackController(QtCore.QObject):
         self._duration_ms = 0
         self._state = PLAYING
         self.backend.load(self.path)
+        if tx_id in self.last_error:
+            # The backend reported an error while loading - synchronously,
+            # before returning. _on_error has already retired this request
+            # and recorded the reason; nothing is played and nothing is
+            # claimed. An earlier version pressed play regardless and
+            # returned True. (A backend that *finishes* synchronously - the
+            # fire-and-forget system player - records no error and is a
+            # success: the recording was handed over.)
+            return False
         self.backend.play()
+        if tx_id in self.last_error:
+            return False               # the same, from play() itself
         self.changed.emit()
         return True
 
@@ -326,11 +337,21 @@ class PlaybackController(QtCore.QObject):
         self._retire()
 
     def _fail(self, tx_id: str, message: str) -> None:
+        """A request for *this* recording could not be honoured.
+
+        Scoped to that recording. If it is the one playing, it is retired -
+        backend stopped, ownership released. If another recording is playing
+        it is left exactly as the backend has it: owner, state, position and
+        controls. An earlier version set the shared state to STOPPED for
+        every failure, so a missing file on B collapsed A's controls while
+        the backend went on playing A with nothing left to stop it.
+        """
         if self.owner == tx_id:
             self.backend.stop()
             self.owner = None
             self.path = ""
-        self._state = STOPPED
+            self._state = STOPPED
+            self._duration_ms = 0
         self.last_error[tx_id] = message
         self.changed.emit()
 

@@ -559,6 +559,13 @@ class TransmissionBubble(QtWidgets.QFrame):
         if error:
             self.status_label.setText(f"Could not play: {error}")
             self.status_label.setToolTip(error)
+            self._playback_error_shown = True
+        elif getattr(self, "_playback_error_shown", False):
+            # The error is gone (a retry succeeded): the line goes back to
+            # describing the message, not a failure that is no longer true.
+            self._playback_error_shown = False
+            self.status_label.setToolTip("")
+            self.update_from(self.tx)
 
     # -- actions ---------------------------------------------------------
 

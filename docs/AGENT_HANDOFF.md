@@ -3838,3 +3838,130 @@ results, not an independent rerun; no Mac.
 - F3, F4 deferred; F6/F7, F8/F9 outside; playback boundary/seek/collapse,
   removal semantics and General unresolved; no candidate contains any of
   the shutdown passes.
+
+---
+
+# Filtered live views (F3) and playback ownership (F4)
+
+Both defects were reproduced again by Codex at `f2c6b80` and reproduced here
+against the same baseline before any production change (the corroboration
+scripts from the earlier pass: the Search view `['tx1']` became
+`['tx3','tx1']` on a non-matching same-Session arrival and the Review view
+gained a confident record; B's missing file left A reading STOPPED with its
+controls collapsed while the backend went on playing A with no stop call).
+Two separately reviewable commits.
+
+## Identifiers
+
+| | |
+|---|---|
+| Base | `f2c6b80` — verified equal to the remote tip at the start, worktree clean |
+| F3 commit | `336923d` |
+| F4 commit | the commit carrying this section (`git log -1 -- docs/AGENT_HANDOFF.md`) |
+| Branch | `claude/radio-decoder-translator-0oslya` |
+| Workflow / tag / release / packaging / logo | nothing dispatched, retried, created, moved, published or changed |
+
+## F3 — the view admits only what its query admits (my design, following Codex's recommendation)
+
+The window remembers what it shows (`_view_kind`: thread, search or
+review; `_view_query`). Every admitted transmission or update goes through
+`_admit()`: the Session's thread takes arrivals at the top and updates in
+place, as before; a Search or Review view re-runs the very store query that
+opened it (`app.search(query)` / `app.review_queue()` - same scope, same
+semantics, same limit) and reconciles the view to that answer: a record
+that qualifies is placed by `TimelineView.place()` where its time puts it
+(updated in place if shown), one that does not, or has stopped qualifying,
+is removed, anything the bounded result no longer holds is removed, and
+the status count is re-announced. No separate matcher; the Store remains
+the behavioural reference, including `review_queue`'s own rules
+(`reviewed = 0 AND hidden = 0 AND (failed OR confidence below threshold)`),
+which are not `Transmission.needs_review`. Show all, Session switch and
+the removed-messages toggle reload the thread and reset the view; a
+cancelled Search changes nothing. Cost: one store query per admitted event
+while a filtered view is open - a choice made over rebuilding widgets
+(F7), noted, not measured here.
+
+## F4 — a failed request touches only its recording
+
+`_fail()` retires the recording only when it is the owner; otherwise
+A's owner, state, position and controls stay as the backend has them and
+B records and shows its own error. `play()` now checks, after `load()` and
+after `play()`, whether the backend recorded an error for this request
+synchronously (`tx_id in last_error`) and returns False rather than
+pressing play and claiming success; a backend that *finishes*
+synchronously - the fire-and-forget system player - records no error and
+remains a success (that distinction was found by the existing system-
+backend test failing against a first, state-based check). A bubble whose
+playback error has cleared (a retry succeeded) returns its status line to
+the message. The five-second threshold, seek amount, collapse at natural
+completion and removal semantics are untouched.
+
+## Tests
+
+`tests/test_alpha5_filtered_views.py` (5) and
+`tests/test_alpha5_playback_ownership.py` (6); all real Qt offscreen; the
+filter tests reach Search and Review through two real menu clicks (the
+Search text dialog substituted to type the word) and deliver persisted
+records through the production event queue drained by the window's timer;
+the playback tests use two real bubbles, real button clicks and the
+scripted backend from `test_alpha5_playback.py` (imported by path), with
+explicit assertions on controller state, backend state, owner, position,
+controls and backend stop calls. The anchoring test measures the anchored
+bubble's viewport y before and after a filtered arrival lands above it and
+a bubble above grows; list order is not used as a substitute.
+
+Fail-before (production files restored from `f2c6b80`): 8 of 11 fail; the
+three that pass are preservation guards (Session switch restores the
+thread; anchoring, which the old code also kept; owner failure, natural
+end, Stop and takeover). Test hygiene: the tautological
+`assert "match" in … or window.timeline.count() >= 0` in
+`test_menus_and_shortcuts_cannot_reach_the_store_during_final_cleanup`
+became `window.timeline.order() == [t.id for t in app.review_queue()]` plus
+the "need review" status - a known result. No other existing assertion
+changed.
+
+## Evidence (this pass)
+
+Environment: Linux container, Python 3.11, PySide6 Essentials (no
+QtMultimedia - the QtMultimedia-backed playback tests skip here, as
+before), `QT_QPA_PLATFORM=offscreen`, fake engines, isolated temporary
+homes and recordings, no cloud provider; nothing of Eric's touched.
+
+| Check | Result |
+|---|---|
+| F3 reproduction, `f2c6b80` | Search view `['tx1']` -> `['tx3','tx1']` on a non-matching arrival; Review view gained a confident record. After repair: not reproduced (view unchanged, count unchanged) |
+| F4 reproduction, `f2c6b80` | B's missing file -> A `STOPPED`, owner `None`, controls collapsed, backend still playing A, no stop call. After repair: A `PLAYING`, owner `a`, position kept, controls shown, B shows its own error |
+| New tests | 11 (5 filtered views, 6 playback ownership), all pass |
+| Fail-before (production restored from `f2c6b80`) | 8 of 11 fail; guards that pass: Session switch, anchoring, owner-failure/natural-end/Stop/takeover |
+| Focused | filtered views + ownership + boundary: 17 passed; ownership + `test_alpha5_playback.py`: 27 passed, 2 skipped; the 30 lifecycle/shutdown/cleanup/boundary tests with the nearest suites: 150 passed, 2 skipped |
+| Full suite | 934 passed, 11 skipped, 0 failed, 172 s |
+| Skips (11) | 2 QtMultimedia not installed; 1 CoreAudio needs macOS; 1 PlistBuddy macOS only; 5 no prepared Whisper model; 2 no Argos language pack |
+| `git diff --check`, `compileall` | clean |
+
+Mutations (one reversal at a time, the named test run, files byte-restored):
+
+| Mutation | Test | Verdict |
+|---|---|---|
+| R1 `_admit` ignores the view's query, every arrival added (F3 root reversed) | `test_search_view_admits_only_what_the_search_admits` | caught |
+| R2 the explicit `else: remove(tx.id)` branch dropped | same | equivalent - the reconcile loop already removes it; the branch was removed from production as redundant |
+| R2b the reconcile loop removed | same | caught (`['tx5','tx3','tx1','tx0'] != ['tx5','tx3','tx0']`) |
+| R3 `place()` always inserts at the top | same | caught |
+| R4 Review view reconciled against the thread, not the review queue | `test_review_view_admits_only_what_the_review_queue_admits` | caught |
+| R5 status count not refreshed | `test_search_view_admits_only_what_the_search_admits` | caught |
+| R6 `_fail` sets shared STOPPED for any recording (F4 root reversed) | `test_bs_missing_file_leaves_a_playing_a_long_recording` | caught |
+| R7 `play()` presses play and claims success after a failed load | `test_a_backend_that_rejects_the_file_on_load_gives_no_false_start` | caught |
+
+No uncaught, non-equivalent mutation.
+
+## Unresolved ledger, updated
+
+- F3 and F4 repaired here; not seen on a Mac (checklist N and O, steps
+  47-50, marked for a future candidate).
+- F6/F7 measured, unrepaired; F8/F9 recommendations; playback boundary,
+  seek steps, collapse at natural completion, removal semantics, General:
+  unresolved; logo (white on black,
+  https://chatgpt.com/s/m_6aa0578e4c248191bc16f0fd776186e4) pending for the
+  assets pass; no candidate contains the shutdown or these passes; run 21
+  historical; no forced cancellation/exit.
+- The filtered view re-queries the store per admitted event; its cost at
+  large thread sizes belongs with F6/F7.

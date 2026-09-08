@@ -1,7 +1,7 @@
 # BabelFishR — Mac bench checklist (no Terminal needed)
 
 **This checklist is for the next candidate build — one made from a commit that
-includes these features (sections I–N are new and are not in run 21).** Do not run it against the candidate you already have
+includes these features (sections I–O are new and are not in run 21).** Do not run it against the candidate you already have
 installed: several steps below describe behaviour that build does not contain,
 so they would fail for the wrong reason. Wait for a new download link.
 
@@ -345,6 +345,18 @@ tests cover it on Linux only.
     *Bad:* messages without the word appearing in the list.
 49. Choose **View → Show all transmissions**. *Good:* every message is back,
     newest first, and new messages keep arriving at the top.
+
+## O. Playback with a second message (new)
+
+Not in run 21 or any later build yet; needs a future candidate.
+
+50. With two messages longer than five seconds, press **▶ Play** on the
+    older one and, while it plays, press **▶ Play** on the newer one.
+    *Good:* the older one's controls collapse and the newer one's expand;
+    one recording plays at a time. Press **■ Stop**. *Good:* the controls
+    collapse and the sound stops.
+    (The case of a message whose recording file has gone missing cannot be
+    arranged by clicking alone; it is covered by automated tests only.)
 
 ---
 
