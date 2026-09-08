@@ -18,7 +18,7 @@ import pathlib
 import shutil
 import sqlite3
 import threading
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .models import (ContentClass, Conversation, ErrorInfo, ProcessingState,
                      RadioProfile, Session, SourceLanguageMode,
@@ -231,6 +231,9 @@ class Store:
         self.recordings_dir = pathlib.Path(
             recordings_dir or (pathlib.Path(self.path).parent / "recordings"))
         self._lock = threading.RLock()
+        #: Bumped on every transmission save. A cached picture of which files
+        #: retained messages refer to is valid only while this has not moved.
+        self._writes = 0
         if self.path != ":memory:":
             pathlib.Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
@@ -436,6 +439,7 @@ class Store:
                 tuple(payload.values()))
             self._index_fts(tx)
             self._conn.commit()
+            self._writes += 1
         return tx
 
     def _index_fts(self, tx: Transmission) -> None:
@@ -552,13 +556,14 @@ class Store:
         in them (removed-from-view ones included), and those messages' files
         sorted the same way a single deletion sorts them."""
         inventory = ConversationInventory(conversation_id=conversation_id)
+        references = self.retained_references()
         for session_id in self.session_ids_for_conversation(conversation_id):
             inventory.session_ids.append(session_id)
             for tx in self.list_transmissions(session_id=session_id,
                                               limit=1_000_000,
                                               include_hidden=True):
                 inventory.transmission_ids.append(tx.id)
-                files = self.deletion_inventory(tx, owned_roots)
+                files = self.deletion_inventory(tx, owned_roots, references)
                 inventory.owned += files.owned
                 inventory.external += files.external
                 inventory.shared += files.shared
@@ -581,11 +586,16 @@ class Store:
             raise ValueError("the default General Session cannot be deleted")
         report = ConversationReport(conversation_id=conversation_id,
                                     name=conversation.name)
+        # One picture of what retained messages refer to, kept current as
+        # rows go (each deletion forgets its own id) and rebuilt by the
+        # single-message path if anything was saved meanwhile.
+        references = self.retained_references()
         for session_id in self.session_ids_for_conversation(conversation_id):
             for tx in self.list_transmissions(session_id=session_id,
                                               limit=1_000_000,
                                               include_hidden=True):
-                one = self.delete_transmission_permanently(tx.id, owned_roots)
+                one = self.delete_transmission_permanently(tx.id, owned_roots,
+                                                           references)
                 if one is not None:
                     report.messages.append(one)
             with self._lock:
@@ -761,7 +771,9 @@ class Store:
         return [_from_row(r) for r in rows]
 
     def deletion_inventory(self, tx: Transmission,
-                           owned_roots: Sequence[str]) -> "DeletionInventory":
+                           owned_roots: Sequence[str],
+                           references: Optional["RetainedReferences"] = None
+                           ) -> "DeletionInventory":
         """Everything a permanent deletion would touch, and what it would not.
 
         Files are sorted into three piles before anything is removed:
@@ -776,8 +788,16 @@ class Store:
 
         Paths come from the message's own fields and every analysis attempt's
         artifacts and derived input; nothing is expanded, globbed or walked.
+
+        Sharing is decided against :meth:`retained_references` - every path a
+        retained row refers to, decoded from its stored form and normalised
+        the same way the candidate is - so a quotation mark or an accented
+        character in a path, or a different spelling of the same file, cannot
+        hide a reference. ``references`` may be a map the caller already
+        built; it is reused only while no save has happened since.
         """
         roots = [pathlib.Path(os.path.realpath(r)) for r in owned_roots if r]
+        references = self._current_references(references)
         candidates: List[str] = []
         for path in (tx.audio_path, tx.processed_audio_path):
             if path:
@@ -804,24 +824,73 @@ class Store:
             if not inside:
                 inventory.external.append(path)
                 continue
-            if self._referenced_elsewhere(path, tx.id):
+            reason = references.why_shared(path, tx.id)
+            if reason:
                 inventory.shared.append(path)
+                inventory.reasons[path] = reason
                 continue
             inventory.owned.append(path)
         return inventory
 
+    def retained_references(self) -> "RetainedReferences":
+        """Every file a transmission row still refers to, by normalised path.
+
+        Read from the rows, not matched against their text. The earlier check
+        ran ``LIKE '%path%'`` over the stored analysis JSON, in which a
+        quotation mark is written ``\\"`` and a non-ASCII character as a
+        ``\\uXXXX`` escape - so exactly those paths were never found, and a
+        file another message still used could be deleted. Every reference is
+        decoded, then keyed by :func:`_same_file_key`, the normalisation the
+        ownership check applies to a candidate.
+
+        A row whose analysis record cannot be read is remembered as
+        unreadable rather than treated as referencing nothing: while any such
+        row is retained, every candidate is treated as possibly shared.
+        """
+        references = RetainedReferences(stamp=self._writes)
+        rows = self._conn.execute(
+            "SELECT id, audio_path, processed_audio_path, analysis_attempts "
+            "FROM transmissions").fetchall()
+        for row in rows:
+            tx_id = row["id"]
+            references.add(tx_id, row["audio_path"])
+            references.add(tx_id, row["processed_audio_path"])
+            raw = row["analysis_attempts"]
+            if not raw or raw == "[]":
+                continue
+            try:
+                attempts = json.loads(raw)
+                if not isinstance(attempts, list):
+                    raise ValueError("analysis_attempts is not a list")
+                for attempt in attempts:
+                    if not isinstance(attempt, dict):
+                        raise ValueError("analysis attempt is not an object")
+                    references.add(tx_id, attempt.get("input_path"))
+                    artifacts = attempt.get("artifacts") or []
+                    if not isinstance(artifacts, list):
+                        raise ValueError("artifacts is not a list")
+                    for artifact in artifacts:
+                        if not isinstance(artifact, dict):
+                            raise ValueError("artifact is not an object")
+                        references.add(tx_id, artifact.get("path"))
+            except (ValueError, TypeError):
+                references.unreadable.add(tx_id)
+        return references
+
+    def _current_references(self, references: Optional["RetainedReferences"]
+                            ) -> "RetainedReferences":
+        """The caller's map if nothing has been saved since it was built."""
+        if references is None or references.stamp != self._writes:
+            return self.retained_references()
+        return references
+
     def _referenced_elsewhere(self, path: str, except_id: str) -> bool:
-        like = f"%{path}%"
-        row = self._conn.execute(
-            """SELECT 1 FROM transmissions
-               WHERE id != ? AND (audio_path = ? OR processed_audio_path = ?
-                                  OR analysis_attempts LIKE ?) LIMIT 1""",
-            (except_id, path, path, like)).fetchone()
-        return row is not None
+        return bool(self.retained_references().why_shared(path, except_id))
 
     def delete_transmission_permanently(self, tx_id: str,
-                                        owned_roots: Sequence[str]
-                                        ) -> Optional["DeletionReport"]:
+                                        owned_roots: Sequence[str],
+                                        references: Optional["RetainedReferences"]
+                                        = None) -> Optional["DeletionReport"]:
         """Delete one message and the files that are its alone.
 
         Order: the tombstone and the row go first, in one transaction, so a
@@ -830,20 +899,28 @@ class Store:
         unlinked individually - never a directory. A file that will not go is
         recorded on the tombstone as a leftover and reported; the deletion is
         not called complete while one remains.
+
+        The whole of it runs under the store's lock. Deciding that a file is
+        unshared and unlinking it are therefore one step with respect to
+        every other writer: a worker's save that would add a reference to
+        the file waits until the deletion has finished, and the decision is
+        made against the rows as they stand at the moment of removal.
         """
-        tx = self.get_transmission(tx_id)
-        if tx is None:
-            return None
-        inventory = self.deletion_inventory(tx, owned_roots)
         with self._lock:
+            tx = self.get_transmission(tx_id)
+            if tx is None:
+                return None
+            references = self._current_references(references)
+            inventory = self.deletion_inventory(tx, owned_roots, references)
             self._tombstone(tx_id, tx.session_id, inventory.owned)
             self._conn.execute("DELETE FROM transmissions WHERE id = ?", (tx_id,))
             if self.fts_enabled:
                 self._conn.execute("DELETE FROM transmissions_fts WHERE id = ?",
                                    (tx_id,))
             self._conn.commit()
-        report = DeletionReport(transmission_id=tx_id, inventory=inventory)
-        self._unlink_owned(report)
+            references.forget(tx_id)
+            report = DeletionReport(transmission_id=tx_id, inventory=inventory)
+            self._unlink_owned(report)
         return report
 
     def _unlink_owned(self, report: "DeletionReport") -> None:
@@ -894,34 +971,50 @@ class Store:
         return out
 
     def retry_leftover_deletions(self, owned_roots: Sequence[str]
-                                 ) -> Dict[str, List[str]]:
-        """Try again for every leftover. Returns what is *still* left."""
+                                 ) -> "LeftoverRetry":
+        """Try again for every leftover, re-checking ownership *and* sharing
+        as they stand now.
+
+        A leftover was this message's alone when the message was deleted.
+        That was true then. If a retained message has since come to refer to
+        the same file, the file is that message's now: it is preserved, taken
+        off the leftover list because nothing is left for the tombstone to
+        remove, and reported as kept - never as removed, and never handed to
+        the unlink. The earlier version trusted the original inventory and
+        deleted it.
+        """
         roots = [pathlib.Path(os.path.realpath(r)) for r in owned_roots if r]
-        still: Dict[str, List[str]] = {}
-        for tx_id, files in self.leftover_deletions().items():
-            remaining: List[str] = []
-            for path in files:
-                p = pathlib.Path(path)
-                real = pathlib.Path(os.path.realpath(path))
-                if not any(_is_within(real, root) for root in roots) or p.is_symlink():
-                    remaining.append(path)     # no longer ours to remove
-                    continue
-                try:
-                    if p.is_dir():
-                        raise IsADirectoryError(path)
-                    p.unlink()
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    remaining.append(path)
-            with self._lock:
+        result = LeftoverRetry()
+        with self._lock:
+            references = self.retained_references()
+            for tx_id, files in self.leftover_deletions().items():
+                remaining: List[str] = []
+                for path in files:
+                    p = pathlib.Path(path)
+                    real = pathlib.Path(os.path.realpath(path))
+                    if (not any(_is_within(real, root) for root in roots)
+                            or p.is_symlink()):
+                        remaining.append(path)     # no longer ours to remove
+                        continue
+                    if references.why_shared(path, tx_id):
+                        result.preserved.setdefault(tx_id, []).append(path)
+                        continue
+                    try:
+                        if p.is_dir():
+                            raise IsADirectoryError(path)
+                        p.unlink()
+                        result.removed.append(path)
+                    except FileNotFoundError:
+                        result.already_gone.append(path)
+                    except OSError:
+                        remaining.append(path)
                 self._conn.execute(
                     "UPDATE deleted_transmissions SET leftover_files = ? WHERE id = ?",
                     (json.dumps(remaining), tx_id))
                 self._conn.commit()
-            if remaining:
-                still[tx_id] = remaining
-        return still
+                if remaining:
+                    result.still[tx_id] = remaining
+        return result
 
     # ---- search --------------------------------------------------------
     def search(self, query: str = "", *, session_id: Optional[str] = None,
@@ -1053,6 +1146,57 @@ class DeletionInventory:
     owned: List[str] = dataclasses.field(default_factory=list)
     external: List[str] = dataclasses.field(default_factory=list)
     shared: List[str] = dataclasses.field(default_factory=list)
+    #: Why each shared path is shared: the id still referring to it, or the
+    #: unreadable record that means it might.
+    reasons: Dict[str, str] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
+class LeftoverRetry:
+    """What Finish unfinished deletions did, file by file."""
+
+    still: Dict[str, List[str]] = dataclasses.field(default_factory=dict)
+    preserved: Dict[str, List[str]] = dataclasses.field(default_factory=dict)
+    removed: List[str] = dataclasses.field(default_factory=list)
+    already_gone: List[str] = dataclasses.field(default_factory=list)
+
+    @property
+    def preserved_paths(self) -> List[str]:
+        return [p for files in self.preserved.values() for p in files]
+
+
+class RetainedReferences:
+    """Which retained transmissions refer to which files, by normalised path.
+
+    ``stamp`` is the store's write counter when this was built; the store
+    rebuilds rather than reuse a map that any save has outdated.
+    """
+
+    def __init__(self, stamp: int):
+        self.stamp = stamp
+        self.by_key: Dict[str, Set[str]] = {}
+        self.unreadable: Set[str] = set()
+
+    def add(self, tx_id: str, path: Optional[str]) -> None:
+        if path:
+            self.by_key.setdefault(_same_file_key(path), set()).add(tx_id)
+
+    def forget(self, tx_id: str) -> None:
+        """A row is gone: it refers to nothing any more."""
+        for ids in self.by_key.values():
+            ids.discard(tx_id)
+        self.unreadable.discard(tx_id)
+
+    def why_shared(self, path: str, except_id: str) -> str:
+        """Why this file must be kept, or "" when no retained row refers to it."""
+        others = self.by_key.get(_same_file_key(path), set()) - {except_id}
+        if others:
+            return f"still used by message {sorted(others)[0]}"
+        unreadable = self.unreadable - {except_id}
+        if unreadable:
+            return (f"the analysis record of message {sorted(unreadable)[0]} "
+                    f"could not be read, so it may still use this file")
+        return ""
 
 
 @dataclasses.dataclass
@@ -1099,6 +1243,17 @@ class ConversationReport:
     @property
     def complete(self) -> bool:
         return not self.failed
+
+
+def _same_file_key(path: str) -> str:
+    """One spelling for one file - the ownership check's own normalisation.
+
+    ``realpath`` collapses ``/./`` and ``..`` segments and follows symlinks,
+    so a reference written another way, or through a link, names the same
+    key as the candidate it protects. Case is left alone, as the ownership
+    check leaves it: the application only ever stores paths it produced.
+    """
+    return os.path.realpath(path)
 
 
 def _is_within(path: pathlib.Path, root: pathlib.Path) -> bool:

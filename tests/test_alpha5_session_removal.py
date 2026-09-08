@@ -367,7 +367,7 @@ def test_an_unremovable_file_is_reported_and_left_for_retry(qt_app, config, stor
     assert shown["warning"] and str(stuck) in shown["warning"][0][2]
     assert store.leftover_deletions() == {ops_txs[0]: [str(stuck)]}
     monkeypatch.setattr(pathlib.Path, "unlink", real_unlink)
-    assert app.retry_leftover_deletions() == {}
+    assert app.retry_leftover_deletions().still == {}
     assert not stuck.exists()
     window.close()
 

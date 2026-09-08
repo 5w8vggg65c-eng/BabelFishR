@@ -1606,16 +1606,21 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self, "Unfinished deletions", "Nothing is left to delete.")
             return
-        still = self.app.retry_leftover_deletions()
-        done = sum(len(v) for v in before.values()) - sum(len(v) for v in still.values())
-        if still:
-            remaining = "\n".join(p for files in still.values() for p in files)
+        result = self.app.retry_leftover_deletions()
+        done = len(result.removed) + len(result.already_gone)
+        summary = f"Removed {done} file(s)."
+        if result.preserved_paths:
+            kept = "\n".join(result.preserved_paths)
+            summary += (f"\n\nKept {len(result.preserved_paths)} file(s) that "
+                        f"another message now uses:\n{kept}")
+        if result.still:
+            remaining = "\n".join(p for files in result.still.values() for p in files)
             QtWidgets.QMessageBox.warning(
                 self, "Unfinished deletions",
-                f"Removed {done} file(s). Still could not remove:\n\n{remaining}")
+                f"{summary}\n\nStill could not remove:\n\n{remaining}")
         else:
             QtWidgets.QMessageBox.information(
-                self, "Unfinished deletions", f"Removed {done} file(s). All done.")
+                self, "Unfinished deletions", f"{summary} All done.")
 
     def _search(self) -> None:
         text, ok = QtWidgets.QInputDialog.getText(
