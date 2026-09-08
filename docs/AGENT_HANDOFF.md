@@ -3182,3 +3182,202 @@ throwaway messages and a throwaway Session first and to act only on those.
   clearing on stop: no specifically identified operator result.
 - Direct electrical radio/PTT/USB connections, SDR, RF metadata, transmitter
   identification: unverified.
+
+---
+
+# First repair pass after the independent corroboration — worker lifetime, shutdown, shared recordings
+
+Written for whoever picks this up next. Two repairs, separately reviewable:
+**A** (lifecycle: `pipeline.py`, `app.py`, `ui/main_window.py`) and **B**
+(shared recordings: `storage.py`, the retry report in `ui/main_window.py`, one
+existing test's assertion). Nothing else in scope was touched: no playback,
+removal-policy, General, paging or dependency-pinning decisions were made.
+
+## Identifiers
+
+| | |
+|---|---|
+| Base | `21be6b0` — verified equal to `origin/claude/radio-decoder-translator-0oslya` at the start of the pass, worktree clean |
+| Repair A commit | `3dbef42` (3dbef42c9c74a47980561dd71e1cc9a8b22094aa) |
+| Repair B commit | `4e6d84d` (4e6d84d10819fd9c42dc0d189cb32b1472057be3) |
+| Docs commit | the commit carrying this section (the branch tip) |
+| Branch | `claude/radio-decoder-translator-0oslya` |
+| Workflow / tag / release | none dispatched, retried, created, moved or published |
+
+## Repair A — ownership and the shutdown sequence
+
+**Accounting.** A transmission id is *in flight* from the moment
+`ProcessingPipeline.submit()` accepts it until the worker that ran it has
+finished with it: queued, dequeued-but-not-yet-running, and running are all
+the same set (`_in_flight`), and `pending` is its size. The earlier
+`queue.qsize() + _active` read zero between `queue.get()` and the `_active`
+increment — the hand-off the corroboration reproduced. Admission and
+accounting share one lock; `submit()` refuses (`ProcessingStopped`) once a
+stop has begun and returns `False` for an id already in flight instead of
+queueing it twice.
+
+**Stopping.** `stop()` closes admission first, then signals and joins, and
+*keeps* any thread that outlives the join (`finished`, `worker_threads()`,
+`shutting_down`); it returns whether every worker actually ended. It no longer
+clears the thread list after a timed join. `stop_if_idle()` is the atomic
+form: idle check and admission close under the same lock, so nothing can land
+between "nothing pending" and "stopped". A worker told to stop refuses to
+call an engine for a stage it has not started (`_engine_gate`): the stage is
+recorded as failed, for that reason, and the message stays retryable — the
+transcript already saved is kept.
+
+**Ownership, in order.** `BabelFishRApp` owns the capture, the live pipeline,
+the standalone pipeline, the engines and the store.
+
+1. `stop_session()` stops the capture (bounded join; a thread that does not
+   return is kept as `_lingering_capture`, and finishes the run itself), then
+   hands the live pipeline over: idle → stopped at once; busy, or a lingering
+   capture may still hand it a final transmission → it carries on as the
+   *standalone* pipeline, still accepting Retry / Transcribe anyway, counted
+   by every check, and stopped only once idle. Nothing is waited for on the
+   caller's thread. The 30-second wait and 10-second join are gone.
+2. `set_mode()` → `mode_change_problem()` (pending work, then
+   `shutdown_problem()`), then `_retire_processing()` uses `stop_if_idle()`;
+   a straggler or late work raises `ModeChangeRefused` **before**
+   `config.mode` moves and before any engine is closed.
+3. `start_session()` refuses (`ProcessingBusy`) while a stopped processor's
+   worker or a lingering capture is still alive, then discards an idle
+   standalone processor or refuses on a busy one (message unchanged).
+4. `_abandon_failed_start()` stops the just-started workers and tracks a
+   survivor in `_retired` rather than forgetting it.
+5. `close(wait, timeout)` — capture, then the standalone processor's
+   outstanding work, then its workers, then engines, then the store. Each
+   step waits for the previous to be *complete*, never merely timed out. A
+   live worker keeps engines and store open and `close` returns `False`.
+   `wait=True` (CLI, tests) blocks until done or `timeout`; `wait=False`
+   (the window) never blocks.
+
+**The window.** `_stop_monitoring()` returns as soon as the capture has
+stopped; if work is outstanding the badge stays **Transcribing** and the
+status line says how many are finishing (`_truthful_state` now keeps a
+processing state when the capture's final Idle arrives while a processor
+still holds work). `closeEvent()` calls `app.close(wait=False)`; if that is
+not yet possible the event is ignored, the status line says it is quitting
+once N transmissions finish, and a 250 ms timer retries until the application
+closes in order — then the event drain stops (`_shutdown_complete`) so no
+timer callback reaches the closed store. A repeated Quit lands in the same
+path and changes nothing.
+
+**The closed-database traceback, identified.** The corroboration saw
+`sqlite3.ProgrammingError: Cannot operate on a closed database` from
+`_drain_events → _belongs_here → store.is_deleted`. That frame is the
+window's 100 ms `QTimer` slot, i.e. the GUI (main) thread, not a worker:
+the old `close()` had closed the store while the drain timer kept firing.
+`test_the_event_drain_never_touches_a_closed_store` reproduces it on the old
+tree (the drain raised) and asserts `threading.current_thread() is
+threading.main_thread()` at the drain.
+
+**Capture.** `CaptureService.stop()` returns `True` only when the audio
+thread has ended; the final detector flush, safety-recording close and Idle
+state run exactly once (`_finish_once`), on whichever side gets there — the
+caller after a completed join, or the thread on its way out. The last
+detected transmission and its WAV are written either way.
+
+## Repair B — shared recordings
+
+`Store.retained_references()` reads every row's `audio_path`,
+`processed_audio_path` and decoded `analysis_attempts` (each attempt's
+`input_path`, derived or not, and every artifact `path`) and keys them by
+`os.path.realpath` — the ownership check's own normalisation, so `/./`, `..`
+and a symlink to the same file match. The earlier `LIKE '%path%'` over stored
+JSON missed any path with a quotation mark (`\"`) or a non-ASCII character
+(`\uXXXX`), exactly as Codex found; the claim that it could only
+over-estimate sharing was wrong and is withdrawn. A row whose record cannot
+be decoded is remembered as *unreadable*: while one is retained, every
+candidate counts as possibly shared, with the reason recorded
+(`DeletionInventory.reasons`).
+
+`delete_transmission_permanently()` runs entirely under the store lock:
+inventory, tombstone, row delete and unlink are one step against every other
+writer, and a cached reference map is reused only while the store's write
+stamp (`_writes`, bumped on every save) has not moved. Session deletion
+builds the map once and forgets each deleted id.
+
+`retry_leftover_deletions()` re-checks ownership *and* sharing as they stand
+now and returns `LeftoverRetry(still, preserved, removed, already_gone)`: a
+leftover a retained message has since come to use is preserved, taken off
+the leftover list and reported as kept — never unlinked, never reported as
+removed. **Tools › Finish unfinished deletions** says "Kept N file(s) that
+another message now uses". Containment, symlink refusal, tombstones,
+external-file exclusion and General's policy are unchanged.
+
+## Tests
+
+`tests/test_alpha5_lifecycle.py` (12) and `tests/test_alpha5_shared_recordings.py`
+(11). Substitutions, precisely: a holding transcription engine and a fake
+cloud translator are registered with the **production factories** under their
+own ids (the fake cloud under `"claude"`, so `guard_cloud` applies to it as
+to the real one) and selected through `config`; `pathlib.Path.unlink` is
+replaced only to make one named file refuse to go; a `CallbackAudioSource`
+subclass whose `read` ignores its timeout stands for a stuck input. The
+dequeue hold wraps the pipeline queue's `get` so the id is dequeued and not
+yet running when the mode change is attempted.
+
+Against the pre-repair tree (production files restored from `21be6b0`, tests
+unchanged): **22 of 23 fail**; the one that passes,
+`test_an_unshared_owned_file_still_deletes`, is a guard that the ordinary case
+still works, not a defect test. Against the repaired tree: 23 pass.
+
+### Existing tests changed
+
+- `tests/test_alpha5_session_removal.py::test_an_unremovable_file_is_reported_and_left_for_retry`:
+  `assert app.retry_leftover_deletions() == {}` → `.still == {}`. Same intent
+  (everything removed on retry); the method now returns a report rather than
+  a dict, because a preserved file is neither removed nor still failing.
+
+### Mutations (repaired code restored after each; pristine copies compared byte-for-byte)
+
+| # | Mutation | Caught by |
+|---|---|---|
+| M1 | `pending` counts the queue only (the old hand-off gap) | `test_a_job_between_the_queue_and_the_worker_still_counts` |
+| M2 | `stop()` clears the thread list after a timed join | `test_a_worker_that_outlives_the_stop_timeout_stays_tracked` |
+| M3 | `submit()` accepts work after a stop has begun | `test_a_stopped_processor_refuses_new_work_and_is_replaced` |
+| M4 | the window closes the store whatever `app.close` says | `test_quit_waits_on_the_event_loop_and_closes_in_order` |
+| M5 | `stop_session` waits for processing on the GUI thread again | `test_stop_monitoring_returns_at_once_and_the_window_keeps_breathing` |
+| M6 | retry trusts the original inventory (no sharing re-check) | `test_retry_preserves_a_file_a_retained_message_has_since_come_to_use` |
+| M7 | references compared by spelling, not by file | `test_equivalent_spellings_of_the_same_file_count_as_the_same_file` |
+| M8 | an unreadable analysis record counts as no reference | `test_an_unreadable_analysis_record_protects_rather_than_permits` |
+| M9 | artifact paths not read from the analysis record | `test_analysis_artifact_paths_with_accents_and_quotes_protect_the_file` |
+| M10 | sharing decision and unlink no longer one locked step | `test_a_save_that_races_the_deletion_waits_for_it` |
+
+All ten caught (each named test failed); after each, the file was compared
+byte-for-byte with the saved repaired copy and found identical.
+
+## Test results
+
+Full suite after both repairs: **905 passed, 11 skipped** in 158.67 s
+(882 before this pass plus the 23 new tests). Skips are the same eleven as
+before: `test_alpha5_playback.py:516` and `:531` (QtMultimedia is not
+installed here; the packaged app has it), `test_coreaudio.py:255` (needs a
+real macOS host with CoreAudio), `test_packaging.py:373` (PlistBuddy is only
+available on macOS), `test_real_engines.py:32` ×5 (no prepared Whisper model
+at `~/.local/share/BabelFishR/models/small`) and `test_real_engines.py:107` ×2
+(no Argos language pack installed). Focused runs first: the seven existing
+suites nearest the change (172 tests) after Repair A; the removal, storage
+and lifecycle suites (53) after Repair B; the two new files (23). Linux,
+Python 3.11, `QT_QPA_PLATFORM=offscreen`, `-p no:cacheprovider`, mock and
+stand-in engines. `git diff --check` and `compileall` over `babelfishr`,
+`tests` and `packaging` clean. This session's results, not an independent
+rerun.
+
+## Unresolved ledger, updated
+
+- **F1 / F5** — repaired here; on Eric's Mac unverified (checklist section M).
+- **F2** — repaired here, including the JSON-escaping and path-spelling holes
+  Codex found; unverified on the Mac.
+- **F3** live traffic in Search/Review, **F4** other-bubble playback error —
+  deferred to the next correctness pass, unchanged.
+- **F6/F7** scaling, **F8/F9** simplification and pinning — recommendations;
+  not worked.
+- Playback boundary (5.000 s, skips, collapse), removal semantics, General:
+  unapproved, unchanged; this pass is not approval.
+- No candidate containing this or the playback/colour/removal work has been
+  built or confirmed on Eric's Mac.
+- A worker that never returns is now *visible* (Quit waits and says why,
+  Start and mode change refuse); there is still no forced-cancellation or
+  forced-exit policy — deliberately, per the directive.
