@@ -1,7 +1,7 @@
 # BabelFishR — Mac bench checklist (no Terminal needed)
 
 **This checklist is for the next candidate build — one made from a commit that
-includes these features (sections I–L are new and are not in run 21).** Do not run it against the candidate you already have
+includes these features (sections I–M are new and are not in run 21).** Do not run it against the candidate you already have
 installed: several steps below describe behaviour that build does not contain,
 so they would fail for the wrong reason. Wait for a new download link.
 
@@ -298,6 +298,30 @@ tabs, name it `Throwaway`, and record one short message into it.
     count. Click **Delete this Session permanently**.
     *Good:* the tab is gone; General is selected and unchanged; **View → Show
     hidden Sessions** does not show it. Quit and reopen: still gone.
+
+## M. Stopping and quitting while a transcription is still running (new)
+
+BabelFishR no longer freezes while it waits for a transcription to finish.
+This needs a message long enough to still be transcribing when you act, so
+speak for ten to fifteen seconds without a pause, then act immediately.
+
+43. Start monitoring, speak for about fifteen seconds, stop speaking, and the
+    moment the bubble shows **Transcribing…** click **Stop monitoring**.
+    *Good:* the button changes to **Start monitoring** at once; the window
+    still responds (scroll the thread, open a menu); the activity indicator
+    still says **Transcribing** and the bottom line says how many
+    transmissions are still finishing; then the transcript appears in the
+    bubble and the indicator returns to **Idle**. *Bad:* the beachball, or a
+    window that does not repaint for many seconds.
+44. Repeat, and this time press **⌘Q** the moment the bubble shows
+    **Transcribing…**. *Good:* the window stays open and responsive, the
+    bottom line says it is quitting once the transmission finishes, and the
+    application quits by itself when the transcript has been saved. Reopen
+    it: the transcript is there. *Bad:* a frozen window, or a message whose
+    transcript never arrived.
+45. Repeat step 43, and while the indicator still says **Transcribing** click
+    **Start monitoring** again. *Good:* a box explains that a saved
+    recording is still being transcribed and to wait; nothing else changes.
 
 ---
 

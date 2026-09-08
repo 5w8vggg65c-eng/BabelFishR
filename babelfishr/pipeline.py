@@ -178,8 +178,21 @@ def _slug(text: str) -> str:
     return safe.strip("-") or "unnamed"
 
 
+class ProcessingStopped(RuntimeError):
+    """Work was offered to a processor that has already begun shutting down."""
+
+
 class ProcessingPipeline:
-    """Queued transcription and translation, isolated from audio capture."""
+    """Queued transcription and translation, isolated from audio capture.
+
+    Accounting rule: an id is *in flight* from the moment :meth:`submit`
+    accepts it until the worker that ran it has finished with it. That
+    covers three states the queue alone cannot see - queued, dequeued but not
+    yet running, and running - so :attr:`pending` never reads zero while a
+    job is anywhere between acceptance and completion. Admission and
+    accounting share one lock, which is what makes :meth:`stop_if_idle`
+    atomic: no submission can land between "nothing pending" and "stopped".
+    """
 
     def __init__(self, store: Store, transcription: Optional[TranscriptionEngine],
                  translation: Optional[TranslationEngine], config: Config,
@@ -196,14 +209,17 @@ class ProcessingPipeline:
         self._queue: "queue.Queue[Optional[str]]" = queue.Queue()
         self._threads: List[threading.Thread] = []
         self._running = False
+        #: True from start() until the first stop request. Read and written
+        #: only under the accounting lock, so a submission cannot slip into a
+        #: processor that has already begun retiring.
+        self._accepting = False
         self._session: Optional[Session] = None
-        # Work in flight is not in the queue any more but is not done either;
-        # counting only the queue would let a caller stop mid-transcription.
-        self._active = 0
+        #: One lock for admission and accounting.
         self._active_lock = threading.Lock()
         self._idle = threading.Event()
         self._idle.set()
-        #: Ids submitted and not yet finished. Lets the application refuse to
+        #: Ids accepted and not yet finished: queued, dequeued but not yet
+        #: running, or running. Also what lets the application refuse to
         #: delete a message a worker is still writing, and say so.
         self._in_flight: set = set()
 
@@ -218,26 +234,84 @@ class ProcessingPipeline:
         """
         self._session = session
         self._running = True
+        with self._active_lock:
+            self._accepting = True
         for index in range(self.worker_count):
             thread = threading.Thread(target=self._work, daemon=True,
                                       name=f"babelfishr-processing-{index}")
             thread.start()
             self._threads.append(thread)
 
-    def stop(self, wait: bool = True, timeout: float = 10.0) -> None:
+    def stop(self, wait: bool = True, timeout: float = 10.0) -> bool:
+        """Ask the workers to stop, and report whether they all have.
+
+        Admission closes first, under the lock, so nothing is accepted after
+        this point. Work already accepted stays accounted for in
+        :attr:`pending` whether or not it ever runs: a worker leaving because
+        of this call finishes the job it holds and takes nothing new, and an
+        id still queued behind the stop stays in flight rather than being
+        forgotten. What was not done is never reported as done.
+
+        Returns True only when every worker thread has actually ended. A
+        thread that outlives the join is *kept* in ``_threads`` - visible
+        through :attr:`finished` and :meth:`worker_threads` - together with
+        the engines and store it can still reach. An earlier version cleared
+        the list after a timed join, which made a still-running worker
+        invisible to everything that decided whether its engines could be
+        closed or its mode changed.
+        """
+        with self._active_lock:
+            self._accepting = False
         self._running = False
         for _ in self._threads:
             self._queue.put(None)
         if wait:
             for thread in self._threads:
                 thread.join(timeout=timeout)
-        self._threads = []
+        self._threads = [t for t in self._threads if t.is_alive()]
+        return not self._threads
+
+    def stop_if_idle(self, timeout: float = 5.0) -> bool:
+        """Stop only if nothing accepted is unfinished; atomic with admission.
+
+        The idle check and the closing of admission happen under the same
+        lock, so a submission cannot land between "nothing pending" and
+        "stopped". Returns False having changed nothing when work is
+        accounted for, and False with admission closed when a worker outlived
+        the join (see :attr:`finished`); the caller tells the two apart by
+        :attr:`pending`.
+        """
+        with self._active_lock:
+            if self._in_flight:
+                return False
+            self._accepting = False
+        return self.stop(wait=True, timeout=timeout)
 
     @property
     def pending(self) -> int:
-        """Queued work plus work currently being processed."""
+        """Everything accepted and not yet finished, wherever it is."""
         with self._active_lock:
-            return self._queue.qsize() + self._active
+            return len(self._in_flight)
+
+    @property
+    def accepting(self) -> bool:
+        """Still taking work - no stop has begun."""
+        with self._active_lock:
+            return self._accepting
+
+    @property
+    def finished(self) -> bool:
+        """No worker thread is alive. True for a pipeline never started."""
+        return not any(t.is_alive() for t in self._threads)
+
+    @property
+    def shutting_down(self) -> bool:
+        """A stop has begun and at least one worker has not yet returned."""
+        return not self.accepting and not self.finished
+
+    def worker_threads(self) -> List[threading.Thread]:
+        """The worker threads still alive - after a stop, the stragglers."""
+        return [t for t in self._threads if t.is_alive()]
 
     def wait_until_idle(self, timeout: float = 120.0) -> bool:
         """Block until nothing is queued or in flight."""
@@ -250,11 +324,26 @@ class ProcessingPipeline:
             self._idle.wait(timeout=0.05)
         return self.pending == 0
 
-    def submit(self, tx_id: str) -> None:
-        self._idle.clear()
+    def submit(self, tx_id: str) -> bool:
+        """Accept one id. Returns False if it is already in flight.
+
+        An id already accepted is not queued twice: one run is what was asked
+        for, and a second queue entry would let ``pending`` reach zero while
+        that entry still waited. Once a stop has begun this refuses, by
+        exception, rather than dropping the id or queueing it behind a
+        worker that will never take it - the caller learns the processor is
+        retiring and can say so.
+        """
         with self._active_lock:
+            if not self._accepting:
+                raise ProcessingStopped(
+                    "this processor is shutting down and takes no new work")
+            if tx_id in self._in_flight:
+                return False
             self._in_flight.add(tx_id)
+            self._idle.clear()
         self._queue.put(tx_id)
+        return True
 
     def is_in_flight(self, tx_id: str) -> bool:
         with self._active_lock:
@@ -283,7 +372,12 @@ class ProcessingPipeline:
         tx.skip_reason = ""
         self.store.save_transmission(tx)
         self.events.publish("updated", tx)
-        self.submit(tx_id)
+        try:
+            self.submit(tx_id)
+        except ProcessingStopped:
+            # Saved as Captured - honestly pending - but this processor is
+            # retiring and will not run it. The caller reports "not now".
+            return False
         return True
 
     def retry(self, tx_id: str) -> bool:
@@ -295,7 +389,10 @@ class ProcessingPipeline:
         tx.state = ProcessingState.CAPTURED
         self.store.save_transmission(tx)
         self.events.publish("updated", tx)
-        self.submit(tx_id)
+        try:
+            self.submit(tx_id)
+        except ProcessingStopped:
+            return False
         return True
 
     # -- worker ----------------------------------------------------------
@@ -307,18 +404,35 @@ class ProcessingPipeline:
                 continue
             if tx_id is None:
                 break
-            with self._active_lock:
-                self._active += 1
+            # Between the get above and the work below the id is neither
+            # queued nor finished. It stayed in _in_flight the whole way, so
+            # pending never read zero during this hand-off - the gap an
+            # earlier version opened by counting the queue plus a separate
+            # "active" figure that was incremented only here.
             try:
                 self._process(tx_id)
             except Exception:  # noqa: BLE001 - a worker must never die
                 log.exception("unhandled error processing %s", tx_id)
             finally:
                 with self._active_lock:
-                    self._active -= 1
                     self._in_flight.discard(tx_id)
-                    if self._active == 0 and self._queue.empty():
+                    if not self._in_flight:
                         self._idle.set()
+
+    def _engine_gate(self, stage: str) -> None:
+        """Refuse an engine call once this processor has been told to stop.
+
+        Defence in depth behind admission and accounting, not a substitute
+        for them: a mode change is refused while anything is in flight, so
+        this is only reached by a stop that arrived mid-job. The stage is
+        then recorded as failed, for this reason, rather than run on engines
+        that may already belong to a retired mode. The recording and any
+        transcript already saved are untouched and the message is retryable.
+        """
+        if not self._running:
+            raise EngineError(
+                f"processing was stopped before {stage} could run; "
+                f"retry when processing is available again")
 
     def _process(self, tx_id: str) -> None:
         tx = self.store.get_transmission(tx_id)
@@ -375,6 +489,7 @@ class ProcessingPipeline:
 
         try:
             audio, rate = self._load_audio(tx)
+            self._engine_gate("transcription")
             result = self.transcription.transcribe(
                 audio, rate, language=language,
                 vocabulary=self.glossary.vocabulary(language) or None)
@@ -422,6 +537,7 @@ class ProcessingPipeline:
         self.events.publish("state", PipelineState.TRANSLATING)
 
         try:
+            self._engine_gate("translation")
             result = self.translation.translate(
                 tx.transcript, target, source_language=tx.source_language,
                 glossary=self.glossary.mapping(tx.source_language) or None,
@@ -472,30 +588,73 @@ class CaptureService:
 
         self._thread: Optional[threading.Thread] = None
         self._running = False
+        # The end of a run - flushing the last detected transmission, closing
+        # the safety recording - happens exactly once, on whichever side gets
+        # there first: stop() or the audio thread on its way out.
+        self._finish_lock = threading.Lock()
+        self._finished = False
         self.state = PipelineState.IDLE
         self.transmissions_captured = 0
         self._level_divisor = max(1, int(0.1 * source.sample_rate
                                          / max(config.audio.block_size, 1)))
         self._block_count = 0
 
+    #: How long stop() waits for the audio thread before reporting that it
+    #: is still running. A bound on the caller's wait, not on the thread.
+    stop_timeout = 5.0
+
     # -- lifecycle -------------------------------------------------------
     def start(self) -> None:
         self.source.start()
         self._running = True
+        self._finished = False
         self._set_state(PipelineState.LISTENING)
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="babelfishr-capture")
         self._thread.start()
 
-    def stop(self, timeout: float = 5.0) -> None:
+    def stop(self, timeout: Optional[float] = None) -> bool:
+        """Stop the audio thread and finish the run. True once it has.
+
+        The last detected transmission and its recording are written by
+        whichever side gets there first - this call, or the audio thread on
+        its way out - and only once (:meth:`_finish_once`). A thread that has
+        not returned by the timeout is *not* forgotten: it stays referenced
+        (:attr:`alive`), this returns False, and the thread completes the
+        finish itself when it does return. An earlier version dropped the
+        reference after a timed join and flushed the detector from the
+        caller while the thread might still be feeding it.
+        """
+        timeout = self.stop_timeout if timeout is None else timeout
         self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
-            self._thread = None
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=timeout)
         try:
             self.source.stop()
         except Exception:  # noqa: BLE001
             log.debug("error stopping source", exc_info=True)
+        if thread is not None and thread.is_alive():
+            # Stopping the source is what frees a read that was blocking.
+            thread.join(timeout=0.5)
+            if thread.is_alive():
+                log.warning("the capture thread has not returned yet; it "
+                            "finishes the run itself when it does")
+                return False
+        self._thread = None
+        self._finish_once()
+        return True
+
+    @property
+    def alive(self) -> bool:
+        """The audio thread is still running."""
+        return self._thread is not None and self._thread.is_alive()
+
+    def _finish_once(self) -> None:
+        with self._finish_lock:
+            if self._finished:
+                return
+            self._finished = True
         for detected in self.detector.flush():
             self._capture(detected)
         self.safety.close()
@@ -505,14 +664,12 @@ class CaptureService:
         """Synchronous variant used by replay and tests."""
         self.source.start()
         self._running = True
+        self._finished = False
         self._set_state(PipelineState.LISTENING)
         self._pump(timeout=timeout)
-        for detected in self.detector.flush():
-            self._capture(detected)
-        self.safety.close()
-        self.source.stop()
         self._running = False
-        self._set_state(PipelineState.IDLE)
+        self._finish_once()
+        self.source.stop()
         return self.transmissions_captured
 
     # -- the audio loop --------------------------------------------------
@@ -524,6 +681,10 @@ class CaptureService:
             self.events.publish("error", {"stage": "capture",
                                           "message": "capture thread stopped"})
             self._set_state(PipelineState.ERROR)
+        if not self._running:
+            # A stop was asked for. If stop() is still waiting it does
+            # nothing further; if it gave up waiting, this is the finish.
+            self._finish_once()
 
     def _pump(self, timeout: Optional[float] = None) -> None:
         import time
@@ -602,7 +763,13 @@ class CaptureService:
         # --- now, and only now, decide about automatic processing -----------
         auto = detected.should_auto_transcribe(self.detector.settings)
         if auto and self.pipeline is not None:
-            self.pipeline.submit(tx.id)
+            try:
+                self.pipeline.submit(tx.id)
+            except ProcessingStopped:
+                # The recording and the row are already safe. The message
+                # stays Captured - honestly pending - and is picked up by the
+                # next processor that resumes unfinished work.
+                log.warning("processor already stopped; %s stays pending", tx.id)
             return tx
 
         tx.auto_processed = False

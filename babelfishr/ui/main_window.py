@@ -76,6 +76,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_theme()
 
         self._state = PipelineState.IDLE
+        # Set once the application has actually closed - engines and store
+        # included. From then on no timer callback touches the store.
+        self._shutdown_complete = False
         self._readiness = None
         self._theming = False
         self._readiness_worker = None
@@ -99,6 +102,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._timer.setInterval(100)
         self._timer.timeout.connect(self._drain_events)
         self._timer.start()
+        # Quitting with work outstanding waits on the event loop, not by
+        # blocking it: this timer retries the close until nothing can still
+        # use the engines or the store.
+        self._quit_timer = QtCore.QTimer(self)
+        self._quit_timer.setInterval(250)
+        self._quit_timer.timeout.connect(self._quit_tick)
 
     def _apply_theme(self) -> None:
         """Restyle from the live system palette (light/dark)."""
@@ -766,13 +775,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Not monitoring. Nothing is being recorded.", 8000)
 
     def _stop_monitoring(self) -> None:
+        # Returns as soon as the capture has stopped. Processing still under
+        # way is not waited for here - this is the GUI thread - and not
+        # abandoned: it carries on, accounted for, and each transcript lands
+        # in its bubble as it finishes. Pressing Stop again is a no-op.
         self.app.stop_session()
         self.start_button.setText("Start monitoring")
         self._set_controls_enabled(True)
         self._refresh_capture_tab_label()
         # Inputs can be changed again, but only once the watch has stopped.
         self.input_panel.set_monitoring(False)
-        self._set_state(PipelineState.IDLE)
+        outstanding = self.app.outstanding_work()
+        if outstanding:
+            self._set_state(PipelineState.TRANSCRIBING)
+            self.status.showMessage(
+                f"Monitoring stopped. Still finishing {outstanding} "
+                f"transmission(s) - each appears in its bubble as it "
+                f"completes.", 10000)
+        else:
+            self._set_state(PipelineState.IDLE)
         self.meter.reset()
 
     def _set_controls_enabled(self, enabled: bool) -> None:
@@ -839,6 +860,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # -- events ----------------------------------------------------------
     def _drain_events(self) -> None:
+        if self._shutdown_complete:
+            return                     # the store is closed; nothing to show
         for event in self.app.events.drain():
             if event.kind == "level":
                 reading = event.payload
@@ -937,15 +960,23 @@ class MainWindow(QtWidgets.QMainWindow):
         # event describes the moment it was published, which may be a run
         # that has since stopped, or a state the capture has since left.
         baseline = capture.state if capture is not None else PipelineState.IDLE
+        working = (PipelineState.TRANSCRIBING, PipelineState.TRANSLATING)
         if state in (PipelineState.LISTENING, PipelineState.RECEIVING,
                      PipelineState.COMPLETE):
-            return baseline
-        if state in (PipelineState.TRANSCRIBING, PipelineState.TRANSLATING):
+            resolved = baseline
+        elif state in working:
             # Processing activity is shown whether or not a microphone is
             # open - but only while there is processing. A Transcribing that
             # arrives after the work has finished describes nothing current.
-            return state if self._processing_active() else baseline
-        return state
+            resolved = state if self._processing_active() else baseline
+        else:
+            resolved = state
+        if resolved == PipelineState.IDLE and self._processing_active():
+            # No capture, but a processor still holds work - the run was
+            # stopped with transcription under way, and it carries on. Idle
+            # would be false; the stage last reported is what is happening.
+            return self._state if self._state in working else PipelineState.TRANSCRIBING
+        return resolved
 
     def _processing_active(self) -> bool:
         """Is any processing pipeline holding queued or in-flight work?"""
@@ -1764,11 +1795,46 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # -- shutdown --------------------------------------------------------
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
+        if self._shutdown_complete or self._finish_shutdown():
+            super().closeEvent(event)
+            return
+        # Work is still outstanding, or a worker has not returned. The window
+        # stays, the event loop keeps turning, and the close is retried from
+        # a timer until the application reports that nothing can still use
+        # its engines or its store. A repeated Quit lands here again and
+        # changes nothing.
+        outstanding = self.app.outstanding_work()
+        self.status.showMessage(
+            f"Quitting once {outstanding} transmission(s) finish processing "
+            f"- the window stays responsive meanwhile." if outstanding else
+            "Quitting once the previous run has finished shutting down.", 0)
+        self.start_button.setEnabled(False)
+        if not self._quit_timer.isActive():
+            self._quit_timer.start()
+        event.ignore()
+
+    def _finish_shutdown(self) -> bool:
+        """Close the application if nothing can still use it. True when done.
+
+        Closing never blocks this thread: the application either closes in
+        order now - workers ended, engines closed, store closed - or reports
+        that it cannot yet. Once it has, the event drain stops for good, so
+        no timer callback can reach the closed store.
+        """
         try:
-            self.app.close()
-        except Exception:  # noqa: BLE001
-            pass
-        super().closeEvent(event)
+            done = self.app.close(wait=False)
+        except Exception:  # noqa: BLE001 - never leave the window unclosable
+            log.exception("closing the application failed")
+            done = True
+        if done:
+            self._quit_timer.stop()
+            self._timer.stop()
+            self._shutdown_complete = True
+        return done
+
+    def _quit_tick(self) -> None:
+        if self._finish_shutdown():
+            self.close()
 
 
 class ProfileDialog(QtWidgets.QDialog):

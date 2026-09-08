@@ -19,7 +19,8 @@ from .audio.source import AudioSource, LiveAudioSource, ReplayAudioSource
 from .config import Config
 from .models import (ProcessingState, RadioProfile, Session, SourceLanguageMode,
                      Transmission, utcnow)
-from .pipeline import CaptureService, EventBus, PipelineState, ProcessingPipeline
+from .pipeline import (CaptureService, EventBus, PipelineState,
+                       ProcessingPipeline, ProcessingStopped)
 from .providers import (EngineUnavailable, Glossary, TranscriptionEngine,
                         TranslationEngine, build_transcription_engine,
                         build_translation_engine, is_placeholder)
@@ -94,6 +95,14 @@ class BabelFishRApp:
         # promises it never will.
         self._standalone_mode = None
         self._session_mode = None
+        #: Processors whose workers outlived a stop. Kept, not forgotten: while
+        #: one is here nothing it can still reach (its engines, the store) is
+        #: closed under it, no mode changes, and nothing new starts alongside
+        #: it. Reaped once its threads have actually ended.
+        self._retired: List[ProcessingPipeline] = []
+        #: A capture whose audio thread outlived its stop, for the same reason.
+        self._lingering_capture: Optional[CaptureService] = None
+        self._closed = False
         # The named thread the operator is working in. One capture service and
         # one pipeline exist globally; this only decides which thread a run is
         # filed under and which rows the window shows.
@@ -138,15 +147,77 @@ class BabelFishRApp:
             return (f"{pending} saved recording(s) are still being processed. "
                     f"Wait for that to finish, then change the mode - the "
                     f"recordings are safe either way.")
+        return self.shutdown_problem()
+
+    # -- shutdown bookkeeping ----------------------------------------------
+    def _reap(self) -> None:
+        """Forget stopped processors and captures whose threads have ended."""
+        self._retired = [p for p in self._retired if not p.finished]
+        if (self.standalone_pipeline is not None
+                and not self.standalone_pipeline.accepting
+                and self.standalone_pipeline.finished):
+            self.standalone_pipeline = None
+            self._standalone_mode = None
+        if (self._lingering_capture is not None
+                and not self._lingering_capture.alive):
+            self._lingering_capture = None
+
+    def _track_retired(self, pipeline: ProcessingPipeline) -> None:
+        if pipeline not in self._retired:
+            self._retired.append(pipeline)
+
+    def shutdown_problem(self) -> str:
+        """Why nothing may start or change yet: a previous run is still leaving.
+
+        A worker that outlived its stop timeout is not proof that its work
+        finished, and a capture thread that has not returned still holds the
+        detector. Until they have actually ended, the engines and the store
+        they can reach stay open, the mode stays put, and monitoring or a new
+        processor does not start beside them.
+        """
+        self._reap()
+        if self._retired or (self.standalone_pipeline is not None
+                             and self.standalone_pipeline.shutting_down):
+            return ("A processor from the previous run is still shutting "
+                    "down. Wait a moment, then try again - nothing is lost "
+                    "either way.")
+        if self._lingering_capture is not None:
+            return ("The previous run has not released the audio input yet. "
+                    "Wait a moment, then try again.")
         return ""
+
+    def outstanding_work(self) -> int:
+        """Accepted, unfinished jobs across every processor, live or retiring."""
+        total = 0
+        for pipeline in (self.pipeline, self.standalone_pipeline, *self._retired):
+            if pipeline is not None:
+                total += pipeline.pending
+        return total
 
     def _retire_processing(self) -> None:
         """Drop every engine and pipeline built under the outgoing mode.
 
-        Only ever called when nothing is in flight, so the stop is immediate.
+        The idle check and the stop are one atomic step
+        (:meth:`ProcessingPipeline.stop_if_idle`), so a job cannot slip in
+        between them. Anything still accounted for, or a worker that has not
+        returned, refuses the retirement - and with it the mode change - so
+        the engines below are only ever closed when nothing can still call
+        them.
         """
         if self.standalone_pipeline is not None:
-            self.standalone_pipeline.stop(wait=True, timeout=5.0)
+            pipeline = self.standalone_pipeline
+            if not pipeline.stop_if_idle(timeout=5.0):
+                pending = pipeline.pending
+                if pending:
+                    raise ModeChangeRefused(
+                        f"{pending} saved recording(s) are still being "
+                        f"processed. Wait for that to finish, then change the "
+                        f"mode - the recordings are safe either way.")
+                # Idle and no longer accepting, but a worker has not returned.
+                # It keeps its engines until it has; see shutdown_problem.
+                raise ModeChangeRefused(
+                    "A processor is still shutting down. Wait a moment, then "
+                    "change the mode.")
             self.standalone_pipeline = None
         self._standalone_mode = None
         for engine in (self.transcription, self.translation):
@@ -331,8 +402,12 @@ class BabelFishRApp:
             source = self._build_source(device, replay_path, realtime_replay,
                                         identity)
 
-        # Before anything is written: a busy standalone processor refuses the
-        # start outright rather than being waited on.
+        # Before anything is written: a previous run still shutting down, or
+        # a busy standalone processor, refuses the start outright rather than
+        # being waited on or started alongside.
+        problem = self.shutdown_problem()
+        if problem:
+            raise ProcessingBusy(problem)
         self._discard_standalone_pipeline()
 
         if self.transcription is None and self.translation is None:
@@ -373,13 +448,15 @@ class BabelFishRApp:
         self.capture = None
 
         if self.pipeline is not None:
+            pipeline, self.pipeline = self.pipeline, None
             try:
                 # Workers may already be running: stop them rather than leave
-                # threads behind on a session that does not exist.
-                self.pipeline.stop(wait=True, timeout=5.0)
+                # threads behind on a session that does not exist. One that
+                # does not return in time is kept in view, not forgotten.
+                if not pipeline.stop(wait=True, timeout=5.0):
+                    self._track_retired(pipeline)
             except Exception:  # noqa: BLE001 - never mask the real failure
                 log.debug("failed-start pipeline cleanup failed", exc_info=True)
-            self.pipeline = None
 
         if session is None:
             return
@@ -531,15 +608,20 @@ class BabelFishRApp:
         method's decision to make: it either retires an idle processor at
         once, or refuses and says why.
         """
+        self._reap()
         if self.standalone_pipeline is None:
             return
-        pending = self.standalone_pipeline.pending
-        if pending:
+        pipeline = self.standalone_pipeline
+        if not pipeline.stop_if_idle(timeout=5.0):
+            pending = pipeline.pending
+            if pending:
+                raise ProcessingBusy(
+                    f"{pending} saved recording(s) are still being transcribed. "
+                    f"Wait for that to finish, then start monitoring - nothing "
+                    f"is lost either way.")
             raise ProcessingBusy(
-                f"{pending} saved recording(s) are still being transcribed. "
-                f"Wait for that to finish, then start monitoring - nothing is "
-                f"lost either way.")
-        self.standalone_pipeline.stop(wait=True, timeout=5.0)
+                "The previous processor is still shutting down. Wait a "
+                "moment, then start monitoring.")
         self.standalone_pipeline = None
         self._standalone_mode = None
 
@@ -553,12 +635,29 @@ class BabelFishRApp:
         """
         session = self.session
         if self.capture is not None:
-            self.capture.stop()
-            self.capture = None
+            capture, self.capture = self.capture, None
+            if not capture.stop():
+                # The audio thread has not returned. It still holds the
+                # detector, the recorder and the processor, so it stays in
+                # view until it has, and finishes the run itself.
+                self._lingering_capture = capture
         if self.pipeline is not None:
-            self.wait_for_processing(timeout=30.0)
-            self.pipeline.stop()
-            self.pipeline = None
+            pipeline, self.pipeline = self.pipeline, None
+            # Nothing is waited for on the caller's thread - this runs on the
+            # window's - and nothing accepted is abandoned. An idle processor
+            # stops at once; one with work still outstanding, or one a
+            # lingering capture may still hand a final transmission to,
+            # carries on as the standalone processor: still accounted for by
+            # every check, still where Retry and Transcribe anyway go, and
+            # stopped only once it is idle. The 30-second wait this replaces
+            # froze the window and, when it ran out, forgot the worker.
+            if (self._lingering_capture is not None
+                    or not pipeline.stop_if_idle(timeout=5.0)):
+                if pipeline.accepting:
+                    self.standalone_pipeline = pipeline
+                    self._standalone_mode = self._session_mode
+                else:
+                    self._track_retired(pipeline)
         self._session_mode = None
         self._capture_conversation_id = ""
         if session is not None:
@@ -592,6 +691,9 @@ class BabelFishRApp:
             return ("Record Only mode has transcription switched off. Change "
                     "the operating mode, then try again - the recording is "
                     "kept either way.")
+        problem = self.shutdown_problem()
+        if problem:
+            return problem
         if (self.pipeline is not None
                 and self._session_mode is not self.mode):
             return ("Monitoring is running with engines chosen for a "
@@ -613,6 +715,7 @@ class BabelFishRApp:
         exactly as it does during a live session, and it runs on its own
         worker thread so the window never freezes.
         """
+        self._reap()
         if self.pipeline is not None:
             # A live pipeline cannot outlive its mode through set_mode, which
             # refuses while monitoring. This covers the other route in: a
@@ -620,6 +723,8 @@ class BabelFishRApp:
             # processed by engines the current mode forbids.
             return self.pipeline if self._session_mode is self.mode else None
         if self.standalone_pipeline is not None:
+            if self.standalone_pipeline.shutting_down:
+                return None            # retiring: takes nothing new
             if self._standalone_mode is self.mode:
                 return self.standalone_pipeline
             # Defence in depth. set_mode retires this already; reaching here
@@ -627,7 +732,12 @@ class BabelFishRApp:
             # belongs to the old one.
             if self.standalone_pipeline.pending:
                 return None
-            self._retire_processing()
+            try:
+                self._retire_processing()
+            except ModeChangeRefused:
+                return None
+        if self._retired:
+            return None                # nothing new starts beside a straggler
 
         self.select_engines()          # honours the current operating mode
         if self.transcription is None:
@@ -924,14 +1034,63 @@ class BabelFishRApp:
             conversation_id = self.conversation_id
         return self.store.review_queue(conversation_id=conversation_id)
 
-    def close(self) -> None:
+    def close(self, wait: bool = True, timeout: Optional[float] = None) -> bool:
+        """Shut down in order, closing engines and the store last - and only
+        when nothing can still use them.
+
+        The order: the capture stops (bounded), any processor finishes what
+        it accepted, its workers end, then the engines close, then the store.
+        Each step waits for the one before it to be *complete*, not merely
+        timed out. A worker that has not returned keeps its engines and the
+        database open, and this returns False so the caller can try again
+        later rather than close a store a thread is still writing to. That is
+        what happened before: a 30-second wait, a 10-second join, and then
+        the store was closed under whatever was still running.
+
+        ``wait=True`` (the command line, tests) blocks until the outstanding
+        work is done, or until ``timeout`` if one is given, returning False
+        with nothing closed if that runs out. ``wait=False`` (the window)
+        never blocks: it closes if it can, and otherwise says not yet.
+        """
+        from time import monotonic
+
+        if self._closed:
+            return True
         self.stop_session()
-        if self.standalone_pipeline is not None:
-            self.standalone_pipeline.wait_until_idle(timeout=30.0)
-            self.standalone_pipeline.stop()
+        deadline = None if timeout is None else monotonic() + timeout
+
+        def remaining() -> Optional[float]:
+            return None if deadline is None else max(0.0, deadline - monotonic())
+
+        pipeline = self.standalone_pipeline
+        if pipeline is not None:
+            if wait:
+                while pipeline.pending:
+                    left = remaining()
+                    if left is not None and left <= 0:
+                        return False
+                    pipeline.wait_until_idle(
+                        timeout=1.0 if left is None else min(1.0, left))
+            if not pipeline.stop_if_idle(timeout=10.0 if wait else 1.0):
+                if pipeline.pending:
+                    return False       # still working; everything stays open
+                self._track_retired(pipeline)
             self.standalone_pipeline = None
             self._standalone_mode = None
+
+        if wait:
+            for straggler in list(self._retired):
+                for thread in straggler.worker_threads():
+                    thread.join(timeout=remaining())
+            if self._lingering_capture is not None and self._lingering_capture._thread:
+                self._lingering_capture._thread.join(timeout=remaining())
+        self._reap()
+        if self._retired or self._lingering_capture is not None:
+            return False               # a thread can still reach the engines
+
         for engine in (self.transcription, self.translation):
             if engine is not None:
                 engine.close()
         self.store.close()
+        self._closed = True
+        return True
