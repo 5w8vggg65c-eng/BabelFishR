@@ -116,6 +116,51 @@ class _FinalCleanup:
             thread.join(timeout=timeout)
 
 
+class _SessionEnd:
+    """Records the end of one run off the caller's thread, once, tracked.
+
+    The Session identity and the ending time are captured at Stop, so a
+    write that lands later cannot close the wrong run or stamp the wrong
+    moment. A failure is recorded, not hidden, and ``start()`` retries; a
+    call while an attempt is running does nothing.
+    """
+
+    def __init__(self, store: Store, session_id: str, ended_at):
+        self.store = store
+        self.session_id = session_id
+        self.ended_at = ended_at
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+        self.done = False
+        self.error: Optional[BaseException] = None
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self) -> None:
+        with self._lock:
+            if self.running or self.done:
+                return
+            self.error = None
+            self._thread = threading.Thread(target=self._attempt, daemon=True,
+                                            name="babelfishr-session-end")
+            self._thread.start()
+
+    def _attempt(self) -> None:
+        try:
+            self.store.close_session(self.session_id, ended_at=self.ended_at)
+            self.done = True
+        except Exception as exc:  # noqa: BLE001 - recorded, reported, retried
+            log.exception("recording the end of run %s failed", self.session_id)
+            self.error = exc
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+
+
 class BabelFishRApp:
     """Coordinates capture, processing and storage for one monitoring session."""
 
@@ -166,6 +211,12 @@ class BabelFishRApp:
         #: the caller's thread, once, with its outcome recorded. See close().
         self._final = _FinalCleanup(self._close_resources)
         self._store_closed = False
+        #: Set when every user of the store has finished and only the final
+        #: cleanup remains. The window shuts its own routes to the store
+        #: before it asks for that cleanup to begin.
+        self._ready_for_cleanup = False
+        #: The end-of-run writes still in flight, oldest first.
+        self._session_ends: List[_SessionEnd] = []
         # The named thread the operator is working in. One capture service and
         # one pipeline exist globally; this only decides which thread a run is
         # filed under and which rows the window shows.
@@ -812,11 +863,46 @@ class BabelFishRApp:
         self._session_mode = None
         self._capture_conversation_id = ""
         if session is not None:
-            self.store.close_session(session.id)
+            # The end is recorded off this thread. The write takes the store
+            # lock, which a worker saving a transcript may be holding; an
+            # earlier version waited for it here, on the window's thread.
+            # Identity and time are fixed now; the write is tracked until
+            # it lands, and close() waits for it before the store closes.
             session.ended_at = utcnow()
+            end = _SessionEnd(self.store, session.id, session.ended_at)
+            self._session_ends.append(end)
+            end.start()
             self.events.publish("session", session)
         self.session = None
         return session
+
+    # -- the end-of-run write --------------------------------------------
+    def _reap_session_ends(self) -> None:
+        self._session_ends = [e for e in self._session_ends if not e.done]
+
+    def session_end_pending(self) -> bool:
+        """An end-of-run write has not landed yet (or failed and awaits retry)."""
+        self._reap_session_ends()
+        return bool(self._session_ends)
+
+    @property
+    def persistence_error(self) -> str:
+        """Why the last end-of-run write failed, or "" - it will be retried."""
+        for end in self._session_ends:
+            if end.error is not None:
+                return f"{type(end.error).__name__}: {end.error}"
+        return ""
+
+    def wait_for_session_ends(self, timeout: Optional[float] = None) -> bool:
+        """Block until every end-of-run write has landed. For blocking callers."""
+        from time import monotonic
+
+        deadline = None if timeout is None else monotonic() + timeout
+        for end in list(self._session_ends):
+            left = None if deadline is None else max(0.0, deadline - monotonic())
+            end.join(left)
+        self._reap_session_ends()
+        return not self._session_ends
 
     def resume_pending(self) -> int:
         return self.pipeline.resume_pending() if self.pipeline else 0
@@ -1202,7 +1288,8 @@ class BabelFishRApp:
             conversation_id = self.conversation_id
         return self.store.review_queue(conversation_id=conversation_id)
 
-    def close(self, wait: bool = True, timeout: Optional[float] = None) -> bool:
+    def close(self, wait: bool = True, timeout: Optional[float] = None,
+              start_cleanup: bool = True) -> bool:
         """Shut down in order, closing engines and the store last - and only
         when nothing can still use them.
 
@@ -1233,9 +1320,29 @@ class BabelFishRApp:
             return False
         self._close_in_progress = True
         try:
-            return self._close(wait, timeout)
+            return self._close(wait, timeout, start_cleanup)
         finally:
             self._close_in_progress = False
+
+    @property
+    def ready_for_cleanup(self) -> bool:
+        """Every user of the store has finished; only the final cleanup is left.
+
+        The window checks this, shuts every route it has to the store - menus,
+        shortcuts, controls, its event drain - and only then calls
+        :meth:`start_final_cleanup`. Until it does, the store stays open.
+        """
+        return self._ready_for_cleanup
+
+    def start_final_cleanup(self) -> None:
+        """Begin closing engines and the store, on the cleanup thread.
+
+        Only valid once :attr:`ready_for_cleanup`; the caller has by then
+        stopped reading the store itself. Starting twice is harmless.
+        """
+        if not self._ready_for_cleanup:
+            raise RuntimeError("the application is not ready for its final cleanup")
+        self._final.start()
 
     @property
     def cleaning(self) -> bool:
@@ -1248,7 +1355,8 @@ class BabelFishRApp:
         error = self._final.error
         return f"{type(error).__name__}: {error}" if error is not None else ""
 
-    def _close(self, wait: bool, timeout: Optional[float]) -> bool:
+    def _close(self, wait: bool, timeout: Optional[float],
+               start_cleanup: bool = True) -> bool:
         from time import monotonic, sleep
 
         self._closing = True
@@ -1339,6 +1447,24 @@ class BabelFishRApp:
             # Nothing can register from here: closing is set and the check
             # above happened under the same lock.
 
+        # 5b. The end of the run, recorded. A failed write is retried, never
+        #     skipped: the store does not close over a run left open.
+        self._reap_session_ends()
+        for end in self._session_ends:
+            if end.error is not None and not end.running:
+                end.start()
+        if wait:
+            for end in list(self._session_ends):
+                end.join(remaining())
+        self._reap_session_ends()
+        if self._session_ends:
+            return False
+
+        # 6. Only the final cleanup is left. A caller with routes of its own
+        #    to the store (the window) shuts them first and then asks for it.
+        self._ready_for_cleanup = True
+        if not start_cleanup:
+            return False
         return finish()
 
     def _close_resources(self) -> None:

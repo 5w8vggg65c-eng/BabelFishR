@@ -138,10 +138,11 @@ def window_with_app(qt_app, config, store):
     return app, window
 
 
-def saved_message(app, wav):
+def saved_message(qt_app, app, wav):
     app.start_session(replay_path=wav, name="run")
     app.run_replay()
     app.stop_session()
+    pump(qt_app, 20)                    # the replay's own events are drained
     return app.recent_transmissions()[0]
 
 
@@ -171,6 +172,7 @@ def test_stop_does_not_wait_on_a_slow_source_close_after_the_thread_ended(
     assert pump_until(qt_app, lambda: not app.capture.alive, timeout=10.0), (
         "the audio thread never ended on its own")
     assert app.capture.detector.open, "the last transmission should still be open"
+    capture = app.capture
     timer, ticks = heartbeat(qt_app)
     try:
         started = time.monotonic()
@@ -183,7 +185,9 @@ def test_stop_does_not_wait_on_a_slow_source_close_after_the_thread_ended(
         assert app.standalone_pipeline is not None and app.standalone_pipeline.accepting
 
         source.stop_held.release.set()
-        assert pump_until(qt_app, lambda: not app.capture_finishing(), timeout=10.0)
+        assert pump_until(qt_app, lambda: not app.capture_finishing(), timeout=10.0), (
+            f"alive={capture.alive} stopping={capture.stopping} finished={capture._finished} "
+            f"stopper={capture._stopper} thread={capture._thread}")
         assert pump_until(qt_app, lambda: app.outstanding_work() == 0, timeout=20.0)
         txs = store.recent_transmissions()
         assert len(txs) == 1 and txs[0].state is ProcessingState.COMPLETE
@@ -257,19 +261,23 @@ def test_retiring_an_idle_worker_joins_nothing_on_the_gui_thread(qt_app, config,
 
 def test_quit_does_not_wait_on_a_slow_engine_close(qt_app, config, store, wav):
     app, window = window_with_app(qt_app, config, store)
-    tx = saved_message(app, wav)
+    tx = saved_message(qt_app, app, wav)
     engine = app.transcription
     engine.close = Held(engine.close)
     reads = {"is_deleted": 0}
     real_is_deleted = store.is_deleted
-    store.is_deleted = lambda tx_id: (reads.__setitem__("is_deleted", reads["is_deleted"] + 1),
-                                      real_is_deleted(tx_id))[1]
+    # Counted only once the cleanup has begun: before that, draining the
+    # replay's own events reads the store legitimately.
+    store.is_deleted = lambda tx_id: (reads.__setitem__(
+        "is_deleted", reads["is_deleted"] + (1 if app.cleaning else 0)),
+        real_is_deleted(tx_id))[1]
     timer, ticks = heartbeat(qt_app)
     try:
         started = time.monotonic()
         assert window.close() is False
         assert time.monotonic() - started < 1.0
-        assert engine.close.entered.wait(5.0), "the cleanup never reached the engine"
+        assert pump_until(qt_app, lambda: engine.close.entered.is_set(), timeout=10.0), (
+            "the cleanup never reached the engine")
         alive_beat(qt_app, ticks)                          # engine.close still held
         assert app.cleaning and not app._closed
         assert not window._timer.isActive(), "the event drain still ran with the store closing"
@@ -294,7 +302,7 @@ def test_quit_does_not_wait_on_a_slow_engine_close(qt_app, config, store, wav):
 def test_quit_does_not_wait_on_a_slow_database_close(qt_app, config, store, wav,
                                                      monkeypatch):
     app, window = window_with_app(qt_app, config, store)
-    tx = saved_message(app, wav)
+    tx = saved_message(qt_app, app, wav)
     held = Held(store.close)
     monkeypatch.setattr(store, "close", held)
     timer, ticks = heartbeat(qt_app)
@@ -302,7 +310,8 @@ def test_quit_does_not_wait_on_a_slow_database_close(qt_app, config, store, wav,
         started = time.monotonic()
         assert window.close() is False
         assert time.monotonic() - started < 1.0
-        assert held.entered.wait(5.0), "the cleanup never reached the store"
+        assert pump_until(qt_app, lambda: held.entered.is_set(), timeout=10.0), (
+            "the cleanup never reached the store")
         alive_beat(qt_app, ticks)                          # store.close still held
         assert app.cleaning and not app._closed and not app._store_closed
         assert not window._timer.isActive()
@@ -325,7 +334,7 @@ def test_quit_does_not_wait_on_a_slow_database_close(qt_app, config, store, wav,
 def test_repeated_quit_runs_one_cleanup_and_closes_each_resource_once(qt_app, config,
                                                                       store, wav):
     app, window = window_with_app(qt_app, config, store)
-    saved_message(app, wav)
+    saved_message(qt_app, app, wav)
     engine = app.transcription
     engine.close = Held(engine.close)
     translation = app.translation
@@ -336,7 +345,7 @@ def test_repeated_quit_runs_one_cleanup_and_closes_each_resource_once(qt_app, co
         for _ in range(3):
             assert window.close() is False
             pump(qt_app, 5)
-        assert engine.close.entered.wait(5.0)
+        assert pump_until(qt_app, lambda: engine.close.entered.is_set(), timeout=10.0)
         for _ in range(3):
             assert window.close() is False                 # while the cleanup runs
             pump(qt_app, 5)

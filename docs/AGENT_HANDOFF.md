@@ -3681,3 +3681,160 @@ packaging or the application was changed for it in this pass.
 - CLI `close()` without a timeout waits indefinitely (Ctrl-C works).
 - F3, F4 deferred; F6/F7, F8/F9 outside; playback boundary/seek/collapse,
   removal semantics and General unresolved; logo not integrated.
+
+---
+
+# Finishing the GUI/database shutdown boundary, and the end-of-run write
+
+Codex, at `62972f7`, independently ran the 24 lifecycle/shutdown/cleanup tests
+(all passed; Linux, Python 3.12.13, PySide6 Essentials 6.8.3, offscreen) and
+found two further defects. **A:** during the held final cleanup the central
+widget was disabled and the drain stopped, but the menu bar and its actions
+stayed enabled - two real clicks (View, then Review queue) raised
+`ProgrammingError: Cannot operate on a closed database` in the interval after
+the real `Store.close` and before cleanup returned. **B:** `stop_session()`
+still called `Store.close_session()` synchronously; with the store's lock
+held by another thread the real Stop handler blocked the main thread for
+1.201 s with zero heartbeat ticks. Both reproduced here and repaired.
+
+## Identifiers
+
+| | |
+|---|---|
+| Base | `62972f7` — verified equal to the remote tip at the start, worktree clean |
+| Commit | the commit carrying this section (the branch tip) |
+| Branch | `claude/radio-decoder-translator-0oslya` |
+| Workflow / tag / release | none dispatched, retried, created, moved or published |
+
+## A — the boundary, now a handshake
+
+`close(wait=False, start_cleanup=False)` runs every precondition and, when
+only the final cleanup is left, sets `app.ready_for_cleanup` and returns
+False *without* starting the cleanup thread. The window then shuts every
+route it has to the store (`_shut_store_routes`): the menu bar, every
+`QToolBar`, the central widget, and every `QAction` it owns - which also
+disarms their shortcuts and the tab and bubble context menus - plus the event
+drain; and every handler that reads the store after a dialog, or from a
+queued path, now checks `_store_gone()` first (Search, Review queue, Show all
+/ reload, Session tabs refresh, New / Rename / Remove Session, Remove message
+/ Delete permanently, Replay, Export clip / Session / text, Operating mode,
+Finish unfinished deletions). Only then does it call
+`app.start_final_cleanup()`. If a modal dialog is open at that moment
+(`QApplication.activeModalWidget()`), it waits: the dialog's handler
+continues on this thread when it closes and must not meet a closing store;
+the status line says "Quitting once the open dialog is closed." The
+command-line `close(wait=True)` keeps `start_cleanup=True` - it has no GUI
+routes to shut.
+
+## B — the end of the run, recorded off-thread and tracked
+
+`stop_session()` fixes `session.ended_at = utcnow()` and the Session id, then
+starts a `_SessionEnd` thread ("babelfishr-session-end") that calls
+`store.close_session(id, ended_at=…)`; the `"session"` event is published at
+once with that time. `close()` step 5b waits for every pending end (joining
+only when `wait=True`), retries a failed one, and never proceeds to the
+final cleanup while one is outstanding - a run is not left open under a
+closed store. `session_end_pending()`, `persistence_error` and
+`wait_for_session_ends()` expose it; the window shows "the end of the run is
+recorded" while waiting and "Could not finish quitting: … Retrying" on a
+failure. `_abandon_failed_start()` still writes synchronously (a failed
+start, not Stop/Quit; recorded).
+
+## Reproductions, before → after (real Qt window, offscreen)
+
+- **A** saved message; before Quit, Ctrl+F reached Search and a real click
+  on View opened the menu. Quit with `Store.close` run for real and then
+  held: menu bar, tool bars, central widget and every action disabled;
+  heartbeat alive; a real click on View did not open it; Ctrl+F,
+  Ctrl+Shift+A, Ctrl+Shift+R, `trigger()` on the Review/Show all/Search
+  actions, direct calls to the Review and reload handlers, a published
+  event and a direct drain: **zero** queries from the main thread (counted
+  on the store's connection), Search not reached, status "was not done";
+  window closed on release. Open dialog: routes shut, cleanup not begun,
+  store still open, `_store_gone()` True, status names the dialog; cleanup
+  begins once the dialog is gone.
+- **B** store lock held by another thread, live session with an open
+  transmission: Stop returned in < 1 s (was 1.201 s), heartbeat alive,
+  `ended_at` not yet written, `session_end_pending()` True; on release the
+  stored `ended_at` equals the time fixed at Stop, the final transmission
+  reached COMPLETE, the window still worked (Stop is not Quit). Quit under
+  the held lock: returned in < 1 s, heartbeat alive, repeated Quit did not
+  start a second write; on release `close_session` ran exactly once for
+  that run and before `store.close`, the final save preceded `store.close`,
+  `ended_at` persisted. Failed write (raises): `persistence_error` set,
+  status "Could not finish quitting: … locked for good", retried each tick,
+  not closed; on restore the write landed with the original time and the
+  window closed.
+
+## Tests
+
+`tests/test_alpha5_boundary.py` (5, real Qt offscreen). Six tests: (1) menus and shortcuts during a held cleanup after the real
+`Store.close` - zero queries from the main thread; (2) an open dialog defers
+cleanup; (3) Stop under a held store lock returns, heartbeat alive, end
+recorded later with the time fixed at Stop; (4) Quit under the held lock -
+end recorded once, before `store.close`, after the final save; (5) a failing
+end-of-run write is reported, retried, and lands with the original time once
+it can; (6) with only the end-of-run write outstanding, cleanup does not
+begin and the store does not close until it has landed.
+
+### Fail-before (production files restored from `62972f7`, tests unchanged)
+
+All six FAIL on `62972f7` (five in the first run - 144.72 s, several stuck
+on the old synchronous paths until their asserts - and the sixth in its own
+run); on the repaired tree all six pass in about 9 s, and the whole boundary
+file was run three further times without a failure.
+
+### Mutations (repaired code restored after each; byte-compared)
+
+| # | Mutation | Result |
+|---|---|---|
+| Q1 | menu bar stays enabled once the store may close | caught |
+| Q2 | actions (and so their shortcuts and context menus) stay enabled | caught |
+| Q3 | handlers past a dialog no longer check the boundary | caught |
+| Q4 | cleanup starts under an open dialog | caught |
+| Q5 | cleanup starts before the window has shut its routes | caught |
+| Q6 | the end of the run is written on the caller's thread again | caught |
+| Q7 | `close()` no longer waits for the end-of-run write | **missed** by the lock-held tests (the capture's own wait masked it); test (6) was added for exactly this, and catches it |
+| Q8 | a failed end-of-run write counts as done | caught |
+
+### Existing tests changed
+
+- `test_alpha5_cleanup.py` (slow engine close, slow database close, repeated
+  Quit): waits for the cleanup thread by pumping the event loop rather than
+  by a blocking `Event.wait` - with the end-of-run write now asynchronous,
+  the quit timer has to tick for `close()` to progress, and a blocking wait
+  starved it (2 of 6 runs failed before the change, 8 of 8 passed after);
+  the replay's own events are drained before Quit; the `is_deleted` read
+  counter counts only once cleanup has begun. Same intents.
+- No assertion in any pre-existing suite changed; the previous 917 pass
+  unmodified.
+
+### Test results
+
+Focused first: the twelve nearest suites (208 passed, one timing assertion
+in the new failing-write test then made deterministic); the boundary file
+(6). Full suite: **923 passed, 11 skipped** in 144.77 s (917 before this pass plus the 6 new tests)****; skips unchanged (`test_alpha5_playback.py:516`,
+`:531`, `test_coreaudio.py:255`, `test_packaging.py:373`,
+`test_real_engines.py:32` ×5, `:107` ×2). `git diff --check` and `compileall`
+over `babelfishr`, `tests`, `packaging` clean. Linux, Python 3.11, PySide6
+Essentials, `QT_QPA_PLATFORM=offscreen`, mock engines. This session's
+results, not an independent rerun; no Mac.
+
+## Unresolved ledger, updated
+
+- Stop/Quit: capture, source, worker, engine and database cleanup, the
+  end-of-run write, and every GUI route to the store are now off the GUI
+  thread or shut before the store can close, as measured by these tests on
+  Linux. This is a statement about the paths tested, not about the whole
+  application; a Mac has not seen any of it (checklist M, steps 43-46).
+- Still synchronous, bounded, outside Stop/Quit: mode change and Start join
+  an idle worker (5 s bound); a failed start closes its Session row inline.
+- A permanently stuck source, worker, engine close, database close or
+  end-of-run write is an explicitly reported unresolved operation; no
+  forced termination or cancellation (Eric's decision).
+- CLI `close()` without a timeout waits indefinitely (Ctrl-C works).
+- Logo (white shapes on black; https://chatgpt.com/s/m_6aa0578e4c248191bc16f0fd776186e4)
+  recorded for the assets pass; not integrated.
+- F3, F4 deferred; F6/F7, F8/F9 outside; playback boundary/seek/collapse,
+  removal semantics and General unresolved; no candidate contains any of
+  the shutdown passes.

@@ -84,6 +84,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # thread: from then on the store may close at any instant, so no
         # timer callback or control here may read it.
         self._store_off_limits = False
+        self._waiting_for_dialog = False
         self._readiness = None
         self._theming = False
         self._readiness_worker = None
@@ -821,7 +822,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _replay_file(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Replay a WAV recording", "", "WAV files (*.wav)")
-        if not path:
+        if not path or self._store_gone():
             return
         if self.app.session is not None:
             self._stop_monitoring()
@@ -1025,7 +1026,7 @@ class MainWindow(QtWidgets.QMainWindow):
         current = list(OperatingMode).index(self.app.mode)
         choice, ok = QtWidgets.QInputDialog.getItem(
             self, "Operating mode", "Mode:", modes, current, False)
-        if ok:
+        if ok and not self._store_gone():
             self._apply_mode(list(OperatingMode)[modes.index(choice)].value)
 
     def _refresh_readiness(self, run_smoke_tests: bool = True) -> None:
@@ -1177,7 +1178,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Export clip", f"{tx.id}.wav", "WAV files (*.wav)")
-        if path:
+        if path and not self._store_gone():
             export_transmission_audio(tx, path)
             self.status.showMessage(f"Exported {path}", 6000)
 
@@ -1185,6 +1186,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # -- named Session tabs ----------------------------------------------
     def _refresh_session_tabs(self) -> None:
         """Rebuild the tab bar from the database, keeping the selection."""
+        if self._store_gone():
+            return
         conversations = self.app.conversations(
             include_hidden=self._showing_hidden_sessions())
         selected = self.app.conversation_id
@@ -1243,7 +1246,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _new_session_tab(self) -> None:
         name, ok = QtWidgets.QInputDialog.getText(
             self, "New Session", "Name for this Session:")
-        if not ok or not name.strip():
+        if not ok or not name.strip() or self._store_gone():
             return
         conversation = self.app.create_conversation(name)
         self.app.select_conversation(conversation.id)
@@ -1314,6 +1317,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "deleted, and cannot be undone.",
             [self.HIDE_SESSION, self.DELETE_SESSION],
             destructive=self.DELETE_SESSION, default=self.HIDE_SESSION)
+        if self._store_gone():
+            return
         if choice == self.HIDE_SESSION:
             self.app.hide_conversation(conversation_id)
             self._refresh_session_tabs()
@@ -1341,7 +1346,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Delete \u201c{conversation.name}\u201d and everything in it?",
                 "\n".join(lines), [self.CONFIRM_DELETE_SESSION],
                 destructive=self.CONFIRM_DELETE_SESSION)
-            if confirm != self.CONFIRM_DELETE_SESSION:
+            if confirm != self.CONFIRM_DELETE_SESSION or self._store_gone():
                 return
             if (self.timeline.playback.owner
                     and self.timeline.playback.owner in inventory.transmission_ids):
@@ -1440,6 +1445,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status.showMessage(
                 f"Session name unchanged: \u201c{current}\u201d", 6000)
             return
+        if self._store_gone():
+            return
         try:
             renamed = self.app.rename_conversation(conversation_id, name)
         except Exception as exc:  # noqa: BLE001 - report it, do not crash
@@ -1469,6 +1476,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _reload_timeline(self) -> None:
         """Restore the selected Session's thread, newest transmission first."""
+        if self._store_gone():
+            return
         self.timeline.set_transmissions(self.app.recent_transmissions(
             include_hidden=self._showing_removed()))
 
@@ -1533,6 +1542,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "exactly what will be deleted, and cannot be undone.",
             [self.REMOVE_KEEP, self.DELETE_FOREVER],
             destructive=self.DELETE_FOREVER, default=self.REMOVE_KEEP)
+        if self._store_gone():
+            return
         if choice == self.REMOVE_KEEP:
             self.app.remove_from_thread(tx_id)
             if not self._showing_removed():
@@ -1575,7 +1586,7 @@ class MainWindow(QtWidgets.QMainWindow):
                               "Delete this message and its recording for good?",
                               "\n".join(lines), [self.CONFIRM_DELETE],
                               destructive=self.CONFIRM_DELETE)
-        if choice != self.CONFIRM_DELETE:
+        if choice != self.CONFIRM_DELETE or self._store_gone():
             return
         # Nothing may be playing the file while it is unlinked.
         if self.timeline.playback.owner == tx.id:
@@ -1613,6 +1624,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status.showMessage("Message restored to the thread.", 6000)
 
     def _finish_unfinished_deletions(self) -> None:
+        if self._store_gone():
+            return
         before = self.app.leftover_deletions()
         if not before:
             QtWidgets.QMessageBox.information(
@@ -1637,7 +1650,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _search(self) -> None:
         text, ok = QtWidgets.QInputDialog.getText(
             self, "Search", "Search original and translated text:")
-        if not ok:
+        if not ok or self._store_gone():
             return
         results = self.app.search(text)
         self.timeline.set_transmissions(results)
@@ -1646,6 +1659,8 @@ class MainWindow(QtWidgets.QMainWindow):
             f"transmissions to go back", 10000)
 
     def _show_review_queue(self) -> None:
+        if self._store_gone():
+            return
         results = self.app.review_queue()
         self.timeline.set_transmissions(results)
         self.status.showMessage(
@@ -1761,7 +1776,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         directory = QtWidgets.QFileDialog.getExistingDirectory(
             self, "Choose a folder for the session bundle")
-        if not directory:
+        if not directory or self._store_gone():
             return
         from ..export import export_session
 
@@ -1802,7 +1817,7 @@ class MainWindow(QtWidgets.QMainWindow):
                    "csv": "CSV (*.csv)"}
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Export", f"babelfishr_{session.id}.{fmt}", filters[fmt])
-        if not path:
+        if not path or self._store_gone():
             return
         renderer = renderers[fmt]
         text = (renderer(transmissions, session) if fmt != "csv"
@@ -1831,6 +1846,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._shutdown_error:
             text = (f"Could not finish quitting: {self._shutdown_error}. "
                     f"Retrying - nothing still in use has been closed.")
+        elif self._waiting_for_dialog:
+            text = "Quitting once the open dialog is closed."
         elif self._store_off_limits:
             text = "Quitting - closing the engines and the database."
         else:
@@ -1840,6 +1857,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 parts.append(f"{outstanding} transmission(s) finish processing")
             for name in self.app.active_operations():
                 parts.append(f"the {name} finishes")
+            if self.app.session_end_pending():
+                parts.append("the end of the run is recorded")
             text = ("Quitting once " + (" and ".join(parts) if parts else
                     "the previous run has finished shutting down")
                     + " - the window stays responsive meanwhile.")
@@ -1858,30 +1877,69 @@ class MainWindow(QtWidgets.QMainWindow):
         only at the very end, so a retry cannot close something still in use.
         """
         try:
-            done = self.app.close(wait=False)
+            done = self.app.close(wait=False, start_cleanup=False)
         except Exception as exc:  # noqa: BLE001 - report, keep, retry
             log.exception("closing the application failed")
             self._shutdown_error = f"{type(exc).__name__}: {exc}"
             return False
-        if self.app.cleaning and not self._store_off_limits:
-            # The engines and the store are now closing on the application's
-            # cleanup thread. Nothing here reads the store from this point:
-            # the event drain stops and the controls that could reach it are
-            # disabled, while the window itself keeps repainting and this
-            # timer keeps asking whether the cleanup has finished.
-            self._store_off_limits = True
-            self._timer.stop()
-            central = self.centralWidget()
-            if central is not None:
-                central.setEnabled(False)
-        # A failure inside the cleanup thread is reported by the application
-        # rather than raised here; it is shown, and the retry is automatic.
-        self._shutdown_error = self.app.cleanup_error
+        self._waiting_for_dialog = False
+        if not done and self.app.ready_for_cleanup and not self.app.cleaning:
+            # Every other user of the store has finished. Before the store may
+            # close, every route from this window to it is shut - menus and
+            # their shortcuts, tool bars, the central controls, the event
+            # drain - and any handler already past a dialog finds the door
+            # closed too (_store_gone). Only then is the cleanup asked for;
+            # a modal dialog still open is let finish first, since its
+            # handler continues on this thread when it closes.
+            self._shut_store_routes()
+            if QtWidgets.QApplication.activeModalWidget() is None:
+                self.app.start_final_cleanup()
+            else:
+                self._waiting_for_dialog = True
+        elif self.app.cleaning and not self._store_off_limits:
+            self._shut_store_routes()          # cleanup begun another way
+        # A failure inside the cleanup thread, or in the end-of-run write, is
+        # reported by the application rather than raised here; it is shown,
+        # and the retry is automatic.
+        self._shutdown_error = self.app.cleanup_error or self.app.persistence_error
         if done:
             self._quit_timer.stop()
             self._timer.stop()
             self._shutdown_complete = True
         return done
+
+    def _shut_store_routes(self) -> None:
+        """Close every way this window can reach the store. Idempotent.
+
+        Disabling controls is the visible half; the other half is that every
+        handler which reads the store after a dialog checks _store_gone(),
+        and the event drain returns at once. The window keeps repainting and
+        the quit timer keeps polling; only the status bar still speaks.
+        """
+        if self._store_off_limits:
+            return
+        self._store_off_limits = True
+        self._timer.stop()
+        self.menuBar().setEnabled(False)
+        for toolbar in self.findChildren(QtWidgets.QToolBar):
+            toolbar.setEnabled(False)
+        central = self.centralWidget()
+        if central is not None:
+            central.setEnabled(False)
+        for action in self.findChildren(QtGui.QAction):
+            action.setEnabled(False)           # menus, shortcuts, context menus
+
+    def _store_gone(self) -> bool:
+        """True once the database may be closing: the caller must not touch it.
+
+        For handlers that were already past a dialog, a queued callback, or
+        anything else that reaches this thread after the routes were shut.
+        """
+        if not self._store_off_limits:
+            return False
+        self.status.showMessage(
+            "Quitting - the database is closing, so that was not done.", 8000)
+        return True
 
     def _quit_tick(self) -> None:
         if self._finish_shutdown():
