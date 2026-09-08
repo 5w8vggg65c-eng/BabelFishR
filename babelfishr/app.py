@@ -70,6 +70,52 @@ class EngineSummary:
         return d
 
 
+class _FinalCleanup:
+    """Runs the last step of shutdown on a thread of its own, once at a time.
+
+    ``started`` is set the moment the first attempt begins and never cleared:
+    from then on the store may close at any instant, so the owner must stop
+    reading it before starting this. A failure is recorded, not hidden, and a
+    later ``start()`` retries; a call while an attempt is running does
+    nothing, so repeated Quit requests cannot overlap.
+    """
+
+    def __init__(self, run):
+        self._run = run
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+        self.started = False
+        self.done = False
+        self.error: Optional[BaseException] = None
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self) -> None:
+        with self._lock:
+            if self.running or self.done:
+                return
+            self.started = True
+            self.error = None
+            self._thread = threading.Thread(target=self._attempt, daemon=True,
+                                            name="babelfishr-cleanup")
+            self._thread.start()
+
+    def _attempt(self) -> None:
+        try:
+            self._run()
+            self.done = True
+        except Exception as exc:  # noqa: BLE001 - recorded, reported, retried
+            log.exception("final cleanup failed")
+            self.error = exc
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+
+
 class BabelFishRApp:
     """Coordinates capture, processing and storage for one monitoring session."""
 
@@ -116,6 +162,10 @@ class BabelFishRApp:
         self._activity_lock = threading.Lock()
         #: Transmissions a capture saved that no processor accepted.
         self._unprocessed: List[str] = []
+        #: The last step of shutdown - engines, then the store - runs off
+        #: the caller's thread, once, with its outcome recorded. See close().
+        self._final = _FinalCleanup(self._close_resources)
+        self._store_closed = False
         # The named thread the operator is working in. One capture service and
         # one pipeline exist globally; this only decides which thread a run is
         # filed under and which rows the window shows.
@@ -227,8 +277,14 @@ class BabelFishRApp:
         processor does not start beside them.
         """
         self._reap()
-        if self._retired or (self.standalone_pipeline is not None
-                             and self.standalone_pipeline.shutting_down):
+        stuck = [p for p in self._retired if p.pending]
+        if self.standalone_pipeline is not None and self.standalone_pipeline.shutting_down:
+            stuck.append(self.standalone_pipeline)
+        if stuck:
+            # A worker that has not returned *with work still accounted to
+            # it* can still reach its engines. One that has finished its work
+            # and is merely leaving cannot: it is tracked until it has gone
+            # (close() waits for it), but it blocks nothing new.
             return ("A processor from the previous run is still shutting "
                     "down. Wait a moment, then try again - nothing is lost "
                     "either way.")
@@ -742,13 +798,17 @@ class BabelFishRApp:
             # every check, still where Retry and Transcribe anyway go, and
             # stopped only once it is idle. The 30-second wait this replaces
             # froze the window and, when it ran out, forgot the worker.
-            if (self._lingering_capture is not None
-                    or not pipeline.stop_if_idle(timeout=5.0)):
-                if pipeline.accepting:
-                    self.standalone_pipeline = pipeline
-                    self._standalone_mode = self._session_mode
-                else:
+            if (self._lingering_capture is None
+                    and pipeline.stop_if_idle(wait=False)):
+                # Idle: admission is closed and the workers have been told to
+                # leave. Nothing is joined here - an earlier version joined
+                # for up to 5 s on this thread. The worker ends on its own;
+                # it stays tracked until it has, and close() waits for it.
+                if not pipeline.finished:
                     self._track_retired(pipeline)
+            else:
+                self.standalone_pipeline = pipeline
+                self._standalone_mode = self._session_mode
         self._session_mode = None
         self._capture_conversation_id = ""
         if session is not None:
@@ -836,7 +896,7 @@ class BabelFishRApp:
                 self._retire_processing()
             except ModeChangeRefused:
                 return None
-        if self._retired:
+        if any(p.pending for p in self._retired):
             return None                # nothing new starts beside a straggler
 
         self.select_engines()          # honours the current operating mode
@@ -1146,23 +1206,26 @@ class BabelFishRApp:
         """Shut down in order, closing engines and the store last - and only
         when nothing can still use them.
 
-        Order: the capture settles first (its stopper thread has joined the
-        audio thread, closed the source and run the final flush, so the last
+        Order: the capture settles (its stopper thread has joined the audio
+        thread, closed the source and run the final flush, so the last
         transmission has been handed over); anything it saved that no
         processor accepted is handed to one; the processor finishes what it
         accepted and its workers end; stragglers end; other store users - a
-        digital analysis saving its result - finish; then the engines close,
-        then the store. Each step waits for the previous to be *complete*,
-        never merely timed out, and returns False with nothing closed if it
-        is not.
+        digital analysis saving its result - finish; then, on a cleanup
+        thread of its own, the engines close (each once) and then the store.
+        Each step waits for the previous to be *complete*, never merely timed
+        out, and returns False with nothing closed if it is not.
 
         Once called, Quit is pending (:attr:`closing`): nothing new starts,
-        accepted work and the final capture hand-off finish. ``wait=True``
-        (the command line, tests) blocks until done or until ``timeout``;
-        ``wait=False`` (the window) never blocks. A second call while one is
-        still running returns False rather than overlap it, and every
-        resource is closed exactly once - engines are dropped as they close,
-        so a failure part-way is retried from where it stopped.
+        accepted work and the final capture hand-off finish. Once the final
+        cleanup has been handed to its thread, :attr:`cleaning` is set: from
+        that moment the store may close at any time and nothing on the
+        calling side may read it. ``wait=True`` (the command line, tests)
+        blocks until done or until ``timeout`` and re-raises a cleanup
+        failure; ``wait=False`` (the window) never joins a thread and never
+        closes a resource itself. A second call while the cleanup thread is
+        running does not start another; a failed cleanup is retried from
+        where it stopped, never re-closing what closed.
         """
         if self._closed:
             return True
@@ -1174,11 +1237,21 @@ class BabelFishRApp:
         finally:
             self._close_in_progress = False
 
+    @property
+    def cleaning(self) -> bool:
+        """The final cleanup has begun: the store may close at any moment."""
+        return self._final.started
+
+    @property
+    def cleanup_error(self) -> str:
+        """Why the last cleanup attempt failed, or "" - it will be retried."""
+        error = self._final.error
+        return f"{type(error).__name__}: {error}" if error is not None else ""
+
     def _close(self, wait: bool, timeout: Optional[float]) -> bool:
         from time import monotonic, sleep
 
         self._closing = True
-        self.stop_session()
         deadline = None if timeout is None else monotonic() + timeout
 
         def remaining() -> Optional[float]:
@@ -1187,6 +1260,30 @@ class BabelFishRApp:
         def out_of_time() -> bool:
             left = remaining()
             return left is not None and left <= 0
+
+        def finish() -> bool:
+            # 6. Engines, then the store - on the cleanup thread, once.
+            if self._final.running:
+                if wait:
+                    self._final.join(remaining())
+                else:
+                    return False
+            if self._final.error is not None and not self._final.running:
+                if wait:
+                    raise self._final.error
+                # Retry: a fresh attempt resumes from what is still open.
+            if not self._closed and not self._final.running:
+                self._final.start()
+                if wait:
+                    self._final.join(remaining())
+                    if self._final.error is not None:
+                        raise self._final.error
+            return self._closed
+
+        if self._final.started:
+            return finish()            # everything before it is already done
+
+        self.stop_session()
 
         # 1. The capture, first: until it has settled it can still produce
         #    the final transmission, and the processor must still be there
@@ -1212,14 +1309,16 @@ class BabelFishRApp:
                     left = remaining()
                     pipeline.wait_until_idle(
                         timeout=1.0 if left is None else min(1.0, left))
-            if not pipeline.stop_if_idle(timeout=10.0 if wait else 1.0):
-                if pipeline.pending:
-                    return False       # still working; everything stays open
-                self._track_retired(pipeline)
-            self.standalone_pipeline = None
-            self._standalone_mode = None
+            if pipeline.stop_if_idle(wait=False):
+                if not pipeline.finished:
+                    self._track_retired(pipeline)  # leaving; waited for below
+                self.standalone_pipeline = None
+                self._standalone_mode = None
+            else:
+                return False           # still working; everything stays open
 
-        # 4. Stragglers.
+        # 4. Every worker has actually ended - nothing is joined on this
+        #    thread unless the caller asked to wait.
         if wait:
             for straggler in list(self._retired):
                 for thread in straggler.worker_threads():
@@ -1240,12 +1339,18 @@ class BabelFishRApp:
             # Nothing can register from here: closing is set and the check
             # above happened under the same lock.
 
-        # 6. Engines, each exactly once, then the store.
+        return finish()
+
+    def _close_resources(self) -> None:
+        """The last step, run on the cleanup thread: engines once, then the
+        store. Whatever closed stays closed if a later step fails; the retry
+        resumes with what is still open."""
         for name in ("transcription", "translation"):
             engine = getattr(self, name)
             if engine is not None:
                 engine.close()
                 setattr(self, name, None)
-        self.store.close()
+        if not self._store_closed:
+            self.store.close()
+            self._store_closed = True
         self._closed = True
-        return True

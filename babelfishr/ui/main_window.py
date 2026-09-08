@@ -80,6 +80,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # included. From then on no timer callback touches the store.
         self._shutdown_complete = False
         self._shutdown_error = ""
+        # Set the moment the application hands its final cleanup to its own
+        # thread: from then on the store may close at any instant, so no
+        # timer callback or control here may read it.
+        self._store_off_limits = False
         self._readiness = None
         self._theming = False
         self._readiness_worker = None
@@ -864,8 +868,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # -- events ----------------------------------------------------------
     def _drain_events(self) -> None:
-        if self._shutdown_complete:
-            return                     # the store is closed; nothing to show
+        if self._shutdown_complete or self._store_off_limits:
+            return                     # the store is closing or closed
         for event in self.app.events.drain():
             if event.kind == "level":
                 reading = event.payload
@@ -1827,6 +1831,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._shutdown_error:
             text = (f"Could not finish quitting: {self._shutdown_error}. "
                     f"Retrying - nothing still in use has been closed.")
+        elif self._store_off_limits:
+            text = "Quitting - closing the engines and the database."
         else:
             parts = []
             outstanding = self.app.outstanding_work()
@@ -1857,7 +1863,20 @@ class MainWindow(QtWidgets.QMainWindow):
             log.exception("closing the application failed")
             self._shutdown_error = f"{type(exc).__name__}: {exc}"
             return False
-        self._shutdown_error = ""
+        if self.app.cleaning and not self._store_off_limits:
+            # The engines and the store are now closing on the application's
+            # cleanup thread. Nothing here reads the store from this point:
+            # the event drain stops and the controls that could reach it are
+            # disabled, while the window itself keeps repainting and this
+            # timer keeps asking whether the cleanup has finished.
+            self._store_off_limits = True
+            self._timer.stop()
+            central = self.centralWidget()
+            if central is not None:
+                central.setEnabled(False)
+        # A failure inside the cleanup thread is reported by the application
+        # rather than raised here; it is shown, and the retry is automatic.
+        self._shutdown_error = self.app.cleanup_error
         if done:
             self._quit_timer.stop()
             self._timer.stop()

@@ -271,21 +271,28 @@ class ProcessingPipeline:
         self._threads = [t for t in self._threads if t.is_alive()]
         return not self._threads
 
-    def stop_if_idle(self, timeout: float = 5.0) -> bool:
+    def stop_if_idle(self, timeout: float = 5.0, wait: bool = True) -> bool:
         """Stop only if nothing accepted is unfinished; atomic with admission.
 
         The idle check and the closing of admission happen under the same
         lock, so a submission cannot land between "nothing pending" and
-        "stopped". Returns False having changed nothing when work is
-        accounted for, and False with admission closed when a worker outlived
-        the join (see :attr:`finished`); the caller tells the two apart by
-        :attr:`pending`.
+        "stopped". With ``wait`` (the default) this joins the workers and
+        returns True only when they have all ended; False either because
+        work is accounted for (nothing changed) or because a worker outlived
+        the join - the caller tells the two apart by :attr:`pending`.
+
+        With ``wait=False`` nothing is joined - for a caller on the GUI
+        thread. True then means the stop *began*: admission is closed and the
+        sentinels are queued; whether the workers have ended is
+        :attr:`finished`, which they reach on their own. False means work is
+        accounted for and nothing changed.
         """
         with self._active_lock:
             if self._in_flight:
                 return False
             self._accepting = False
-        return self.stop(wait=True, timeout=timeout)
+        ended = self.stop(wait=wait, timeout=timeout)
+        return ended if wait else True
 
     @property
     def pending(self) -> int:
@@ -595,6 +602,7 @@ class CaptureService:
         self._finished = False
         #: The thread stop_async() hands the waiting to. None until then.
         self._stopper: Optional[threading.Thread] = None
+        self._source_stopped = False
         #: Transmissions saved here that no processor accepted. Nothing is
         #: lost - the WAV and the row exist - but they are pending, and the
         #: application must not report them finished.
@@ -614,6 +622,7 @@ class CaptureService:
         self.source.start()
         self._running = True
         self._finished = False
+        self._source_stopped = False
         self._set_state(PipelineState.LISTENING)
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="babelfishr-capture")
@@ -647,13 +656,17 @@ class CaptureService:
         """
         self._running = False
         thread = self._thread
-        if thread is None or not thread.is_alive():
+        ended = thread is None or not thread.is_alive()
+        if ended and self._finished and self._source_stopped:
             self._thread = None
-            self._stop_source()
-            self._finish_once()
-            return
+            return                     # nothing is left to do: settled already
         if self._stopper is not None and self._stopper.is_alive():
             return                     # a stop is already under way
+        # Even with the audio thread gone, closing the source and flushing
+        # the detector can take time (a device's stop, the last WAV), so they
+        # too run on the stopper, never on the caller. An earlier version ran
+        # them here when the thread had ended, and a slow source.stop() held
+        # the GUI thread for its duration.
         self._stopper = threading.Thread(
             target=self._stop_blocking, args=(self.stop_timeout,),
             name="babelfishr-capture-stop", daemon=True)
@@ -680,6 +693,7 @@ class CaptureService:
             self.source.stop()
         except Exception:  # noqa: BLE001
             log.debug("error stopping source", exc_info=True)
+        self._source_stopped = True
 
     @property
     def alive(self) -> bool:
@@ -728,11 +742,12 @@ class CaptureService:
         self.source.start()
         self._running = True
         self._finished = False
+        self._source_stopped = False
         self._set_state(PipelineState.LISTENING)
         self._pump(timeout=timeout)
         self._running = False
         self._finish_once()
-        self.source.stop()
+        self._stop_source()
         return self.transmissions_captured
 
     # -- the audio loop --------------------------------------------------

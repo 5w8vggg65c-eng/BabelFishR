@@ -363,9 +363,13 @@ def test_a_straggler_blocks_starts_and_mode_changes_until_it_has_left(config, st
     app, tx = saved_recording(config, store, wav)
 
     class Straggler:
+        """A stopped processor whose worker has not returned and still holds
+        its job. (One that has finished its work and is merely leaving is
+        tracked, and waited for by close(), but blocks nothing new.)"""
+
         alive = True
         accepting = False
-        pending = 0
+        pending = 1
 
         @property
         def finished(self):
@@ -449,6 +453,17 @@ def window_with_a_held_job(qt_app, config, store, wav, engines):
     return app, window, engine
 
 
+def close_and_wait(qt_app, window, timeout: float = 20.0) -> None:
+    """Quit as the operator does. The final cleanup runs on the application's
+    own thread, so the window closes a tick later, never inside close()."""
+    window.close()
+    deadline = time.monotonic() + timeout
+    while window.isVisible() and time.monotonic() < deadline:
+        pump(qt_app, 5)
+    assert not window.isVisible(), "the window never closed"
+    assert window._shutdown_complete
+
+
 def cleanup(qt_app, window, engine, timer):
     """Never leave a parked worker, a live heartbeat or an open window behind
     for the next test: that is how one failure becomes a crash later."""
@@ -498,7 +513,7 @@ def _stop_monitoring_body(qt_app, app, window, engine, timer, ticks, wav):
     assert tx.state is ProcessingState.COMPLETE and tx.transcript
     assert "Idle" in window.state_badge.text(), window.state_badge.text()
     timer.stop()
-    assert window.close() is True
+    close_and_wait(qt_app, window)
 
 
 def test_quit_waits_on_the_event_loop_and_closes_in_order(qt_app, config, store,
@@ -572,8 +587,8 @@ def test_the_event_drain_never_touches_a_closed_store(qt_app, config, store, wav
     app.run_replay()
     app.stop_session()
     tx = app.recent_transmissions()[0]
-    assert window.close() is True
-    assert window._shutdown_complete and not window._timer.isActive()
+    close_and_wait(qt_app, window)
+    assert not window._timer.isActive()
 
     app.events.publish("transmission", tx)
     assert threading.current_thread() is threading.main_thread()

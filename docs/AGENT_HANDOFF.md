@@ -3534,3 +3534,150 @@ stand-in engines. This session's results, not an independent rerun; no Mac.
 - F3, F4 deferred; F6/F7, F8/F9 outside; playback, removal semantics and
   General unresolved; no Mac validation of any of this (checklist M,
   steps 43–46, says so now).
+
+---
+
+# Completing non-blocking Stop/Quit — the terminal cleanup phase
+
+Codex, at `20be9b7`, passed the final-voice/Quit and held-analysis probes and
+then measured three remaining paths that still held the main thread: (1)
+`CaptureService.stop_async()` closed the source and flushed on the caller
+when the audio thread had already ended - 1.200 s with a slow `source.stop()`;
+(2) `stop_session()` called `stop_if_idle(timeout=5.0)`, a worker join - 1.201 s
+with the worker held at its stop sentinel; (3) `close(wait=False)` called
+`engine.close()` and `store.close()` inline - 1.201 s with a slow engine
+close. Those were counterexamples to the previous report's "returns
+promptly"; the phrase "fraction of a second" there was a characterisation,
+not a measurement, and is withdrawn.
+
+## Identifiers
+
+| | |
+|---|---|
+| Base | `20be9b7` — verified equal to the remote tip at the start, worktree clean |
+| Commit | the commit carrying this section (the branch tip) |
+| Branch | `claude/radio-decoder-translator-0oslya` |
+| Workflow / tag / release | none dispatched, retried, created, moved or published |
+
+## What changed
+
+- **Capture.** `stop_async()` starts its stopper thread whenever anything
+  remains to do - a live audio thread, a source not yet stopped, a finish not
+  yet run - and returns without work only when all three are already done
+  (`_source_stopped` tracks the source; `run_to_completion` sets it). The
+  source close and the final flush therefore never run on the caller.
+- **Idle worker retirement.** `ProcessingPipeline.stop_if_idle(wait=False)`
+  closes admission atomically and queues the sentinels without joining; it
+  returns True when the stop *began*. `stop_session()` uses it and tracks a
+  worker that has not yet returned in `_retired`; the worker ends on its own
+  (the sentinel makes `queue.get` return at once) and `_reap()` drops it.
+  `shutdown_problem()` and `_processing_pipeline()` now refuse only for a
+  retired worker that still holds work (`pending > 0`); one that has finished
+  its work and is merely leaving blocks nothing new, but `close()` still
+  waits for it before the final cleanup.
+- **Final cleanup.** `close()` hands the last step - engines, each once and
+  dropped as closed, then the store - to a cleanup thread
+  (`_FinalCleanup`, "babelfishr-cleanup"). `app.cleaning` is set the moment
+  that thread is started and never cleared: from then on the store may close
+  at any instant. A second `close(wait=False)` while it runs starts nothing.
+  A failure is recorded (`cleanup_error`), `_closed` stays False, and the next
+  call retries from what is still open. `close(wait=True)` (CLI, tests)
+  starts the same thread and joins it, re-raising a failure.
+- **Window.** `_finish_shutdown()`: when `app.cleaning` first becomes true it
+  stops the event-drain timer, marks the store off limits (`_drain_events`
+  returns at once) and disables the central widget, while the window itself
+  keeps repainting and the quit timer keeps asking; `cleanup_error` is shown
+  as before ("Could not finish quitting: … Retrying"). An idle window's first
+  Quit therefore returns False and completes on the next tick - nothing
+  closes on the GUI thread any more.
+
+Not changed, deliberately, and recorded as remaining synchronous *bounded*
+paths outside Stop/Quit: `_retire_processing()` (mode change) and
+`_discard_standalone_pipeline()` (Start) still `stop_if_idle(timeout=5.0)`
+an idle processor with a join, and `_abandon_failed_start()` still joins the
+workers of a start that failed. Each is a join of an idle worker that exits
+on its sentinel; each is bounded by 5 s; none is Stop or Quit.
+
+## Tests
+
+`tests/test_alpha5_cleanup.py` (5, real Qt offscreen): (1) already-ended
+capture + held `source.stop()`: Stop < 1 s, heartbeat through the hold,
+capture still "finishing", nothing flushed until the source closed, then one
+COMPLETE transmission; (2) worker held at its stop sentinel: Stop < 1 s and
+Quit < 1 s with the heartbeat alive, worker tracked in `_retired`, an idle
+leaving worker blocks nothing new, cleanup does not begin until it has gone;
+(3) held `engine.close()`: Quit < 1 s, heartbeat through the hold, drain
+timer stopped, central widget disabled, a published event and a direct
+`_drain_events()` reach the store zero times (counted on `store.is_deleted`),
+store still open (engines first), one cleanup thread, engine closed once;
+(4) held `store.close()`: same, plus repeated Quit starts no second cleanup;
+(5) repeated Quit before and during the cleanup: one thread, each engine
+closed once, `close()` after completion is a no-op.
+
+Substitutions: a `CallbackAudioSource` subclass that reports itself finished
+once its queue is empty after the test says so (the audio thread ends like a
+replay's) and whose `stop()` blocks until released; the live pipeline queue's
+`get` wrapped to hold after the sentinel; `MockTranscriptionEngine.close` and
+`Store.close` wrapped on the instance to block until released. Production
+timeouts unchanged (`stop_timeout` asserted 5.0; the 5 s join is never
+reached because nothing joins on the GUI thread).
+
+### Existing tests changed
+
+- `test_alpha5_lifecycle.py::test_a_straggler_blocks_starts_and_mode_changes_until_it_has_left`:
+  the stand-in straggler now reports `pending = 1`. An idle worker merely
+  leaving no longer blocks starts or mode changes; one still holding work
+  does - which is what the test is about.
+- `test_alpha5_lifecycle.py` (two tests) and `test_alpha5_shutdown.py` (two
+  tests): `assert window.close() is True` became "close, then pump until
+  hidden", because the final cleanup now completes on its own thread a tick
+  later; the failed-close test waits for the asynchronous outcome (status
+  text, engine closed once) instead of asserting it synchronously. Same
+  intents.
+
+### Fail-before (production files restored from `20be9b7`, tests unchanged)
+
+Three of the five cleanup tests FAIL outright on `20be9b7`; the fourth
+(held `engine.close()`) did not fail - it *hung*: pytest's 120 s timeout
+fired with the main thread inside `_finish_shutdown → app.close →
+engine.close`, which is the blocking path itself; the fifth was not reached.
+On the repaired tree all five pass (26 s), as do the 19 tests of the two
+previous new-pass files (23 s).
+
+### Mutations (repaired code restored after each; byte-compared)
+
+| # | Mutation | Result |
+|---|---|---|
+| P1 | `stop_async` closes the source and flushes on the caller when the thread has ended | caught (slow-source test) |
+| P2 | `stop_session` joins the idle worker again | caught (idle-worker test) |
+| P3 | `close()` runs the final cleanup on the caller's thread | caught (slow-engine test) |
+| P4 | the window keeps draining while the store is closing | caught (slow-engine test) |
+| P5 | `_FinalCleanup.start()` no longer refuses while running | **not caught — equivalent mutant**: `close()` checks `running` before calling `start()`, so the inner guard alone is redundant |
+| P5b | both guards removed (a second Quit really starts a second cleanup) | still not caught with two guards removed - a third check of `running` sits before `start()` in `finish()`; with **all three** removed (P5c) the test fails: 6 cleanup threads for 1, the engine closed 3 times for 1. The test catches a genuine overlap; P5 and P5b are equivalent mutants of layered guards |
+| P6 | `close()` cleans up before the retired worker has finished | caught (idle-worker test) |
+| P7 | a cleanup failure is treated as done | caught (failed-close test) |
+
+### Test results
+
+Focused first: the ten nearest existing suites (223 passed); the two previous new-pass files (19 passed); this pass's file (5 passed). Full suite: **917 passed, 11 skipped** in 181.88 s (912 before this pass plus the 5 new tests); skips unchanged (`test_alpha5_playback.py:516`, `:531`, `test_coreaudio.py:255`, `test_packaging.py:373`, `test_real_engines.py:32` ×5, `:107` ×2). `git diff --check` and `compileall` over `babelfishr`, `tests`, `packaging` clean. Linux, Python 3.11, PySide6 Essentials, `QT_QPA_PLATFORM=offscreen`, mock and stand-in engines. This session's results, not an independent rerun; no Mac.
+
+## Logo — preserved for the assets pass, not integrated
+
+Eric supplied a logo sketch and asked for white shapes on black; Codex
+generated artwork; Eric shared the design here:
+https://chatgpt.com/s/m_6aa0578e4c248191bc16f0fd776186e4 . Nothing in
+packaging or the application was changed for it in this pass.
+
+## Unresolved ledger, updated
+
+- Stop/Quit no longer wait on the GUI thread for capture, source, worker,
+  engine or database cleanup, as measured by the tests above on Linux; on a
+  Mac this is untested (checklist M, steps 43-46).
+- Mode change, Start and a failed start still join an idle worker for up to
+  5 s on the GUI thread (bounded; not Stop/Quit; noted above).
+- A permanently stuck source, worker, engine close or database close is an
+  explicitly reported unresolved operation: Quit waits and says what for; no
+  forced termination or cancellation exists (Eric's decision).
+- CLI `close()` without a timeout waits indefinitely (Ctrl-C works).
+- F3, F4 deferred; F6/F7, F8/F9 outside; playback boundary/seek/collapse,
+  removal semantics and General unresolved; logo not integrated.

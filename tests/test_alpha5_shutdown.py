@@ -263,7 +263,8 @@ def test_stop_only_still_processes_the_final_transmission_and_saved_recordings(
         assert pump_until(qt_app, lambda: app.outstanding_work() == 0, timeout=20.0)
         assert engine.calls == 2
         timer.stop()
-        assert window.close() is True
+        window.close()
+        assert pump_until(qt_app, lambda: not window.isVisible(), timeout=20.0)
     finally:
         cleanup(qt_app, window, source, timer)
 
@@ -433,31 +434,34 @@ def test_new_work_is_refused_while_quit_is_pending(qt_app, config, store, wav,
 def test_a_failed_close_is_not_reported_complete_and_retries_safely(qt_app, config,
                                                                     store, wav,
                                                                     monkeypatch):
+    """The store refuses to close. The cleanup runs on the application's own
+    thread, so the outcome arrives a tick later - and it is a failure, shown,
+    retried, and never reported as complete."""
     app, window, tx = window_with_a_saved_message(qt_app, config, store, wav)
     engine = app.transcription
     closes = {"engine": 0}
     real_engine_close = engine.close
     engine.close = lambda: (closes.__setitem__("engine", closes["engine"] + 1),
                             real_engine_close())[1]
-    real_store_close = store.close
 
     def failing_close():
         raise OSError("disk went away")
 
-    store.close = failing_close
-    assert window.close() is False, "a failed close was accepted as a close"
-    assert not window._shutdown_complete
-    assert window.isVisible()
-    assert window._quit_timer.isActive() and window._timer.isActive()
-    assert "could not finish quitting" in window.status.currentMessage().lower()
+    monkeypatch.setattr(store, "close", failing_close)
+    assert window.close() is False, "a close still to run was reported done"
+    assert pump_until(qt_app, lambda: "could not finish quitting" in
+                      window.status.currentMessage().lower(), timeout=10.0), (
+        window.status.currentMessage())
     assert "disk went away" in window.status.currentMessage()
+    assert not window._shutdown_complete and window.isVisible()
+    assert window._quit_timer.isActive()
     assert closes["engine"] == 1
-    pump(qt_app, 80)                                       # retries happen, still failing
+    pump(qt_app, 80)                                       # retries keep failing
     assert not window._shutdown_complete and window.isVisible()
     assert closes["engine"] == 1, "a retry closed the engine again"
     assert app.transcription is None and not app._closed
 
-    store.close = real_store_close                         # the obstacle is gone
+    monkeypatch.undo()                                      # the obstacle is gone
     assert pump_until(qt_app, lambda: not window.isVisible(), timeout=20.0)
     assert window._shutdown_complete and app._closed
     assert closes["engine"] == 1
