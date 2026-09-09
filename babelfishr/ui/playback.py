@@ -240,8 +240,13 @@ class PlaybackController(QtCore.QObject):
             self._fail(tx_id, f"the recording file is missing: {path}")
             return False
         if self.owner == tx_id and self._state == PAUSED and self.path == path:
+            self.last_error.pop(tx_id, None)
             self.backend.play()          # resume where it was paused
-            return True
+            # The same rule as a fresh start: a backend that rejects the
+            # resume synchronously has already retired this recording and
+            # recorded why; say so rather than claim success. An earlier
+            # version returned True here regardless.
+            return tx_id not in self.last_error
         if self.owner is not None and self.owner != tx_id:
             # One recording at a time. Retire the previous owner outright.
             self.backend.stop()

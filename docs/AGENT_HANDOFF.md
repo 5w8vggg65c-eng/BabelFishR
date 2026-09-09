@@ -3931,6 +3931,7 @@ homes and recordings, no cloud provider; nothing of Eric's touched.
 |---|---|
 | F3 reproduction, `f2c6b80` | Search view `['tx1']` -> `['tx3','tx1']` on a non-matching arrival; Review view gained a confident record. After repair: not reproduced (view unchanged, count unchanged) |
 | F4 reproduction, `f2c6b80` | B's missing file -> A `STOPPED`, owner `None`, controls collapsed, backend still playing A, no stop call. After repair: A `PLAYING`, owner `a`, position kept, controls shown, B shows its own error |
+| *Correction (next pass)* | The row above says owner `None`; that is wrong. The old `_fail()` set the shared state to `STOPPED` for B's failure and left A's owner as `a` - `state_for("a")` read `STOPPED` because the shared state did, not because ownership was cleared. The fail-before output of that pass shows it (`assert ('a' == 'a' and 'stopped' == 'playing')`), as does Codex's own `f2c6b80` reproduction. Original wording left in place; corrected here rather than rewritten. |
 | New tests | 11 (5 filtered views, 6 playback ownership), all pass |
 | Fail-before (production restored from `f2c6b80`) | 8 of 11 fail; guards that pass: Session switch, anchoring, owner-failure/natural-end/Stop/takeover |
 | Focused | filtered views + ownership + boundary: 17 passed; ownership + `test_alpha5_playback.py`: 27 passed, 2 skipped; the 30 lifecycle/shutdown/cleanup/boundary tests with the nearest suites: 150 passed, 2 skipped |
@@ -3964,4 +3965,210 @@ No uncaught, non-equivalent mutation.
   assets pass; no candidate contains the shutdown or these passes; run 21
   historical; no forced cancellation/exit.
 - The filtered view re-queries the store per admitted event; its cost at
-  large thread sizes belongs with F6/F7.
+  large thread sizes belongs with F6/F7. *(Superseded by the next section:
+  one query per drained batch, and the membership is the complete bounded
+  result.)*
+
+---
+
+# Filter reconciliation completed, and failed-resume reporting
+
+Codex's independent check of `c904284` (57 passed, 2 skipped across the
+seven nearest suites, Python 3.12, PySide6 6.8.3, offscreen) confirmed the
+F3 and F4 repairs and found three things the first pass left incomplete.
+All three were reproduced here against `c904284` before any edit, with the
+same scripts that now stand as tests:
+
+- **A. Capped results not fully reconciled.** 201 qualifying rows, view
+  opened through the View menu, the newest shown row made to stop
+  qualifying (Search: transcript changed and `updated` published; Review:
+  `app.correct()`). Store: 200 rows including `tx0`; timeline: 199 rows,
+  `tx0` missing; status: "200". `_admit()` placed only the event's own row
+  and never added a record newly entering the bounded result.
+- **B. GUI removal bypassed the Search filter.** Show removed messages on,
+  Search "giraffe", the bubble's ⋯ → Remove message → Remove from thread
+  (only the question's answer substituted): the row hidden in the store,
+  `app.search` empty, `_view_kind` still "search", the hidden bubble still
+  displayed. `_on_remove_message()` updated the widgets directly. A second,
+  event-path probe (store hide + `updated` event) showed `_belongs_here()`
+  rejecting the update so the shown widget stayed.
+- **C. Failed resume returned True.** A paused at 700 ms, a backend whose
+  `play()` emits `errorOccurred` and reports STOPPED, `controller.play("a",
+  path)` → `True` with owner `None`, state STOPPED and the error shown. The
+  PAUSED resume branch returned True straight after `backend.play()`.
+
+## Identifiers
+
+| | |
+|---|---|
+| Base | `c904284` — verified equal to the remote tip at the start, worktree clean |
+| F3 follow-up commit | `a71c2fc` |
+| F4 follow-up commit | the commit carrying this section (`git log -1 -- docs/AGENT_HANDOFF.md`) |
+| Branch | `claude/radio-decoder-translator-0oslya` |
+| Workflow / tag / release / packaging / logo / FTS schema / dependency locking | nothing dispatched, retried, created, moved, published or changed |
+
+## A and B — the Store's bounded answer is the membership (my design, on Codex's recommendation)
+
+`_admit()` no longer draws anything from a filtered view's event; the
+event only says the answer may have changed (anything shown, or anything
+of this Session's - hidden or deleted included). The drain collects the
+ids touched and calls `_refresh_view(touched)` **once per drained batch**:
+the very store query that opened the view is run again, and its complete
+bounded result is the membership - shown rows it does not hold are
+removed, rows it holds that are not shown are placed by
+`TimelineView.place()` where their time puts them (a replacement for one
+that left a full result lands at the bottom), shown rows whose event
+arrived are updated to the row as the store has it, and the count is
+re-announced. Widgets that stay are the same widgets. The Session's own
+thread keeps its arrival/update behaviour and now also drops a shown row
+whose update says it is hidden (removed messages not shown) or that was
+deleted. `_belongs_here()` is split: `_in_this_conversation()` is the
+Session test; the visibility tests stay in `_belongs_here()` for the
+thread.
+
+The operator's own changes go through the same reconciliation:
+`_after_local_change()` (Remove from thread, Restore to thread) refreshes
+a filtered view against its query and treats the thread as before;
+permanent deletion refreshes the view after removing the widget, so a full
+result gets its replacement. Operator messages in a filtered view carry the
+view's count ("1 match(es) for 'giraffe'. Message removed from the
+thread..."), so the status line stays truthful about the view it describes.
+`_refresh_view()` returns at once when the store routes are shut; the
+drain already did. Toggling View › Show removed messages still reloads the
+thread (as Show all does) - preserved, tested, and not a decision about
+whether Search should include hidden rows: the Store's rule is unchanged.
+
+`TimelineView.place()` is now a single anchored insertion (`_insert()`,
+shared with `add()`), not an insertion at the top followed by a move; and
+the deferred anchor passes are coalesced into one chain. Two anchored
+changes in one turn (a row removed, its replacement placed) used to start
+two chains, spending the three settle passes twice as fast - before the
+scroll area had resized the container to its new content, while a full
+200-row thread was still squeezed to the old height - and the reading
+position settled a bubble's height (57 px in the test) off. With one chain
+the position is back within a pixel by the third turn. **Limitation:** in
+a full 200-row view the correction is visible as a transient of up to two
+event-loop turns; measured here offscreen, not on a screen.
+
+Query count, measured: five same-Session arrivals published and drained
+in one batch → **1** store query (was 5, one per event); three
+other-Session arrivals → **0** queries. No FTS or schema change; F6/F7
+are not addressed.
+
+## C — resume reports like a fresh start
+
+The PAUSED branch of `PlaybackController.play()` clears any stale error,
+presses `backend.play()`, and returns `tx_id not in self.last_error`: a
+backend that rejects the resume synchronously has already retired the
+recording through `_on_error` and recorded why, and the caller is told
+False. A resume that works returns True and continues from the paused
+position with a single `play()` call - no reload, no stop. Cross-bubble
+protection, takeover, Stop, natural completion and the system-player
+fallback are unchanged (`test_alpha5_playback.py`,
+`test_alpha5_playback_ownership.py` all pass). A scripted signal order
+shows the controller's contract, not what a QtMultimedia build emits;
+QtMultimedia is not installed here.
+
+## Tests
+
+`tests/test_alpha5_view_reconciliation.py` (8) and
+`tests/test_alpha5_playback_resume.py` (3), real Qt offscreen, helpers
+imported by path from the earlier suites. Search and Review at 201 rows
+through the real menu, a shown row made to stop qualifying by the
+production paths (`updated` event; `app.correct()`), membership asserted
+equal to the Store's result and the count read from the status line; the
+surviving bubbles asserted to be the same widget objects and the anchored
+bubble's viewport y measured before and after (±1 px); Remove from thread
+through two real clicks on the bubble's ⋯ menu with only `_choose`
+substituted, with removed messages shown; Delete permanently through the
+two real questions, bringing in the next record the limit kept out; the
+event path for hidden and deleted rows in both a Search and the thread;
+the removed-messages toggle preserved; one query per drained batch and
+none for other Sessions; no query against a closing store
+(`_shut_store_routes()`, the production shutter). No test removes a widget
+itself to manufacture a result.
+
+## Evidence (this pass)
+
+Environment: Linux container, Python 3.11, PySide6 Essentials (no
+QtMultimedia), `QT_QPA_PLATFORM=offscreen`, mock engines, isolated
+temporary databases and recordings, no cloud provider; nothing of Eric's
+touched. Substitutions: the Search text dialog (`QInputDialog.getText`)
+types the word; the removal question (`MainWindow._choose`) is answered;
+the scripted playback backend stands in for QtMultimedia. Everything else
+is the production window, menus, bubbles, store and event queue.
+
+| Check | Result |
+|---|---|
+| A, B, C on `c904284` | all three reproduced as Codex described (A: store 200 incl. `tx0`, timeline 199, status "200", Search and Review alike; B: `['tx0']` shown, `app.search` empty, view "search"; C: `True`, owner `None`, STOPPED, error shown). After repair: A timeline 200 incl. `tx0`, count 200; B view empty, count 0; C returns `False` |
+| New tests | 11 (8 reconciliation, 3 resume), all pass |
+| Fail-before (production from `c904284`) | 8 of 11 fail; the 3 that pass are guards: removed-messages toggle returns to the thread; a working resume; a paused recording surviving B's failure and yielding to a valid B. `test_reconciliation_never_queries_a_closing_store` fails before because `_refresh_view` does not exist there, not because the old drain queried a closing store |
+| Focused (11 suites: reconciliation, resume, filtered views, ownership, playback, boundary, cleanup, shutdown, lifecycle, message removal, shared recordings) | 94 passed, 2 skipped |
+| Full suite | 945 passed, 11 skipped, 0 failed, 192 s |
+| Skips (11) | 2 QtMultimedia not installed; 1 CoreAudio needs macOS; 1 PlistBuddy macOS only; 5 no prepared Whisper model; 2 no Argos language pack |
+| `git diff --check`, `compileall` | clean |
+
+Reversals (one at a time, the named test run, files byte-restored and verified):
+
+| Reversal | Test | Verdict |
+|---|---|---|
+| M1 `_refresh_view` places only the touched row (finding A reversed) | `test_a_full_search_replaces_a_row_that_stops_qualifying` | caught (`tx0` missing) |
+| M1b the same, Review queue | `test_a_full_review_queue_replaces_a_row_the_operator_reviews` | caught |
+| M2 removal updates the widgets directly (finding B reversed) | `test_removing_a_shown_message_leaves_the_search_even_while_removed_messages_are_shown` | caught (`['tx1','tx0'] != ['tx0']`) |
+| M2b deletion does not refresh the view | `test_removing_and_deleting_from_a_full_search_bring_in_replacements` | caught (`tx-1` missing) |
+| M3 a filtered view is invalidated only by events `_belongs_here` admits | `test_a_shown_row_that_is_hidden_or_deleted_by_an_event_leaves` | caught |
+| M3b the thread ignores a shown row now hidden | same | caught (`['tx2'] != []`) |
+| M4 refresh per event, not per batch | `test_one_query_per_drained_batch_and_none_for_other_sessions` | caught (5 queries != 1) |
+| M5 no closing-store guard in `_refresh_view` | `test_reconciliation_never_queries_a_closing_store` | caught (2 queries) |
+| M6 deferred anchor passes not coalesced | `test_a_full_search_replaces_a_row_that_stops_qualifying` | caught (moved 57 px) |
+| M7 failed resume returns True (finding C reversed) | `test_a_resume_the_backend_rejects_returns_false_and_shows_the_error` | caught |
+
+No surviving reversal. Existing tests changed: none (two new files only).
+One test-harness lesson recorded: a scratch script named `profile.py`
+next to a probe shadowed the standard-library `profile` module and ran a
+second window inside the probe process; it distorted one timing probe
+before it was found and renamed. No repository file was involved.
+
+## Provenance corrections
+
+- The previous pass's chat report closed with "Carried forward verbatim
+  from the directive: ... acoustic radio test not performed ...". That was
+  a summary, not a verbatim carry-forward, and the acoustic statement was
+  wrong as written. **Eric's acoustic radio test is recorded** (above, in
+  "Eric's run-21 results" and the run-20 status): work radio speaker →
+  acoustic sound → laptop microphone → BabelFishR, with conversation
+  breaks, transcription and translation observed by Eric, who clarified
+  "live translation & transcription still came from my laptop's
+  microphone, but i held my work radio up to it". What is untested is the
+  direct electrical radio/PTT/USB path, SDR operation, RF metadata and
+  transmitter identification - and no acoustic or hardware test was run in
+  any of these coding sessions. The two must not be conflated again.
+- The F4 baseline description "owner `None`" in the previous section is
+  corrected in place (annotation row under its table): the old `_fail()`
+  changed the shared state only; A's owner remained `a`.
+
+## Unresolved ledger, carried forward
+
+- F1 worker/offline safeguards and F2 shared-recording protection stand.
+- F5 shutdown repairs green in Codex's latest focused run; physical Mac
+  validation pending. Permanently stuck operations have no
+  forced-cancellation policy; CLI close without a timeout can wait
+  indefinitely; Start/mode-change bounded synchronous paths remain;
+  unreadable retained analysis records conservatively prevent file
+  deletion; the historical "fraction of a second" wording is not a
+  measured bound.
+- F3: contamination repaired (previous pass); capped replacement and GUI
+  removal repaired here. F4: cross-bubble ownership repaired (previous
+  pass); failed-resume return repaired here. Neither seen on a Mac
+  (checklist N, O, P; steps 47-51; future candidate).
+- F6 search-index write amplification and F7 large-thread costs
+  unrepaired; F8 selective cleanup and F9 dependency locking remain
+  recommendations.
+- Exactly-five-second playback boundary, seeking and natural-completion
+  collapse: unresolved product decisions. Removal semantics, General's
+  treatment, forced cancellation/exit: unresolved; preserving or testing
+  existing code does not approve those choices.
+- Eric's white-on-black logo integration pending.
+- No candidate contains these repairs.
+- Direct electrical radio/PTT/USB, SDR, RF metadata and transmitter
+  identification unverified. Acoustic radio testing IS recorded (above).

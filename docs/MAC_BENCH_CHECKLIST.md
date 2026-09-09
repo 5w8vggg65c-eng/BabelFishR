@@ -353,8 +353,10 @@ Not in run 21 or any later build yet; needs a future candidate.
 50. With two messages longer than five seconds, press **▶ Play** on the
     older one and, while it plays, press **▶ Play** on the newer one.
     *Good:* the older one's controls collapse and the newer one's expand;
-    one recording plays at a time. Press **■ Stop**. *Good:* the controls
-    collapse and the sound stops.
+    one recording plays at a time. Press **⏸** to pause, wait a moment,
+    then press **▶ Play** on the same message. *Good:* it continues from
+    where it paused, not from the start. Press **■ Stop**. *Good:* the
+    controls collapse and the sound stops.
     (The case of a message whose recording file has gone missing cannot be
     arranged by clicking alone; it is covered by automated tests only.)
 
