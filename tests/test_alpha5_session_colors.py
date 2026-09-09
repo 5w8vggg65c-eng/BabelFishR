@@ -17,7 +17,7 @@ from babelfishr.app import BabelFishRApp
 from babelfishr.models import ProcessingState
 from babelfishr.providers.mock import (MockTranscriptionEngine,
                                        MockTranslationEngine)
-from babelfishr.storage import Store
+from babelfishr.storage import SCHEMA_VERSION, Store
 from babelfishr.testing import build_fixture
 
 SR = 48_000
@@ -318,7 +318,7 @@ def test_a_run_21_database_gains_colours_without_losing_anything(tmp_path):
     _schema_4_database(database, "")
 
     store = Store(database, recordings_dir=str(tmp_path))
-    assert store.schema_version == 5
+    assert store.schema_version == SCHEMA_VERSION
     conversations = {c.id: c for c in store.list_conversations()}
     assert set(conversations) == {"conv_gen", "conv_ops"}
     assert conversations["conv_gen"].is_default
@@ -340,7 +340,7 @@ def test_a_run_21_database_gains_colours_without_losing_anything(tmp_path):
     again = Store(database, recordings_dir=str(tmp_path))
     assert again.get_conversation("conv_ops").color == "#00ffaa"
     assert again.get_conversation("conv_gen").color == ""
-    assert again.schema_version == 5
+    assert again.schema_version == SCHEMA_VERSION
     again.close()
 
 
@@ -350,5 +350,5 @@ def test_the_migration_is_idempotent_at_schema_5(tmp_path):
     for _ in range(3):
         store = Store(database, recordings_dir=str(tmp_path))
         assert len(store.list_conversations()) == 2
-        assert store.schema_version == 5
+        assert store.schema_version == SCHEMA_VERSION
         store.close()

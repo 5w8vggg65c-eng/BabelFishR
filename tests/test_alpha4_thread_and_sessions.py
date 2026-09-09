@@ -26,7 +26,7 @@ from babelfishr.models import (AnalysisAttempt, AnalysisOutcome,
                                Provenance, Session, Transmission)
 from babelfishr.providers.mock import (MockTranscriptionEngine,
                                        MockTranslationEngine)
-from babelfishr.storage import Store
+from babelfishr.storage import SCHEMA_VERSION, Store
 from babelfishr.testing import build_fixture
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -475,7 +475,7 @@ def test_an_alpha_3_database_upgrades_without_losing_anything(tmp_path):
     before.close()
 
     store = Store(database, recordings_dir=str(tmp_path))
-    assert store.schema_version == 5
+    assert store.schema_version == SCHEMA_VERSION
 
     conversations = store.list_conversations()
     assert [c.name for c in conversations] == [DEFAULT_CONVERSATION_NAME]

@@ -27,7 +27,15 @@ from .models import (ContentClass, Conversation, ErrorInfo, ProcessingState,
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+
+#: Layout of the search index and its maintenance table (meta key
+#: ``fts_layout``). 1: the index alone, maintained by deleting and rewriting
+#: the entry on every save, looked up by its UNINDEXED id - a full scan of
+#: the index for each save and each deletion. 2: an entry per message that
+#: has something searchable, addressed through ``transmissions_fts_map`` by
+#: the index's own rowid, rewritten only when the searchable text changes.
+FTS_LAYOUT = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -173,7 +181,21 @@ CREATE VIRTUAL TABLE IF NOT EXISTS transmissions_fts USING fts5 (
     id UNINDEXED, transcript, translation, correction, notes, tags,
     tokenize = 'unicode61'
 );
+
+-- Which index entry belongs to which message. FTS5 addresses its rows by
+-- rowid (its content table is 'id INTEGER PRIMARY KEY', so the rowid is
+-- explicit and survives VACUUM); this table is the only place that rowid is
+-- remembered, so the index is maintained by rowid and never scanned by id.
+-- Derived from transmissions like the index itself: rebuild_search_index()
+-- recreates both from the authoritative rows.
+CREATE TABLE IF NOT EXISTS transmissions_fts_map (
+    id        TEXT PRIMARY KEY,
+    fts_rowid INTEGER NOT NULL UNIQUE
+);
 """
+
+#: The searchable fields, in the index's column order after ``id``.
+_FTS_COLUMNS = ("transcript", "translation", "correction", "notes", "tags")
 
 def _conversation_from_row(row) -> Conversation:
     keys = row.keys()
@@ -283,11 +305,125 @@ class Store:
             self._conn.executescript(_POST_MIGRATION_SCHEMA)
 
             self._backfill_default_conversation()
+            self._conn.commit()
+
+            if self.fts_enabled:
+                self._upgrade_fts_layout()
 
             self._conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
                 (str(SCHEMA_VERSION),))
             self._conn.commit()
+
+    # ---- search index layout -------------------------------------------
+    def _upgrade_fts_layout(self) -> None:
+        """Bring the search index to FTS_LAYOUT, once, and lose nothing.
+
+        Layout 1 kept one index row per message and found it by scanning for
+        its id. Layout 2 remembers each row's rowid in transmissions_fts_map.
+        The upgrade adopts the rows already indexed (no rewrite of a healthy
+        index), drops duplicates and orphans, indexes any message the index
+        is missing and corrects any entry whose text differs from the message
+        - all in one transaction with the ``fts_layout`` mark, so a failure
+        leaves the mark unwritten and the next open tries again. Meanwhile
+        search falls back to LIKE for this process rather than run against a
+        half-built layout. Messages, Sessions and files are never touched.
+
+        Repeatable: an index already at layout 2 whose map covers every row
+        is left alone. A map that no longer matches the index (an older build
+        rewrote entries by id, say) is reconciled the same way.
+        """
+        layout = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'fts_layout'").fetchone()
+        current = int(layout["value"]) if layout else 1
+        if current == FTS_LAYOUT and self._fts_map_covers_index():
+            return
+        try:
+            self._conn.execute("BEGIN")
+            self._reconcile_fts()
+            self._conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('fts_layout', ?)",
+                (str(FTS_LAYOUT),))
+            self._conn.execute("COMMIT")
+            log.info("search index at layout %d (was %d)", FTS_LAYOUT, current)
+        except sqlite3.Error as exc:
+            with contextlib.suppress(sqlite3.Error):
+                self._conn.execute("ROLLBACK")
+            self.fts_enabled = False
+            log.warning("search index upgrade failed (%s); the index is left as it "
+                        "was and search falls back to LIKE until the next start",
+                        exc)
+
+    def _fts_map_covers_index(self) -> bool:
+        """Does every index row have exactly one map entry and vice versa?
+
+        A count on each side: cheap, and enough to notice an index another
+        build rewrote by id (rows without map entries) or a map entry whose
+        row is gone.
+        """
+        rows = self._conn.execute(
+            "SELECT count(*), COALESCE(max(rowid), 0) FROM transmissions_fts").fetchone()
+        mapped = self._conn.execute(
+            "SELECT count(*), COALESCE(max(fts_rowid), 0) FROM transmissions_fts_map").fetchone()
+        # The same number of rows and the same highest rowid. A build at
+        # layout 1 rewrites an entry by deleting it and inserting a new row,
+        # which takes a rowid above every mapped one unless it re-used the
+        # very rowid it freed - in which case the map is still right.
+        return tuple(rows) == tuple(mapped)
+
+    def _reconcile_fts(self) -> None:
+        """Make the index and its map agree with the messages. Inside the
+        caller's transaction."""
+        conn = self._conn
+        # Adopt: one map entry per indexed id that still names a message,
+        # keeping the newest row where an id was indexed more than once.
+        conn.execute("DELETE FROM transmissions_fts_map")
+        conn.execute(
+            "INSERT INTO transmissions_fts_map (id, fts_rowid) "
+            "SELECT f.id, MAX(f.rowid) FROM transmissions_fts f "
+            "WHERE f.id IN (SELECT id FROM transmissions) GROUP BY f.id")
+        # Orphans (deleted messages, duplicates) leave the index.
+        conn.execute(
+            "DELETE FROM transmissions_fts WHERE rowid NOT IN "
+            "(SELECT fts_rowid FROM transmissions_fts_map)")
+        # Every message: indexed when it has searchable text, with that text.
+        rows = conn.execute(
+            "SELECT id, transcript, translation, transcript_correction, "
+            "translation_correction, notes, tags FROM transmissions").fetchall()
+        for row in rows:
+            try:
+                tags = json.loads(row["tags"] or "[]")
+            except (TypeError, ValueError):
+                tags = []
+            self._index_content(row["id"], _searchable(
+                row["transcript"], row["translation"], row["transcript_correction"],
+                row["translation_correction"], row["notes"], tags))
+
+    def rebuild_search_index(self) -> int:
+        """Recreate the index and its map from the messages. Returns the
+        number of messages indexed. Maintenance; never needed in normal use."""
+        if not self.fts_enabled:
+            return 0
+        with self._lock:
+            if self._conn.in_transaction:      # nothing of the store's is ever
+                self._conn.commit()            # left open between operations
+            self._conn.execute("BEGIN")
+            try:
+                # ('delete-all' is for contentless and external-content
+                # tables only; this one stores its text.)
+                self._conn.execute("DELETE FROM transmissions_fts")
+                self._conn.execute("DELETE FROM transmissions_fts_map")
+                self._reconcile_fts()
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('fts_layout', ?)",
+                    (str(FTS_LAYOUT),))
+                self._conn.execute("COMMIT")
+            except sqlite3.Error:
+                with contextlib.suppress(sqlite3.Error):
+                    self._conn.execute("ROLLBACK")
+                raise
+            return self._conn.execute(
+                "SELECT count(*) FROM transmissions_fts_map").fetchone()[0]
 
     def _columns(self, table: str) -> set:
         return {row["name"] for row in
@@ -445,14 +581,71 @@ class Store:
     def _index_fts(self, tx: Transmission) -> None:
         if not self.fts_enabled:
             return
-        self._conn.execute("DELETE FROM transmissions_fts WHERE id = ?", (tx.id,))
-        self._conn.execute(
-            "INSERT INTO transmissions_fts (id, transcript, translation, "
-            "correction, notes, tags) VALUES (?,?,?,?,?,?)",
-            (tx.id, tx.transcript, tx.translation,
-             " ".join(filter(None, (tx.transcript_correction,
-                                    tx.translation_correction))),
-             tx.notes, " ".join(tx.tags)))
+        self._index_content(tx.id, _searchable(
+            tx.transcript, tx.translation, tx.transcript_correction,
+            tx.translation_correction, tx.notes, tx.tags))
+
+    def _index_content(self, tx_id: str, content: Tuple[str, ...]) -> None:
+        """Bring one message's index entry to *content*, writing only if it
+        has to.
+
+        The entry is found through the map by the index's own rowid - an
+        equality lookup, never a scan for the UNINDEXED id. What is compared
+        is the searchable text the index actually holds, read back from the
+        row, against what is being saved: the Transmission object itself is
+        no reference, because callers mutate and save the same instance. A
+        save that changed only the processing state, a path or a confidence
+        writes nothing here; one that changed the text updates the entry in
+        place; a message with nothing searchable has no entry at all. An
+        earlier version deleted and rewrote the entry on every save.
+        """
+        conn = self._conn
+        mapped = conn.execute(
+            "SELECT fts_rowid FROM transmissions_fts_map WHERE id = ?",
+            (tx_id,)).fetchone()
+        if mapped is not None:
+            stored = conn.execute(
+                f"SELECT {', '.join(_FTS_COLUMNS)} FROM transmissions_fts "
+                f"WHERE rowid = ?", (mapped[0],)).fetchone()
+            if stored is not None:
+                if tuple(c or "" for c in stored) == content:
+                    return                             # nothing changed
+                if not any(content):
+                    conn.execute("DELETE FROM transmissions_fts WHERE rowid = ?",
+                                 (mapped[0],))
+                    conn.execute("DELETE FROM transmissions_fts_map WHERE id = ?",
+                                 (tx_id,))
+                    return
+                conn.execute(
+                    f"UPDATE transmissions_fts SET "
+                    f"{', '.join(f'{c} = ?' for c in _FTS_COLUMNS)} WHERE rowid = ?",
+                    (*content, mapped[0]))
+                return
+            # The map names a row the index no longer has - another build
+            # rewrote the index by id. Clear whatever that left for this id
+            # (the one scan, on the repair path only) and start over.
+            conn.execute("DELETE FROM transmissions_fts WHERE id = ?", (tx_id,))
+            conn.execute("DELETE FROM transmissions_fts_map WHERE id = ?", (tx_id,))
+        if not any(content):
+            return                                     # nothing to find
+        cursor = conn.execute(
+            f"INSERT INTO transmissions_fts (id, {', '.join(_FTS_COLUMNS)}) "
+            f"VALUES (?,?,?,?,?,?)", (tx_id, *content))
+        conn.execute(
+            "INSERT INTO transmissions_fts_map (id, fts_rowid) VALUES (?, ?)",
+            (tx_id, cursor.lastrowid))
+
+    def _unindex_fts(self, tx_id: str) -> None:
+        """Remove a message's index entry, by rowid, through the map."""
+        if not self.fts_enabled:
+            return
+        mapped = self._conn.execute(
+            "SELECT fts_rowid FROM transmissions_fts_map WHERE id = ?",
+            (tx_id,)).fetchone()
+        if mapped is None:
+            return
+        self._conn.execute("DELETE FROM transmissions_fts WHERE rowid = ?", (mapped[0],))
+        self._conn.execute("DELETE FROM transmissions_fts_map WHERE id = ?", (tx_id,))
 
     def get_transmission(self, tx_id: str) -> Optional[Transmission]:
         row = self._conn.execute("SELECT * FROM transmissions WHERE id = ?",
@@ -741,8 +934,7 @@ class Store:
         with self._lock:
             self._tombstone(tx_id, tx.session_id if tx else None, [])
             self._conn.execute("DELETE FROM transmissions WHERE id = ?", (tx_id,))
-            if self.fts_enabled:
-                self._conn.execute("DELETE FROM transmissions_fts WHERE id = ?", (tx_id,))
+            self._unindex_fts(tx_id)
             self._conn.commit()
         if delete_audio and tx:
             for path in (tx.audio_path, tx.processed_audio_path):
@@ -914,9 +1106,7 @@ class Store:
             inventory = self.deletion_inventory(tx, owned_roots, references)
             self._tombstone(tx_id, tx.session_id, inventory.owned)
             self._conn.execute("DELETE FROM transmissions WHERE id = ?", (tx_id,))
-            if self.fts_enabled:
-                self._conn.execute("DELETE FROM transmissions_fts WHERE id = ?",
-                                   (tx_id,))
+            self._unindex_fts(tx_id)
             self._conn.commit()
             references.forget(tx_id)
             report = DeletionReport(transmission_id=tx_id, inventory=inventory)
@@ -1267,6 +1457,15 @@ def _is_within(path: pathlib.Path, root: pathlib.Path) -> bool:
 def _is_hex_color(value: str) -> bool:
     return (len(value) == 7 and value[0] == "#"
             and all(c in "0123456789abcdefABCDEF" for c in value[1:]))
+
+
+def _searchable(transcript, translation, transcript_correction,
+                translation_correction, notes, tags) -> Tuple[str, ...]:
+    """The searchable text of a message, in the index's column order - the
+    same six fields the index has always held, joined the same way."""
+    return (transcript or "", translation or "",
+            " ".join(filter(None, (transcript_correction, translation_correction))),
+            notes or "", " ".join(tags or ()))
 
 
 def _fts_query(query: str) -> str:

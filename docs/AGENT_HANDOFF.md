@@ -4172,3 +4172,190 @@ before it was found and renamed. No repository file was involved.
 - No candidate contains these repairs.
 - Direct electrical radio/PTT/USB, SDR, RF metadata and transmitter
   identification unverified. Acoustic radio testing IS recorded (above).
+
+---
+
+# F6 — search-index write amplification
+
+Codex's audit of `71ada52` (94 passed, 2 skipped across the seven nearest
+suites; independent probes of the capped-result, removal and resume
+scenarios) found no new F3/F4 blocker and scoped this pass to F6: every
+accepted save deleted and rewrote the message's search-index entry, found
+by scanning the whole index for its UNINDEXED id, and every deletion
+scanned it again.
+
+## Identifiers
+
+| | |
+|---|---|
+| Base | `71ada52` — verified equal to the remote tip at the start, worktree clean |
+| Commit | the commit carrying this section, `git log -1 -- tests/test_alpha5_search_index.py` (storage change, upgrade and tests together: the rowid maintenance needs the map, so the migration is not separable) |
+| Branch | `claude/radio-decoder-translator-0oslya` |
+| Workflow / tag / release / packaging / logo / dependency locking | nothing dispatched, retried, created, moved, published or changed |
+| Schema | **6** (one new table, `transmissions_fts_map`; meta key `fts_layout` = 2). The schema-3 fixture is untouched. |
+
+## Baseline, measured before editing (this container, Python 3.11, SQLite 3.45.1, FTS5 compiled in)
+
+- SQL trace of a replayed fixture through the real app on mock engines: 5
+  messages, 23 saves, **46 index writes** (a DELETE and an INSERT per save;
+  9.2 per message) although each message's searchable text changes at most
+  twice.
+- Query plan of the maintenance lookup `DELETE FROM transmissions_fts WHERE
+  id = ?`: `SCAN transmissions_fts VIRTUAL TABLE INDEX 0:` - a scan of the
+  content table for the UNINDEXED id. The rowid form reads `... INDEX 0:=`;
+  the `=` is the rowid-equality constraint (both contain "SCAN", so no test
+  here rejects that word).
+- Cost per save on fully indexed histories, median of 40 saves × 3 runs:
+  500 rows ≈ 1.1 ms, 5,000 ≈ 2.5 ms, **50,000 ≈ 19 ms** - linear in the
+  history. Indexing 50,000 rows one save at a time took 424 s (the scan
+  per insert; quadratic).
+
+## Design (mine, on Codex's recommendation; SQLite facts verified here, source cited where it could be)
+
+- **Map by rowid.** `transmissions_fts_map (id TEXT PRIMARY KEY, fts_rowid
+  INTEGER NOT NULL UNIQUE)` remembers which index row is which message's.
+  Maintenance goes through it: `SELECT ... FROM transmissions_fts WHERE
+  rowid = ?`, `UPDATE ... WHERE rowid = ?`, `DELETE ... WHERE rowid = ?` -
+  each planned as `INDEX 0:=`. The FTS5 content table is declared `id
+  INTEGER PRIMARY KEY` (SQLite source, `ext/fts5/fts5_storage.c`; this
+  build's `sqlite_master` shows `'transmissions_fts_content'(id INTEGER
+  PRIMARY KEY, c0..c5)`), so the rowid is explicit and survives VACUUM -
+  checked here by deleting rows, VACUUMing and comparing. The map is the
+  only place the rowid is kept; it is derived from the messages, like the
+  index, and `rebuild_search_index()` recreates both.
+- **Write only on change.** `_index_content()` reads the searchable text
+  the index actually holds (by rowid) and compares it with the text being
+  saved - the six fields as before: transcript, translation, both
+  corrections (joined), notes, tags (joined). Equal → nothing written.
+  Different → `UPDATE` in place. Nothing searchable → no entry (an existing
+  one is deleted). The Transmission object is never the reference: callers
+  mutate and save the same instance.
+- **Deletion** (retention and permanent) removes the entry by rowid through
+  the map, and the map row. Tombstones are untouched; a late save is still
+  refused before it reaches the index.
+- **Upgrade** (`_upgrade_fts_layout`, on open, when `fts_layout` ≠ 2 or the
+  map does not cover the index): in one transaction - adopt the existing
+  rows (map ← `id, MAX(rowid)` per id that still names a message), delete
+  orphans and duplicates by rowid, then for every message bring its entry
+  to its current text (index the never-indexed, correct the stale, leave
+  the rest) and write the `fts_layout` mark. Failure → ROLLBACK, mark not
+  written, `fts_enabled = False` for that process (search falls back to
+  LIKE, saves persist normally), retried at the next start. Messages,
+  Sessions and files are never touched. Repeatable: at layout 2 with the
+  map covering the index (same row count and same highest rowid on both
+  sides) the open does no index work. An index a layout-1 build rewrote by
+  id (rows above every mapped rowid) is reconciled the same way; a map
+  entry whose row is gone is also repaired at save time, by clearing that
+  id's rows (the one scan, on that repair path only).
+- Assumption corrected while testing: FTS5's `'delete-all'` command is for
+  contentless/external-content tables only (error text from this SQLite);
+  the rebuild uses `DELETE FROM transmissions_fts`.
+- `save_transmission` still commits every save and still bumps `_writes`
+  (the retained-file-reference cache stamp) on every save.
+
+## After
+
+- Pipeline scenario (same replay): 23 saves, **8 index writes** (5
+  INSERTs when the transcripts arrived, 3 UPDATEs when translations did;
+  no DELETE) plus 5 map inserts; every transcript and translation found.
+- Maintenance statements traced from real saves and deletions all read
+  `WHERE rowid = <n>` and plan as `INDEX 0:=`.
+
+## Measurements (`bench_fts.py`, fully populated and fully indexed temporary databases; setup separate; medians of 40 operations - 20 for deletions - per run, three runs; index writes are top-level statements against `transmissions_fts`, map writes shown separately)
+
+| history | operation | baseline median ms (3 runs) | repaired median ms (3 runs) | index writes per run: baseline → repaired (+ map writes) |
+|---|---|---|---|---|
+| 500 | setup: bulk rows, then index (baseline: one save-path index write per row; repaired: `rebuild_search_index()`) | 0.36 s | 0.08 s | - |
+| 500 | state only | 1.793 / 1.063 / 1.126 | 0.849 / 0.57 / 0.614 | 80 → 0 (+0) |
+| 500 | text change | 1.829 / 1.111 / 1.141 | 0.971 / 0.831 / 0.732 | 80 → 40 (+0) |
+| 500 | new insert | 1.027 / 0.81 / 0.779 | 0.694 / 0.698 / 0.689 | 80 → 40 (+40) |
+| 500 | retention delete | 0.977 / 1.012 / 0.8 | 0.825 / 0.627 / 0.612 | 20 → 20 (+20) |
+| 500 | permanent delete | 6.95 / 4.312 / 4.185 | 4.013 / 3.661 / 3.781 | 20 → 20 (+20) |
+| 5,000 | setup: bulk rows, then index (baseline: one save-path index write per row; repaired: `rebuild_search_index()`) | 4.62 s | 0.84 s | - |
+| 5,000 | state only | 2.465 / 2.339 / 2.667 | 0.605 / 0.76 / 0.749 | 80 → 0 (+0) |
+| 5,000 | text change | 2.479 / 2.389 / 2.628 | 0.773 / 0.9 / 0.896 | 80 → 40 (+0) |
+| 5,000 | new insert | 2.179 / 2.388 / 2.359 | 0.826 / 0.805 / 0.73 | 80 → 40 (+40) |
+| 5,000 | retention delete | 2.118 / 2.184 / 2.395 | 0.683 / 0.592 / 0.705 | 20 → 20 (+20) |
+| 5,000 | permanent delete | 35.002 / 36.257 / 35.455 | 32.668 / 33.161 / 33.868 | 20 → 20 (+20) |
+| 50,000 | setup: bulk rows, then index (baseline: one save-path index write per row; repaired: `rebuild_search_index()`) | 424.52 s | 8.32 s | - |
+| 50,000 | state only | 18.887 / 19.024 / 19.91 | 0.678 / 0.791 / 0.678 | 80 → 0 (+0) |
+| 50,000 | text change | 19.32 / 19.183 / 20.8 | 0.837 / 1.011 / 0.841 | 80 → 40 (+0) |
+| 50,000 | new insert | 18.758 / 19.786 / 19.781 | 0.915 / 0.714 / 0.756 | 80 → 40 (+40) |
+| 50,000 | retention delete | 18.93 / 18.183 / 18.741 | 0.632 / 0.637 / 0.761 | 20 → 20 (+20) |
+| 50,000 | permanent delete | 375.555 / 377.37 / 382.576 | 362.982 / 365.013 / 361.182 | 20 → 20 (+20) |
+
+Query plans, both builds: `DELETE ... WHERE id = ?` → `SCAN transmissions_fts VIRTUAL TABLE INDEX 0:`; `... WHERE rowid = ?` → `SCAN transmissions_fts VIRTUAL TABLE INDEX 0:=`. The repaired code issues only the rowid form (traced statements, `test_index_maintenance_addresses_entries_by_rowid...`). Per-save index cost went from linear in the history (1.1 → 2.5 → 19 ms) to flat (≈0.6-0.8 ms at every size); a state-only save writes nothing to the index at all. The baseline's 424 s setup at 50,000 is the quadratic cost of indexing one save at a time; the repaired rebuild of the same 50,000 rows took 8.3 s (it is also what the first start after the upgrade would do only if the existing rows could not be adopted - adoption itself writes nothing for rows that are already right).
+
+Limits of the measurements: one Linux container, temporary databases on
+its disk, medians of 40 operations × 3 runs; they show the shape (constant
+vs linear) and are not Mac timings or a cross-platform guarantee. Permanent
+deletion stays at ~360 ms at 50,000 rows because it rebuilds the
+retained-file-reference map (F2's shared-file protection, a full scan of
+`transmissions`), not because of the index; out of this pass's scope.
+
+## Tests (`tests/test_alpha5_search_index.py`, 13)
+
+State-only saves persist (state, confidence, path) with zero index writes
+and the `_writes` stamp still moving; the same mutated instance updates the
+entry in place under the same rowid; every searchable field added, changed
+and cleared (notes-only and tags-only found; nothing left → no entry);
+traced maintenance statements address rowids and plan as `INDEX 0:=`; a
+coarse growth check (20 vs 4,000 indexed messages); retention and
+permanent deletion remove entry and map row and a tombstoned late save
+cannot bring either back; a populated layout-1 database (with a stale
+duplicate, an orphan and a never-indexed message) upgrades with every row
+byte-identical, results preserved, duplicates and orphan gone, the missing
+message found, rowids adopted not rebuilt, and reopening does no index
+work; the schema-3 fixture gains a searchable index; a failure half-way
+through the upgrade leaves no mark, no map, all messages, LIKE search and
+normal saves, and the next start completes it; an index rewritten by an
+older build is reconciled on open; `rebuild_search_index()`; operation
+without FTS5 (the CREATE VIRTUAL TABLE made to fail as a missing module
+would); and the production pipeline scenario on the standard fixture.
+Substitutions: none beyond the mock engines and the two deliberate
+failures (a raising `_reconcile_fts`, a missing FTS module).
+
+## Evidence
+
+| Check | Result |
+|---|---|
+| Fail-before (storage.py from `71ada52`, new tests run) | 13 of 13 fail. Behavioural: state-only saves write 2 index statements each; the pipeline replay writes 46; deletion/rewrite go by id. The rest fail because the map table, `rebuild_search_index()` and the layout mark do not exist there (the test file collects against the old code; `FTS_LAYOUT` is read tolerantly). |
+| Reversals (one at a time, named test, file byte-restored) | R1 rewrite on every save → caught (state-only test); R1b same via the pipeline replay → caught; R2 lookup by id instead of rowid → caught (plan test); R3 deletion leaves the entry → caught; R4 failed upgrade marked complete → caught; R5 map trusted on open without the coverage check → caught (older-build rewrite test); R6 stale entry kept when nothing searchable remains → caught. None survived. |
+| New tests | 13 passed |
+| Focused (search index, storage, thread/sessions migration, session colours migration, message removal, shared recordings, acceptance, pipeline, offline, offline integration, filtered views, view reconciliation, shutdown, cleanup, lifecycle, boundary) | 220 passed, 0 skipped |
+| Full suite | 958 passed, 11 skipped, 0 failed, 196 s |
+| Skips (11) | 2 QtMultimedia not installed; 1 CoreAudio needs macOS; 1 PlistBuddy macOS only; 5 no prepared Whisper model; 2 no Argos language pack |
+| `git diff --check`, `compileall` | clean |
+
+Environment: Linux container, Python 3.11.15, SQLite 3.45.1 with FTS5, PySide6 Essentials (no QtMultimedia), offscreen Qt, mock engines, temporary databases and recordings; nothing of Eric's touched. Not a Mac.
+
+## Existing tests changed
+
+`schema_version == 5` → `== SCHEMA_VERSION` in
+`test_alpha4_thread_and_sessions.py` (1) and `test_alpha5_session_colors.py`
+(3), with the constant imported: the version is 6 now. No other existing
+assertion changed.
+
+## Ledger after F6
+
+- F1, F2, F5 preserved (full suite green; deletion/shared-recording and
+  shutdown suites in the focused run).
+- F3/F4 repaired and independently verified by Codex; Mac pending.
+- **F6 repaired here**; not seen on a Mac (checklist Q, steps 52-54, future
+  candidate).
+- F7 large-thread memory/rendering costs pending; F8 selective cleanup and
+  F9 dependency locking deferred.
+- Product decisions unresolved: exactly-five-second playback, seeking,
+  natural-completion collapse, removal policy, General's treatment, forced
+  cancellation/exit. Logo pending. No candidate contains these passes.
+- Hardware: acoustic radio test recorded (Eric); electrical radio/PTT/USB,
+  SDR, RF metadata, transmitter identification unverified.
+- Carried forward verbatim from the previous ledger: permanently stuck
+  operations have no forced-cancellation policy; CLI close without a
+  timeout can wait indefinitely; Start/mode-change bounded synchronous
+  paths remain; unreadable retained analysis records conservatively
+  prevent file deletion; the historical "fraction of a second" wording is
+  not a measured bound; in a full 200-row view the anchoring correction is
+  a transient of up to two event-loop turns, measured offscreen only;
+  whether the packaged QtMultimedia backend emits a synchronous
+  errorOccurred is unverified here.

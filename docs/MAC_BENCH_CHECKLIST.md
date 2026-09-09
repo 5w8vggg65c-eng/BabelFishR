@@ -1,7 +1,7 @@
 # BabelFishR — Mac bench checklist (no Terminal needed)
 
 **This checklist is for the next candidate build — one made from a commit that
-includes these features (sections I–P are new and are not in run 21).** Do not run it against the candidate you already have
+includes these features (sections I–Q are new and are not in run 21).** Do not run it against the candidate you already have
 installed: several steps below describe behaviour that build does not contain,
 so they would fail for the wrong reason. Wait for a new download link.
 
@@ -375,6 +375,29 @@ Not in run 21 or any later build yet; needs a future candidate.
     messages are not searched). Click **⋯** on it in the thread and choose
     **Restore to thread**; search once more. *Good:* it is a match again.
     *Bad:* a removed message staying in the search view.
+
+## Q. Search still finds everything after the upgrade (new)
+
+Not in run 21 or any later build yet; needs a future candidate. The first
+start of that candidate reorganises the search index behind the scenes; it
+keeps every message and should take at most a few seconds even for a long
+history.
+
+52. Before installing the new candidate, pick a word you know appears in an
+    older message (or note one from **View → Search…**). After installing
+    and starting the new candidate, choose **View → Search…**, type that
+    word, press Return. *Good:* the same older message is found, and the
+    bottom line gives the same count as before. *Bad:* the message is
+    missing, or the count changed without you removing anything.
+53. On any message, click **⋯ → Add or edit note…** (or **Edit transcript and translation…**) and type
+    a word that appears nowhere else - for example `marigold`. Choose
+    **View → Search…** and search for it. *Good:* that message is the one
+    match. Now edit the note again and remove the word; search again.
+    *Good:* "0 match(es)". *Bad:* the old word still matching after it was
+    removed.
+54. Quit and start BabelFishR again, then repeat the search from step 52.
+    *Good:* the same result, and the start is as quick as before (no long
+    pause on the first screen).
 
 ---
 
