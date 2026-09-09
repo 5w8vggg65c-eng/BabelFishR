@@ -671,6 +671,7 @@ class TimelineView(QtWidgets.QScrollArea):
         self._order: List[str] = []
         self._pending_anchor = None
         self._anchor_passes = 0
+        self._anchor_scheduled = False
         self.playback = PlaybackController(parent=self)
         self._player = self.playback          # what bubbles are handed
         self.playback_backend = self.playback.backend_name
@@ -790,22 +791,44 @@ class TimelineView(QtWidgets.QScrollArea):
                 # so one deferred pass is not always enough. Bounded and
                 # short: three turns of the event loop, which is microseconds,
                 # then it stops for good and never fights a real scroll.
+                # One chain of deferred passes at a time: two anchored
+                # changes in the same turn (a bubble removed and its
+                # replacement placed) used to start two chains, which spent
+                # the passes twice as fast - before the scroll area had
+                # resized the container to its new content, while a full
+                # thread was still squeezed to the old height - and the
+                # reading position settled a bubble's height off.
                 self._pending_anchor = anchor
                 self._anchor_passes = _ANCHOR_SETTLE_PASSES
-                QtCore.QTimer.singleShot(0, self._reapply_anchor)
+                self._schedule_anchor_pass()
+
+    def _schedule_anchor_pass(self) -> None:
+        if not self._anchor_scheduled:
+            self._anchor_scheduled = True
+            QtCore.QTimer.singleShot(0, self._reapply_anchor)
 
     def _reapply_anchor(self) -> None:
+        self._anchor_scheduled = False
         if self._pending_anchor is None or self._anchor_passes <= 0:
             self._pending_anchor = None
             return
         self._anchor_passes -= 1
         self._restore(self._pending_anchor)
-        QtCore.QTimer.singleShot(0, self._reapply_anchor)
+        self._schedule_anchor_pass()
 
     def add(self, tx: Transmission, scroll: bool = False) -> TransmissionBubble:
         if tx.id in self._bubbles:
             self.update(tx)
             return self._bubbles[tx.id]
+        # Position 0: newest at the top. The stretch stays last so the older
+        # bubbles stack downwards and a short thread does not float.
+        return self._insert(0, tx)
+
+    def _insert(self, index: int, tx: Transmission) -> TransmissionBubble:
+        """One new bubble at *index*, under the viewport anchor. The single
+        insertion matters: a bubble inserted and then moved is laid out
+        between the two, and the anchor taken for the move reads stale
+        geometry, so the reading position lands a bubble's height off."""
         self.empty_label.hide()
         bubble = TransmissionBubble(tx, self._player)
         bubble.correctionRequested.connect(self.correctionRequested)
@@ -818,12 +841,9 @@ class TimelineView(QtWidgets.QScrollArea):
         bubble.analyzeDigitalRequested.connect(self.analyzeDigitalRequested)
         bubble.removeRequested.connect(self.removeRequested)
         bubble.restoreRequested.connect(self.restoreRequested)
-
-        # Position 0: newest at the top. The stretch stays last so the older
-        # bubbles stack downwards and a short thread does not float.
         with self._anchored():
-            self._layout.insertWidget(0, bubble)
-            self._order.insert(0, tx.id)
+            self._layout.insertWidget(index, bubble)
+            self._order.insert(index, tx.id)
             self._bubbles[tx.id] = bubble
         return bubble
 
@@ -839,21 +859,14 @@ class TimelineView(QtWidgets.QScrollArea):
         if tx.id in self._bubbles:
             self.update(tx)
             return self._bubbles[tx.id]
-        bubble = self.add(tx)
         key = (tx.started_at, tx.id)
-        index = len(self._order) - 1                 # add() put it at 0
-        for position, other_id in enumerate(self._order[1:]):
+        index = len(self._order)                     # older than everything shown
+        for position, other_id in enumerate(self._order):
             other = self._bubbles[other_id].tx
             if key > (other.started_at, other.id):
                 index = position
                 break
-        if index != 0:
-            with self._anchored():
-                self._layout.removeWidget(bubble)
-                self._order.remove(tx.id)
-                self._layout.insertWidget(index, bubble)
-                self._order.insert(index, tx.id)
-        return bubble
+        return self._insert(index, tx)
 
     def append_older(self, tx: Transmission) -> TransmissionBubble:
         """Add a bubble at the bottom - for loading history, not new traffic."""

@@ -876,6 +876,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _drain_events(self) -> None:
         if self._shutdown_complete or self._store_off_limits:
             return                     # the store is closing or closed
+        touched = set()             # ids whose row a filtered view must re-read
         for event in self.app.events.drain():
             if event.kind == "level":
                 reading = event.payload
@@ -893,8 +894,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 # operator reviewing history must not see live traffic
                 # appear in the Session they are reading - and a Search or
                 # Review view admits only what its own query admits.
-                if self._belongs_here(event.payload):
-                    self._admit(event.payload, arrival=event.kind == "transmission")
+                if self._admit(event.payload, arrival=event.kind == "transmission"):
+                    touched.add(event.payload.id)
             elif event.kind == "audio-status":
                 payload = event.payload or {}
                 kind = payload.get("kind", "")
@@ -917,34 +918,67 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.status.showMessage(
                     f"{payload.get('stage', 'processing')} error: "
                     f"{payload.get('message', '')}", 12000)
+        if touched:
+            # One query for the whole drained batch, not one per event.
+            self._refresh_view(touched)
 
-    def _admit(self, tx, arrival: bool) -> None:
+    def _admit(self, tx, arrival: bool) -> bool:
         """Show a live transmission or update as the current view allows.
 
         The Session's own thread takes every arrival at the top and every
-        update in place, as before. A Search or Review view is different: it
-        is the answer to a question, so the question is asked again - the
-        very store query that opened the view, with its scope and limit -
-        and the view is reconciled to the answer. A record that qualifies is
-        placed where its time puts it (updated in place if already shown); one
-        that does not, or has stopped qualifying, leaves; nothing else on
-        screen moves, and the count in the status line stays truthful. An
-        earlier version added every same-Session arrival to whatever was on
-        screen, so a Search for one word filled up with unrelated traffic.
+        update in place, as before - and a shown message that has just been
+        removed from view or deleted leaves it. A Search or Review view is
+        different: it is the answer to a question, so nothing is drawn from
+        the event itself; the event only says the answer may have changed.
+        Returns True when the view has to be refreshed against its query
+        (see _refresh_view), which the drain does once for the whole batch.
+
+        Two things this must not do, both seen before: add every same-
+        Session arrival to whatever was on screen, so a Search for one word
+        filled up with unrelated traffic; and judge by the event's record
+        alone, so a record that had merely fallen out of a full result set
+        could never come back, and one that had just been removed from view
+        was ignored before the view could be reconciled.
         """
         if self._view_kind == "thread":
-            if arrival:
-                self.timeline.add(tx)
-            else:
-                self.timeline.update(tx)
+            if self._belongs_here(tx):
+                if arrival:
+                    self.timeline.add(tx)
+                else:
+                    self.timeline.update(tx)
+            elif tx.id in self.timeline.order():
+                self.timeline.remove(tx.id)    # removed from view or deleted
+            return False
+        # A filtered view: anything shown, or anything of this Session's,
+        # can change the answer - a record that now qualifies, one that no
+        # longer does, or a replacement for one that left a full result.
+        return tx.id in self.timeline.order() or self._in_this_conversation(tx)
+
+    def _refresh_view(self, touched=()) -> None:
+        """Reconcile a Search or Review view to its own query, completely.
+
+        The very store query that opened the view is run again - the same
+        scope, semantics and limit - and its complete bounded result is the
+        membership: a record it holds that is not shown is placed where its
+        time puts it, a shown one whose event arrived (*touched*) is updated
+        to the row as the store has it, anything shown that it does not hold
+        leaves, and the count in the status line follows. Widgets that stay
+        are the same widgets, under the same viewport anchoring as every
+        other growth; nothing is rebuilt to change membership. Never runs
+        against a closing store.
+        """
+        if self._view_kind == "thread" or self._store_gone():
             return
         results = self._view_results()
         wanted = {t.id: t for t in results}
-        if tx.id in wanted:
-            self.timeline.place(wanted[tx.id])     # the row as the store has it
-        for shown in self.timeline.order():
-            if shown not in wanted:
-                self.timeline.remove(shown)        # stopped qualifying, or beyond the limit
+        shown = set(self.timeline.order())
+        for tx_id in shown - set(wanted):
+            self.timeline.remove(tx_id)            # stopped qualifying
+        for row in results:
+            if row.id not in shown:
+                self.timeline.place(row)           # newly qualifying, or a replacement
+            elif row.id in touched:
+                self.timeline.update(row)          # the row as the store has it
         self._announce_view(len(results))
 
     def _view_results(self):
@@ -954,15 +988,18 @@ class MainWindow(QtWidgets.QMainWindow):
             return self.app.review_queue()
         return []
 
-    def _announce_view(self, count: int) -> None:
+    def _view_summary(self, count: int) -> str:
         if self._view_kind == "search":
+            return f"{count} match(es) for {self._view_query!r}"
+        if self._view_kind == "review":
+            return f"{count} transmission(s) need review"
+        return ""
+
+    def _announce_view(self, count: int) -> None:
+        if self._view_kind != "thread":
             self.status.showMessage(
-                f"{count} match(es) for {self._view_query!r} - View > Show all "
-                f"transmissions to go back", 10000)
-        elif self._view_kind == "review":
-            self.status.showMessage(
-                f"{count} transmission(s) need review - View > Show all "
-                f"transmissions to go back", 10000)
+                f"{self._view_summary(count)} - View > Show all transmissions "
+                f"to go back", 10000)
 
     def _belongs_here(self, tx) -> bool:
         """Is this transmission part of the Session currently on screen?
@@ -971,12 +1008,16 @@ class MainWindow(QtWidgets.QMainWindow):
         not draw it back), and not removed from view unless removed messages
         are being shown.
         """
-        session_id = getattr(tx, "session_id", "")
-        if not session_id:
-            return False
         if self.app.store.is_deleted(tx.id):
             return False
         if getattr(tx, "hidden", False) and not self._showing_removed():
+            return False
+        return self._in_this_conversation(tx)
+
+    def _in_this_conversation(self, tx) -> bool:
+        """Was this transmission filed under the Session on screen?"""
+        session_id = getattr(tx, "session_id", "")
+        if not session_id:
             return False
         viewing = self.app.conversation_id
         session = self.app.store.get_session(session_id)
@@ -1595,16 +1636,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._store_gone():
             return
         if choice == self.REMOVE_KEEP:
-            self.app.remove_from_thread(tx_id)
-            if not self._showing_removed():
-                self.timeline.remove(tx_id)
-            else:
-                refreshed = self.app.store.get_transmission(tx_id)
-                if refreshed is not None:
-                    self.timeline.update(refreshed)
+            refreshed = self.app.remove_from_thread(tx_id)
+            self._after_local_change(refreshed)
             self.status.showMessage(
-                "Message removed from the thread. Its recording and data are "
-                "kept - View \u203a Show removed messages to restore it.", 10000)
+                self._with_view_count(
+                    "Message removed from the thread. Its recording and data "
+                    "are kept - View \u203a Show removed messages to restore "
+                    "it."), 10000)
         elif choice == self.DELETE_FOREVER:
             self._confirm_and_delete(tx)
 
@@ -1648,12 +1686,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         report = self.app.delete_permanently(tx.id)
         self.timeline.remove(tx.id)
+        self._refresh_view()           # a Search or Review view may owe a replacement
         if report is None:
-            self.status.showMessage("That message was already gone.", 6000)
+            self.status.showMessage(
+                self._with_view_count("That message was already gone."), 6000)
             return
         if report.complete:
-            self.status.showMessage(
-                f"Message deleted. {len(report.removed)} file(s) removed.", 8000)
+            self.status.showMessage(self._with_view_count(
+                f"Message deleted. {len(report.removed)} file(s) removed."), 8000)
         else:
             failed = "\n".join(f"{p}\n    {why}" for p, why in report.failed)
             QtWidgets.QMessageBox.warning(
@@ -1662,16 +1702,45 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"could not be removed:\n\n{failed}\n\nThey are recorded so "
                 f"you can try again from Tools \u203a Finish unfinished "
                 f"deletions.")
-            self.status.showMessage(
-                f"Message deleted; {len(report.failed)} file(s) still on disk.",
+            self.status.showMessage(self._with_view_count(
+                f"Message deleted; {len(report.failed)} file(s) still on disk."),
                 10000)
 
     def _on_restore_message(self, tx_id: str) -> None:
         restored = self.app.restore_to_thread(tx_id)
         if restored is None:
             return
-        self.timeline.update(restored)
-        self.status.showMessage("Message restored to the thread.", 6000)
+        self._after_local_change(restored)
+        self.status.showMessage(
+            self._with_view_count("Message restored to the thread."), 6000)
+
+    def _after_local_change(self, tx) -> None:
+        """The operator changed one message here (removed it from view, or
+        put it back): show the consequence as the current view defines it.
+
+        The thread shows or drops it by the removed-messages preference. A
+        Search or Review view is reconciled to its own query instead - the
+        store's answer, not the widget's - so a message removed from view
+        leaves a Search that excludes removed messages even while the
+        thread would still show it, and a restored one comes back if it
+        qualifies. An earlier version updated the widgets directly and a
+        removed message stayed in the Search view it no longer belonged to.
+        """
+        if tx is None:
+            return
+        if self._view_kind != "thread":
+            self._refresh_view({tx.id})
+        elif self._belongs_here(tx):
+            self.timeline.update(tx)
+        else:
+            self.timeline.remove(tx.id)
+
+    def _with_view_count(self, message: str) -> str:
+        """Prefix an operator message with the filtered view's current count,
+        so the status line stays truthful about the view it describes."""
+        if self._view_kind == "thread":
+            return message
+        return f"{self._view_summary(self.timeline.count())}. {message}"
 
     def _finish_unfinished_deletions(self) -> None:
         if self._store_gone():

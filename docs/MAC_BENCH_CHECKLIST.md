@@ -1,7 +1,7 @@
 # BabelFishR — Mac bench checklist (no Terminal needed)
 
 **This checklist is for the next candidate build — one made from a commit that
-includes these features (sections I–O are new and are not in run 21).** Do not run it against the candidate you already have
+includes these features (sections I–P are new and are not in run 21).** Do not run it against the candidate you already have
 installed: several steps below describe behaviour that build does not contain,
 so they would fail for the wrong reason. Wait for a new download link.
 
@@ -357,6 +357,22 @@ Not in run 21 or any later build yet; needs a future candidate.
     collapse and the sound stops.
     (The case of a message whose recording file has gone missing cannot be
     arranged by clicking alone; it is covered by automated tests only.)
+
+## P. Removing a message while searching (new)
+
+Not in run 21 or any later build yet; needs a future candidate.
+
+51. Choose **View → Search…**, type a word that one message contains, press
+    Return. On that message, click **⋯** and choose **Remove message…**, then
+    **Remove from thread (keep the recording and data)**. *Good:* the message
+    leaves the search view and the bottom line says "0 match(es)" together
+    with "Message removed from the thread". Choose **View → Show removed
+    messages**, then **View → Show all transmissions**. *Good:* the message is
+    back in the list, marked as removed. Choose **View → Search…** with the
+    same word again. *Good:* it is still not among the matches (removed
+    messages are not searched). Click **⋯** on it in the thread and choose
+    **Restore to thread**; search once more. *Good:* it is a match again.
+    *Bad:* a removed message staying in the search view.
 
 ---
 
