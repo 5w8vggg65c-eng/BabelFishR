@@ -296,6 +296,11 @@ class Store:
             self._conn.executescript(_SCHEMA)
             try:
                 self._conn.executescript(_FTS_SCHEMA)
+                # CREATE ... IF NOT EXISTS is accepted for a table that is
+                # already there whether or not its module is loadable, so
+                # the existence of the table proves nothing about FTS5 on
+                # this SQLite: touch the index once.
+                self._conn.execute("SELECT rowid FROM transmissions_fts LIMIT 0")
             except sqlite3.OperationalError as exc:  # FTS5 not compiled in
                 self.fts_enabled = False
                 log.warning("FTS5 unavailable (%s); search falls back to LIKE", exc)
@@ -329,14 +334,19 @@ class Store:
         search falls back to LIKE for this process rather than run against a
         half-built layout. Messages, Sessions and files are never touched.
 
-        Repeatable: an index already at layout 2 whose map covers every row
-        is left alone. A map that no longer matches the index (an older build
-        rewrote entries by id, say) is reconciled the same way.
+        Repeatable: an index already at layout 2 whose map is consistent
+        with it is left alone. Reconciled the same way when the map is not -
+        an older build rewrote entries by id - or when the index is marked
+        stale (``fts_stale``: messages were written while FTS5 was
+        unavailable, so the index is behind the authoritative rows). The
+        stale mark is cleared in the same transaction as the reconcile, so a
+        failure keeps it and the next start tries again.
         """
         layout = self._conn.execute(
             "SELECT value FROM meta WHERE key = 'fts_layout'").fetchone()
         current = int(layout["value"]) if layout else 1
-        if current == FTS_LAYOUT and self._fts_map_covers_index():
+        stale = self._index_marked_stale()
+        if current == FTS_LAYOUT and not stale and self._fts_index_consistent():
             return
         try:
             self._conn.execute("BEGIN")
@@ -344,8 +354,10 @@ class Store:
             self._conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('fts_layout', ?)",
                 (str(FTS_LAYOUT),))
+            self._conn.execute("DELETE FROM meta WHERE key = 'fts_stale'")
             self._conn.execute("COMMIT")
-            log.info("search index at layout %d (was %d)", FTS_LAYOUT, current)
+            log.info("search index at layout %d (was %d%s)", FTS_LAYOUT, current,
+                     ", marked stale" if stale else "")
         except sqlite3.Error as exc:
             with contextlib.suppress(sqlite3.Error):
                 self._conn.execute("ROLLBACK")
@@ -354,22 +366,39 @@ class Store:
                         "was and search falls back to LIKE until the next start",
                         exc)
 
-    def _fts_map_covers_index(self) -> bool:
-        """Does every index row have exactly one map entry and vice versa?
+    def _fts_index_consistent(self) -> bool:
+        """Is every index row mapped to its own message, and nothing else?
 
-        A count on each side: cheap, and enough to notice an index another
-        build rewrote by id (rows without map entries) or a map entry whose
-        row is gone.
+        One pass over the index joined to the map on rowid: every row must
+        have a map entry naming the same message id, and the map must hold
+        nothing more. Counts and highest rowids were compared before, and
+        that accepted a wrong association: a layout-1 build that deletes
+        message A (index row 1) and then indexes a new message B re-uses
+        rowid 1, so the map's "A -> 1" matched an index row that was B's,
+        and editing B then left B's old wording searchable under a second
+        row. The association itself is what is checked now. About 26 ms
+        for 50,000 messages here, once per start.
         """
-        rows = self._conn.execute(
-            "SELECT count(*), COALESCE(max(rowid), 0) FROM transmissions_fts").fetchone()
+        total, matched = self._conn.execute(
+            "SELECT count(*), COALESCE(SUM(m.id IS f.id), 0) FROM transmissions_fts f "
+            "LEFT JOIN transmissions_fts_map m ON m.fts_rowid = f.rowid").fetchone()
         mapped = self._conn.execute(
-            "SELECT count(*), COALESCE(max(fts_rowid), 0) FROM transmissions_fts_map").fetchone()
-        # The same number of rows and the same highest rowid. A build at
-        # layout 1 rewrites an entry by deleting it and inserting a new row,
-        # which takes a rowid above every mapped one unless it re-used the
-        # very rowid it freed - in which case the map is still right.
-        return tuple(rows) == tuple(mapped)
+            "SELECT count(*) FROM transmissions_fts_map").fetchone()[0]
+        return total == matched == mapped
+
+    def _index_marked_stale(self) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM meta WHERE key = 'fts_stale'").fetchone() is not None
+
+    def _mark_index_stale(self) -> None:
+        """Record, durably and in the caller's transaction, that a message
+        was written while the index could not be: the index is behind the
+        authoritative rows until a start with FTS5 reconciles it. Without
+        this, a healthy-looking index and map agreed with each other and the
+        edits made meanwhile were never searchable (an existing limitation,
+        confirmed on the build before F6 too)."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('fts_stale', '1')")
 
     def _reconcile_fts(self) -> None:
         """Make the index and its map agree with the messages. Inside the
@@ -573,7 +602,10 @@ class Store:
                 f"INSERT INTO transmissions ({columns}) VALUES ({placeholders}) "
                 f"ON CONFLICT(id) DO UPDATE SET {updates}",
                 tuple(payload.values()))
-            self._index_fts(tx)
+            if self.fts_enabled:
+                self._index_fts(tx)
+            else:
+                self._mark_index_stale()
             self._conn.commit()
             self._writes += 1
         return tx
@@ -604,9 +636,7 @@ class Store:
             "SELECT fts_rowid FROM transmissions_fts_map WHERE id = ?",
             (tx_id,)).fetchone()
         if mapped is not None:
-            stored = conn.execute(
-                f"SELECT {', '.join(_FTS_COLUMNS)} FROM transmissions_fts "
-                f"WHERE rowid = ?", (mapped[0],)).fetchone()
+            stored = self._mapped_row(tx_id, mapped[0])
             if stored is not None:
                 if tuple(c or "" for c in stored) == content:
                     return                             # nothing changed
@@ -635,14 +665,43 @@ class Store:
             "INSERT INTO transmissions_fts_map (id, fts_rowid) VALUES (?, ?)",
             (tx_id, cursor.lastrowid))
 
+    def _mapped_row(self, tx_id: str, rowid: int):
+        """The index row the map names for *tx_id*, verified to be that
+        message's: the searchable columns, or None when the row is gone or
+        holds another message. A wrong association is repaired on the spot -
+        the map's entry dropped and any row still carrying this id cleared -
+        so no save or deletion ever updates or removes another message's
+        entry through a stale map."""
+        row = self._conn.execute(
+            f"SELECT id, {', '.join(_FTS_COLUMNS)} FROM transmissions_fts "
+            f"WHERE rowid = ?", (rowid,)).fetchone()
+        if row is not None and row[0] == tx_id:
+            return tuple(row)[1:]
+        if row is not None:
+            log.warning("search index row %d is %s's, not %s's; repairing the map",
+                        rowid, row[0], tx_id)
+            self._conn.execute("DELETE FROM transmissions_fts_map WHERE id = ?", (tx_id,))
+            self._conn.execute(
+                "INSERT OR REPLACE INTO transmissions_fts_map (id, fts_rowid) VALUES (?, ?)",
+                (row[0], rowid))                       # the row's real owner
+        return None
+
     def _unindex_fts(self, tx_id: str) -> None:
-        """Remove a message's index entry, by rowid, through the map."""
+        """Remove a message's index entry, by rowid, through the map. With
+        FTS5 unavailable the index is marked stale instead."""
         if not self.fts_enabled:
+            self._mark_index_stale()
             return
         mapped = self._conn.execute(
             "SELECT fts_rowid FROM transmissions_fts_map WHERE id = ?",
             (tx_id,)).fetchone()
         if mapped is None:
+            return
+        if self._mapped_row(tx_id, mapped[0]) is None:
+            # Gone, or another message's (the map was repaired): the one scan,
+            # on this repair path only, so nothing of this id stays behind.
+            self._conn.execute("DELETE FROM transmissions_fts WHERE id = ?", (tx_id,))
+            self._conn.execute("DELETE FROM transmissions_fts_map WHERE id = ?", (tx_id,))
             return
         self._conn.execute("DELETE FROM transmissions_fts WHERE rowid = ?", (mapped[0],))
         self._conn.execute("DELETE FROM transmissions_fts_map WHERE id = ?", (tx_id,))

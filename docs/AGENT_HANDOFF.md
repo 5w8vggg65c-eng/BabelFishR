@@ -4247,6 +4247,15 @@ scanned it again.
   id (rows above every mapped rowid) is reconciled the same way; a map
   entry whose row is gone is also repaired at save time, by clearing that
   id's rows (the one scan, on that repair path only).
+  *Correction (next pass):* the claim two sentences up - that a layout-1
+  build's rewrite is detected unless it re-used the very rowid it freed,
+  "in which case the map is still right" - was wrong. Codex reproduced the
+  case: the old build deletes message A (row 1) and indexes a new message
+  B, which takes row 1; the map's "A -> 1" then names B's row while row
+  count and highest rowid still agree, and editing B leaves its old
+  wording searchable under a second row. The check now verifies the
+  association itself (see "F6 follow-up" below). Original wording left in
+  place.
 - Assumption corrected while testing: FTS5's `'delete-all'` command is for
   contentless/external-content tables only (error text from this SQLite);
   the rebuild uses `DELETE FROM transmissions_fts`.
@@ -4359,3 +4368,156 @@ assertion changed.
   a transient of up to two event-loop turns, measured offscreen only;
   whether the packaged QtMultimedia backend emits a synchronous
   errorOccurred is unverified here.
+
+---
+
+# F6 follow-up — the two search-recovery gaps
+
+Codex audited `26b7b17` (215 passed, 3 skipped, 2 failed across the 16
+nearest suites in its environment - the two failures are
+`test_offline.py`'s Whisper-availability assertions with faster-whisper
+absent, failing identically on `71ada52`; all 13 F6 tests passed) and
+confirmed the normal-path efficiency (zero index writes for state-only
+saves, one update for changed text, flat per-save cost at 500 / 5,000 /
+50,000; at 50,000: 9.1 ms → 0.085 ms state-only, 9.1 → 0.12 ms text
+change, its Linux runtime). It reproduced two recovery gaps, both
+reproduced here on `26b7b17` before any edit:
+
+- **A - wrong association accepted after rowid re-use.** New build indexes
+  A ("albatross") at row 1, map A -> 1. The real `71ada52` Store (checked
+  out separately) deletes A and saves B ("bramble"): FTS5 re-uses row 1
+  for B; map still A -> 1. New build reopens: row count 1 = 1, highest
+  rowid 1 = 1, so the old check accepted it. Editing B to "cobalt" then
+  produced rows (1, B, bramble) and (2, B, cobalt), map A -> 1, B -> 2;
+  search "bramble" returned B, whose transcript is "cobalt"; it survived a
+  restart. Older-build round trip, not ordinary same-version use, no
+  recording lost.
+- **B - fallback writes never reach the index.** An existing limitation,
+  present on `71ada52` too (Codex reproduced it there as well). With FTS5
+  unavailable the store fell back to LIKE correctly, edits and new
+  messages were found through LIKE, and after FTS5 returned the index and
+  map still agreed with each other, so reconciliation was skipped: search
+  found "obsolete" for A (transcript "replacement") and nothing for
+  "replacement" or "juniper".
+- Found while reproducing B here: `CREATE VIRTUAL TABLE IF NOT EXISTS ...
+  USING fts5` is accepted for a table that already exists whether or not
+  the module is loadable, so on an existing database without FTS5 the
+  store believed it had FTS5 and the first save raised "no such module:
+  fts5" instead of falling back. (Codex's reproduction failed the schema
+  step itself, as a new database would.)
+
+## Identifiers
+
+| | |
+|---|---|
+| Base | `26b7b17` — verified equal to the remote tip at the start, worktree clean |
+| Commit | the commit carrying this section (`git log -1 -- tests/test_alpha5_search_recovery.py`) |
+| Branch | `claude/radio-decoder-translator-0oslya` |
+| Workflow / tag / release / packaging / logo / dependency locking / F7 | nothing dispatched, retried, created, moved, published or changed |
+
+## Repairs (mine, on Codex's recommendation; smallest forms I found)
+
+- **A, at start:** `_fts_index_consistent()` replaces the count-and-
+  highest-rowid comparison: one pass over the index LEFT JOINed to the map
+  on rowid, requiring every row's map entry to name the same message id,
+  and the map to hold nothing more (`total == matched == mapped`). Measured
+  here: 29 ms at 50,000 rows, once per start (the old check
+  was 9.5 ms). Inconsistent → the existing transactional `_reconcile_fts()`
+  (adopt by id, drop orphans, correct text) before the index is used.
+- **A, per operation:** `_mapped_row()` reads the row's `id` together with
+  its text and returns it only if it is this message's. Another message's
+  row → the map is repaired on the spot (this id's entry dropped, the
+  row's real owner mapped with `INSERT OR REPLACE`) and the caller takes
+  its "no valid entry" path, which clears any row still carrying this id
+  (the one scan, on that repair path only) before inserting. So neither a
+  save nor a deletion can update or remove another message's entry through
+  a stale map. The healthy path reads one extra column and nothing else.
+- **B:** a durable stale mark. With FTS5 unavailable, `save_transmission`
+  and `_unindex_fts` (retention and permanent deletion) write
+  `meta('fts_stale', '1')` inside the same transaction as the row. On a
+  start with FTS5, the mark - like a missing layout mark or an inconsistent
+  map - triggers `_reconcile_fts()`; the mark is deleted in the same
+  transaction as the reconcile and the layout mark, so a failure rolls all
+  of it back, keeps the mark, disables indexed search for that process
+  (LIKE) and retries at the next start. Authoritative rows are never
+  written by the repair.
+- **Availability probe:** after the schema script, `SELECT rowid FROM
+  transmissions_fts LIMIT 0` - the first statement that actually needs
+  the module - inside the same try, so an existing index whose module is
+  missing enters the fallback (and marks stale) instead of raising on the
+  first save.
+- Not done: no rebuild on healthy starts (the healthy start still writes
+  nothing to the index); no change to Store search semantics, removal
+  semantics, F7, dependencies, logo, packaging, workflows. Running an
+  older application version against a newer database remains unsupported;
+  what is established is that derived search data recovers from it.
+
+## Tests (`tests/test_alpha5_search_recovery.py`, 8)
+
+The layout-1 build's index maintenance is reproduced in SQL, statement for
+statement, from `babelfishr/storage.py` at `71ada52` (`OldBuild` in the
+test file, provenance in its docstring); no git history is needed at test
+time. FTS5 unavailability is produced at the connection boundary only, two
+ways: `NoFTS5AtInit` (the schema script fails, as for a new database -
+Codex's boundary) and `NoFTS5` (the schema step is accepted for an existing
+table and every statement touching it fails "no such module: fts5" - what
+SQLite does). Everything after is production code.
+
+- A: the exact sequence; reopening establishes B -> 1; editing B leaves
+  one row (1, B, cobalt), "bramble" gone; correct after another restart;
+  A stays deleted and tombstoned.
+- The per-operation guard, with a deliberately swapped map (labelled as
+  such: not the A sequence): P's save does not overwrite Q's row, Q's
+  deletion does not remove P's.
+- B: on an already-marked layout-2 database, edit, create, clear all
+  searchable text, and delete while unavailable (mark asserted after the
+  first save); after FTS5 returns, results agree with the rows (A found by
+  "replacement" not "obsolete", B found, C not found by anything, D gone
+  and tombstoned), map equals the index, and the following start writes
+  nothing. Deletion-only variant. Codex's initialisation-failure sequence.
+- The existing-table/missing-module detection (falls back; saves succeed).
+- Recovery failure (a raising `_reconcile_fts` after the stale mark was
+  set): mark kept, index left as it was, `fts_enabled` False, LIKE search
+  answers from the rows, `transmissions` byte-identical before and after;
+  the next start completes it.
+- A healthy start reads the index and writes nothing.
+
+Substitutions: the two connection classes above at `sqlite3.connect`; the
+raising `_reconcile_fts`; nothing else (mock engines are not involved).
+
+## Evidence
+
+| Check | Result |
+|---|---|
+| Reproductions on `26b7b17`, before editing | A: with the real `71ada52` Store in a separate checkout - FTS `(1, B, bramble)`, map `A -> 1`, check True; after editing B: rows `(1, B, bramble)`, `(2, B, cobalt)`, map `A -> 1, B -> 2`, "bramble" → B, survives restart. B: reproduced at the connection boundary (`NoFTS5AtInit`): after FTS5 returned, "replacement" → [], "juniper" → [], "obsolete" → A. At the other boundary (`NoFTS5`, existing table) `26b7b17` raised "no such module: fts5" from the first save instead of falling back. |
+| After | A: reopening gives map `B -> 1`; editing B leaves `(1, B, cobalt)` only; "bramble" → []; same after restart. B: stale mark set by the first fallback save; after FTS5 returns: "replacement" → A, "juniper" → B, "obsolete" → [], mark cleared. Missing module on an existing table → fallback, saves succeed. |
+| Fail-before (storage.py from `26b7b17`, the 8 new tests) | 8 of 8 fail. Behavioural: A (stale association accepted), the guard (Q's entry lost), B at both boundaries ("the edit made during fallback is not searchable"; "no such module" raised from save). Not behavioural proof: the healthy-start test fails on the missing `_fts_index_consistent` attribute; the recovery-failure test fails at the missing-module boundary before reaching the recovery. |
+| Reversals (one at a time, named test, byte-restored) | RA1 count-and-highest-rowid check restored → caught (A sequence). RA2 mapped row trusted without checking its id → caught (guard). RB1 no stale mark on fallback saves → caught (B, mark asserted after the first save). RB1b no stale mark on fallback deletions → caught (deletion-only test). RB2 failed recovery clears the mark → caught. RB3 no availability probe → caught. Two earlier reversal attempts (RB1/RB1b against the combined B test) were masked by the other write path marking stale; the tests were split so each path is proved on its own. None survived. |
+| New tests | 8 passed (21 with the 13 F6 tests) |
+| Focused (17 suites: search recovery, search index, storage, both migrations, message removal, shared recordings, acceptance, pipeline, offline, offline integration, filtered views, view reconciliation, shutdown, cleanup, lifecycle, boundary) | 228 passed, 0 skipped, 0 failed (faster-whisper is installed here, so `test_offline.py` passes) |
+| Full suite | 966 passed, 11 skipped, 0 failed, 207 s |
+| Skips (11) | 2 QtMultimedia not installed; 1 CoreAudio needs macOS; 1 PlistBuddy macOS only; 5 no prepared Whisper model; 2 no Argos language pack |
+| `git diff --check`, `compileall` | clean |
+| Normal path preserved | the 13 F6 tests unchanged and green: zero index writes for state-only saves with `_writes` advancing, one rowid UPDATE for changed text, rowid deletes, no per-save scan; healthy start writes nothing (new test) |
+| Cost of the new start-up check | 29 ms at 50,000 rows (old check 9.5 ms); a healthy open at 50,000 rows, everything included, 137 ms here. Not a rebuild; not Mac timings. |
+
+Environment: Linux container, Python 3.11.15, SQLite 3.45.1 with FTS5, offscreen Qt, temporary databases and recordings; nothing of Eric's touched. Existing tests changed: none.
+
+## Ledger after the F6 follow-up
+
+- F6 normal maintenance confirmed by Codex; recovery gaps A and B closed
+  here (B was an existing limitation, now addressed); the older-build
+  round trip is still not a supported way to run the application.
+- Everything else as in the F6 ledger above: F1/F2/F5 preserved; F3/F4
+  repaired, Mac pending; F7 pending, F8/F9 deferred; product decisions
+  (exactly-five-second playback, seeking, natural-completion collapse,
+  removal policy, General, forced cancellation/exit) open; logo pending;
+  run 21 the latest candidate and it predates these repairs; Eric's
+  acoustic radio test recorded; electrical radio/PTT/USB, SDR, RF
+  metadata, transmitter identification unverified. Shutdown limitations
+  as recorded (no forced-cancellation policy; CLI close without a timeout
+  can wait indefinitely; Start/mode-change bounded synchronous paths;
+  unreadable retained analysis records prevent file deletion; "fraction of
+  a second" not a measured bound). Anchoring transient of up to two
+  event-loop turns in a full view, offscreen only. QtMultimedia signal
+  order unverified here.
