@@ -303,10 +303,7 @@ def test_deleting_the_viewed_session_moves_to_general_and_stops_its_playback(
     window._reload_timeline()
     backend = module.make_scripted_backend()
     controller = PlaybackController(backend, parent=window.timeline)
-    window.timeline.playback.changed.disconnect(window.timeline._on_playback_changed)
-    window.timeline.playback = controller
-    window.timeline._player = controller
-    controller.changed.connect(window.timeline._on_playback_changed)
+    window.timeline.set_playback(controller)      # the view rewires changed and positionChanged itself
     controller.play(ops_txs[0], ops_files[0])
     assert controller.owner == ops_txs[0]
 

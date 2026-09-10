@@ -4521,3 +4521,160 @@ Environment: Linux container, Python 3.11.15, SQLite 3.45.1 with FTS5, offscreen
   a second" not a measured bound). Anchoring transient of up to two
   event-loop turns in a full view, offscreen only. QtMultimedia signal
   order unverified here.
+
+---
+
+# F7 first pass — playback notification and history-layout work
+
+Codex's independent verification of `1f25c1b` closed F6 within its tested
+scope (117 tests; the original delete-A/create-B sequence with the real
+`71ada52` Store; interrupted recovery rolls back and retries; a healthy open
+traced from connection creation with zero index/map writes; FTS5 module
+unregistered through the public SQLite API confirms the availability
+probe). It then measured F7 on the same commit, with 500 real bubbles and
+the scripted backend: loading = 1,000 insertWidget + 500 removeWidget;
+one controller change = 1,000 `_render_playback` calls (two per bubble);
+a real Play click = 1,000 renders; one backend position event = 500 bubble
+callbacks though one recording plays. Sources: every bubble connected the
+controller's `changed` to its own `_render_playback` while the view's
+`_on_playback_changed()` rendered every bubble again; every bubble received
+`positionChanged`; `append_older()` inserted at the top, removed and
+re-inserted at the bottom.
+
+## Identifiers
+
+| | |
+|---|---|
+| Base | `1f25c1b` — verified equal to the remote tip at the start, worktree clean |
+| Commit | the commit carrying this section (`git log -1 -- tests/test_alpha5_playback_routing.py`) |
+| Branch | `claude/radio-decoder-translator-0oslya` |
+| Not done | history cap, pagination, virtualization, removal/General/playback policies, F8/F9, logo, packaging, workflow, tag, release |
+
+## Design (mine, on Codex's scope)
+
+- `PlaybackController.changed` is now `Signal(object)` carrying a frozenset
+  of the recordings a change concerns: `play()` names the previous owner
+  and the new one; `_fail()` the failed request; `_retire()` the owner
+  that stopped (Stop, natural end, error); a backend state change the
+  owner. `positionChanged` already carried the owner.
+- `TimelineView.set_playback(controller)` is the one place the view is
+  wired to a controller (`changed` → `_on_playback_changed(affected)`,
+  `positionChanged` → `_on_playback_position`). The view redraws only the
+  affected bubbles, inside `_anchored()` as before, and hands a position
+  report to the owner's bubble alone. Bubbles created by the view are
+  constructed with `follow_player=False` and listen to nothing; a
+  `TransmissionBubble` built on its own keeps `follow_player=True`, listens
+  for itself and redraws when its id is named. Cleared or removed bubbles
+  are simply absent from `_bubbles`, so nothing is routed to them.
+- `append_older()` → `_insert(len(self._order), tx)`: one anchored
+  insertion in the final place. Layout invariant kept: bubbles contiguous
+  from index 0, then the hidden empty-state label, then the stretch
+  (checked by the insertion test).
+- Chosen over alternatives: keeping per-bubble listeners with an id filter
+  (still one callback per bubble per change - the all-bubble dispatch
+  hidden behind an early return); or dropping only one of the two render
+  paths (leaves the other scaling with N).
+
+## Measurements (`probe_f7.py`: fresh process per label and size; real TimelineView, real QTest clicks, scripted backend; `_render_playback` and `_on_playback_position` counted at class level; layout `insertWidget`/`removeWidget` counted; deferred deletes processed between loads so counts are for live bubbles; timings are single probes in this container and only their shape is claimed)
+
+| | baseline 500 | repaired 500 | baseline 5,000 | repaired 5,000 |
+|---|---|---|---|---|
+| load, 3 runs (s) | 3.61 / 1.89 / 1.92 | 2.03 / 1.74 / 1.74 | 59.6 / 48.1 / 48.4 | 56.6 / 45.2 / 44.1 |
+| layout ops per load | 1,000 insertWidget + 500 removeWidget | **500 insertWidget + 0 removeWidget** | 10,000 + 5,000 | **5,000 + 0** |
+| renders during load (one per bubble, legitimate) | 500 | 500 | 5,000 | 5,000 |
+| `clear()` (s) | 2.3 | 2.0 | **198** | **175** |
+| one `changed` notification: renders | 1,000 (13.8 ms) | **1** (0.17 ms) | 10,000 (136 ms) | **1** (0.18 ms) |
+| real Play click: renders / position callbacks | 1,000 / 500 (122 ms) | **1 / 1** (98 ms) | 10,000 / 5,000 (1,393 ms) | **1 / 1** (1,348 ms) |
+| one backend position event: callbacks | 500 (1.6 ms) | **1** (0.11 ms) | 5,000 (19 ms) | **1** (0.12 ms) |
+| Pause click: renders | 1,000 (15 ms) | **1** (1.0 ms) | 10,000 (196 ms) | **1** (9.7 ms) |
+| resume click: renders | 1,000 (67 ms) | **1** (54 ms) | 10,000 (1,145 ms) | **1** (912 ms) |
+| takeover click: renders / position callbacks | 2,000 / 500 (83 ms) | **3 / 1** (62 ms) | 20,000 / 5,000 (1,378 ms) | **3 / 1** (1,021 ms) |
+| Stop click: renders | 1,000 (126 ms) | **1** (138 ms) | 10,000 (1,591 ms) | **1** (1,434 ms) |
+| RSS before → after load (MB) | 90 → 216 | 90 → 215 | 90 → 1,320 | 90 → 1,315 |
+
+Reading: dispatch work is now proportional to the recordings affected
+(1 to 3 redraws, 1 position callback) at every thread size. The wall time
+of a Play, resume, takeover or Stop click did not fall in proportion: at
+5,000 bubbles it stays around 1-1.4 s, and that time is Qt relaying out
+the one QVBoxLayout that holds every bubble when a bubble's height
+changes (controls expanding or collapsing; a Pause, which changes no
+height, dropped from 196 ms to 10 ms). Loading is dominated by widget
+construction and first layout (~9 ms per bubble here), not by the removed
+remove/re-insert cycle. `clear()` at 5,000 bubbles takes about three
+minutes in both builds: one `removeWidget` per bubble on a 5,000-item
+layout plus 5,000 deferred deletions - untouched by this pass and recorded
+below. Memory is ~0.25 MB per bubble (RSS of a fresh process, before and
+after loading; not high-water marks).
+
+## Tests (`tests/test_alpha5_playback_routing.py`, 11)
+
+Real Qt offscreen, real QTest clicks, scripted backend. Render and
+position callbacks are counted per bubble by wrapping the bubble's slots at
+class level, so an all-bubble dispatch would be counted even if it did
+nothing. Play/Pause/resume/Stop keep controller, backend and every bubble's
+visible controls in agreement and redraw the owner only (the load-time
+duration report is one legitimate position callback to the owner);
+takeover redraws the previous and new owner, each at most twice (the
+backend stop, then the takeover); B's missing file redraws B only while A
+keeps playing at 700 ms, and the retry after the file appears clears B's
+error; a late duration report, five ticks and natural completion reach the
+owner only; the same work at 6 and at 240 bubbles (equal totals and the
+same affected set); cleared and removed bubbles receive nothing and a
+switched thread still plays; a standalone bubble still follows its
+controller (and hears every report, as before, being alone); a transcript
+update mid-playback keeps position and controls; history is inserted once
+per record at its final index (50 inserts, 0 removes, indices 0..49),
+final order, membership and layout invariant checked, ties by id, an
+existing record updated not duplicated, empty state restored; the reading
+position measured in pixels (±1) holds through a record placed above, a
+bubble growing above, and playback controls expanding and collapsing
+above. Substitutions: the scripted backend; nothing else.
+
+Existing tests changed: the three helpers that swapped in a scripted
+controller by hand (`test_alpha5_playback.make_view`,
+`test_alpha5_message_removal`, `test_alpha5_session_removal`) now call
+`view.set_playback(controller)`, because the hand wiring reconnected only
+`changed` and the view now also routes `positionChanged`. No assertion
+changed.
+
+## Evidence
+
+| Check | Result |
+|---|---|
+| Reproduced before editing (500 bubbles, this container) | loading 1,000 insertWidget + 500 removeWidget; one change = 1,000 renders; Play click = 1,000 renders + 500 position callbacks; one position event = 500 callbacks - as Codex measured |
+| Fail-before (`timeline.py`, `playback.py` and the `make_view` helper from `1f25c1b`) | 8 of 10 fail (all the routing, thread-size, lifecycle, standalone-count and insertion tests, on their work counts or on the old zero-argument `changed`); the two that pass are guards: a transcript update mid-playback, and the pixel anchoring, which the old code also kept |
+| Reversals (one at a time, named test, files byte-restored) | RV1 bubbles in the view listen for themselves again → caught (work grew 36→1,440 renders); RV2 view redraws every bubble → caught; RV3 position reports to every bubble → caught; RV4 append_older via add-then-move → caught (100 inserts, 50 removes); RV5 playback redraw outside the anchoring → caught (pixel test); RV6 takeover names only the new owner → survived against the scripted backend (its synchronous stop report covered the previous owner) and is **caught** by the added asynchronous-stop test; RV7 a failed request names nobody → caught. None survive. |
+| New tests | 11 passed |
+| Focused (14 suites: routing, playback, ownership, resume, filtered views, view reconciliation, message removal, session removal, alpha-3 repairs (standalone bubbles), shutdown, cleanup, lifecycle, boundary, thread/sessions) | 174 passed, 2 skipped |
+| Full suite | 976 passed, 11 skipped, 0 failed, 205 s |
+| Skips (11) | 2 QtMultimedia not installed; 1 CoreAudio needs macOS; 1 PlistBuddy macOS only; 5 no prepared Whisper model; 2 no Argos language pack |
+| `git diff --check`, `compileall` | clean |
+
+Environment: Linux container, Python 3.11.15, PySide6 Essentials (no QtMultimedia), offscreen Qt, scripted backend, temporary files; nothing of Eric's touched; not a Mac.
+
+## What remains of F7 (ledger)
+
+- One QVBoxLayout holds every bubble: a height change anywhere (controls
+  expanding or collapsing, a transcript growing) still costs one relayout
+  of the whole container - about 100 ms at 500 bubbles and 1-1.4 s at 5,000 in this container, for a Play, resume, takeover or Stop - and so does each anchored
+  correction. That is the remaining per-action cost at large thread sizes
+  and it is Qt layout work, not our dispatch; reducing it means fewer
+  widgets in the layout (a cap, pagination or virtualization), which is a
+  product decision not taken here.
+- Memory: ~0.25 MB of RSS per bubble here (90 → 215 MB for 500, 90 → 1,315 MB for 5,000, fresh processes), unchanged by this pass. Widgets are heavy; a thread that grows without bound
+  grows without bound. This pass does not establish an acceptable
+  capacity or approve a history cap.
+- Loading time is dominated by widget construction and first layout, not
+  by the removed remove/re-insert cycle (see the table).
+- `clear()` - leaving or switching a thread - takes about three minutes at
+  5,000 bubbles in both builds (one `removeWidget` per bubble on the full
+  layout plus the deferred deletions). Not touched here; a candidate for
+  the next F7 pass, and further reason the widget count itself is the
+  remaining question.
+- The controller does not correlate a backend state report with the
+  recording it belongs to: a stop report arriving *after* a takeover
+  (possible if a backend reports asynchronously) would retire the new
+  owner. The scripted backend reports synchronously; QtMultimedia's actual
+  ordering is unverified here. Recorded, not changed.
+- Long-session memory and broader history-loading costs remain separate
+  questions.

@@ -114,12 +114,18 @@ class TransmissionBubble(QtWidgets.QFrame):
     restoreRequested = QtCore.Signal(str)               # tx_id
 
     def __init__(self, tx: Transmission, player: PlaybackController,
-                 parent: Optional[QtWidgets.QWidget] = None):
+                 parent: Optional[QtWidgets.QWidget] = None, *,
+                 follow_player: bool = True):
         super().__init__(parent)
         self.tx = tx
         self._player = player
-        self._player.changed.connect(self._render_playback)
-        self._player.positionChanged.connect(self._on_playback_position)
+        if follow_player:
+            # A bubble on its own listens to the controller itself. Inside a
+            # TimelineView it does not: the view hands each change to the
+            # bubbles it concerns, so a notification costs work in proportion
+            # to the recordings affected, not to the length of the thread.
+            self._player.changed.connect(self._on_player_changed)
+            self._player.positionChanged.connect(self._on_playback_position)
         self.setObjectName("bubble")
         self.setFrameShape(QtWidgets.QFrame.StyledPanel)
 
@@ -515,6 +521,10 @@ class TransmissionBubble(QtWidgets.QFrame):
         if owner == self.tx.id:
             self.position_label.setText(format_clock(position_ms, duration_ms))
 
+    def _on_player_changed(self, affected) -> None:
+        if self.tx.id in affected:
+            self._render_playback()
+
     def _render_playback(self) -> None:
         """Draw this bubble's playback controls from the controller's truth.
 
@@ -672,13 +682,10 @@ class TimelineView(QtWidgets.QScrollArea):
         self._pending_anchor = None
         self._anchor_passes = 0
         self._anchor_scheduled = False
-        self.playback = PlaybackController(parent=self)
-        self._player = self.playback          # what bubbles are handed
+        self.playback: Optional[PlaybackController] = None
+        self._player: Optional[PlaybackController] = None
+        self.set_playback(PlaybackController(parent=self))
         self.playback_backend = self.playback.backend_name
-        # Expanding or collapsing a control bar changes a bubble's height, so
-        # it happens inside the same anchoring every other growth does: the
-        # operator's reading position does not move.
-        self.playback.changed.connect(self._on_playback_changed)
 
         self.empty_label = QtWidgets.QLabel(
             "No transmissions yet.\n\n"
@@ -719,10 +726,42 @@ class TimelineView(QtWidgets.QScrollArea):
             self.empty_label.show()
         return True
 
-    def _on_playback_changed(self) -> None:
+    def set_playback(self, controller: PlaybackController) -> None:
+        """Use *controller* for every bubble here, present and future.
+
+        The view is the controller's only listener on behalf of its bubbles:
+        each change names the recordings it concerns and only their bubbles
+        are redrawn; each position report goes to the owner's bubble alone.
+        Before, every bubble listened for itself and the view redrew every
+        bubble as well, so one change redrew a thread of N bubbles twice
+        and every position tick reached all N.
+        """
+        if self.playback is not None:
+            self.playback.changed.disconnect(self._on_playback_changed)
+            self.playback.positionChanged.disconnect(self._on_playback_position)
+        self.playback = controller
+        self._player = controller             # what bubbles are handed
+        controller.changed.connect(self._on_playback_changed)
+        controller.positionChanged.connect(self._on_playback_position)
+        for bubble in self._bubbles.values():
+            bubble._player = controller
+
+    def _on_playback_changed(self, affected) -> None:
+        # Expanding or collapsing a control bar changes a bubble's height, so
+        # it happens inside the same anchoring every other growth does: the
+        # operator's reading position does not move.
+        bubbles = [self._bubbles[tx_id] for tx_id in affected if tx_id in self._bubbles]
+        if not bubbles:
+            return
         with self._anchored():
-            for bubble in self._bubbles.values():
+            for bubble in bubbles:
                 bubble._render_playback()
+
+    def _on_playback_position(self, owner: str, position_ms: int,
+                              duration_ms: int) -> None:
+        bubble = self._bubbles.get(owner)
+        if bubble is not None:
+            bubble._on_playback_position(owner, position_ms, duration_ms)
 
     def count(self) -> int:
         return len(self._bubbles)
@@ -830,7 +869,7 @@ class TimelineView(QtWidgets.QScrollArea):
         between the two, and the anchor taken for the move reads stale
         geometry, so the reading position lands a bubble's height off."""
         self.empty_label.hide()
-        bubble = TransmissionBubble(tx, self._player)
+        bubble = TransmissionBubble(tx, self._player, follow_player=False)
         bubble.correctionRequested.connect(self.correctionRequested)
         bubble.tagsChanged.connect(self.tagsChanged)
         bubble.bookmarkToggled.connect(self.bookmarkToggled)
@@ -873,13 +912,10 @@ class TimelineView(QtWidgets.QScrollArea):
         if tx.id in self._bubbles:
             self.update(tx)
             return self._bubbles[tx.id]
-        bubble = self.add(tx)
-        with self._anchored():
-            self._layout.removeWidget(bubble)
-            self._layout.insertWidget(self._layout.count() - 1, bubble)
-            self._order.remove(tx.id)
-            self._order.append(tx.id)
-        return bubble
+        # Straight into its final place, below every bubble shown. Before,
+        # it was inserted at the top and then removed and re-inserted at
+        # the bottom: three layout operations per record of history.
+        return self._insert(len(self._order), tx)
 
     def update(self, tx: Transmission) -> None:
         bubble = self._bubbles.get(tx.id)

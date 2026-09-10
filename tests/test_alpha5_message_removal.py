@@ -474,10 +474,7 @@ def _scripted_controller(view):
     from babelfishr.ui.playback import PlaybackController
 
     controller = PlaybackController(backend, parent=view)
-    view.playback.changed.disconnect(view._on_playback_changed)
-    view.playback = controller
-    view._player = controller
-    controller.changed.connect(view._on_playback_changed)
+    view.set_playback(controller)      # the view rewires changed and positionChanged itself
     return backend, controller
 
 

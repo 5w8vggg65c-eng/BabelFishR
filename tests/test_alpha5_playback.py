@@ -137,10 +137,7 @@ def make_view(backend):
     # Swap the view's controller for one on the scripted backend, and rewire
     # the anchoring slot, so bubbles created from here on use it.
     controller = PlaybackController(backend, parent=view)
-    view.playback.changed.disconnect(view._on_playback_changed)
-    view.playback = controller
-    view._player = controller
-    controller.changed.connect(view._on_playback_changed)
+    view.set_playback(controller)      # the view rewires changed and positionChanged itself
     return view, controller
 
 

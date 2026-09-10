@@ -190,8 +190,11 @@ def make_backend(parent: Optional[QtCore.QObject] = None) -> PlaybackBackend:
 class PlaybackController(QtCore.QObject):
     """Which recording is playing, and what it is doing. One per thread."""
 
-    #: Ownership or state changed: bubbles re-render from the controller.
-    changed = QtCore.Signal()
+    #: Ownership or state changed, carrying the ids of the recordings whose
+    #: controls that concerns (a frozenset): the one playing, the one that
+    #: was, the one whose request failed. Bubbles for other recordings have
+    #: nothing to redraw, and a thread of thousands must not redraw them.
+    changed = QtCore.Signal(object)
     #: (owner transmission id, position ms, duration ms) - for the label only.
     positionChanged = QtCore.Signal(str, int, int)
 
@@ -247,7 +250,8 @@ class PlaybackController(QtCore.QObject):
             # recorded why; say so rather than claim success. An earlier
             # version returned True here regardless.
             return tx_id not in self.last_error
-        if self.owner is not None and self.owner != tx_id:
+        previous = self.owner
+        if previous is not None and previous != tx_id:
             # One recording at a time. Retire the previous owner outright.
             self.backend.stop()
         self.owner = tx_id
@@ -268,7 +272,7 @@ class PlaybackController(QtCore.QObject):
         self.backend.play()
         if tx_id in self.last_error:
             return False               # the same, from play() itself
-        self.changed.emit()
+        self._emit_changed(previous, tx_id)
         return True
 
     def toggle(self, tx_id: str, path: Optional[str]) -> None:
@@ -313,7 +317,7 @@ class PlaybackController(QtCore.QObject):
             return
         if state != self._state:
             self._state = state
-            self.changed.emit()
+            self._emit_changed(self.owner)
 
     def _on_position(self, position_ms: int) -> None:
         if self.owner is not None:
@@ -358,16 +362,20 @@ class PlaybackController(QtCore.QObject):
             self._state = STOPPED
             self._duration_ms = 0
         self.last_error[tx_id] = message
-        self.changed.emit()
+        self._emit_changed(tx_id)
 
     def _retire(self) -> None:
         if self.owner is None and self._state == STOPPED:
             return
+        owner = self.owner
         self.owner = None
         self.path = ""
         self._state = STOPPED
         self._duration_ms = 0
-        self.changed.emit()
+        self._emit_changed(owner)
+
+    def _emit_changed(self, *tx_ids: Optional[str]) -> None:
+        self.changed.emit(frozenset(tx_id for tx_id in tx_ids if tx_id))
 
 
 def format_clock(position_ms: int, duration_ms: int) -> str:

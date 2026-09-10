@@ -1,7 +1,7 @@
 # BabelFishR — Mac bench checklist (no Terminal needed)
 
 **This checklist is for the next candidate build — one made from a commit that
-includes these features (sections I–Q are new and are not in run 21).** Do not run it against the candidate you already have
+includes these features (sections I–R are new and are not in run 21).** Do not run it against the candidate you already have
 installed: several steps below describe behaviour that build does not contain,
 so they would fail for the wrong reason. Wait for a new download link.
 
@@ -398,6 +398,21 @@ history.
 54. Quit and start BabelFishR again, then repeat the search from step 52.
     *Good:* the same result, and the start is as quick as before (no long
     pause on the first screen).
+
+## R. Playing an older message while reading (new)
+
+Not in run 21 or any later build yet; needs a future candidate.
+
+55. With a long thread (twenty or more messages), scroll so that you are
+    reading a message in the middle of the list. Press **▶ Play** on a
+    message *above* the one you are reading (scroll up to it, press, then
+    scroll back). *Good:* the message you were reading is still exactly
+    where it was; the playing message's controls opened without pushing
+    your text down. Press **■ Stop** on it. *Good:* your text still does not
+    move. *Bad:* the list jumping when the controls open or close.
+56. While a long recording plays, watch the time counter on *its* message
+    only. *Good:* it counts up on that message; no other message shows a
+    counter or changes.
 
 ---
 
