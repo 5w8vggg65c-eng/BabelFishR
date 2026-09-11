@@ -5464,8 +5464,10 @@ FalconClaw/PTT remain unverified.
      (the process's own name, or the executable given, with `--root`
      compared). Production on a Mac (binary named `sdrpp`) is unchanged in
      effect.
-   These are stand-in and timing changes; they have not been run on a Mac
-   and the receiver tests have still never passed on one. Locally: the four
+   Classification, corrected: the idle-filler catch-up and the macOS
+   process detection are **production** changes (babelfishr/receiver/
+   stream.py and sdrpp.py); the clock-paced fake and the log wait are
+   stand-in/test changes. None of it had run on a Mac at that point. Locally: the four
    receiver files 52 passed, 2 skipped; full suite 1031 passed, 11 skipped.
    The run also left orphan Python processes (the stand-ins) that the
    runner terminated at job end.
@@ -5485,3 +5487,70 @@ receiver" and checklist section S; nothing there has been run on a Mac.
 Eric's acoustic radio test stands (work radio speaker → laptop microphone
 → BabelFishR); direct RTL-SDR reception and FalconClaw/PTT remain
 unverified.
+
+
+---
+
+# Mac process-path regression closed; candidate build #2
+
+## Identifiers
+
+| | |
+|---|---|
+| Base | `0b3d4ad8bec3311ca5a883f19fca19246eb0cd0e` (verified equal to the remote tip, worktree clean, no tag at HEAD) |
+| Commit | the commit carrying this section |
+| Branch | `claude/radio-decoder-translator-0oslya` |
+
+## The regression (Codex, source-backed boundary test) and the repair
+
+`sdrpp_processes()` on Darwin parsed `ps -axo pid=,comm=,args=` with
+`line.split(None, 2)` and `parts[2].split()`: ps joins the arguments with
+single spaces and the boundaries are gone (adv_cmds ps/print.c), so an
+explicit `--root /Users/eric/Library/Application Support/sdrpp` compared as
+`/Users/eric/Library/Application`, the running SDR++ was taken for another
+receiver's, its files were rewritten and a second SDR++ was launched.
+(BabelFishR's default launch passes no `--root`; this needed an explicit
+root with a space in it.)
+
+Repair (`babelfishr/receiver/sdrpp.py`): the words after `--root` are
+joined as far as an existing directory reaches (`_root_from_flattened_words`,
+the longest existing prefix); a root that cannot be established from ps is
+**unknown, and unknown protects the running SDR++** - it counts as this
+receiver's, never as proof of absence. The Linux `/proc` path keeps exact
+arguments. Plain roots, a known different root, the SDR++.app binary named
+`sdrpp` without `--root`, and the stand-in are all still matched or
+excluded as before.
+
+## Tests (`tests/test_sdr_receiver_mac_gate.py`, 5 - run on every host, so on the Mac gate too)
+
+- Spaced root through the production controller with an owned stand-in on
+  `…/Library/Application Support/sdrpp` and ps-shaped output at the
+  subprocess boundary (`platform.system` → Darwin, `subprocess.run` for ps
+  only): the process is found, `ensure_sdrpp` refuses naming the Rigctl
+  Server, no second launch, settings byte-for-byte unchanged, the
+  operator's process alive. **Fails on 0b3d4ad** ("the root split at its
+  space was taken for a different receiver's: [] == [pid]").
+- Plain root detected; a known different root excluded; a root nobody has
+  excluded; the `sdrpp`-named app binary without `--root` counted; refusal
+  when running without rigctl. Passes on 0b3d4ad too (guard).
+- A root that reaches no existing directory protects the process. **Fails
+  on 0b3d4ad** ("an unreadable root was taken as proof … [] == [777]").
+- Delayed-wake regressions for the two timing repairs, with `time.sleep`
+  forced to 0.5 s whatever is asked: the idle filler covers ≥ elapsed − 0.6 s
+  of 2.5 s (**dded501: 0.10 s** - the review's number) and 2.5 s of audio
+  reaches the stand-in's client within 3.6 s (**dded501: 0.48 s in 12 s**).
+  Coverage and arrival time are measured, not timeouts extended.
+
+## Evidence
+
+| Check | Result |
+|---|---|
+| `tests/test_sdr_receiver_mac_gate.py` | 5 passed (9.7 s) |
+| Fail-before, one test per process in worktrees | on `0b3d4ad`: spaced root fails (`[] == [pid]`), unknown root fails (`[] == [777]`), plain root passes; on `dded501`: idle filler 0.10 s of 2.50 s, stand-in 0.48 s of audio in 12 s |
+| Focused suites with QtMultimedia 6.11.2 present (5 receiver files, playback, lifecycle, shutdown, cleanup, boundary, menu) | 113 passed, 2 skipped (the real-decoder env), 238 s |
+| Full suite, nothing else running, QtMultimedia present | **1036 passed, 11 skipped, 0 failed**, 362 s; skips: CoreAudio (real host), PlistBuddy, Whisper model ×5, Argos ×2, real-decoder ×2 |
+| `git diff --check`, `compileall` | clean |
+
+Build #2 is recorded in the report that accompanies this commit (dispatched
+from this commit's SHA with `runner_label=macos-26`,
+`publish_prerelease=false`, `release_tag=""`, one run, not retried).

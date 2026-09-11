@@ -319,31 +319,48 @@ def sdrpp_processes(executable: str = "", root: Optional[str] = None) -> List[in
     pids: List[int] = []
     wanted = pathlib.Path(executable).name if executable else ""
 
-    def matches(pid: int, comm: str, args: List[str]) -> bool:
+    def same_root(theirs: Optional[str]) -> bool:
+        """None means their root could not be established: counted as the
+        same, never as proof that this is some other receiver's SDR++."""
+        if theirs is None:
+            return True
+        try:
+            return pathlib.Path(theirs).expanduser().resolve() == pathlib.Path(root).expanduser().resolve()
+        except OSError:
+            return True
+
+    def matches(pid: int, comm: str, args: List[str], their_root: Optional[str]) -> bool:
         if pid == os.getpid():
             return False
         names = {pathlib.Path(a).name for a in args[:2]}
         if comm != "sdrpp" and "sdrpp" not in names and not (wanted and wanted in names):
             return False
         if root is not None and "--root" in args:
-            index = args.index("--root")
-            theirs = args[index + 1] if index + 1 < len(args) else ""
-            if pathlib.Path(theirs).expanduser().resolve() != pathlib.Path(root).expanduser().resolve():
-                return False
+            return same_root(their_root)
         return True
 
     try:
         if platform.system() == "Darwin":
-            # The same rule as below, from ps: the process's own name (the
-            # SDR++.app binary is "sdrpp") or the executable given.
+            # The same rule as below, from ps. ps prints the arguments joined
+            # by single spaces with the boundaries gone (adv_cmds ps/print.c),
+            # so a root such as "…/Library/Application Support/sdrpp" arrives
+            # as two words. The root is rebuilt by joining the words after
+            # --root as far as an existing directory reaches; when no
+            # existing directory can be found the root is unknown, and an
+            # unknown root protects the running SDR++ rather than excusing a
+            # second launch on the same receiver.
             result = subprocess.run(["ps", "-axo", "pid=,comm=,args="], capture_output=True,
                                     text=True, timeout=5)
             for line in result.stdout.splitlines():
                 parts = line.split(None, 2)
                 if len(parts) < 3 or not parts[0].isdigit():
                     continue
-                pid, comm, args = int(parts[0]), pathlib.Path(parts[1]).name, parts[2].split()
-                if matches(pid, comm, args):
+                pid, comm = int(parts[0]), pathlib.Path(parts[1]).name
+                words = parts[2].split()
+                their_root: Optional[str] = None
+                if "--root" in words:
+                    their_root = _root_from_flattened_words(words[words.index("--root") + 1:])
+                if matches(pid, comm, words, their_root):
                     pids.append(pid)
             return pids
         for entry in pathlib.Path("/proc").iterdir():
@@ -355,11 +372,30 @@ def sdrpp_processes(executable: str = "", root: Optional[str] = None) -> List[in
                         (entry / "cmdline").read_bytes().split(b"\0") if a]
             except OSError:
                 continue
-            if matches(int(entry.name), comm, args):
+            their_root: Optional[str] = None
+            if "--root" in args:
+                index = args.index("--root")
+                their_root = args[index + 1] if index + 1 < len(args) else ""
+            if matches(int(entry.name), comm, args, their_root):
                 pids.append(int(entry.name))
     except Exception:  # noqa: BLE001 - advisory
         log.debug("process scan failed", exc_info=True)
     return pids
+
+
+def _root_from_flattened_words(words: List[str]) -> Optional[str]:
+    """The --root path from words that ps joined with spaces: the longest
+    prefix of them that names an existing directory. None when none does -
+    the boundary is then unknowable from ps alone."""
+    found = None
+    for count in range(1, len(words) + 1):
+        candidate = " ".join(words[:count])
+        try:
+            if pathlib.Path(candidate).expanduser().is_dir():
+                found = candidate
+        except OSError:
+            continue
+    return found
 
 
 def rtl_sdr_present() -> Optional[bool]:
