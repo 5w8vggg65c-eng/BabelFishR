@@ -208,6 +208,7 @@ def audio_sink(host, port, rate, state):
         log("audio client connected")
         position = 0
         connected_at = time.time()
+        sent_pieces = 0                  # paced by the clock, not by sleep
         try:
             while True:
                 if drop_after and time.time() - connected_at > drop_after:
@@ -221,18 +222,26 @@ def audio_sink(host, port, rate, state):
                     conn.close()
                     srv.close()
                     return
-                if state.playing and pcm and position < len(pcm):
+                if not state.playing:
+                    time.sleep(0.02)
+                    connected_at = time.time() - sent_pieces * 0.02
+                    continue
+                # Real time by the clock: as many 20 ms pieces as the elapsed
+                # time calls for, so a machine whose sleep() wakes late still
+                # streams at the sink's rate rather than at a fraction of it.
+                due = int((time.time() - connected_at) / 0.02)
+                if sent_pieces >= due:
+                    time.sleep(0.005)
+                    continue
+                if pcm and position < len(pcm):
                     data = pcm[position:position + piece]
                     position += piece
                     if position >= len(pcm) and loop:
                         position = 0
-                elif state.playing:
-                    data = silence
                 else:
-                    time.sleep(0.02)
-                    continue
+                    data = silence
                 conn.sendall(data)
-                time.sleep(0.02)
+                sent_pieces += 1
         except OSError:
             log("audio client gone")
         finally:

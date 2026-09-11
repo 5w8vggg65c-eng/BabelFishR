@@ -5410,3 +5410,78 @@ env-gated tests; file replay is not reception; mock recognition is not
 recognition. Eric's acoustic radio test stands (work radio speaker →
 laptop microphone → BabelFishR); direct RTL-SDR reception and
 FalconClaw/PTT remain unverified.
+
+---
+
+# Candidate build attempt at 542ac7a (run 22): failed at the test gate
+
+## What was dispatched
+
+| | |
+|---|---|
+| Base for this pass | `dded5011ca6d12c71fc748358a7496398a3d9659` (verified equal to the remote tip, worktree clean, no tag at HEAD; tags v0.3.0-alpha.1-3 and their three prereleases unchanged) |
+| Documentation commit | `542ac7a2f8b5077947efbf1cb76266bdacb6573d` - README and checklist S only (still-checking USB line, control connection not a precondition, "audio arriving" in digital mode, Stop-before-switching, DSD-neo line not a running indicator, a station carrying speech); application code at `dded501` |
+| Real decoder recheck before dispatch | dsd-neo 2.9.0 built from `630a123e`, fixture `dmr_voice_disc48k.wav` (192 042 bytes): both env-gated tests passed (2 passed, 15.3 s) on the final tree |
+| Workflow | `.github/workflows/macos-release.yml`, workflow_dispatch, ref `claude/radio-decoder-translator-0oslya`, `runner_label=macos-26`, `publish_prerelease=false`, `release_tag=""`; no run existed at 542ac7a; one run dispatched |
+| Run | #22, id 34641195384, attempt 1, https://github.com/5w8vggg65c-eng/BabelFishR/actions/runs/34641195384 - checkout SHA `542ac7a2f8b5077947efbf1cb76266bdacb6573d` (verified from the run record), runner macos-26 (arm64 gate passed), Python 3.12.10 |
+| Conclusion | **failure** in "Build, test, verify, sign and package" at the test gate: `11 failed, 1020 passed, 11 skipped in 759.53s`; no bundle, no signing, no DMG, no verification reports produced ("not produced" for every report); the reports artifact `BabelFishR-macOS-reports` (id 10280727106, 48 523 bytes, 30-day retention) holds only the test report. No DMG artifact, no SHA-256, nothing published. Not re-dispatched. |
+
+## The eleven failures
+
+1. **Production defect, reproduced and fixed here** - `test_the_qt_backend_reports_a_missing_file_as_an_error`,
+   `test_the_qt_backend_learns_a_real_wav_duration`:
+   `RuntimeError: Failed to connect signal "positionChanged(qlonglong)" to
+   signal "positionChanged(int)"` in `QtMultimediaBackend.__init__`
+   (babelfishr/ui/playback.py). The workflow installs an unpinned
+   `PySide6>=6.5`; this run resolved 6.11.2, which refuses a signal-to-
+   signal connection between `QMediaPlayer.positionChanged(qlonglong)` and
+   the backend's `Signal(int)`. The backend could not be constructed at all,
+   so playback would have been broken in the packaged app. Reproduced in
+   this container after installing PySide6-Addons 6.11.2 (plus libpulse0):
+   the two tests fail with exactly the runner's message; with the fix
+   (position and duration relayed through slots that emit `int`) all 18
+   playback tests pass, and the full suite is 1031 passed, 11 skipped.
+2. **Receiver stand-in tests on a slow-timer machine** (never before run
+   on macOS; nine failures):
+   - `test_the_rigctl_client_speaks_sdrpps_protocol`: the fake's log was
+     read before the fake had logged `\start`/`q` - a race in the test;
+     it now waits for the line.
+   - `test_an_idle_decoder_does_not_end_the_stream`: 0.5 s of silence fill
+     covered 2.5 s of wall time - the idle filler emitted one 20 ms block
+     per loop iteration, and `time.sleep(0.02)` on that runner woke late.
+     The filler now covers everything uncovered in one block per wake.
+   - `test_analog_reception…` (no two complete transmissions in 40 s),
+     `test_digital_reception…` (call identifiers expired before capture),
+     `test_recordings_after_retunes…` (recordings 13.5 s apart for 2.8 s
+     bursts; a 5.66 s recording), `test_a_retune_during_a_transmission…`,
+     `test_held_audio…`: the fake SDR++ paced its stream with
+     `sendall(); sleep(0.02)`, so late wakes streamed audio at a fraction
+     of real time. It now sends as many 20 ms pieces as the clock calls for.
+   - `test_a_running_sdrpp_whose_rigctl_is_off…` (`DID NOT RAISE
+     ReceiverUnavailable`): `sdrpp_processes()` on macOS used
+     `pgrep -x sdrpp` only, so a Python stand-in was invisible; it now
+     applies the same rule as on Linux through `ps -axo pid,comm,args`
+     (the process's own name, or the executable given, with `--root`
+     compared). Production on a Mac (binary named `sdrpp`) is unchanged in
+     effect.
+   These are stand-in and timing changes; they have not been run on a Mac
+   and the receiver tests have still never passed on one. Locally: the four
+   receiver files 52 passed, 2 skipped; full suite 1031 passed, 11 skipped.
+   The run also left orphan Python processes (the stand-ins) that the
+   runner terminated at job end.
+
+## State after this pass
+
+The candidate is not built. The fixes above are committed on the branch
+(commit carrying this section); the next candidate must be dispatched
+from that SHA with the same non-publishing inputs, and its test gate is
+the first thing to read. Nothing was tagged, released or published; run 22
+stays as the record of the failure.
+
+## For Eric (once a candidate exists)
+
+Installation, first bench and the acoustic-radio note are in README "SDR
+receiver" and checklist section S; nothing there has been run on a Mac.
+Eric's acoustic radio test stands (work radio speaker → laptop microphone
+→ BabelFishR); direct RTL-SDR reception and FalconClaw/PTT remain
+unverified.

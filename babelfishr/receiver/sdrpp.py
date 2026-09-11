@@ -318,13 +318,36 @@ def sdrpp_processes(executable: str = "", root: Optional[str] = None) -> List[in
     """
     pids: List[int] = []
     wanted = pathlib.Path(executable).name if executable else ""
+
+    def matches(pid: int, comm: str, args: List[str]) -> bool:
+        if pid == os.getpid():
+            return False
+        names = {pathlib.Path(a).name for a in args[:2]}
+        if comm != "sdrpp" and "sdrpp" not in names and not (wanted and wanted in names):
+            return False
+        if root is not None and "--root" in args:
+            index = args.index("--root")
+            theirs = args[index + 1] if index + 1 < len(args) else ""
+            if pathlib.Path(theirs).expanduser().resolve() != pathlib.Path(root).expanduser().resolve():
+                return False
+        return True
+
     try:
         if platform.system() == "Darwin":
-            result = subprocess.run(["pgrep", "-x", "sdrpp"], capture_output=True,
+            # The same rule as below, from ps: the process's own name (the
+            # SDR++.app binary is "sdrpp") or the executable given.
+            result = subprocess.run(["ps", "-axo", "pid=,comm=,args="], capture_output=True,
                                     text=True, timeout=5)
-            return [int(p) for p in result.stdout.split() if p.isdigit()]
+            for line in result.stdout.splitlines():
+                parts = line.split(None, 2)
+                if len(parts) < 3 or not parts[0].isdigit():
+                    continue
+                pid, comm, args = int(parts[0]), pathlib.Path(parts[1]).name, parts[2].split()
+                if matches(pid, comm, args):
+                    pids.append(pid)
+            return pids
         for entry in pathlib.Path("/proc").iterdir():
-            if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            if not entry.name.isdigit():
                 continue
             try:
                 comm = (entry / "comm").read_text().strip()
@@ -332,15 +355,8 @@ def sdrpp_processes(executable: str = "", root: Optional[str] = None) -> List[in
                         (entry / "cmdline").read_bytes().split(b"\0") if a]
             except OSError:
                 continue
-            names = {pathlib.Path(a).name for a in args[:2]}
-            if comm != "sdrpp" and "sdrpp" not in names and not (wanted and wanted in names):
-                continue
-            if root is not None and "--root" in args:
-                index = args.index("--root")
-                theirs = args[index + 1] if index + 1 < len(args) else ""
-                if pathlib.Path(theirs).expanduser().resolve() != pathlib.Path(root).expanduser().resolve():
-                    continue
-            pids.append(int(entry.name))
+            if matches(int(entry.name), comm, args):
+                pids.append(int(entry.name))
     except Exception:  # noqa: BLE001 - advisory
         log.debug("process scan failed", exc_info=True)
     return pids

@@ -99,10 +99,21 @@ class QtMultimediaBackend(PlaybackBackend):
         self._output = QAudioOutput(self)
         self._player.setAudioOutput(self._output)
         self._player.playbackStateChanged.connect(self._on_state)
-        self._player.positionChanged.connect(self.positionChanged)
-        self._player.durationChanged.connect(self.durationChanged)
+        # Relayed through slots, not signal-to-signal: QMediaPlayer reports
+        # position and duration as qlonglong, and PySide6 6.11 refuses to
+        # connect a qlonglong signal straight to this int signal (seen on
+        # the macOS build runner: "Failed to connect signal
+        # positionChanged(qlonglong) to signal positionChanged(int)").
+        self._player.positionChanged.connect(self._on_position)
+        self._player.durationChanged.connect(self._on_duration)
         self._player.mediaStatusChanged.connect(self._on_status)
         self._player.errorOccurred.connect(self._on_error)
+
+    def _on_position(self, position_ms) -> None:
+        self.positionChanged.emit(int(position_ms))
+
+    def _on_duration(self, duration_ms) -> None:
+        self.durationChanged.emit(int(duration_ms))
 
     def load(self, path: str) -> None:
         self._player.setSource(QtCore.QUrl.fromLocalFile(str(path)))

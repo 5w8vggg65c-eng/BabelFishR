@@ -174,6 +174,9 @@ def test_the_rigctl_client_speaks_sdrpps_protocol(receiver_config, tmp_path):
             rig.set_mode("DMR")                       # not one of SDR++'s modes
         rig.start()
         rig.close()
+        # The fake logs each command as it reads it, a moment after the
+        # client sent it; on a slow machine that moment is not yet here.
+        assert wait_for(lambda: "rigctl \\start" in sdrpp_log(receiver_config), timeout=5)
         log = sdrpp_log(receiver_config)
         assert "rigctl F 462562500" in log and "rigctl f" in log
         assert "rigctl M FM 12500" in log and "rigctl \\start" in log and "rigctl q" in log

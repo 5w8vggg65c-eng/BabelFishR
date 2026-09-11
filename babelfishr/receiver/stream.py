@@ -748,11 +748,15 @@ class DecodedVoiceSource(_StreamSource):
                 continue
             with self._timeline_lock:
                 elapsed = now - self._start_mono
-                if elapsed - self._timeline < block_seconds:
+                uncovered = elapsed - self._timeline
+                if uncovered < block_seconds:
                     continue
+                # Everything not yet covered, in one block: a coarse sleep
+                # (a loaded machine wakes this loop late) must not leave the
+                # timeline behind the clock.
                 offset = self._timeline
-                self._timeline += block_seconds
-            self._silence(block_seconds, offset)
+                self._timeline += uncovered
+            self._silence(uncovered, offset)
 
     def _watch_stderr(self) -> None:
         try:
