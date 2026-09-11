@@ -1,7 +1,7 @@
 # BabelFishR — Mac bench checklist (no Terminal needed)
 
 **This checklist is for the next candidate build — one made from a commit that
-includes these features (sections I–R are new and are not in run 21).** Do not run it against the candidate you already have
+includes these features (sections I–S are new and are not in run 21).** Do not run it against the candidate you already have
 installed: several steps below describe behaviour that build does not contain,
 so they would fail for the wrong reason. Wait for a new download link.
 
@@ -413,6 +413,46 @@ Not in run 21 or any later build yet; needs a future candidate.
 56. While a long recording plays, watch the time counter on *its* message
     only. *Good:* it counts up on that message; no other message shows a
     counter or changes.
+
+## S. SDR receiver through SDR++ (new; needs the RTL-SDR and a new candidate)
+
+Not in run 21 or any later build yet. Needs: the RTL-SDR Blog V3 plugged in,
+SDR++ installed in Applications, and - for step 60 only - DSD-neo installed.
+Nothing here has been seen on a Mac; the steps say what *should* happen.
+
+57. Choose **Receiver → Receiver status…**. *Good:* it names SDR++ as found,
+    says whether DSD-neo was found, and says "RTL-SDR on USB: yes".
+    *Bad:* "not found" for SDR++ although it is in Applications, or "no" for
+    the USB receiver while it is plugged in. Write down exactly what it says.
+58. Choose **Receiver → Open receiver window (SDR++)**. *Good:* SDR++ opens
+    (its own window), starts receiving, and BabelFishR's bottom line says
+    SDR++ is running. In SDR++, the Source should read RTL-SDR and the Radio
+    panel's sink should read *Network*. *Bad:* SDR++ does not open, or opens
+    and closes again, or the bottom line says it did not answer.
+59. In the **Audio input** list choose **SDR receiver — SDR++ with the
+    RTL-SDR**. Choose **Receiver → Tune receiver…**, type a frequency you can
+    hear something on (a local FM broadcast station in WFM is a good first
+    test; a GMRS/FRS channel with a handheld transmitting next to you is the
+    real one), leave *Digital voice* unticked, press OK. *Good:* SDR++ tunes
+    to it and the bottom line says "SDR++ confirms ... MHz". Press **Start
+    monitoring**, speak into the handheld (or wait for the station to talk).
+    *Good:* messages appear, are transcribed and, if foreign, translated,
+    and each message's details show the frequency SDR++ confirmed. *Bad:*
+    nothing appears while SDR++ clearly plays audio; or BabelFishR records
+    the room (it must never fall back to the microphone).
+60. Only if you have a digital handheld (or a known DMR/P25 channel): in
+    **Tune receiver…** tick **Digital voice**, choose the protocol, press OK,
+    then **Start monitoring**. *Good:* speech from the digital radio appears
+    as messages; noise and encrypted traffic produce nothing. *Bad:* garbage
+    text from noise presented as a message.
+61. While monitoring, quit SDR++ from its own menu. *Good:* BabelFishR shows
+    a warning that the receiver stopped, keeps every message already
+    recorded, and does not switch to another input. Press **Stop**, reopen the
+    receiver window, and start again. Then unplug the RTL-SDR while
+    monitoring and note what SDR++ and BabelFishR each say.
+62. With monitoring running, choose **Quit** in BabelFishR. *Good:* BabelFishR
+    quits normally; SDR++ closes too if BabelFishR had opened it (and stays
+    open if you had opened it yourself before).
 
 ---
 

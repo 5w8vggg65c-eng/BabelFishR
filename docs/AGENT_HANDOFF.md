@@ -4678,3 +4678,233 @@ Environment: Linux container, Python 3.11.15, PySide6 Essentials (no QtMultimedi
   ordering is unverified here. Recorded, not changed.
 - Long-session memory and broader history-loading costs remain separate
   questions.
+
+---
+
+# SDR receiver integration: SDR++ receives, DSD-neo decodes, BabelFishR records
+
+Eric's requirements: recognise the connected RTL-SDR Blog V3 once its
+software is installed; a conventional receiver window for band/frequency;
+Start monitoring then records, transcribes and translates; digital
+demodulation and voice decoding; reuse existing components; no Terminal.
+Codex's proposed design (adopted, as an architecture to prove, not a proven
+integration): SDR++ is the receiver window and owns the USB receiver; its
+network audio sink and rigctl server are the connection; DSD-neo decodes
+digital voice; BabelFishR manages the connection into its own capture
+pipeline.
+
+## Identifiers
+
+| | |
+|---|---|
+| Base | `d24aa10` (the F7 first pass, complete and pushed) — verified equal to the remote tip, worktree clean |
+| Commit | the commit carrying this section (`git log -1 -- babelfishr/receiver`) |
+| Branch | `claude/radio-decoder-translator-0oslya` |
+| Workflow / tag / release / packaging | nothing dispatched, tagged or published; the .app spec is unchanged (nothing new is bundled) |
+
+## Component contract, pinned (babelfishr/receiver/contract.py)
+
+- **SDR++** master, files read 2026-09-11 (raw.githubusercontent.com; the
+  commit id of master could not be read - api.github.com and the Releases
+  pages are blocked here): `sink_modules/network_sink/src/main.cpp` -
+  config in `<root>/network_sink_config.json` keyed by *stream* name, keys
+  hostname/port/protocol(TCP=0, UDP=1)/sampleRate/stereo/listening; TCP mode
+  listens and accepts ONE client; int16 LE, mono unless stereo, raw PCM, no
+  framing; `if (startNow) startServer()` when listening is true.
+  `misc_modules/rigctl_server/src/main.cpp` - `<root>/rigctl_server_config.json`
+  keyed by instance name, keys host/port(4532)/tuning/recording/autoStart/vfo/
+  recorder; `postInit: if (autoStart) startServer()`; commands F, f, M, m,
+  V, v, \start, \stop, q, \dump_state; `F` tunes the named VFO without
+  checking whether the SDR is started. `core/src/core.cpp` defConfig:
+  moduleInstances[name] = {module, enabled}; streams["Radio"] = {muted, sink,
+  volume}; `command_args.cpp`: `--root` default `$HOME/Library/Application
+  Support/sdrpp` (macOS bundle) / `$HOME/.config/sdrpp` (Linux); `--autostart`.
+- **dsd-neo** `630a123e2d7dd52d66b8444314049c50d904a41e` (project version
+  2.9.0), built here from source with mbelib-neo
+  `be5992dab7589aec6f3a45fa1881139c0caa2a97` (2.1.0): `-i tcp:host:port` (a
+  client of the PCM producer), `-s 48000`, `-o -` = s16le 8000 Hz 2 channels
+  (left slot 1, right slot 2 - **observed**, the channels differ), `-w`,
+  `-P -7 <dir>` per-call WAVs (observed names
+  `20260911_061358_37692_DMR_CC_2__TGT_0_SRC_0.wav`), `-V <slot>`, events on
+  stderr (`Sync: +DMR  [SLOT1]  slot2  | Color Code=02 | VC1`). Observed:
+  connection refused → exit 0 at once; producer closing → dsd-neo stays up
+  until terminated. `--iq-replay <fixture.iq.json>` replays the project's
+  IQ fixtures (cu8, 48 kHz, tuner 851.375 MHz).
+- **Stream formats verified explicitly**: SDR++ sink → 48 000 Hz mono s16le;
+  dsd-neo out → 8 000 Hz stereo s16le (one channel taken); analog recordings
+  are 48 kHz mono WAV, digital recordings 8 kHz mono WAV (checked in tests).
+
+## What was run against the real decoder (this container, no receiver)
+
+dsd-neo's own IQ fixtures (GPL-3 project test data; not copied into this
+repository) through two paths:
+
+| Fixture | `--iq-replay` (IQ path) | FM-discriminated to 48 kHz audio, `-i file.wav` (the network-sink shape) | `-i tcp:` from a Python TCP producer (the SDR++ sink shape) |
+|---|---|---|---|
+| dmr_voice.iq (2 s), `-fs` | DMR sync, VC frames, 0.42 s decoded 8 kHz stereo (rms 0.059) | DMR sync, 0.96 s decoded (rms 0.051) | same 0.96 s, on stdout (30 720 bytes = 0.96 s stereo 8 kHz), stderr events, one connect |
+| p25p1_c4fm_vc.iq (3 s), `-f1` | not run | P25p1 sync, 1.44 s decoded (rms 0.063); `LDU2 ALG ID: 0x80` (clear) | not run |
+| noise_floor.iq (10 s), `-fa` | not run | **no decode: 44-byte WAV** | not run |
+
+Then the full software path: fake SDR++ (rigctl + TCP sink) looping the
+FM-discriminated DMR fixture → real dsd-neo (`-i tcp ... -fs -V 1 -o -`) →
+`DecodedVoiceSource` → CaptureService → recording → mock transcription:
+`test_real_dsd_neo_decodes_a_digital_fixture_into_speech_for_the_pipeline`
+passes (recording 8 kHz mono, >2 s, rms > 0.01, transcript present,
+protocol DMR, colour code 02, SDR provenance). The looped fixture decodes
+as one continuous call (detector hang time 0.8 s), so the transmission
+closes when monitoring stops; real traffic has gaps.
+
+Resource use over an 8 s digital run here (from /proc, one sample):
+dsd-neo 1.2 s CPU, 29 MB RSS; the fake SDR++ 0.06 s, 12 MB; the BabelFishR
+process (no Qt) 0.45 s, 31 MB. SDR++ itself, faster-whisper and Argos were
+not running; a full-stack measurement on a Mac remains to be taken.
+
+Protocol coverage, stated separately:
+- **Demonstrated through demodulated audio (the connection used here):** DMR
+  (dual-slot decoder), P25 Phase 1 C4FM.
+- **Supported by dsd-neo but not tried here:** NXDN48/96, D-STAR, YSF, M17,
+  dPMR, ProVoice/EDACS, X2-TDMA, P25 Phase 2 - available as presets.
+- **Expected to need the IQ path, not covered by this connection:** P25
+  CQPSK/LSM (simulcast) - dsd-neo's own fixtures for it are IQ.
+- **Not attempted, not claimed:** scanning, trunk tracking, encrypted
+  traffic (dsd-neo mutes it; events with a non-0x80 ALG ID or "ENC" set an
+  `encrypted` flag on the metadata).
+
+## Design (mine, on Codex's proposal)
+
+- `babelfishr/receiver/`: `contract.py` (above); `sdrpp.py` - `find_sdrpp`
+  (configured path → `/Applications/SDR++.app/Contents/MacOS/sdrpp` → PATH),
+  `SdrppConfigurator.ensure()` (writes only the named keys in the three
+  files, backs each up once as `*.before-babelfishr.json`, never overrides a
+  chosen source, idempotent), `RigctlClient` (F/f/M/m/\start/\stop/q),
+  `SdrppProcess` (launch with `--autostart`; terminate only what we
+  launched), `rtl_sdr_present()` (macOS system_profiler / Linux sysfs;
+  None when it cannot tell); `stream.py` - `PcmTcpSource` (SDR++'s TCP sink
+  client, int16 → float blocks, reader thread, generation counter so
+  `flush()` after a retune drops audio buffered under the old frequency),
+  `DecodedVoiceSource` (spawns dsd-neo, reads its stdout, takes one slot's
+  channel, parses stderr events into protocol/slot/colour code/talkgroup/
+  unit/encrypted, reports `decoder-exited`), `TuningState` (requested vs
+  confirmed frequency; SDR provenance only when confirmed by `f`);
+  `controller.py` - `ReceiverController` (the one tuning authority:
+  attach if rigctl answers, else configure + launch; tune → read back;
+  \start; build the source; release the source at Stop; shutdown at Quit)
+  and `receiver_status()`.
+- Config: `ReceiverConfig` (sdrpp_path/root, launch, hosts/ports, sample
+  rate, frequency, mode, bandwidth, digital, protocol preset, slot,
+  timeout); `InputSelection.kind = "receiver"`; `Config.record_receiver_input()`.
+- App: `app.receiver`; `_build_source` returns the receiver's source when
+  the receiver was chosen by name (never as a fallback); `input_status()`
+  state `receiver`; `stop_session` releases our consumers (SDR++ stays for
+  the operator); `_close` shuts the receiver down first (SDR++ terminated
+  only if we launched it).
+- Window: the Audio input list offers "SDR receiver — SDR++ with the RTL-SDR"
+  when SDR++ is installed or running (or was chosen before); a Receiver
+  menu (Open receiver window, Tune receiver…, Receiver status…); the status
+  line shows SDR++/DSD-neo state and the requested tuning; `decoder-exited`
+  and `stream-error` raise the existing input warning; Field Check gains an
+  "SDR receiver (SDR++ / DSD-neo)" row.
+- Invariants kept: capture-first recording of the received/decoded audio;
+  Session ownership, timestamps and metadata provenance unchanged; offline
+  enforcement untouched (nothing here reaches the network beyond
+  127.0.0.1); shutdown ordering: the receiver's processes and sockets are
+  tracked and stopped before the store closes; no microphone fallback
+  anywhere (an unavailable receiver raises `ReceiverUnavailable` and the
+  window says so).
+
+## Tests (`tests/test_sdr_receiver.py`, 16; stand-ins `tests/stubs/fake_sdrpp.py`, `tests/stubs/fake_dsd_stream.py`)
+
+Configurator writes exactly the needed keys, keeps the rest, backs up once,
+is idempotent, sets the RTL-SDR source only on a fresh root; `find_sdrpp`;
+rigctl protocol against the fake (which reads the files we wrote and starts
+its servers only if `autoStart` is true and the sink is TCP); a refused
+tune is an error, nothing confirmed; the PCM stream arrives as float blocks
+at 48 kHz with SDR provenance and no RSSI/SNR; a retune drops buffered
+audio; SDR++ dying ends the stream with `disconnected` and nothing takes
+over; without SDR++ monitoring refuses (`ReceiverUnavailable`), no session
+row is left open; an SDR++ already running is attached to and left running;
+analog end to end (real app, mock engines: recorded 48 kHz WAVs, transcripts,
+a translation, confirmed frequency with SDR provenance, SDR++ terminated at
+Quit but not at Stop); digital end to end with the fake dsd-neo (8 kHz mono
+recording, protocol/talkgroup/unit metadata, slot 1, dsd-neo gone after the
+run); the decoder dying is reported (`decoder-exited`) and the run stays the
+operator's to stop; decoder events → metadata with clear P25 (ALG ID 0x80)
+not called encrypted; the **real dsd-neo** end to end (skipped unless
+`BABELFISHR_DSD_NEO` and `BABELFISHR_DSD_FIXTURE_WAV` are set - both were,
+here); the window offers the receiver, Tune… saves through the real dialog,
+Start monitoring starts from it, the status line shows the confirmed
+frequency, Stop and close work and the launched SDR++ is gone.
+
+Substitutions: the two stand-ins (SDR++ and, except in one test, dsd-neo),
+mock engines, `QDialog.exec` for the Tune dialog. No hardware, no Mac, no
+audio backend.
+
+## Evidence
+
+| Check | Result |
+|---|---|
+| New tests | 16 in `tests/test_sdr_receiver.py`: 15 pass with the stand-ins; the real-dsd-neo test passes when `BABELFISHR_DSD_NEO`/`BABELFISHR_DSD_FIXTURE_WAV` are set (done here) and is skipped otherwise |
+| Nearest suites (input panel, source selection, lifecycle, shutdown, cleanup, boundary, acceptance, pipeline, analysis, dsd cli, alpha-4 metadata/startup and integration repairs, offline, offline integration) | 308 passed |
+| Full suite (before the one test update below) | 991 passed, 1 failed, 12 skipped, 242 s - the failure was `test_the_menu_bar_is_drawn_inside_the_window` asserting the exact menu list `File, View, Tools, Help`; the window now has a Receiver menu |
+| After updating that assertion | its file and the receiver suite: green (`git diff --check`, `compileall` clean) |
+| Skips (12) | the 11 as before (QtMultimedia ×2, CoreAudio, PlistBuddy, Whisper model ×5, Argos ×2) + 1 real-dsd-neo test when the environment does not name a binary |
+
+Existing tests changed: the menu-list assertion in `tests/test_alpha4_menu_access.py` (`test_the_menu_bar_is_drawn_inside_the_window`) gains "Receiver" between View and Tools. No other assertion changed.
+
+Environment: Linux container, Python 3.11.15, PySide6 Essentials offscreen, no audio backend, no receiver, no display; dsd-neo 2.9.0 built from `630a123e` with mbelib-neo 2.1.0 (`be5992da`), audio backend none, terminal UI off, RTL-SDR support on (for `--iq-replay`); apt: libsndfile1-dev, librtlsdr-dev. GitHub Releases and api.github.com were blocked by the egress proxy (source files via raw.githubusercontent.com were not).
+
+## Reported separately, as asked
+
+- **Automated tests:** above, all green here with the stand-ins and with the
+  real dsd-neo.
+- **Real-component tests:** dsd-neo (built from the pinned revision) on its
+  own DMR and P25 fixtures, through the IQ path and through discriminated
+  audio over TCP - decoded speech reached BabelFishR and was transcribed by
+  the mock engine. Not SDR++: no display, no receiver here; its behaviour is
+  taken from its source only.
+- **Packaged Mac tests:** none. No candidate contains this work; run 21
+  predates it; nothing was built or published.
+- **Eric's hardware observations:** none yet for the SDR path. His acoustic
+  radio test stands (work radio speaker → laptop microphone → BabelFishR).
+
+## Packaging, licences, installation
+
+Nothing new is bundled. SDR++ (GPL-3.0) and dsd-neo (GPL-3.0-or-later,
+portions ISC; mbelib-neo GPL-2.0-or-later) are separate installs, so no
+redistribution files are added to the .app (MIT). The README tells Eric
+what to download and where to put it; BabelFishR finds
+`/Applications/SDR++.app` and `dsd-neo` on PATH or at the configured path.
+Unverified here: the exact Release asset names (SDR++ macOS package;
+dsd-neo `dsd-neo-macos-arm64-portable-<version>.dmg` per its README),
+whether the SDR++ macOS build ships the network_sink and rigctl_server
+modules (both are in-tree), Gatekeeper prompts for either, and whether the
+RTL-SDR needs a driver step on macOS (librtlsdr is inside SDR++). Bundling
+either program inside BabelFishR.app would bring GPL obligations (source
+offer, licence texts) and is a decision not taken here.
+
+## Open questions and limitations
+
+- Which digital protocol Eric's eventual BTECH/Baofeng uses is unknown; DMR
+  (the likeliest) is the one demonstrated. The IQ path (needed for CQPSK
+  P25) is not wired: dsd-neo would have to own the dongle then, which
+  conflicts with SDR++ owning it - a separate milestone.
+- Conventional-channel monitoring is what is built. Scanning and trunk
+  tracking are not; dsd-neo has them, this connection does not use them.
+- Two-slot DMR: one slot per run. Transcribing both needs a second capture
+  per session - not built.
+- Retuning during reception: audio buffered before the retune is dropped
+  (tested); a message in progress at that moment is cut where the buffer
+  was, under the new frequency's metadata if it completes after the retune
+  - the boundary is the retune, not a resynchronised timestamp.
+- SDR++ already running keeps its own in-memory settings; our files are
+  written only when we launch it. If the operator had never enabled the
+  network sink or rigctl in a running SDR++, Start reports "did not answer"
+  rather than reconfiguring it under them.
+- The RTL-SDR USB probe uses `system_profiler` on macOS; not exercised here.
+- FIELD OFFLINE: the receiver path uses only 127.0.0.1 sockets; not tested
+  under the offline enforcement suite specifically beyond the existing
+  suites passing.
+- No CPU/RAM figures for SDR++ or the real engines alongside; container
+  figures for dsd-neo and the app are above.
+- The click-only installation and every operator step in checklist S are
+  untested on a Mac.

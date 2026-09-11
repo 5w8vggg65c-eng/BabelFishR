@@ -535,6 +535,19 @@ class BabelFishRApp:
         """
         return resolve_identity(self.selected_input_identity())
 
+    # -- the SDR receiver ----------------------------------------------------
+    @property
+    def receiver(self):
+        """The receiver controller (SDR++ / DSD-neo), created on first use."""
+        if getattr(self, "_receiver", None) is None:
+            from .receiver import ReceiverController
+
+            self._receiver = ReceiverController(
+                self.config,
+                on_status=lambda kind, message: self.events.publish(
+                    "audio-status", {"kind": kind, "message": message}))
+        return self._receiver
+
     def input_status(self) -> dict:
         """Everything the window needs to say what it is listening to.
 
@@ -547,6 +560,13 @@ class BabelFishRApp:
         """
         selection = self.config.audio.input
         identity = self.selected_input_identity()
+        if selection.kind == "receiver" and selection.confirmed:
+            from .receiver import receiver_status
+
+            status = receiver_status(self.config)
+            return {"state": "receiver", "identity": identity, "device": None,
+                    "label": "SDR receiver (SDR++)", "expected": "SDR receiver (SDR++)",
+                    "candidates": [], "receiver": status}
         if selection.use_system_default and selection.confirmed:
             return {"state": "system-default", "identity": identity,
                     "device": None, "label": "macOS system default input",
@@ -726,6 +746,14 @@ class BabelFishRApp:
                                      block_size=self.config.audio.block_size)
 
         selection = self.config.audio.input
+        if self.config.input_is_receiver and device is None:
+            # The operator chose the receiver by name. Everything up to a
+            # source comes from the receiver controller, and a receiver that
+            # cannot be used is an error - never another input in its place.
+            source = self.receiver.open_source()
+            self._signal_source = source
+            return source
+
         if identity is None or identity.empty:
             if device is not None:
                 # An explicit selector from this call or the command line: the
@@ -839,6 +867,11 @@ class BabelFishRApp:
                 capture.unprocessed.clear()
             else:
                 self._lingering_capture = capture
+        if getattr(self, "_receiver", None) is not None:
+            # Our consumers of the receiver (the stream, dsd-neo) go with the
+            # run; SDR++ itself stays as the operator left it.
+            self._receiver.release_source()
+            self._signal_source = None
         if self.pipeline is not None:
             pipeline, self.pipeline = self.pipeline, None
             # Nothing is waited for on the caller's thread - this runs on the
@@ -1360,6 +1393,14 @@ class BabelFishRApp:
         from time import monotonic, sleep
 
         self._closing = True
+        if getattr(self, "_receiver", None) is not None:
+            # Independent of the store: our stream and dsd-neo stop, rigctl
+            # closes, and an SDR++ we started is stopped (one we attached to
+            # is left alone). Nothing here can fail the close.
+            try:
+                self._receiver.shutdown()
+            except Exception:  # noqa: BLE001
+                log.exception("receiver shutdown failed")
         deadline = None if timeout is None else monotonic() + timeout
 
         def remaining() -> Optional[float]:

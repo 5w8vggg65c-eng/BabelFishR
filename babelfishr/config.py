@@ -58,6 +58,11 @@ class InputSelection:
     words, that they want whatever macOS currently calls the default input.
     """
 
+    kind: str = "device"
+    """``device`` (an audio input, identified above) or ``receiver`` (the SDR
+    receiver through SDR++; see ReceiverConfig). Chosen by name, never
+    inferred."""
+
 
 @dataclasses.dataclass
 class AudioConfig:
@@ -191,6 +196,53 @@ class SdrConfig:
 
 
 @dataclasses.dataclass
+class ReceiverConfig:
+    """The SDR receiver path: SDR++ receives and demodulates, DSD-neo decodes
+    digital voice, BabelFishR records, transcribes and translates.
+
+    Nothing here is required. The receiver is used only when the operator
+    selects it as the input, by name.
+    """
+
+    sdrpp_path: str = ""
+    """SDR++ executable or .app; empty finds /Applications/SDR++.app or PATH."""
+
+    sdrpp_root: str = ""
+    """SDR++ settings folder (its --root). Empty means SDR++'s own default."""
+
+    launch_sdrpp: bool = True
+    """Start SDR++ when it is not running. It is attached to, never
+    duplicated, when it already is."""
+
+    rigctl_host: str = "127.0.0.1"
+    rigctl_port: int = 4532
+    audio_host: str = "127.0.0.1"
+    audio_port: int = 7355
+    sample_rate: int = 48000
+    """The network sink's rate; also what dsd-neo is told (-s)."""
+
+    frequency_hz: Optional[float] = None
+    """The last frequency the operator asked for. What SDR++ confirms is
+    recorded separately, on each transmission."""
+
+    mode: str = "FM"
+    """SDR++ demodulator: FM (narrow), WFM, AM, USB, LSB, DSB, CW, RAW."""
+
+    bandwidth_hz: int = 12500
+    digital: bool = False
+    """Route the audio through DSD-neo and take its decoded speech."""
+
+    digital_protocol: str = "auto"
+    """A DSD-neo preset id (see analysis.dsd PRESETS): auto, dmr-dual, p25p1 ..."""
+
+    digital_slot: int = 1
+    """Which TDMA slot's speech to take (1 or 2). Two conversations in the
+    two slots are never mixed into one transcript."""
+
+    connect_timeout_s: float = 15.0
+
+
+@dataclasses.dataclass
 class SetupState:
     """What the operator has already chosen. Persisted across restarts."""
 
@@ -229,6 +281,7 @@ class Config:
     session: SessionConfig = dataclasses.field(default_factory=SessionConfig)
     analysis: AnalysisConfig = dataclasses.field(default_factory=AnalysisConfig)
     sdr: SdrConfig = dataclasses.field(default_factory=SdrConfig)
+    receiver: ReceiverConfig = dataclasses.field(default_factory=ReceiverConfig)
     setup: SetupState = dataclasses.field(default_factory=SetupState)
     mode: str = "online-setup"
     """``field-offline``, ``online-setup`` or ``record-only``."""
@@ -300,7 +353,7 @@ class Config:
             "audio": cfg.audio, "detector": cfg.detector, "asr": cfg.asr,
             "translate": cfg.translate, "recording": cfg.recording,
             "session": cfg.session, "analysis": cfg.analysis, "sdr": cfg.sdr,
-            "setup": cfg.setup,
+            "receiver": cfg.receiver, "setup": cfg.setup,
         }
         for name, obj in sections.items():
             values = dict(data.get(name) or {})
@@ -407,7 +460,21 @@ class Config:
         selection = self.audio.input
         if not selection.confirmed:
             return False
-        return bool(selection.use_system_default or selection.identity)
+        return bool(selection.use_system_default or selection.identity
+                    or selection.kind == "receiver")
+
+    @property
+    def input_is_receiver(self) -> bool:
+        selection = self.audio.input
+        return bool(selection.confirmed and selection.kind == "receiver")
+
+    def record_receiver_input(self, save: bool = True) -> str:
+        """The operator chose the SDR receiver (SDR++) as the input, by name."""
+        self.audio.input = InputSelection(
+            identity="", label="SDR receiver (SDR++)", confirmed=True,
+            use_system_default=False, kind="receiver")
+        self.audio.device = None
+        return self.save() if save else ""
 
     def record_input_selection(self, device, *,
                                profile_id: Optional[str] = None,

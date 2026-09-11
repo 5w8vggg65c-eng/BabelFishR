@@ -34,6 +34,8 @@ from .widgets import LevelMeterWidget
 NONE = "none"
 DEVICE = "device"
 SYSTEM_DEFAULT = "system-default"
+RECEIVER = "receiver"
+RECEIVER_TEXT = "SDR receiver  —  SDR++ with the RTL-SDR (opens the receiver window)"
 
 CHOOSE_TEXT = "— Choose an audio input —"
 SYSTEM_DEFAULT_TEXT = ("Use the macOS system default input "
@@ -145,11 +147,26 @@ class InputPanel(QtWidgets.QWidget):
                                         {"kind": DEVICE, "index": device.index})
             self.device_box.addItem(SYSTEM_DEFAULT_TEXT,
                                     {"kind": SYSTEM_DEFAULT})
-            self.device_box.setEnabled(bool(self._devices) and not self._monitoring)
+            if self._receiver_offered():
+                self.device_box.addItem(RECEIVER_TEXT, {"kind": RECEIVER})
+            self.device_box.setEnabled(
+                (bool(self._devices) or self._receiver_offered()) and not self._monitoring)
             self._restore_selection()
         finally:
             self._loading = False
         self.refresh_status()
+
+    def _receiver_offered(self) -> bool:
+        """The SDR receiver is listed when SDR++ is installed or running, or
+        when it was chosen before - never invented on a machine without it."""
+        from ..receiver import receiver_status
+
+        try:
+            status = receiver_status(self.app.config)
+        except Exception:  # noqa: BLE001 - listing inputs must never fail
+            return self.app.config.input_is_receiver
+        return bool(status["sdrpp"] or status["sdrpp_running"]
+                    or self.app.config.input_is_receiver)
 
     def _label_for(self, device: AudioDevice, labels) -> str:
         kind = ("built-in microphone" if device.is_builtin
@@ -168,6 +185,10 @@ class InputPanel(QtWidgets.QWidget):
             return
         if selection.use_system_default:
             index = self.device_box.findData({"kind": SYSTEM_DEFAULT})
+            self.device_box.setCurrentIndex(max(index, 0))
+            return
+        if selection.kind == RECEIVER:
+            index = self.device_box.findData({"kind": RECEIVER})
             self.device_box.setCurrentIndex(max(index, 0))
             return
         resolution = resolve_input(DeviceIdentity.parse(selection.identity),
@@ -193,6 +214,8 @@ class InputPanel(QtWidgets.QWidget):
             self.app.config.clear_input_selection()
         elif kind == SYSTEM_DEFAULT:
             self.app.config.record_system_default_input()
+        elif kind == RECEIVER:
+            self.app.config.record_receiver_input()
         else:
             device = self._device_at(data.get("index"))
             if device is None:
@@ -287,19 +310,29 @@ class InputPanel(QtWidgets.QWidget):
     def selected_identity(self) -> Optional[DeviceIdentity]:
         """The identity to capture from, or ``None`` for the system default."""
         status = self.app.input_status()
-        if status["state"] == "system-default":
+        if status["state"] in ("system-default", "receiver"):
             return None
         identity = status["identity"]
         return None if identity.empty else identity
 
     def ready_to_monitor(self):
         """``(ok, message)``. Never returns ok for an unconfirmed input."""
+        status = self.app.input_status()
+        state = status["state"]
+        if state == "receiver":
+            # The receiver arrives over the network from SDR++; no audio
+            # device backend is involved, so none is required.
+            receiver = status["receiver"]
+            if receiver["available"]:
+                return True, ""
+            return False, ("The SDR receiver cannot be used right now:\n\n"
+                           + "\n".join(f"    {p}" for p in receiver["problems"])
+                           + "\n\nBabelFishR will not record from the microphone "
+                             "or any other input in its place.")
         if not backend_available():
             return False, ("There is no working audio backend on this machine, "
                            "so nothing can be captured. Replaying a WAV file "
                            "still works.")
-        status = self.app.input_status()
-        state = status["state"]
         if state == "none":
             return False, ("Choose an audio input first. BabelFishR will not "
                            "pick one for you: the built-in microphone and a "
@@ -338,6 +371,19 @@ class InputPanel(QtWidgets.QWidget):
         if state == "none":
             self._set_status("INPUT: none selected", "idle")
             self._show_alert("")
+            self.meter.reset()
+        elif state == "receiver":
+            receiver = status["receiver"]
+            if receiver["available"]:
+                running = "running" if receiver["sdrpp_running"] else "will be started"
+                self._set_status(f"INPUT: SDR receiver (SDR++ {running}) — SELECTED",
+                                 "working")
+                self._show_alert("")
+            else:
+                self._set_status("INPUT: SDR receiver — NOT AVAILABLE", "error")
+                self._show_alert("<b>SDR RECEIVER NOT AVAILABLE.</b> "
+                                 + " ".join(receiver["problems"])
+                                 + " Nothing else has been selected in its place.")
             self.meter.reset()
         elif state == "system-default":
             self._set_status("INPUT: macOS system default — SELECTED", "working")

@@ -252,6 +252,7 @@ def field_check(config, *, run_smoke_tests: bool = True,
     # -- optional extras -------------------------------------------------
     report.add(_dsd_check(config))
     report.add(_sdr_check(config))
+    report.add(_receiver_check(config))
 
     # -- mode guarantees -------------------------------------------------
     report.add(_cloud_disabled_check(mode))
@@ -505,6 +506,27 @@ def _sdr_check(config) -> Check:
     if not status["available"]:
         return Check("SDR input", CheckStatus.WARN, status["reason"])
     return Check("SDR input", CheckStatus.PASS, status["detail"])
+
+
+def _receiver_check(config) -> Check:
+    from .receiver import receiver_status
+
+    try:
+        status = receiver_status(config)
+    except Exception as exc:  # noqa: BLE001
+        return Check("SDR receiver (SDR++ / DSD-neo)", CheckStatus.WARN,
+                     f"could not be checked: {exc}")
+    if not config.input_is_receiver and not status["sdrpp"] and not status["sdrpp_running"]:
+        return Check("SDR receiver (SDR++ / DSD-neo)", CheckStatus.SKIP,
+                     "not installed and not selected (optional; the audio path is the default)")
+    detail = (f"SDR++ {'running' if status['sdrpp_running'] else 'installed'}; "
+              f"DSD-neo {status['dsd_neo_version'] or 'not installed'}; "
+              f"RTL-SDR on USB: "
+              + {True: "yes", False: "no", None: "unknown here"}[status["rtl_sdr_present"]])
+    if status["problems"]:
+        return Check("SDR receiver (SDR++ / DSD-neo)", CheckStatus.WARN,
+                     detail + " - " + " ".join(status["problems"]))
+    return Check("SDR receiver (SDR++ / DSD-neo)", CheckStatus.PASS, detail)
 
 
 def _cloud_disabled_check(mode: OperatingMode) -> Check:
