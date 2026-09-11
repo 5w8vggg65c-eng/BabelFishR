@@ -87,18 +87,37 @@ class SdrppConfigurator:
         core = self._load(SDRPP.config_file)
         core_before = json.loads(json.dumps(core))
         instances = core.setdefault("moduleInstances", {})
+        # core.cpp accepts the old string form ("Radio": "radio") and rewrites
+        # it to {"module", "enabled"} itself; written here in the form it
+        # reads, so a partially written file never carries a bare string.
         for instance, module in ((SDRPP.audio_instance, SDRPP.audio_module),
                                  (SDRPP.rigctl_instance, SDRPP.rigctl_module),
-                                 (SDRPP.rtl_source_instance, SDRPP.rtl_source_module)):
-            entry = instances.setdefault(instance, {})
+                                 (SDRPP.rtl_source_instance, SDRPP.rtl_source_module),
+                                 (SDRPP.radio_instance, SDRPP.radio_module)):
+            entry = instances.get(instance)
+            if isinstance(entry, str):
+                entry = {"module": entry, "enabled": True}
+            if not isinstance(entry, dict):
+                entry = {}
             if entry.get("module") != module or entry.get("enabled") is not True:
                 entry["module"], entry["enabled"] = module, True
                 changes.append(f"{SDRPP.config_file}: module {instance!r} enabled")
+            instances[instance] = entry
+        # sink.cpp loadStreamConfig reads "sink", "volume" and "muted" with
+        # typed reads: a stream object missing any of them is a null read.
+        # Core only fills in whole top-level keys that are absent, never
+        # these nested ones, so a partial "Radio" stream has to be completed
+        # here with upstream's own defaults (muted false, volume 1.0).
         stream = core.setdefault("streams", {}).setdefault(SDRPP.radio_stream, {})
         if stream.get("sink") != SDRPP.audio_sink_name:
             stream["sink"] = SDRPP.audio_sink_name
             changes.append(f"{SDRPP.config_file}: stream {SDRPP.radio_stream!r} "
                            f"sink -> {SDRPP.audio_sink_name}")
+        for key, default in (("muted", False), ("volume", 1.0)):
+            if key not in stream:
+                stream[key] = default
+                changes.append(f"{SDRPP.config_file}: stream {SDRPP.radio_stream!r} "
+                               f"{key} -> {default!r} (upstream default, was missing)")
         if not core.get("source"):
             # Only when no source has been chosen at all: an operator's own
             # choice of source is theirs.
@@ -123,9 +142,16 @@ class SdrppConfigurator:
         rig = self._load(SDRPP.rigctl_config_file)
         rig_before = json.loads(json.dumps(rig))
         entry = rig.setdefault(SDRPP.rigctl_instance, {})
+        # rigctl_server reads all seven keys with typed reads once the
+        # instance exists; its own defaults are only inserted when the whole
+        # instance is absent. So every key is written: ours, and upstream's
+        # defaults for the two we do not use (recording false, recorder "").
         wanted = {"host": rigctl_host, "port": int(rigctl_port), "tuning": True,
-                  "autoStart": True, "vfo": SDRPP.radio_stream}
+                  "recording": False, "autoStart": True, "vfo": SDRPP.radio_stream,
+                  "recorder": ""}
         for key, value in wanted.items():
+            if key in ("recording", "recorder") and key in entry:
+                continue                      # the operator's own value stands
             if entry.get(key) != value:
                 entry[key] = value
                 changes.append(f"{SDRPP.rigctl_config_file}: {key} -> {value!r}")
@@ -213,11 +239,24 @@ class RigctlClient:
         except ValueError:
             return mode, -1
 
+    def _send(self, text: str) -> None:
+        if self._sock is None:
+            raise RigctlError("not connected to SDR++")
+        try:
+            self._sock.sendall((text + "\n").encode("ascii"))
+        except OSError as exc:
+            raise RigctlError(f"rigctl {text!r} failed: {exc}") from exc
+
     def start(self) -> None:
-        self._command("\\start")
+        """Ask SDR++ to start the radio. Upstream's handler calls
+        setPlayState(true) and writes NO reply, so this is fire-and-forget:
+        sending it proves nothing about whether the receiver started. An
+        earlier version waited for a line and timed out."""
+        self._send("\\start")
 
     def stop(self) -> None:
-        self._command("\\stop")
+        """Ask SDR++ to stop the radio. No reply is written (see start)."""
+        self._send("\\stop")
 
 
 def rigctl_reachable(host: str, port: int, timeout: float = 0.5) -> bool:
@@ -262,6 +301,47 @@ class SdrppProcess:
         except subprocess.TimeoutExpired:
             self.process.kill()
             self.process.wait(timeout=timeout)
+
+
+def sdrpp_processes(executable: str = "", root: Optional[str] = None) -> List[int]:
+    """PIDs of SDR++ processes on this machine, whatever started them. A
+    closed rigctl port says nothing about whether SDR++ is running - it may
+    simply have its Rigctl Server switched off - and a second SDR++ would be
+    a second claimant on the USB receiver.
+
+    A process counts when it is named ``sdrpp`` or runs *executable*; when
+    *root* is given, one started with an explicit ``--root`` counts only if
+    that root is the same (two SDR++ instances on different roots are two
+    different receivers' worth of settings - test stand-ins, for one).
+    """
+    pids: List[int] = []
+    wanted = pathlib.Path(executable).name if executable else ""
+    try:
+        if platform.system() == "Darwin":
+            result = subprocess.run(["pgrep", "-x", "sdrpp"], capture_output=True,
+                                    text=True, timeout=5)
+            return [int(p) for p in result.stdout.split() if p.isdigit()]
+        for entry in pathlib.Path("/proc").iterdir():
+            if not entry.name.isdigit() or int(entry.name) == os.getpid():
+                continue
+            try:
+                comm = (entry / "comm").read_text().strip()
+                args = [a.decode("utf-8", "replace") for a in
+                        (entry / "cmdline").read_bytes().split(b"\0") if a]
+            except OSError:
+                continue
+            names = {pathlib.Path(a).name for a in args[:2]}
+            if comm != "sdrpp" and "sdrpp" not in names and not (wanted and wanted in names):
+                continue
+            if root is not None and "--root" in args:
+                index = args.index("--root")
+                theirs = args[index + 1] if index + 1 < len(args) else ""
+                if pathlib.Path(theirs).expanduser().resolve() != pathlib.Path(root).expanduser().resolve():
+                    continue
+            pids.append(int(entry.name))
+    except Exception:  # noqa: BLE001 - advisory
+        log.debug("process scan failed", exc_info=True)
+    return pids
 
 
 def rtl_sdr_present() -> Optional[bool]:

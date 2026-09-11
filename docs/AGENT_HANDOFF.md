@@ -4908,3 +4908,217 @@ offer, licence texts) and is a decision not taken here.
   figures for dsd-neo and the app are above.
 - The click-only installation and every operator step in checklist S are
   untested on a Mac.
+
+---
+
+# SDR receiver: corrections before Eric's hardware bench
+
+Codex audited the receiver integration (items A1-A2, B4-B7, C8-C9, D10-D13)
+and asked for each to be corrected at its boundary, for the real SDR++ to be
+exercised where a file source made that possible, and for concrete,
+click-only Mac instructions. This section records what was found, what was
+changed, what ran against the real programs, and what still has not.
+
+## Identifiers
+
+| | |
+|---|---|
+| Base | `fef259b19cc54a2d0374e0328c0aa5fa0989c54f` (the receiver integration, verified equal to the remote tip, worktree clean before editing) |
+| Commit | the commit carrying this section |
+| Branch | `claude/radio-decoder-translator-0oslya` |
+| Workflow / tag / release / packaging | nothing dispatched, tagged or published; no packaging change; run 21 cannot test this |
+| SDR++ source | `8c9f5ee8fe405775bfcd62c8c8f8c0fc928a64af`, cloned and **built** here (v1.3.0; core + file_source, network_sink, radio, rigctl_server, rtl_sdr_source) |
+| dsd-neo | `630a123e` (2.9.0) built earlier here with mbelib-neo `be5992da` |
+
+## Source inspection at the pinned revision (what Codex said, checked)
+
+- **A1** `misc_modules/rigctl_server/src/main.cpp` 588-593: `\start` and
+  `\stop` call `gui::mainWindow.setPlayState()` and write nothing back.
+  `RigctlClient.start()` previously waited for a reply line. Corrected:
+  `_send()` fire-and-forget; `TuningState.play_requested` records the
+  request; `radio_start_confirmed` is `None` in every metadata record and
+  the status dialog says "requested (SDR++ does not confirm it; arriving
+  audio does)". The fake writes no reply either.
+- **A2** rigctl_server reads its seven keys typed whenever the instance
+  exists (defaults only for a wholly absent instance); `sink.cpp
+  loadStreamConfig()` reads `sink`, `volume`, `muted` typed; `core.cpp`
+  upgrades a string-valued module instance. The configurator wrote a
+  five-key rigctl instance, a `streams.Radio` without `volume`/`muted`, and
+  no `Radio` module instance. Corrected: all seven rigctl keys (`recording`
+  false, `recorder` "" only when absent), stream `volume` 1.0 / `muted`
+  false when missing, `Radio` instance added, string-form instances
+  upgraded, everything else untouched. The fake's loader performs the same
+  typed reads (a missing/null key is fatal, as nlohmann's typed get would
+  throw); the corrections test runs it over a fresh root and over a partial
+  one that fails before and loads after.
+- **B4/B5** `app.stop_session` and `_close` called the receiver's cleanup
+  inline; `start_session` built the source (launching SDR++) before the
+  closing check. Corrected: `stop_session` only releases the source (the
+  capture's stopper thread stops and settles it, one owner); `_close` step
+  3b takes a `ReceiverShutdown` handle on the receiver's own thread, waits
+  only when asked, returns False while unsettled, and on failure reports
+  once and **returns False** (the window shows "Could not finish quitting:
+  the receiver did not shut down: …" and retries; the controller keeps the
+  process that did not end so the retry tries again). Closing checks come
+  before `_build_source`; the window's receiver handlers check
+  `_receiver_blocked()` before and after their dialogs.
+- **B6** A closed rigctl port is not proof SDR++ is absent. Corrected:
+  `sdrpp_processes(executable, root)` (Linux `/proc` comm/argv match with
+  `--root` compared; macOS `pgrep -x sdrpp`); a running instance without
+  rigctl raises `ReceiverUnavailable` naming the Module Manager steps, no
+  second launch, no file rewrite (mtimes checked in the test). One rigctl
+  connection is held and reused (upstream serves one client at a time -
+  confirmed on the real SDR++: a second client connects at TCP level and
+  gets no reply while the first is open).
+- **B7** `receiver_status()` ran `system_profiler`/`dsd-neo --version`
+  inline. Corrected: `Discovery` runs the slow probes on a thread with a
+  30 s cache; snapshots return at once with `usb_probed`; four facts kept
+  apart (software found / USB detected / control connected / audio
+  receiving, the last from the reader's arrivals, not synthesised silence);
+  `LOOPBACK_HOSTS` enforced unless `allow_remote_receiver`.
+- **C8** `open_source()` tuned to the stored frequency over whatever the
+  operator set in SDR++'s window. Corrected: Start reads back (`f`, `m`)
+  and adopts it; the stored frequency is applied only when the operator
+  asked in Tune receiver (`pending_tune`) or when we launched SDR++ with
+  one; a 1 s poll follows later changes made in the SDR++ window and marks a
+  boundary. Confirmed against the real SDR++: a stale 155.1 MHz in config
+  lost to SDR++'s 851.375 MHz.
+- **C9** A retune flushed the queue but left the detector open, so the
+  transmission was labelled with the new frequency, and a read begun
+  before the flush could deliver old samples under the new generation.
+  Corrected: `_Reader` tags each block with the generation current *before*
+  its read; `retuned()` drops the queue and enqueues a `StreamBoundary`
+  carrying the ending epoch's metadata; the pipeline closes the open
+  transmission under that metadata and resets the detector. rigctl `f` is
+  the VFO frequency: `center_frequency_hz` is now `None` (unknown), not the
+  VFO value.
+- **D10** Slot 2 events replaced slot 1 identifiers; the encrypted flag
+  stuck. Corrected: `CallTracker` keeps calls per slot, attaches
+  identifiers only to the active slot's current call (2 s hold), clears
+  the flag on ALG ID 0x80, starts every call clean.
+- **D11** `_Reader` derived time from the sample count while dsd-neo emits
+  audio only during voice. Corrected: the decoded source keeps wall-clock
+  time and fills idle gaps with zero blocks (`IDLE_FILL_SECONDS`), so two
+  calls 1.2 s apart are two transmissions and an idle decoder does not end
+  the stream. The fake decoder now emits nothing for quiet input.
+- **D12** Producer loss with dsd-neo alive was invisible. Corrected:
+  dsd-neo's own stderr lines drive `upstream-lost` / `upstream-restored`
+  (window warnings). Read further in `dsd_symbol.c symbol_read_sample_tcp()`:
+  after ONE failed retry it prints "Connection to TCP Server Disconnected."
+  and opens its own audio input (`symbol_open_pulse_input_and_reconfigure_output`)
+  - a sound device, when it has one. From then on its output is not the
+  receiver. Corrected: that line ends the stream (`receiver-lost`), stops
+  dsd-neo, and the reader enqueues nothing more. The fake decoder plays
+  this part with a loud tone after "Disconnected."; the test shows none of
+  it is recorded. Also read: dsd-neo's TCP input carries a 1.5 s receive
+  timeout (`dsd_rigctl.c Connect()`), so SDR++ pausing its radio for longer
+  than that counts as a loss to dsd-neo.
+- **D13** Unbounded PCM queues. Corrected: `QUEUE_SECONDS` (10 s) bound,
+  drop-oldest with `dropped_frames` in the metadata and `audio-dropped` /
+  `audio-resumed` reports.
+
+## Real-component runs (this container: Linux, Xvfb, no RTL-SDR, no Mac)
+
+SDR++ v1.3.0 built from `8c9f5ee8` (apt: libglfw3-dev, libfftw3-dev,
+libvolk-dev, libzstd-dev, librtlsdr-dev …), launched headless
+(`xvfb-run … sdrpp --root <root> --autostart`) on a root written by our
+`SdrppConfigurator.ensure()` plus `"source": "File Source"` and a
+`file_source_config.json` naming a 20 s IQ WAV made from dsd-neo's
+`dmr_voice.iq` fixture (48 kHz, named `baseband_851375000Hz_…wav` so the
+File Source takes 851.375 MHz as centre). Then:
+
+| Step | Result |
+|---|---|
+| Configured root loads | rigctl 4632 and network sink 7455 listening within 1 s; modules File Source, Network Sink, RTL-SDR Source, Radio, Rigctl Server initialised |
+| `RigctlClient`: `f`, `m`, `F 851375000`, `M FM 12500`, read-back | 851375000.0, ('FM', 12500) - confirmed; startup VFO was SDR++'s own 851399000 WFM 150000 (its default), and after our tune SDR++ persisted 851.375 FM 12500 into its own config across a restart |
+| `\start` | returned in 0.000 s, no reply (A1 confirmed); a second rigctl client connected but received no reply while the first was open (single client confirmed) |
+| Audio after `--autostart` | **none**; `\start` alone: none (already "playing"); `\stop` then `\start`: 5.4 MB in 2 s. Cause read in `file_source/src/main.cpp`: the WAV reader is created when the source menu first renders, so the autostart's `start()` found `reader == NULL`. A File-Source quirk; says nothing about the RTL-SDR source |
+| Network sink to a raw client | int16 mono, ~24x real time (the File Source is unpaced through the network sink; `ConnClass::write` blocks, so the client paces it) |
+| Real dsd-neo `-i tcp:127.0.0.1:7455 -s 48000 -fs -o -` at **FM 12500** | 1252 DMR sync lines, every frame `VOICE CACH/EMB ERR`, 0 bytes of voice; the sink's audio captured to a file: rms 0.526, **peak 1.000 (clipped)** |
+| at FM 15000 (file) | some clipping (0.56 % of samples), 4.7 s voice decoded from 20 s |
+| at FM 20000 (file) | no clipping, 8.4 s voice, 30 CACH errors |
+| at FM 25000 (file, and live over TCP) | no clipping; live: **65 s of decoded DMR voice PCM in 25 s wall time**, Color Code 02, slots 1 and 2, 0 interruptions |
+| Cross-check | an independent FM discriminator (numpy) of the same WAV → dsd-neo: 8.5 s voice, 30 CACH errors - the recording is fine; the 12.5 kHz result is SDR++'s demodulator output for this signal |
+| `ReceiverController` against that SDR++ (digital, real dsd-neo) | `ensure_sdrpp` attached in 0.001 s (no launch); `open_source` adopted SDR++'s 851.375 FM 25000 over a stale 155.1 MHz in config (C8); `DecodedVoiceSource` delivered 14.9 s of voice blocks plus dsd-neo's own quiet output in 30 s, first voice 0.3 s after start; metadata: tuned 851375000.0, FM, SDR provenance, protocol DMR, colour code 02, 1575 sync lines; `tune(+12.5 kHz)` produced a `StreamBoundary` carrying 851375000.0 / epoch 0, then metadata 851387500.0 / epoch 1 (C9); `release_source` 0.000 s; `stop`+`settle` 0.42 s, exit 0; `begin_shutdown` 0.000 s, settled without error; SDR++ left running (attached) |
+| `ReceiverController` analog (`PcmTcpSource`) | 86 s of 48 kHz audio in 3 s wall (unpaced source), 0 dropped, metadata tuned 851375000.0 FM bw 25000, `center_frequency_hz` None |
+| `sdrpp_processes()` | found the real process by comm and by `--root`; `[]` for another root |
+| Real dsd-neo through the fake SDR++ (existing test, env set) | passes |
+
+Talkgroup/unit identifiers: the real dsd-neo printed no `TGT=`/`SRC=` lines
+for this recording (`SLCO CRC ERR` on the embedded LC), so those fields
+stayed empty; the fake prints them, which is why the stand-in tests can
+assert them. Real traffic may or may not carry them.
+
+Consequence in the product: Tune receiver has a **Filter width** choice
+(12.5 / 15 / 20 / 25 kHz); ticking Digital voice moves 12.5 → 20 kHz
+(`SDRPP.digital_voice_bandwidth_hz`, evidence in `contract.py`). One
+recording, one protocol; nothing is claimed for the other presets.
+
+## Tests
+
+- `tests/test_sdr_receiver_corrections.py` (18): one or more per item
+  above, plus the window guards and the filter-width default. Run against
+  the base commit's package in a worktree (with these stand-ins and guarded
+  imports): see the evidence table for the fail-before count.
+- `tests/test_sdr_receiver.py` (16): configurator expectations updated to
+  the complete form; the encrypted-event test adjusted (no call → nothing
+  to attach to); the window test records `QMessageBox.critical` instead of
+  blocking on it. 15 pass, 1 skipped unless `BABELFISHR_DSD_NEO` and
+  `BABELFISHR_DSD_FIXTURE_WAV` are set (set here: passes).
+- `tests/test_alpha4_menu_access.py`: the Tools-menu failure was the test
+  holding a `QMenu` from a temporary `QAction` expression (binding
+  lifetime); the test now keeps the action; the menu checks are unchanged.
+- Stand-ins: `fake_sdrpp.py` gains typed loading, no reply to `\start`/`\stop`,
+  one rigctl client at a time, `FAKE_SDRPP_DROP_AUDIO_AFTER`,
+  `FAKE_SDRPP_AUDIO_STOP_AFTER`, `FAKE_SDRPP_NO_RIGCTL`,
+  `FAKE_SDRPP_TUNE_FILE` (the operator's dial); `fake_dsd_stream.py` is
+  silent for quiet input, prints dsd-neo's loss/retry lines, gives TCP up
+  after one failed retry and then plays a tone (its "own input"),
+  `FAKE_DSD_SIGTERM_DELAY`.
+
+## Evidence
+
+| Check | Result |
+|---|---|
+| `tests/test_sdr_receiver_corrections.py` | 18 passed (108 s) |
+| The same tests against the base commit `fef259b` in a worktree, with the new stand-ins and guarded imports, one test per process with a 150 s limit | run 1 (stand-ins as committed): 18/18 fail - 17 within 0.5 s because the baseline's incomplete config files end the typed-reading fake at once (item A2 alone), the window test ended without a summary line. Run 2 (fake made lenient about missing keys): 18/18 fail - most after the 3 s rigctl timeout, because the baseline client waits for a reply to `\start` that the fake, like SDR++, never writes (item A1 alone). Run 3 (fake also replying `RPRT 0` to `\start`/`\stop`, so A1 and A2 are out of the way): 18/18 still fail, each on its own item - e.g. B4 "Stop waited 1.52 s on the receiver's processes", C8 "Start put the stored 155.1 MHz back over the operator's 162.55 MHz", D12/D13/C9 on missing boundary/queue/abandonment behaviour, D10 on slot 2 replacing slot 1 |
+| `tests/test_sdr_receiver.py` + `tests/test_alpha4_menu_access.py` | 23 passed, 1 skipped (the real-dsd-neo test without its env) |
+| The real-dsd-neo test with `BABELFISHR_DSD_NEO`/`BABELFISHR_DSD_FIXTURE_WAV` set | 1 passed (10.5 s) - the real decoder ran |
+| Full suite, nothing else running | **1010 passed, 12 skipped, 0 failed**, 248 s |
+| Full suite while the baseline loop was also running | 1 failure, `test_the_pcm_stream_arrives_as_float_blocks_at_the_sink_rate_and_stops_cleanly` ("only silence arrived"): it reads 4 s of the fake's real-time stream whose first 1.6 s are quiet, and under that load fell short; it passed alone twice and in the quiet full run. Pre-existing timing sensitivity, not a regression |
+| Skips (12) | as before: QtMultimedia ×2, CoreAudio, PlistBuddy, Whisper model ×5, Argos ×2, plus the real-dsd-neo test when its env is unset |
+| `git diff --check`, `compileall` | clean |
+
+Environment: Linux container, Python 3.11, PySide6 offscreen, Xvfb for SDR++, no audio backend, no receiver, no Mac. Mock ASR/translation throughout; nothing here is recognition.
+
+## Mac setup and bench (for Eric)
+
+README "SDR receiver" and checklist section S: SDR++ from its GitHub
+Releases into Applications (or **Receiver › Choose SDR++ application…**),
+dsd-neo from its Releases `.dmg` and **Receiver › Choose DSD-neo program…**
+- no PATH, no Terminal. Release pages and api.github.com are blocked from
+this container, so the asset names are the projects' documented ones, not
+downloaded ones; the checklist says to note any difference. Initial
+reception with an existing signal (FM broadcast in WFM, NOAA weather in
+FM), no handheld assumed, no protocol assumed for a future BTECH/Baofeng.
+The stale footer ("every step uses microphone audio") is corrected.
+
+## Limitations (exact)
+
+- No RTL-SDR, no over-the-air signal, no macOS SDR++ binary was used. The
+  `--autostart` finding is about the File Source; the RTL-SDR source opens
+  its device in its own start path (not run here).
+- The File Source is unpaced, so the timing of the real runs is not the
+  timing of live reception; the boundary and lifecycle checks do not depend
+  on pacing.
+- dsd-neo's 1.5 s TCP receive timeout means an SDR++ whose radio is
+  stopped for longer than that loses dsd-neo (now reported as receiver
+  lost and stopped, never substituted); a silent-but-running channel is not
+  affected because SDR++ streams silence while the radio runs.
+- Filter width measured for DMR only; P25 and the rest untested through
+  SDR++'s demodulator.
+- Mock ASR/translation in every automated run: transcripts there are mock
+  output, not recognition.
+- Run 21 cannot test any of this; the next Mac candidate must be built from
+  this commit and remain non-publishing. No tag or release was created or
+  moved.

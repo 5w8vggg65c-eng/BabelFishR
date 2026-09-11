@@ -7,10 +7,14 @@ docs/network-audio.md and the run recorded in babelfishr/receiver/contract.py):
 input rate, "-o -" writes decoded audio to stdout as s16le 8000 Hz two
 channels (left slot 1, right slot 2), decoder events go to stderr as
 "Sync: +DMR  [SLOT1]  slot2  | Color Code=02 | VC1", connection refused
-exits 0 at once, and a producer that closes leaves dsd-neo running until
-terminated. It decodes NOTHING: while the input is loud it writes the input
-downsampled to 8 kHz into the selected slot's channel and silence into the
-other; while the input is quiet it writes silence and no events.
+exits 0 at once, and a producer that closes leaves dsd-neo running: it
+prints "Connection to TCP Server Interrupted. Trying again in 300 ms." and
+retries, then "TCP Socket Reconnected Successfully." or "Connection to TCP
+Server Disconnected." - all observed on the real binary. It decodes
+NOTHING: while the input is loud it writes the input downsampled to 8 kHz
+into the selected slot's channel and silence into the other; while the
+input is quiet it writes NOTHING (the real binary emits audio only while
+decoding voice - observed).
 """
 
 import os
@@ -42,6 +46,12 @@ def main():
         sys.stderr.flush()
         return 0
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    delay = float(os.environ.get("FAKE_DSD_SIGTERM_DELAY") or 0)
+    if delay:
+        def slow_exit(*_):
+            time.sleep(delay)
+            sys.exit(0)
+        signal.signal(signal.SIGTERM, slow_exit)
     step = rate // 8000
     out = sys.stdout.buffer
     frames_emitted = 0
@@ -52,8 +62,31 @@ def main():
         except OSError:
             chunk = b""
         if not chunk:
-            # Producer gone: like the real dsd-neo, stay alive until stopped.
-            time.sleep(0.1)
+            # Producer gone: like the real dsd-neo, stay alive, say so, retry.
+            sys.stderr.write("\nConnection to TCP Server Interrupted. Trying again in 300 ms.\n")
+            sys.stderr.flush()
+            time.sleep(0.3)
+            try:
+                conn.close()
+                conn = socket.create_connection((host, port), timeout=2)
+                sys.stderr.write("TCP Socket Reconnected Successfully.\n")
+            except OSError:
+                # Observed on the real binary (dsd_symbol.c, symbol_read_sample_tcp):
+                # one retry after 300 ms; when that fails too it prints this
+                # line, gives the TCP input up for good and opens its own
+                # audio input instead (a sound device, when it has one). From
+                # here on whatever it decodes is NOT the receiver. This
+                # stand-in plays the part with a loud tone, in real time.
+                sys.stderr.write("Connection to TCP Server Disconnected.\n")
+                sys.stderr.flush()
+                import math
+                tone = b"".join(struct.pack("<hh", v, v) for v in
+                                (int(12000 * math.sin(2 * math.pi * 440 * i / 8000)) for i in range(160)))
+                while True:
+                    out.write(tone)
+                    out.flush()
+                    time.sleep(0.02)
+            sys.stderr.flush()
             continue
         pending += chunk
         usable = len(pending) - len(pending) % (2 * step)
@@ -63,11 +96,12 @@ def main():
         pending = pending[usable:]
         decimated = samples[::step]
         loud = max(abs(s) for s in decimated) > 1500
+        if not loud:
+            continue                          # no voice, no output - as observed
         frames = []
         for value in decimated:
-            voice = value if loud else 0
-            left = voice if slot in (1, 3) else 0
-            right = voice if slot in (2, 3) else 0
+            left = value if slot in (1, 3) else 0
+            right = value if slot in (2, 3) else 0
             frames.append(struct.pack("<hh", left, right))
         out.write(b"".join(frames))
         out.flush()

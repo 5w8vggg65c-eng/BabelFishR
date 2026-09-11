@@ -2,9 +2,11 @@
 
 Every value here was taken from the named file at the named revision, not
 from memory, and the behaviour marked *observed* was exercised against the
-real dsd-neo binary built from that revision. Nothing here has run against
-SDR++ itself in the development environment (no receiver, no display); the
-SDR++ facts are source facts until a Mac with SDR++ confirms them.
+real dsd-neo binary built from that revision. The SDR++ facts were then
+exercised against SDR++ v1.3.0 built from that revision, headless (Xvfb)
+with its File Source playing an IQ recording - no RTL-SDR, no Mac; what that
+run showed is marked OBSERVED. A Mac with the receiver still has to confirm
+the rest.
 """
 
 from __future__ import annotations
@@ -15,7 +17,12 @@ from typing import Tuple
 
 @dataclasses.dataclass(frozen=True)
 class SdrppContract:
-    """SDR++ (AlexandreRouma/SDRPlusPlus, master as inspected 2026-09-11)."""
+    """SDR++ (AlexandreRouma/SDRPlusPlus) at the immutable revision
+    8c9f5ee8fe405775bfcd62c8c8f8c0fc928a64af (2026-07-04), read from a local
+    checkout of that commit and run (built from it, Linux, headless) with a
+    File Source. Not a verified macOS binary."""
+
+    revision: str = "8c9f5ee8fe405775bfcd62c8c8f8c0fc928a64af"
 
     #: rigctl_server module, misc_modules/rigctl_server/src/main.cpp:
     #: config keyed by module instance name in <root>/rigctl_server_config.json.
@@ -25,9 +32,35 @@ class SdrppContract:
     rigctl_module: str = "rigctl_server"
     rigctl_instance: str = "Rigctl Server"
     #: Commands: "F <hz>" -> "RPRT 0"; "f" -> "<hz>\n"; "M <mode> <bw>" ->
-    #: "RPRT 0" (bw 0 or -1 = default); "m" -> "<mode>\n<bw>\n"; "\start",
-    #: "\stop" set the play state; "q" closes. Unknown -> "RPRT 1".
+    #: "RPRT 0" (bw 0 or -1 = default); "m" -> "<mode>\n<bw>\n"; "\start" and
+    #: "\stop" call gui::mainWindow.setPlayState() and write NO reply; "q"
+    #: closes. Unknown -> "RPRT 1". The server serves ONE client at a time:
+    #: clientHandler() waits for that client to end before accepting the next
+    #: (main.cpp lines 306-318). Its seven config keys (host, port, tuning,
+    #: recording, autoStart, vfo, recorder) are read typed whenever the
+    #: instance exists; defaults are inserted only for a wholly absent
+    #: instance (lines 38-55).
     rigctl_modes: Tuple[str, ...] = ("FM", "WFM", "AM", "DSB", "USB", "CW", "LSB", "RAW")
+    #: "M FM <bw>" sets the VFO bandwidth; the NFM demodulator scales its
+    #: output to bw/2 of deviation (decoder_modules/radio/src/demodulators/
+    #: nfm.h, core/src/dsp/demod/fm.h). OBSERVED on the real SDR++ (v1.3.0
+    #: built from this revision, File Source playing dsd-neo's DMR voice IQ
+    #: fixture, network sink → real dsd-neo -fs): at 12 500 Hz the demodulated
+    #: audio clipped (peak 1.0, rms 0.53) and dsd-neo synchronised but decoded
+    #: no voice (VOICE CACH/EMB ERR on every frame); at 15 000 Hz some
+    #: clipping and partial voice; at 20 000 and 25 000 Hz no clipping and
+    #: the voice decoded. Hence the width offered for digital voice below.
+    #: One fixture, one protocol: DMR. Other protocols are not claimed.
+    analog_bandwidth_hz: int = 12500
+    digital_voice_bandwidth_hz: int = 20000
+    bandwidth_choices_hz: Tuple[int, ...] = (12500, 15000, 20000, 25000)
+    #: Also OBSERVED: with the File Source the audio flowed only after a
+    #: "\stop" then "\start" over rigctl - "--autostart" alone produced no
+    #: samples (the file reader is created when its menu first renders), and
+    #: "\start" on an already "playing" instance is a no-op. The File Source
+    #: is unpaced through the network sink (~24x real time here); a hardware
+    #: source paces the stream itself. Neither is proof about the RTL-SDR
+    #: source, which was not present.
     #: "F" tunes the VFO named in config "vfo" (we set "Radio"); it does not
     #: check whether the SDR is started.
 
@@ -51,8 +84,13 @@ class SdrppContract:
     #: core/src/command_args.cpp: --root default "$HOME/Library/Application
     #: Support/sdrpp" (macOS bundle), "$HOME/.config/sdrpp" (Linux);
     #: --autostart starts the SDR after loading.
+    #: sink.cpp loadStreamConfig() reads streams[name]["sink"], ["volume"],
+    #: ["muted"] typed (lines 305-324). core.cpp upgrades a string-valued
+    #: module instance to {"module": ..., "enabled": true}.
     config_file: str = "config.json"
     radio_stream: str = "Radio"
+    radio_module: str = "radio"
+    radio_instance: str = "Radio"
     rtl_source_module: str = "rtl_sdr_source"
     rtl_source_instance: str = "RTL-SDR Source"
     rtl_source_name: str = "RTL-SDR"

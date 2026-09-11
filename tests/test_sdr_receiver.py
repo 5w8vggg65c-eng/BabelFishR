@@ -110,6 +110,7 @@ def test_the_configurator_writes_exactly_what_monitoring_needs_and_keeps_the_res
     assert core["moduleInstances"]["Rigctl Server"] == {"module": "rigctl_server", "enabled": True}
     assert core["moduleInstances"]["RTL-SDR Source"] == {"module": "rtl_sdr_source", "enabled": True}
     assert core["moduleInstances"]["Recorder"] == {"module": "recorder", "enabled": True}
+    assert core["moduleInstances"]["Radio"] == {"module": "radio", "enabled": True}
     assert core["streams"]["Radio"] == {"muted": False, "sink": "Network", "volume": 0.7}
     assert core["source"] == "Airspy", "the operator's own source choice was overwritten"
     assert core["theme"] == "Dark" and core["vfoColors"] == {"Radio": "#FF0000"}
@@ -119,7 +120,8 @@ def test_the_configurator_writes_exactly_what_monitoring_needs_and_keeps_the_res
     assert sink["Other"] == {"hostname": "10.0.0.5", "port": 9000}
     rig = json.loads((root / "rigctl_server_config.json").read_text())
     assert rig["Rigctl Server"] == {"host": "127.0.0.1", "port": 4600, "tuning": True,
-                                    "autoStart": True, "vfo": "Radio"}
+                                    "recording": False, "autoStart": True, "vfo": "Radio",
+                                    "recorder": ""}
     assert (root / "config.before-babelfishr.json").exists()
     assert json.loads((root / "config.before-babelfishr.json").read_text())["streams"]["Radio"]["sink"] == "Audio"
     assert (root / "network_sink_config.before-babelfishr.json").exists()
@@ -139,6 +141,8 @@ def test_a_fresh_root_gets_the_rtl_sdr_source_only_because_none_was_chosen(tmp_p
                                    rigctl_host="127.0.0.1", rigctl_port=4532)
     core = json.loads((root / "config.json").read_text())
     assert core["source"] == "RTL-SDR"
+    assert core["streams"]["Radio"] == {"sink": "Network", "muted": False, "volume": 1.0}
+    assert core["moduleInstances"]["Radio"] == {"module": "radio", "enabled": True}
     assert not list(root.glob("*.before-babelfishr.json"))
 
 
@@ -454,7 +458,10 @@ def test_decoder_events_become_metadata_and_clear_p25_is_not_called_encrypted(tm
     source._note_event("Voice frame ENC: encrypted, KEY ID 42")
     assert source.metadata().extra["encrypted"] is True
     other = DecodedVoiceSource("dsd-neo", "127.0.0.1", 1, TuningState())
-    other._note_event(" LDU1 ALG ID: 0x84 KEY ID: 0x0001")             # AES-256: encrypted
+    other._note_event(" LDU1 ALG ID: 0x84 KEY ID: 0x0001")             # no call yet: nothing to attach it to
+    assert other.metadata().extra["encrypted"] is False
+    other._note_event("07:00:00 Sync: +P25p1 [SLOT1] | NAC=293 | VOICE")
+    other._note_event(" LDU1 ALG ID: 0x84 KEY ID: 0x0001")             # AES-256, within the call
     assert other.metadata().extra["encrypted"] is True
 
 
@@ -509,8 +516,12 @@ def test_the_window_offers_the_receiver_and_starts_monitoring_from_it(qt_app, re
     pump(qt_app)
     assert receiver_config.receiver.frequency_hz == pytest.approx(155.16e6)
 
+    boxes = []
+    monkeypatch.setattr(QtWidgets.QMessageBox, "critical",
+                        staticmethod(lambda *a, **k: boxes.append(a[2] if len(a) > 2 else a)))
     QTest.mouseClick(window.start_button, QtCore.Qt.LeftButton)
     pump(qt_app, 40)
+    assert not boxes, f"monitoring refused: {boxes}"
     assert app.capture is not None, "monitoring did not start from the receiver"
     assert isinstance(app._signal_source, PcmTcpSource)
     assert app.receiver.tuning.confirmed_hz == 155160000.0

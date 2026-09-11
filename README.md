@@ -369,40 +369,85 @@ radio work and BabelFishR does the recording, transcription and translation.
   (the demodulated audio, sent to BabelFishR over a local connection) and
   the *Rigctl Server* (so Receiver › Tune receiver can set the frequency).
   SDR++'s other settings are left alone, and each file it changes is backed
-  up first as `*.before-babelfishr.json`.
+  up first as `*.before-babelfishr.json`. An SDR++ that is already running
+  is attached to, never started a second time and never reconfigured under
+  you; if its Rigctl Server is off, BabelFishR says which panel to switch it
+  on in.
 - **DSD-neo** decodes digital voice (DMR, P25, NXDN, D-STAR, YSF, ...). When
   *Digital voice* is ticked in Tune receiver, BabelFishR runs DSD-neo between
   SDR++ and itself and records the decoded speech. One TDMA slot is
   transcribed at a time, chosen in the same dialog; two simultaneous
   conversations are never mixed into one transcript.
 
-**Installing, without Terminal.** Download SDR++ for macOS from its GitHub
-Releases page and drag it to Applications (BabelFishR looks for
-`/Applications/SDR++.app`). For digital voice, download the DSD-neo macOS
-arm64 DMG from its Releases page and put `dsd-neo` where BabelFishR can find
-it (in your PATH, or name it in *Tools › Setup assistant* under the DSD path).
-Receiver › Receiver status shows what BabelFishR found. Neither program is
-bundled inside BabelFishR (both are GPL-licensed and are installed and
-updated on their own terms).
+**Installing, without Terminal.** Both programs come from their projects'
+GitHub *Releases* pages (BabelFishR bundles neither; both are GPL-licensed
+and are installed and updated on their own terms). Those pages could not be
+reached from the machine this was written on, so the file names below are
+the projects' documented ones, not ones seen downloaded:
+
+1. SDR++: https://github.com/AlexandreRouma/SDRPlusPlus/releases - the
+   macOS download is a `.pkg` or `.zip` containing **SDR++.app**. Put it in
+   **Applications**. BabelFishR looks for `/Applications/SDR++.app`; if it is
+   somewhere else, use **Receiver › Choose SDR++ application…** and pick it.
+2. DSD-neo (only for digital voice): https://github.com/arancormonk/dsd-neo/releases
+   - the macOS Apple-silicon download is a `.dmg` whose name contains
+   `macos-arm64`. Open it and drag the **dsd-neo** program (or its folder) to
+   a place you can find again, such as **Applications**. Then use **Receiver ›
+   Choose DSD-neo program…** and pick the `dsd-neo` file. (Nothing needs to be
+   "on the PATH".)
+3. On first launch of either, macOS may say it cannot verify the developer:
+   System Settings › Privacy & Security › **Open Anyway**, once per program.
+
+**Receiver › Receiver status…** then shows, separately: whether the SDR++
+software was found, whether an RTL-SDR is on the USB bus, whether SDR++ is
+running and answering, and whether audio is actually arriving. Those are
+four different things, and the window never runs them together.
 
 **Using it.** Plug in the RTL-SDR, choose *SDR receiver* in the Audio input
-list, open the receiver window, tune (in SDR++ or with Tune receiver), then
-press **Start monitoring**. Each message records what SDR++ *confirmed* it
-was tuned to, separately from what you asked for; a confirmed frequency is
-not proof that speech is arriving. If SDR++ is not running, cannot be started
-or stops during a watch, monitoring refuses or stops and says so - BabelFishR
-never records from the laptop microphone in the receiver's place.
+list, open the receiver window, tune - in SDR++'s own window or with
+Receiver › Tune receiver - then press **Start monitoring**. Start reads what
+SDR++ is tuned to *now* and uses that; tuning you did in the SDR++ window is
+respected, and a change you make there while monitoring is picked up within
+a second and marked on the messages. Each message records what SDR++
+*confirmed* it was tuned to, separately from what you asked for; a confirmed
+frequency is not proof that speech is arriving. A retune while a
+transmission is being heard closes that transmission under the frequency it
+was heard on before audio under the new one is taken. If SDR++ is not
+running, cannot be started or stops during a watch, monitoring refuses or
+stops and says so - BabelFishR never records from the laptop microphone in
+the receiver's place, and if DSD-neo loses SDR++'s audio and gives up on it,
+DSD-neo is stopped too (left to itself it would turn to a sound device).
 
-**What is proven and what is not.** The connection between the three programs
-is exercised by automated tests against stand-ins that reproduce SDR++'s and
-DSD-neo's interfaces, and the digital path has been run through the *real*
-DSD-neo on its own DMR and P25 recordings (decoded speech reached BabelFishR
-and was transcribed). No RTL-SDR, no SDR++ and no Mac took part in that: live
-reception, the SDR++ window itself and the click-only installation on a Mac
-are untested until a bench run says otherwise (see docs/MAC_BENCH_CHECKLIST.md
-section S). Digital protocols that need the raw IQ path (P25 CQPSK/LSM
-simulcast, for one) are not covered by the audio connection used here.
-Encrypted traffic is not decoded and is not presented as speech.
+**Filter width for digital voice.** Tune receiver has a *Filter width*
+choice. Ticking *Digital voice* moves it from 12.5 kHz to **20 kHz**: with
+the real SDR++ playing a DMR recording, its FM output at 12.5 kHz was
+clipped and DSD-neo decoded no speech, while at 20 and 25 kHz it decoded.
+That was measured with one DMR recording; other protocols were not tried.
+
+**What is proven and what is not.** Three levels, kept apart:
+
+- *Automated, with stand-ins:* the files SDR++ reads, its rigctl line
+  protocol (including that `\start` writes no reply and that one client is
+  served at a time), its raw network-sink stream, DSD-neo's command line,
+  output and event lines - exercised by stand-ins that reproduce what was
+  read in the two programs' sources, in `tests/test_sdr_receiver.py` and
+  `tests/test_sdr_receiver_corrections.py`.
+- *Real programs, no radio:* SDR++ (v1.3.0, built from the pinned source
+  revision, run headless on Linux with its **File Source** playing DSD-neo's
+  own DMR voice IQ recording) was configured by BabelFishR's configurator,
+  tuned over rigctl, and its network sink fed the real DSD-neo, which decoded
+  DMR voice; BabelFishR's receiver controller attached to that SDR++, adopted
+  its tuning, took the decoded speech, marked a retune boundary and shut down
+  in order. Also observed there: `--autostart` alone produced no audio from
+  the File Source until a stop/start over rigctl (a File-Source quirk, not
+  seen with hardware, which was absent), and that source runs unpaced.
+- *Not yet:* an RTL-SDR, over-the-air reception, the macOS SDR++ build,
+  the click-only installation on a Mac and every step of checklist section
+  S. Digital protocols that need the raw IQ path (P25 CQPSK/LSM simulcast,
+  for one) are not covered by the audio connection used here. Encrypted
+  traffic is not decoded and is not presented as speech. DSD-neo did not
+  report talkgroup or radio identifiers for the DMR recording used, so those
+  fields may stay empty on real traffic too.
 
 ## Privacy
 

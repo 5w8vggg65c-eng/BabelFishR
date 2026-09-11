@@ -193,6 +193,8 @@ class BabelFishRApp:
         #: closed under it, no mode changes, and nothing new starts alongside
         #: it. Reaped once its threads have actually ended.
         self._retired: List[ProcessingPipeline] = []
+        self._receiver_failure_reported = False
+        self.receiver_error = ""
         #: A capture whose audio thread outlived its stop, for the same reason.
         self._lingering_capture: Optional[CaptureService] = None
         self._closed = False
@@ -606,13 +608,12 @@ class BabelFishRApp:
         if self.capture is not None:
             raise RuntimeError("a session is already running")
 
-        if source is None:
-            source = self._build_source(device, replay_path, realtime_replay,
-                                        identity)
-
-        # Before anything is written: a pending Quit, a previous run still
-        # shutting down, or a busy standalone processor refuses the start
-        # outright rather than being waited on or started alongside.
+        # Before anything is written - and before any source is opened: a
+        # pending Quit, a previous run still shutting down, or a busy
+        # standalone processor refuses the start outright rather than being
+        # waited on or started alongside. Building the receiver's source
+        # launches processes and tunes a radio; none of that may begin while
+        # the application is closing.
         if self._closing:
             raise ProcessingBusy("BabelFishR is quitting; monitoring cannot "
                                  "start now.")
@@ -620,6 +621,10 @@ class BabelFishRApp:
         if problem:
             raise ProcessingBusy(problem)
         self._discard_standalone_pipeline()
+
+        if source is None:
+            source = self._build_source(device, replay_path, realtime_replay,
+                                        identity)
 
         if self.transcription is None and self.translation is None:
             self.select_engines()
@@ -869,7 +874,8 @@ class BabelFishRApp:
                 self._lingering_capture = capture
         if getattr(self, "_receiver", None) is not None:
             # Our consumers of the receiver (the stream, dsd-neo) go with the
-            # run; SDR++ itself stays as the operator left it.
+            # run - stopped and waited for by the capture's stopper thread,
+            # like any source. SDR++ itself stays as the operator left it.
             self._receiver.release_source()
             self._signal_source = None
         if self.pipeline is not None:
@@ -1393,14 +1399,6 @@ class BabelFishRApp:
         from time import monotonic, sleep
 
         self._closing = True
-        if getattr(self, "_receiver", None) is not None:
-            # Independent of the store: our stream and dsd-neo stop, rigctl
-            # closes, and an SDR++ we started is stopped (one we attached to
-            # is left alone). Nothing here can fail the close.
-            try:
-                self._receiver.shutdown()
-            except Exception:  # noqa: BLE001
-                log.exception("receiver shutdown failed")
         deadline = None if timeout is None else monotonic() + timeout
 
         def remaining() -> Optional[float]:
@@ -1465,6 +1463,33 @@ class BabelFishRApp:
                 self._standalone_mode = None
             else:
                 return False           # still working; everything stays open
+
+        # 3b. The receiver: its stream and dsd-neo are gone with the capture
+        #     above; rigctl closes and an SDR++ we started is stopped, on the
+        #     receiver's own thread. One owner, waited for like every other
+        #     straggler - a failure is reported, never counted as done.
+        receiver = getattr(self, "_receiver", None)
+        if receiver is not None:
+            handle = receiver.begin_shutdown()
+            if wait:
+                handle.join(remaining())
+            if not handle.settled:
+                return False
+            if handle.error is not None:
+                # Not done: a failure here is reported and the close is
+                # retried (the controller keeps what did not end and tries
+                # again on the next begin_shutdown), never counted as success.
+                self.receiver_error = f"the receiver did not shut down: {handle.error}"
+                if not self._receiver_failure_reported:
+                    self._receiver_failure_reported = True
+                    log.error("receiver shutdown failed: %s", handle.error)
+                    self.events.publish("audio-status", {
+                        "kind": "receiver-shutdown-failed",
+                        "message": f"The receiver did not shut down cleanly: {handle.error}. "
+                                   f"SDR++ may still be running; quit it yourself, and "
+                                   f"BabelFishR will finish quitting."})
+                return False
+            self.receiver_error = ""
 
         # 4. Every worker has actually ended - nothing is joined on this
         #    thread unless the caller asked to wait.

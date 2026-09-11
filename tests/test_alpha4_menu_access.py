@@ -302,7 +302,11 @@ def test_the_tools_menu_reaches_the_existing_setup_and_diagnostics(
 
     app = mock_app(config, store)
     window = shown_window(qt_app, app)
-    tools = top_level_action(window, "Tools").menu()
+    # Keep the QAction alive while its menu is used: a temporary wrapper
+    # expression can leave the QMenu wrapper invalid in PySide (a binding
+    # lifetime effect, reproduced in minimal Qt; not a production defect).
+    tools_action = top_level_action(window, "Tools")
+    tools = tools_action.menu()
     labels = [a.text() for a in tools.actions() if a.text()]
     for expected in ("Field readiness...", "Setup assistant...",
                      "Copy Diagnostic Report", "Reveal Logs in Finder"):

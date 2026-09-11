@@ -691,6 +691,12 @@ class CaptureService:
     def _stop_source(self) -> None:
         try:
             self.source.stop()
+            # A source with a process of its own (dsd-neo) is asked to end
+            # by stop() and waited for here - on the stopper thread, which
+            # is what this method runs on; never on the caller's.
+            settle = getattr(self.source, "settle", None)
+            if settle is not None and not settle(5.0):
+                log.warning("%s did not end when asked", getattr(self.source, "name", "source"))
         except Exception:  # noqa: BLE001
             log.debug("error stopping source", exc_info=True)
         self._source_stopped = True
@@ -776,7 +782,10 @@ class CaptureService:
                 if self.source.finished:
                     break
                 continue
-            self._handle_block(block)
+            if isinstance(block, AudioBlock):
+                self._handle_block(block)
+            else:
+                self._boundary(block)
 
     def _handle_block(self, block: AudioBlock) -> None:
         reading = self.meter.update(block)
@@ -793,8 +802,24 @@ class CaptureService:
         elif was_open and not self.detector.open:
             self._set_state(PipelineState.LISTENING)
 
+    def _boundary(self, boundary) -> None:
+        """The source's tuning changed. Whatever the detector holds open was
+        received under the tuning that just ended: it is closed now, under
+        that tuning's metadata, and the detector starts afresh. Audio the
+        source had buffered under the old tuning was dropped by the source
+        before this marker arrived, so nothing is labelled with a frequency
+        it may not have been received on."""
+        was_open = self.detector.open
+        for detected in self.detector.flush():
+            self._capture(detected, metadata=boundary.metadata)
+        self.detector.reset()
+        if was_open:
+            self._set_state(PipelineState.LISTENING)
+        log.info("capture boundary (%s): %s", boundary.reason,
+                 "transmission closed" if was_open else "nothing open")
+
     # -- capture ---------------------------------------------------------
-    def _capture(self, detected: DetectedTransmission) -> Transmission:
+    def _capture(self, detected: DetectedTransmission, metadata=None) -> Transmission:
         """Persist a detected event, then decide what to do with it.
 
         The order is the invariant: WAV to disk, row to the database, and only
@@ -829,7 +854,7 @@ class CaptureService:
             state=ProcessingState.CAPTURED,
         )
         tx.ended_at = detected.ended_at
-        self._apply_measured_metadata(tx)
+        self._apply_measured_metadata(tx, metadata)
 
         # --- persistence, before any classification-driven decision ---------
         tx.audio_path = self.recorder.write(tx, self.session, detected.audio,
@@ -859,7 +884,7 @@ class CaptureService:
         self.events.publish("updated", tx)
         return tx
 
-    def _apply_measured_metadata(self, tx: Transmission) -> None:
+    def _apply_measured_metadata(self, tx: Transmission, metadata=None) -> None:
         """Overlay what a signal source genuinely reported, if there is one.
 
         Delegated to :func:`babelfishr.signal_metadata.apply_source_metadata`
@@ -877,7 +902,8 @@ class CaptureService:
         if not getattr(source, "measures_rf", False):
             return
         try:
-            metadata = source.metadata()
+            if metadata is None:
+                metadata = source.metadata()
             if metadata is None:
                 return
             apply_source_metadata(tx, metadata)

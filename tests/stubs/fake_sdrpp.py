@@ -2,17 +2,28 @@
 """A stand-in for SDR++ at BabelFishR's integration boundary.
 
 It reproduces the two interfaces BabelFishR uses, as read from SDR++'s
-sources (misc_modules/rigctl_server/src/main.cpp, sink_modules/network_sink/
-src/main.cpp): a rigctl line server (F/f/M/m/\\start/\\stop/q, "RPRT 0")
-and a TCP network audio sink that listens and streams raw int16 mono PCM to
-the one client it accepts. It reads the ports from the config files
-BabelFishR writes under --root, exactly as SDR++ would, so the configurator
-is exercised for real. It proves NOTHING about SDR++ itself or about radio
-reception: the audio it streams is the WAV named by FAKE_SDRPP_WAV.
+sources at 8c9f5ee8fe405775bfcd62c8c8f8c0fc928a64af (misc_modules/
+rigctl_server/src/main.cpp, sink_modules/network_sink/src/main.cpp,
+core/src/signal_path/sink.cpp): a rigctl line server that serves ONE client
+at a time (F/f/M/m/q answer; \\start and \\stop change the play state and
+write NOTHING back) and a TCP network audio sink that listens and streams
+raw int16 mono PCM to the one client it accepts, only while playing. It
+reads the config files BabelFishR writes under --root with the same typed
+reads SDR++ performs (a missing or null key is fatal, as nlohmann::json's
+typed get would throw), so the configurator is exercised for real. It
+proves NOTHING about SDR++ itself or about radio reception: the audio it
+streams is the WAV named by FAKE_SDRPP_WAV.
 
 Environment: FAKE_SDRPP_WAV (48 kHz mono WAV to stream; silence if unset),
 FAKE_SDRPP_LOG (file that receives one line per rigctl command and event),
-FAKE_SDRPP_LOOP=1 (loop the WAV), FAKE_SDRPP_REFUSE_TUNE=1 (reply RPRT 1 to F).
+FAKE_SDRPP_LOOP=1 (loop the WAV), FAKE_SDRPP_REFUSE_TUNE=1 (reply RPRT 1 to F),
+FAKE_SDRPP_DROP_AUDIO_AFTER=<seconds> (close the audio client after that
+long while keeping rigctl up, like a sink switched off in the SDR++ window),
+FAKE_SDRPP_NO_RIGCTL=1 (run without the rigctl server, whatever the config),
+FAKE_SDRPP_AUDIO_STOP_AFTER=<seconds> (close the audio client and stop
+listening for good after that long; rigctl stays up), FAKE_SDRPP_TUNE_FILE
+(a file whose contents "<hz> [<mode> [<bw>]]" are applied as if the operator
+tuned in the SDR++ window, then removed).
 """
 
 import json
@@ -33,6 +44,21 @@ def log(text):
             handle.write(text + "\n")
 
 
+def typed(obj, key, kind, where):
+    """SDR++ reads these with nlohmann::json typed gets: a missing key reads
+    as null and the conversion throws. Same here: fail, loudly, naming it."""
+    if key not in obj or obj[key] is None:
+        raise SystemExit(f"fatal: {where}[{key!r}] is missing/null (SDR++ typed read would throw)")
+    value = obj[key]
+    if kind is float and isinstance(value, int):
+        value = float(value)
+    if kind is int and isinstance(value, bool):
+        raise SystemExit(f"fatal: {where}[{key!r}] is a bool where an int is read")
+    if not isinstance(value, kind):
+        raise SystemExit(f"fatal: {where}[{key!r}]={value!r} is not {kind.__name__}")
+    return value
+
+
 def load_settings(root):
     root = pathlib.Path(root)
     core = json.loads((root / "config.json").read_text()) if (root / "config.json").exists() else {}
@@ -40,20 +66,48 @@ def load_settings(root):
         if (root / "network_sink_config.json").exists() else {}
     rig = json.loads((root / "rigctl_server_config.json").read_text()) \
         if (root / "rigctl_server_config.json").exists() else {}
-    stream = sink.get("Radio", {})
-    server = rig.get("Rigctl Server", {})
+    # core.cpp: a string-valued instance is upgraded to {module, enabled}.
+    modules = {}
+    for name, inst in core.get("moduleInstances", {}).items():
+        if isinstance(inst, str):
+            inst = {"module": inst, "enabled": True}
+        typed(inst, "module", str, f"moduleInstances[{name!r}]")
+        typed(inst, "enabled", bool, f"moduleInstances[{name!r}]")
+        modules[name] = inst
+    # sink.cpp loadStreamConfig: sink, volume, muted - all typed.
+    stream_conf = core.get("streams", {}).get("Radio")
+    if stream_conf is None:
+        raise SystemExit("fatal: streams['Radio'] missing")
+    sink_selected = typed(stream_conf, "sink", str, "streams['Radio']")
+    typed(stream_conf, "volume", float, "streams['Radio']")
+    typed(stream_conf, "muted", bool, "streams['Radio']")
+    if "Radio" not in modules or modules["Radio"]["module"] != "radio":
+        raise SystemExit("fatal: no 'Radio' module instance - the Radio stream has no VFO")
+    # network_sink: defaults inserted only when the stream entry is absent.
+    stream = sink.get("Radio")
+    if stream is None:
+        stream = {"hostname": "localhost", "port": 7355, "protocol": 1,
+                  "sampleRate": 48000.0, "stereo": False, "listening": False}
+    audio = {k: typed(stream, k, t, "network_sink['Radio']") for k, t in
+             (("hostname", str), ("port", int), ("protocol", int), ("sampleRate", float),
+              ("stereo", bool), ("listening", bool))}
+    # rigctl_server: defaults only when the whole instance is absent; all seven typed.
+    server = rig.get("Rigctl Server")
+    if server is None:
+        server = {"host": "localhost", "port": 4532, "tuning": True, "recording": False,
+                  "autoStart": False, "vfo": "", "recorder": ""}
+    rigc = {k: typed(server, k, t, "rigctl['Rigctl Server']") for k, t in
+            (("host", str), ("port", int), ("tuning", bool), ("recording", bool),
+             ("autoStart", bool), ("vfo", str), ("recorder", str))}
     return {
-        "modules": core.get("moduleInstances", {}),
-        "sink_selected": core.get("streams", {}).get("Radio", {}).get("sink"),
-        "audio_host": stream.get("hostname", "localhost"),
-        "audio_port": int(stream.get("port", 7355)),
-        "audio_protocol": stream.get("protocol", 1),
-        "audio_rate": int(stream.get("sampleRate", 48000)),
-        "audio_listening": bool(stream.get("listening", False)),
-        "rig_host": server.get("host", "localhost"),
-        "rig_port": int(server.get("port", 4532)),
-        "rig_autostart": bool(server.get("autoStart", False)),
-        "rig_vfo": server.get("vfo", ""),
+        "modules": modules,
+        "sink_selected": sink_selected,
+        "audio_host": audio["hostname"], "audio_port": audio["port"],
+        "audio_protocol": audio["protocol"], "audio_rate": int(audio["sampleRate"]),
+        "audio_listening": audio["listening"],
+        "rig_host": rigc["host"], "rig_port": rigc["port"],
+        "rig_autostart": rigc["autoStart"], "rig_vfo": rigc["vfo"],
+        "rig_tuning": rigc["tuning"],
     }
 
 
@@ -107,20 +161,22 @@ def rigctl_server(host, port, state):
                     elif parts[0] in ("m", "\\get_mode"):
                         reply = f"{state.mode}\n{state.bandwidth}\n"
                     elif parts[0] == "\\start":
-                        state.playing = True
-                        reply = "RPRT 0\n"
+                        state.playing = True       # setPlayState(true); no reply
+                        continue
                     elif parts[0] == "\\stop":
-                        state.playing = False
-                        reply = "RPRT 0\n"
+                        state.playing = False      # setPlayState(false); no reply
+                        continue
                     elif parts[0] in ("q", "\\quit"):
                         return
                     else:
                         reply = "RPRT 1\n"
                     conn.sendall(reply.encode("ascii"))
 
+    # One client at a time, as upstream's clientHandler does: the next
+    # connection is accepted only after the current one has ended.
     while True:
         conn, _ = srv.accept()
-        threading.Thread(target=serve, args=(conn,), daemon=True).start()
+        serve(conn)
 
 
 def audio_sink(host, port, rate, state):
@@ -141,12 +197,26 @@ def audio_sink(host, port, rate, state):
     piece = rate * 2 // 50
     silence = b"\0" * piece
     loop = os.environ.get("FAKE_SDRPP_LOOP") == "1"
+    drop_after = float(os.environ.get("FAKE_SDRPP_DROP_AUDIO_AFTER") or 0)
+    stop_after = float(os.environ.get("FAKE_SDRPP_AUDIO_STOP_AFTER") or 0)
     while True:
         conn, _ = srv.accept()
         log("audio client connected")
         position = 0
+        connected_at = time.time()
         try:
             while True:
+                if drop_after and time.time() - connected_at > drop_after:
+                    log("audio client dropped by the sink (FAKE_SDRPP_DROP_AUDIO_AFTER)")
+                    drop_after = 0
+                    break
+                if stop_after and time.time() - connected_at > stop_after:
+                    # The sink goes away for good (the operator removed the
+                    # module, say) while SDR++ and its rigctl stay up.
+                    log("audio sink stopped for good (FAKE_SDRPP_AUDIO_STOP_AFTER)")
+                    conn.close()
+                    srv.close()
+                    return
                 if state.playing and pcm and position < len(pcm):
                     data = pcm[position:position + piece]
                     position += piece
@@ -179,13 +249,30 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: (log("terminated"), sys.exit(0)))
     threading.Thread(target=audio_sink, args=(settings["audio_host"], settings["audio_port"],
                                               settings["audio_rate"], state), daemon=True).start()
-    if settings["rig_autostart"]:
+    if settings["rig_autostart"] and os.environ.get("FAKE_SDRPP_NO_RIGCTL") != "1":
         threading.Thread(target=rigctl_server, args=(settings["rig_host"], settings["rig_port"], state),
                          daemon=True).start()
     else:
-        log("rigctl not autostarted (config says autoStart false)")
+        log("rigctl not started (autoStart false or FAKE_SDRPP_NO_RIGCTL)")
+    tune_file = os.environ.get("FAKE_SDRPP_TUNE_FILE")
     while True:
-        time.sleep(0.5)
+        time.sleep(0.1)
+        # The operator turning the dial in the SDR++ window: a file naming
+        # "<hz> [<mode> [<bw>]]" is applied to the VFO and removed. Not a
+        # rigctl command - the window's own tuning, which rigctl "f" reports.
+        if tune_file and os.path.exists(tune_file):
+            try:
+                parts = pathlib.Path(tune_file).read_text().split()
+                os.remove(tune_file)
+            except OSError:
+                continue
+            if parts:
+                state.frequency = int(float(parts[0]))
+                if len(parts) > 1:
+                    state.mode = parts[1]
+                if len(parts) > 2:
+                    state.bandwidth = int(parts[2])
+                log(f"gui tune {state.frequency} {state.mode} {state.bandwidth}")
 
 
 if __name__ == "__main__":

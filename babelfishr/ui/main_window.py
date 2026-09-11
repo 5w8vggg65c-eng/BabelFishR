@@ -521,6 +521,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.receiver_status_action = QtGui.QAction("Receiver status...", self)
         self.receiver_status_action.triggered.connect(self._show_receiver_status)
         receiver_menu.addAction(self.receiver_status_action)
+        receiver_menu.addSeparator()
+        self.choose_sdrpp_action = QtGui.QAction("Choose SDR++ application...", self)
+        self.choose_sdrpp_action.setStatusTip(
+            "Point BabelFishR at SDR++ if it is not in Applications")
+        self.choose_sdrpp_action.triggered.connect(self._choose_sdrpp)
+        receiver_menu.addAction(self.choose_sdrpp_action)
+        self.choose_dsd_action = QtGui.QAction("Choose DSD-neo program...", self)
+        self.choose_dsd_action.setStatusTip(
+            "Point BabelFishR at the dsd-neo program for digital voice")
+        self.choose_dsd_action.triggered.connect(self._choose_dsd)
+        receiver_menu.addAction(self.choose_dsd_action)
 
         tools_menu = bar.addMenu("&Tools")
         tools_menu.setObjectName("toolsMenu")
@@ -619,16 +630,59 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sdr_label.setText(text)
 
     # -- the SDR receiver ---------------------------------------------------
+    def _receiver_blocked(self) -> bool:
+        """Quitting, or the store already shut: no receiver work begins."""
+        if self.app.closing or self._store_off_limits:
+            self.status.showMessage("BabelFishR is quitting; the receiver is not "
+                                    "started now.", 6000)
+            return True
+        return False
+
+    def _choose_sdrpp(self) -> None:
+        if self._receiver_blocked():
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Choose the SDR++ application", "/Applications",
+            "Applications and programs (*.app sdrpp);;All files (*)")
+        if self._store_gone() or not path:
+            return
+        self.app.config.receiver.sdrpp_path = path
+        self._save_receiver_settings()
+        self._refresh_sdr_label()
+        self.input_panel.refresh_devices()
+
+    def _choose_dsd(self) -> None:
+        if self._receiver_blocked():
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Choose the dsd-neo program", str(pathlib.Path.home()),
+            "Programs (dsd-neo dsd-neo* *);;All files (*)")
+        if self._store_gone() or not path:
+            return
+        self.app.config.analysis.dsd_path = path
+        self._save_receiver_settings()
+        self._refresh_sdr_label()
+
+    def _save_receiver_settings(self) -> None:
+        try:
+            self.app.config.save()
+        except OSError:  # noqa: BLE001 - a preference is never worth a crash
+            pass
+
     def _open_receiver(self) -> None:
         """Start SDR++ (configured for BabelFishR) or show that it is running.
         Nothing is recorded until Start monitoring."""
         from ..receiver import ReceiverError
 
+        if self._receiver_blocked():
+            return
         try:
             self.app.receiver.ensure_sdrpp()
         except ReceiverError as exc:
             QtWidgets.QMessageBox.warning(self, "The receiver is not available", str(exc))
             self._refresh_sdr_label()
+            return
+        if self._store_gone():
             return
         changes = self.app.receiver.configuration_changes
         note = (" SDR++'s settings were adjusted for BabelFishR: " + "; ".join(changes)
@@ -641,6 +695,8 @@ class MainWindow(QtWidgets.QMainWindow):
         from ..analysis.dsd import PRESETS
         from ..receiver import SDRPP, ReceiverError
 
+        if self._receiver_blocked():
+            return
         settings = self.app.config.receiver
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle("Tune receiver")
@@ -656,9 +712,34 @@ class MainWindow(QtWidgets.QMainWindow):
             mode.addItem(name)
         mode.setCurrentText(settings.mode or "FM")
         form.addRow("Mode", mode)
+        width = QtWidgets.QComboBox()
+        width.setObjectName("filterWidth")
+        labels = {SDRPP.analog_bandwidth_hz: "12.5 kHz (analog voice, the usual channel)",
+                  15000: "15 kHz",
+                  SDRPP.digital_voice_bandwidth_hz: "20 kHz (digital voice: the width that "
+                                                    "decoded DMR through SDR++ here)",
+                  25000: "25 kHz (wide)"}
+        for hz in SDRPP.bandwidth_choices_hz:
+            width.addItem(labels.get(hz, f"{hz / 1000:g} kHz"), hz)
+        current = settings.bandwidth_hz or SDRPP.analog_bandwidth_hz
+        if width.findData(current) < 0:
+            width.addItem(f"{current / 1000:g} kHz", current)
+        width.setCurrentIndex(width.findData(current))
+        form.addRow("Filter width", width)
         digital = QtWidgets.QCheckBox("Digital voice: decode with DSD-neo")
         digital.setChecked(settings.digital)
         form.addRow(digital)
+
+        def digital_toggled(checked: bool) -> None:
+            # Observed on SDR++ (contract.py): at 12.5 kHz its FM output of
+            # a DMR signal clipped and dsd-neo decoded no voice; at 20 kHz
+            # it decoded. The default follows the tick; a width the operator
+            # picked deliberately is left alone.
+            wanted = SDRPP.digital_voice_bandwidth_hz if checked else SDRPP.analog_bandwidth_hz
+            other = SDRPP.analog_bandwidth_hz if checked else SDRPP.digital_voice_bandwidth_hz
+            if width.currentData() == other:
+                width.setCurrentIndex(width.findData(wanted))
+        digital.toggled.connect(digital_toggled)
         protocol = QtWidgets.QComboBox()
         for preset in PRESETS:
             protocol.addItem(preset.label, preset.id)
@@ -673,7 +754,9 @@ class MainWindow(QtWidgets.QMainWindow):
         note = QtWidgets.QLabel(
             "SDR++ is asked to tune and then read back. What it confirms is "
             "recorded on each message; a confirmed frequency is not proof that "
-            "speech is arriving. One slot is transcribed at a time.")
+            "speech is arriving. One slot is transcribed at a time. Tuning done "
+            "in the SDR++ window itself is respected: Start monitoring reads "
+            "what SDR++ is tuned to.")
         note.setWordWrap(True)
         form.addRow(note)
         buttons = QtWidgets.QDialogButtonBox(
@@ -684,8 +767,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tune_dialog = dialog
         if dialog.exec() != QtWidgets.QDialog.Accepted:
             return
+        if self._receiver_blocked():
+            return                                    # Quit arrived under the dialog
         settings.frequency_hz = float(frequency.value()) * 1e6
         settings.mode = mode.currentText()
+        settings.bandwidth_hz = int(width.currentData())
         settings.digital = digital.isChecked()
         settings.digital_protocol = protocol.currentData()
         settings.digital_slot = int(slot.currentData())
@@ -694,34 +780,48 @@ class MainWindow(QtWidgets.QMainWindow):
         except OSError:  # noqa: BLE001 - a preference is never worth a crash
             pass
         self._refresh_sdr_label()
-        if self.app.receiver.status()["sdrpp_running"]:
+        receiver = self.app.receiver
+        if receiver.status()["sdrpp_running"]:
             try:
-                result = self.app.receiver.tune()
+                result = receiver.tune()
             except ReceiverError as exc:
+                receiver.pending_tune = True
                 QtWidgets.QMessageBox.warning(self, "SDR++ did not tune", str(exc))
                 return
             self.status.showMessage(
                 f"SDR++ confirms {result['confirmed_hz'] / 1e6:.4f} MHz "
                 f"{result['mode']}.", 10000)
         else:
-            self.status.showMessage("Saved. SDR++ will be tuned when it starts.", 8000)
+            # Applied when BabelFishR next starts SDR++. An SDR++ the operator
+            # opens and tunes themselves keeps their tuning.
+            receiver.pending_tune = True
+            self.status.showMessage("Saved. Applied when BabelFishR starts SDR++; an "
+                                    "SDR++ you open yourself keeps its own tuning.", 8000)
 
     def _show_receiver_status(self) -> None:
+        if self.app.closing:
+            return
         status = self.app.receiver.status()
+        usb = {True: "yes", False: "no", None: "still checking" if status.get("usb_probed") is False
+               else "cannot tell here"}[status["rtl_sdr_present"]]
         lines = [
-            f"SDR++: {status['sdrpp'] or 'not found'}"
-            f"{' (running)' if status['sdrpp_running'] else ''}",
+            f"SDR++ software: {status['sdrpp'] or 'not found'}",
+            f"SDR++ running: {'yes' if status['sdrpp_running'] else 'no'}",
+            f"Control connection (rigctl): {'connected' if status['control_connected'] else 'not connected'}",
+            f"Audio arriving from the receiver: {'yes' if status['audio_receiving'] else 'no'}",
             f"DSD-neo: {status['dsd_neo'] or 'not found'} {status['dsd_neo_version']}",
-            "RTL-SDR on USB: " + {True: "yes", False: "no", None: "cannot tell here"}[
-                status["rtl_sdr_present"]],
+            f"RTL-SDR on USB: {usb}",
             f"SDR++ settings folder: {status['root']}",
         ]
         tuning = status["tuning"]
         if tuning["confirmed_hz"]:
-            lines.append(f"SDR++ confirmed: {tuning['confirmed_hz'] / 1e6:.4f} MHz "
-                         f"{tuning['mode']}")
-        elif tuning["requested_hz"]:
-            lines.append(f"Requested (not yet confirmed): {tuning['requested_hz'] / 1e6:.4f} MHz")
+            when = tuning["confirmed_at"].astimezone().strftime("%H:%M:%S") if tuning["confirmed_at"] else ""
+            lines.append(f"SDR++ last reported: {tuning['confirmed_hz'] / 1e6:.4f} MHz "
+                         f"{tuning['mode']} (read at {when})")
+        if tuning["requested_hz"]:
+            lines.append(f"Last asked for: {tuning['requested_hz'] / 1e6:.4f} MHz")
+        lines.append("Radio start: " + ("requested (SDR++ does not confirm it; arriving "
+                                       "audio does)" if tuning["radio_start_requested"] else "not requested"))
         if status["problems"]:
             lines.append("")
             lines.extend(status["problems"])
@@ -1045,12 +1145,26 @@ class MainWindow(QtWidgets.QMainWindow):
                 message = payload.get("message", "")
                 self.status.showMessage(f"Audio: {kind} - {message}", 8000)
                 self.input_panel.report_audio_status(kind, message)
-                if kind in ("decoder-exited", "stream-error"):
+                if kind in ("decoder-exited", "stream-error", "receiver-lost"):
                     self._warn(
                         f"The receiver path stopped: {message} Nothing else is "
                         f"being recorded in its place. Transmissions already "
                         f"captured are safe. Press Stop, check SDR++, then start "
                         f"again.", source="audio-input")
+                elif kind == "upstream-lost":
+                    self._warn(
+                        f"DSD-neo has lost the audio from SDR++ ({message}). It keeps "
+                        f"trying to reconnect; nothing else is recorded in its place. "
+                        f"Check that SDR++ is running and its Network sink is on.",
+                        source="audio-input")
+                elif kind in ("upstream-restored", "audio-resumed"):
+                    self._clear_warning("audio-input")
+                elif kind == "audio-dropped":
+                    self._warn(f"Receiver audio is arriving faster than it can be handled; "
+                               f"the oldest buffered audio is being dropped. {message}",
+                               source="audio-input")
+                elif kind == "receiver-shutdown-failed":
+                    self._warn(message, source="audio-input")
                 elif kind == "tuned":
                     self._refresh_sdr_label()
                 elif kind in ("disconnected", "reconnect-failed"):
@@ -2169,7 +2283,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # A failure inside the cleanup thread, or in the end-of-run write, is
         # reported by the application rather than raised here; it is shown,
         # and the retry is automatic.
-        self._shutdown_error = self.app.cleanup_error or self.app.persistence_error
+        self._shutdown_error = (self.app.cleanup_error or self.app.persistence_error
+                                or getattr(self.app, "receiver_error", ""))
         if done:
             self._quit_timer.stop()
             self._timer.stop()

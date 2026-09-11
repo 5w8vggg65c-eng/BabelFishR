@@ -240,6 +240,10 @@ class ReceiverConfig:
     two slots are never mixed into one transcript."""
 
     connect_timeout_s: float = 15.0
+    allow_remote_receiver: bool = False
+    """Only a local SDR++ (127.0.0.1) is used unless this is set: the
+    receiver path must not become a way for audio to leave or enter this
+    computer over the network."""
 
 
 @dataclasses.dataclass
