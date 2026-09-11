@@ -2284,7 +2284,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # reported by the application rather than raised here; it is shown,
         # and the retry is automatic.
         self._shutdown_error = (self.app.cleanup_error or self.app.persistence_error
-                                or getattr(self.app, "receiver_error", ""))
+                                or getattr(self.app, "receiver_error", "")
+                                or getattr(self.app, "capture_error", ""))
         if done:
             self._quit_timer.stop()
             self._timer.stop()

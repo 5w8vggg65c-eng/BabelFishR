@@ -195,6 +195,7 @@ class BabelFishRApp:
         self._retired: List[ProcessingPipeline] = []
         self._receiver_failure_reported = False
         self.receiver_error = ""
+        self.capture_error = ""
         #: A capture whose audio thread outlived its stop, for the same reason.
         self._lingering_capture: Optional[CaptureService] = None
         self._closed = False
@@ -1437,11 +1438,16 @@ class BabelFishRApp:
         #    to take it.
         capture = self._lingering_capture
         if capture is not None:
+            # A source whose stop failed is still this capture's: the retry
+            # runs only the part that did not succeed, on its own thread.
+            capture.retry_stop_source()
             if wait:
                 capture.wait_settled(timeout=remaining())
             self._reap()
             if self._lingering_capture is not None:
+                self.capture_error = getattr(capture, "source_error", "") or ""
                 return False
+        self.capture_error = ""
 
         # 2. Whatever a capture saved that nothing accepted.
         self._adopt_unprocessed()

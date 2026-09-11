@@ -5281,3 +5281,132 @@ program…**).
 - Eric's acoustic radio test stands (work radio speaker → laptop
   microphone → BabelFishR); direct RTL-SDR reception and FalconClaw/PTT
   remain unverified.
+
+---
+
+# SDR receiver: stream cleanup and recording identity
+
+Codex verified `025c4ee` (82 passed, 2 skipped in its environment) and
+reported five further counterexamples in three areas. Each is reproduced
+below in a test that fails on `025c4ee` and passes now, and each change is
+confined to its area.
+
+## Identifiers
+
+| | |
+|---|---|
+| Base | `025c4ee3eb1fe402f6ef7ad0599c718c67f6b615` (verified equal to the remote tip, worktree clean before editing) |
+| Commit | the commit carrying this section |
+| Branch | `claude/radio-decoder-translator-0oslya` |
+| Workflow / tag / release / packaging | nothing dispatched, tagged or published; no packaging change; run 21 cannot test this |
+
+## A. Decoder pipe and reconnection lifetime
+
+- **A1** A decoder that stops reading fills the pipe; the pump then sits
+  inside `write()` holding `_stdin_lock`, and `stop()` waited for that lock
+  in `_close_stdin()` before ever reaching `process.terminate()` - the
+  capture's stopper hung there, the decoder lived, Quit stayed pending.
+  **Change:** `stop()` never waits on the pump: it closes the socket, asks
+  the process to end first (the process ending is what fails the blocked
+  write and frees the lock), and closes the input only if the lock is free
+  within 50 ms; the pump closes it on its way out, and `settle()` closes it
+  once the pump has ended. Process-stop policy unchanged (terminate, then
+  `settle()` kills after its timeout).
+- **A2** A `create_connection` that returned after Stop was installed as
+  the source's socket, "upstream-restored" was announced with
+  `_running=False`, and `settle()`/`settled` said True while the pump and
+  the socket lived. **Change:** the socket handoff is under `_sock_lock`
+  with `_running` set under the same lock, so a connection that completes
+  after cancellation is closed and never installed; `settle()` joins the
+  pump, reader, event watcher and filler (bounded) and closes any held
+  socket; `settled` is true only when process, pump and socket are all
+  gone; "upstream-restored" is announced when PCM actually arrives again
+  (`_awaiting_pcm`), not when a socket is accepted.
+- Decoded timeline (found while closing C1 on the decoded path): the
+  reader's wall-clock offsets left small uncovered gaps whenever voice
+  resumed after idle, so sample time and clock drifted apart by ~0.1 s per
+  resumption. `DecodedVoiceSource` now keeps one continuous timeline
+  (`_timeline`): idle wall time is covered with silence before decoded
+  audio is placed (`_place`), and the idle filler advances the same
+  timeline; block offsets and the sample count agree, and the detector's
+  discontinuity rule (below) is never tripped by the decoded path's own
+  clock.
+
+## B. Failed source cleanup under ordinary Stop / Quit
+
+`CaptureService._stop_source` swallowed a `stop()` exception (and logged a
+failed `settle()` as a warning) and marked the source stopped; the
+controller had already detached it; the capture was reaped; Quit returned
+True with the decoder alive. **Change:** the failure is kept
+(`source_error`), `_source_stopped` stays False, `settled` requires it, a
+`source-stop-failed` status is published once, and `retry_stop_source()`
+runs only the part that did not succeed (a `stop()` that already succeeded
+is not repeated; `settle()` is). `app.close` retries once per call through
+the lingering capture, sets `capture_error`, and returns False until the
+source has finished; the window shows the error while Quit retries.
+
+## C. Recording time and frequency belong to the captured audio
+
+- **C1** Re-anchoring the detector's origin on every block moved audio
+  already buffered: a 3 s timestamp gap before the closing silence dated
+  the 1.46 s recording 3 s late. **Change:** the origin is fixed by the
+  first block after a start or reset and left alone; a block whose
+  timestamp sits more than `DISCONTINUITY_SECONDS` (0.25 s) from where the
+  sample count puts it is a break: what is open closes there, with its
+  own time; the pre-roll from before the break is dropped; the origin is
+  fixed afresh at that block, so later audio carries its own later time.
+  `discontinuities` counts them.
+- **C2** A block already in hand when a retune went by closed the
+  recording through the ordinary path, which took `source.metadata()` -
+  the new tuning. **Change:** every block handed out by `read()` carries
+  `block.tuning`, a frozen `TuningState` for its generation (taken at the
+  first read of that generation; the controller now writes the new tuning
+  *before* marking the boundary and hands the boundary the ending epoch's
+  metadata it took beforehand). `_handle_block` labels a recording it
+  completes with that block's tuning (`source.metadata(tuning=...)`), and
+  the final flush uses the last block's. Markers still close what they
+  find open under their own metadata. Call identifiers stay current.
+
+## Tests (`tests/test_sdr_receiver_cleanup.py`, 8)
+
+A1 with a child that never reads stdin, through the application and
+capture (pipe full, pump blocked in write, Stop returns, capture settles,
+decoder gone, `settled` true); A2 with `socket.create_connection` held
+after connecting until after Stop (late socket closed, no restored
+announcement, `settled` false until the pump ends); restored announced only
+after new PCM; B with `stop()` raising and with `settle()` returning False
+twice, through `app.stop_session()` / `app.close()` (capture unsettled,
+error kept and shown, event once, decoder alive until the retry succeeds,
+`stop()` called once in the settle case); C1 with explicitly timestamped
+blocks through a scripted source, the real capture, detector, recorder and
+store (a 3 s break before the closing silence: recording dated 0.4-1.05 s
+after stream start; and audio after a break dated at its own later time);
+C2 holding an in-hand block that will close the open recording, retuning,
+releasing: saved as 155.1 MHz, epoch 0. Also: the bounded-queue test's
+drain assertion was a race (it read while the sink still sent) and now
+waits until the reader has taken everything in; the recording-times test's
+tautological boundary assertion is replaced by the fixture's own period
+(bursts 2.8 s apart).
+
+## Evidence
+
+| Check | Result |
+|---|---|
+| `tests/test_sdr_receiver_cleanup.py` | 8 passed (24 s) |
+| The same tests against `025c4ee` in a worktree, one test per process, 150 s limit | A1: "the capture's stopper never got past closing the decoder's input"; A2: "settled while the pump (and its connect) were still alive"; restored: "announced with no new PCM since the loss (96000 → 96000)"; B stop(): "a capture whose source did not stop reported itself settled"; B settle(): capture `settled` True with the decoder alive; C1: "recording dated 3.740s after stream start" (the review's number exactly); C2: "audio heard on 155.100 MHz was saved as 162.55 MHz". One passes on the baseline as a guard (audio after a break keeping its own later time - the old per-block re-anchoring gave later audio its later time; what it broke was the earlier audio) |
+| Receiver suites (4 files) + lifecycle, shutdown, cleanup, boundary, cleanup-and-labels, menu suites | 108 passed, 2 skipped (220 s) |
+| Full suite, nothing else running | **1029 passed, 13 skipped, 0 failed**, 355 s |
+| Skips (13) | QtMultimedia ×2, CoreAudio, PlistBuddy, Whisper model ×5, Argos ×2, the two real-decoder tests when their env is unset |
+| `git diff --check`, `compileall` | clean |
+| Real decoder in this pass | not re-run: the changes are on BabelFishR's side of the pipe (stop ordering, socket handoff, settlement, timeline, capture ownership, detector timing, block tags); the stdin/EOF behaviour relied on is the previous section's verified run |
+
+Environment: Linux container, Python 3.11, PySide6 offscreen, no audio backend, no receiver, no Mac. Mock ASR/translation throughout.
+
+## Still unknown
+
+Unchanged from the previous section: nothing here ran on a Mac or with the
+RTL-SDR; the real-decoder evidence is the stdin/EOF run and the two
+env-gated tests; file replay is not reception; mock recognition is not
+recognition. Eric's acoustic radio test stands (work radio speaker →
+laptop microphone → BabelFishR); direct RTL-SDR reception and
+FalconClaw/PTT remain unverified.

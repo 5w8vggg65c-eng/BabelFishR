@@ -433,6 +433,7 @@ class RadioActivityDetector(TransmissionDetector):
         self._clipped = False
         self._floor_at_open = -120.0
         self._samples_seen = 0
+        self.discontinuities = 0
         self._pre_samples = 0
         self._start_offset = 0.0
         self._hang_remaining = 0.0
@@ -462,21 +463,37 @@ class RadioActivityDetector(TransmissionDetector):
         self.__init__(self.sample_rate, self.settings)  # noqa: PLC2801
 
     # -- streaming -------------------------------------------------------
+    #: How far a block's timestamp may sit from where the sample count says
+    #: it should be before the stream is taken to have a break in it.
+    DISCONTINUITY_SECONDS = 0.25
+
     def push(self, block: AudioBlock) -> List[DetectedTransmission]:
-        # Time follows the blocks, not this detector's own sample count: the
-        # origin is re-anchored on every block so that the sample position
-        # where this block begins maps to the block's timestamp. A reset (a
-        # tuning boundary) starts the count again, and the next block anchors
-        # it again - recordings after a boundary keep their true times. A
-        # source whose offsets are wall-clock with gaps (the decoded path)
-        # is followed the same way.
+        out: List[DetectedTransmission] = []
         ahead = (self._samples_seen + self._pending.size) / float(self.sample_rate)
-        self.stream_start = block.timestamp - _dt.timedelta(seconds=ahead)
+        if self.stream_start is None:
+            # The first block (or the first after a reset) fixes the origin:
+            # the sample position where it begins is its timestamp.
+            self.stream_start = block.timestamp - _dt.timedelta(seconds=ahead)
+        else:
+            expected = self.stream_start + _dt.timedelta(seconds=ahead)
+            gap = (block.timestamp - expected).total_seconds()
+            if abs(gap) > self.DISCONTINUITY_SECONDS:
+                # A break in the stream (audio missing, or a clock that
+                # jumped). Audio already buffered keeps the time it really
+                # has: what is open closes here, ending where the audio
+                # ends; the pre-roll from before the break is not attached
+                # to anything after it; then the origin is fixed afresh at
+                # this block, so what follows carries its own time.
+                out.extend(self.flush())
+                self._pre_roll.clear()
+                self._consecutive = 0
+                ahead = self._samples_seen / float(self.sample_rate)
+                self.stream_start = block.timestamp - _dt.timedelta(seconds=ahead)
+                self.discontinuities += 1
         samples = np.asarray(block.samples, dtype=np.float64).ravel()
         self._pending = (np.concatenate([self._pending, samples])
                          if self._pending.size else samples)
 
-        out: List[DetectedTransmission] = []
         count = self._pending.size // self.frame_size
         for i in range(count):
             frame = self._pending[i * self.frame_size:(i + 1) * self.frame_size]

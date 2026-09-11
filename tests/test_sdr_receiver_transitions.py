@@ -327,10 +327,16 @@ def test_recordings_after_retunes_keep_their_true_times(receiver_config, store, 
             previous_end = parse(rows[index - 1][0]) + _dt.timedelta(seconds=rows[index - 1][1])
             assert start >= previous_end - _dt.timedelta(seconds=0.25), \
                 f"recording {index} overlaps the one before it: {rows}"
-    # Every recording made after a boundary starts after it.
-    for boundary in boundaries:
-        after = [parse(r[0]) for r in rows if parse(r[0]) > boundary - _dt.timedelta(seconds=1.5)]
-        assert all(t >= boundary - _dt.timedelta(seconds=1.5) for t in after)
+    # The fixture is periodic: lead 0.6 s, talk 1.2 s, gap 1.0 s, so bursts
+    # start 2.8 s apart, and each recording begins on a burst (within the
+    # detector's opening lag and pre-roll). Consecutive recordings are
+    # therefore whole periods apart - not 0.74 s from stream start again.
+    period = 0.6 + 1.2 + 1.0
+    for earlier, later in zip(times, times[1:]):
+        spacing = (later - earlier).total_seconds()
+        periods = round(spacing / period)
+        assert periods >= 1 and abs(spacing - periods * period) < 0.35, \
+            f"recordings {spacing:.2f}s apart do not sit on the fixture's {period}s bursts: {rows}"
     frequencies = [round(row[2], 4) for row in rows]
     # Each recording carries the tuning it was heard on: the first burst
     # closed by itself on 155.1, the next was cut by the retune to 155.16 (so

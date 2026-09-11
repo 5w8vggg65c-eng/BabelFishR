@@ -657,13 +657,16 @@ def test_a_slow_consumer_bounds_the_queue_and_the_loss_is_reported(monkeypatch):
     try:
         source.start()
         sink.send_seconds(6.0)                                    # nobody reads for a while
-        assert wait_for(lambda: source.dropped_frames > 0, timeout=10), "the queue grew without bound"
+        # Until the reader has taken all six seconds in, at least five and a
+        # half of them must have been dropped: the buffer holds half a second.
+        assert wait_for(lambda: source.dropped_frames >= int(5.4 * RATE), timeout=15), \
+            f"the queue grew without bound (dropped {source.dropped_frames})"
         assert source.buffered <= source.capacity <= 30
         assert "audio-dropped" in statuses
         drained = 0
         while source.read(timeout=0.3) is not None:
             drained += 1
-        assert drained <= 30
+        assert drained <= source.capacity
         assert source.dropped_frames >= 4 * RATE
         assert source.metadata().extra["dropped_frames"] == source.dropped_frames
         sink.send_seconds(0.1)

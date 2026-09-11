@@ -603,6 +603,9 @@ class CaptureService:
         #: The thread stop_async() hands the waiting to. None until then.
         self._stopper: Optional[threading.Thread] = None
         self._source_stopped = False
+        self._source_stop_called = False
+        self._source_failure_reported = False
+        self.source_error = ""
         #: Transmissions saved here that no processor accepted. Nothing is
         #: lost - the WAV and the row exist - but they are pending, and the
         #: application must not report them finished.
@@ -623,6 +626,7 @@ class CaptureService:
         self._running = True
         self._finished = False
         self._source_stopped = False
+        self._source_stop_called = False
         self._set_state(PipelineState.LISTENING)
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="babelfishr-capture")
@@ -689,17 +693,48 @@ class CaptureService:
         return True
 
     def _stop_source(self) -> None:
+        """Stop the source, then settle it (a source with a process of its
+        own - dsd-neo - is waited for here, on the stopper thread, never the
+        caller's). A failure is kept, not swallowed: the source stays this
+        capture's to finish, :attr:`settled` stays False, the failure is
+        published once, and :meth:`retry_stop_source` tries again - only
+        the part that did not succeed."""
+        name = getattr(self.source, "name", "source")
         try:
-            self.source.stop()
-            # A source with a process of its own (dsd-neo) is asked to end
-            # by stop() and waited for here - on the stopper thread, which
-            # is what this method runs on; never on the caller's.
+            if not self._source_stop_called:
+                self.source.stop()
+                self._source_stop_called = True
             settle = getattr(self.source, "settle", None)
             if settle is not None and not settle(5.0):
-                log.warning("%s did not end when asked", getattr(self.source, "name", "source"))
-        except Exception:  # noqa: BLE001
-            log.debug("error stopping source", exc_info=True)
+                raise RuntimeError(f"{name} did not end when asked")
+        except Exception as exc:  # noqa: BLE001 - kept, reported, retried
+            self.source_error = f"{type(exc).__name__}: {exc}"
+            log.warning("stopping %s failed: %s", name, self.source_error)
+            if not self._source_failure_reported:
+                self._source_failure_reported = True
+                self.events.publish("audio-status", {
+                    "kind": "source-stop-failed",
+                    "message": f"The input did not stop cleanly ({self.source_error}); "
+                               f"BabelFishR keeps trying and will not report the run "
+                               f"closed until it has."})
+            return
+        self.source_error = ""
         self._source_stopped = True
+
+    def retry_stop_source(self) -> bool:
+        """A source stop that failed is tried again on a fresh stopper thread.
+        True when a retry was started; False when nothing is left to do or a
+        stop is already under way."""
+        if self._source_stopped or self.stopping or self.alive:
+            return False
+        self._stopper = threading.Thread(
+            target=self._stop_source, name="babelfishr-capture-stop-retry", daemon=True)
+        self._stopper.start()
+        return True
+
+    @property
+    def source_stopped(self) -> bool:
+        return self._source_stopped
 
     @property
     def alive(self) -> bool:
@@ -713,13 +748,15 @@ class CaptureService:
 
     @property
     def settled(self) -> bool:
-        """The run is over: audio thread and stopper ended, finish done.
+        """The run is over: audio thread and stopper ended, finish done, and
+        the source this capture owns actually stopped and settled.
 
         Only then has the last transmission been handed over (or recorded
         in :attr:`unprocessed`), so only then may the processor it feeds be
-        retired.
+        retired; and only then is nothing of the run still running.
         """
-        return self._finished and not self.alive and not self.stopping
+        return (self._finished and not self.alive and not self.stopping
+                and self._source_stopped)
 
     def wait_settled(self, timeout: Optional[float] = None) -> bool:
         """Block until settled, or until ``timeout``. For blocking callers."""
@@ -740,7 +777,7 @@ class CaptureService:
             self._finished = True
         self._drain_source()
         for detected in self.detector.flush():
-            self._capture(detected)
+            self._capture(detected, tuning=getattr(self, "_block_tuning", None))
         self.safety.close()
         self._set_state(PipelineState.IDLE)
 
@@ -750,6 +787,7 @@ class CaptureService:
         self._running = True
         self._finished = False
         self._source_stopped = False
+        self._source_stop_called = False
         self._set_state(PipelineState.LISTENING)
         self._pump(timeout=timeout)
         self._running = False
@@ -819,8 +857,12 @@ class CaptureService:
         self.safety.feed(block)
 
         was_open = self.detector.open
+        # The tuning this block was received under travels with it; a
+        # recording the detector completes while handling it is labelled
+        # with that, never with whatever the receiver reports by now.
+        self._block_tuning = getattr(block, "tuning", None)
         for detected in self.detector.push(block):
-            self._capture(detected)
+            self._capture(detected, tuning=self._block_tuning)
         if self.detector.open and not was_open:
             self._set_state(PipelineState.RECEIVING)
         elif was_open and not self.detector.open:
@@ -843,7 +885,7 @@ class CaptureService:
                  "transmission closed" if was_open else "nothing open")
 
     # -- capture ---------------------------------------------------------
-    def _capture(self, detected: DetectedTransmission, metadata=None) -> Transmission:
+    def _capture(self, detected: DetectedTransmission, metadata=None, tuning=None) -> Transmission:
         """Persist a detected event, then decide what to do with it.
 
         The order is the invariant: WAV to disk, row to the database, and only
@@ -878,6 +920,8 @@ class CaptureService:
             state=ProcessingState.CAPTURED,
         )
         tx.ended_at = detected.ended_at
+        if metadata is None and tuning is not None:
+            metadata = self._metadata_under(tuning)
         self._apply_measured_metadata(tx, metadata)
 
         # --- persistence, before any classification-driven decision ---------
@@ -907,6 +951,18 @@ class CaptureService:
         self.store.save_transmission(tx)
         self.events.publish("updated", tx)
         return tx
+
+    def _metadata_under(self, tuning):
+        """The source's metadata as it stands, but under the tuning a block
+        was received with - for sources that can be asked."""
+        source = self.source
+        try:
+            return source.metadata(tuning=tuning)
+        except TypeError:
+            return source.metadata() if hasattr(source, "metadata") else None
+        except Exception:  # noqa: BLE001 - metadata must never break capture
+            log.debug("signal source metadata failed", exc_info=True)
+            return None
 
     def _apply_measured_metadata(self, tx: Transmission, metadata=None) -> None:
         """Overlay what a signal source genuinely reported, if there is one.

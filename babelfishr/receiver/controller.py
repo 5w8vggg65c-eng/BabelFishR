@@ -351,16 +351,23 @@ class ReceiverController:
 
         changed = (self.tuning.confirmed_hz is not None
                    and (confirmed != self.tuning.confirmed_hz or mode != self.tuning.mode))
-        if changed and self.source is not None and self.source.running:
-            # The boundary carries the tuning that is ending; the source
-            # drops what it buffered under it before the new values apply.
-            self.source.retuned("retune")
+        source = self.source
+        ending = None
+        if changed and source is not None and source.running:
+            # The metadata of the epoch that is ending is taken before the
+            # new values are written, and handed to the source with the
+            # boundary; everything the source hands out after the boundary
+            # then carries the new tuning, and nothing read before it can.
+            ending = source.metadata()
         self.tuning.confirmed_hz = confirmed
         self.tuning.mode = mode
         self.tuning.bandwidth_hz = bandwidth if bandwidth > 0 else None
         self.tuning.confirmed_at = utcnow()
         if changed:
             self.tuning.epoch += 1
+        if ending is not None:
+            source.retuned("retune", ending)
+        if changed:
             self._report("tuned", f"SDR++ reports {confirmed / 1e6:.4f} MHz {mode}")
         return {"confirmed_hz": confirmed, "mode": mode, "bandwidth_hz": bandwidth,
                 "changed": changed}
