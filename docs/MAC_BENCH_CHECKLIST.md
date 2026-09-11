@@ -418,7 +418,8 @@ Not in run 21 or any later build yet; needs a future candidate.
 
 Not in run 21 or any later build yet: this needs a candidate built from the
 commit that carries these corrections. Needs: the RTL-SDR Blog V3 plugged
-in, SDR++ installed in Applications, and - for steps 61-62 only - DSD-neo.
+in, SDR++ installed in Applications, and - for the digital parts of
+steps 61-63 only - DSD-neo.
 No Mac has run any of this. What *has* been run: the real SDR++ (built from
 its source, on Linux, headless, playing a recorded DMR signal from a file)
 and the real DSD-neo, connected exactly as BabelFishR connects them, with
@@ -449,39 +450,60 @@ step 62 needs a known digital channel or a digital radio you do not yet have.
   independent review; nothing about their contents or installation has been
   tried on a Mac. If what you see differs, note the names you found.
 
+**Three things to know before the steps:**
+
+- **"RTL-SDR on USB: still checking".** The first time you open **Receiver ›
+  Receiver status…** after launching BabelFishR, the USB check may not have
+  finished; the line then reads *still checking*. Close the box, wait a few
+  seconds, open **Receiver › Receiver status…** again, and it reads *yes* or
+  *no*. Only the second reading counts.
+- **"Control connection (rigctl)".** BabelFishR talks to SDR++ only while it
+  needs to - when it starts SDR++, when you use Tune receiver, and while
+  monitoring runs. Between runs the line reads *not connected* even though
+  SDR++ is open; that is normal. Do **not** wait for *connected* before
+  pressing Start monitoring; *SDR++ running: yes* is what matters.
+- **"Audio arriving from the receiver"** means SDR++'s audio is reaching
+  BabelFishR. With **Digital voice** ticked it still means that - the audio
+  going *into* DSD-neo - not that DSD-neo decoded any speech. An analog
+  station or the weather channel gives *yes* with no digital speech and no
+  messages. That is correct, not a fault.
+
 57. Choose **Receiver › Receiver status…** with the RTL-SDR plugged in and
     SDR++ *not* running. *Good:* four separate lines: "SDR++ software:
     /Applications/SDR++.app…", "SDR++ running: no", "Control connection
     (rigctl): not connected", "Audio arriving from the receiver: no"; plus
-    "RTL-SDR on USB: yes" and the DSD-neo line (found or not found). The
-    window must open at once, not after a pause. *Bad:* "not found" for
-    SDR++ although it is in Applications (then use **Receiver › Choose SDR++
-    application…** and pick it), or "no" for the USB receiver while it is
-    plugged in. Write down exactly what it says.
+    "RTL-SDR on USB: yes" (or *still checking* - close, wait, reopen) and
+    the DSD-neo line (found or not found). The box must open at once, not
+    after a pause. *Bad:* "not found" for SDR++ although it is in
+    Applications (then use **Receiver › Choose SDR++ application…** and pick
+    it), or "no" for the USB receiver while it is plugged in after a second
+    reading. Write down exactly what it says.
 58. Choose **Receiver › Open receiver window (SDR++)**. *Good:* SDR++ opens
     in its own window and starts receiving (its waterfall moves); the
     BabelFishR bottom line says SDR++ is running and, the first time, that
     its settings were adjusted. In SDR++'s left panel: **Source** reads
     *RTL-SDR*; in **Sinks**, the Radio stream's sink reads *Network*;
     **Rigctl Server** shows *Listening*. **Receiver status…** now says
-    "SDR++ running: yes" and "Control connection (rigctl): connected".
-    *Bad:* SDR++ does not open, opens and closes again, or the bottom line
-    says it did not answer. If SDR++ was already open when you chose this,
-    *Good* is a message that it was attached to - SDR++ is never opened
-    twice.
-59. **Tune in SDR++'s own window** to an FM broadcast station you know (drag
-    the frequency, choose **WFM** in the Radio panel) until you hear it from
-    the Mac's speaker or see a strong signal. Then in BabelFishR choose the
-    **Audio input** *SDR receiver — SDR++ with the RTL-SDR* and press **Start
+    "SDR++ running: yes"; the control-connection line may read *not
+    connected* - see above; that is fine. *Bad:* SDR++ does not open, opens
+    and closes again, or the bottom line says it did not answer. If SDR++
+    was already open when you chose this, *Good* is a message that it was
+    attached to - SDR++ is never opened twice.
+59. **Tune in SDR++'s own window** to an FM broadcast station carrying
+    speech - a talk or news station rather than music (drag the frequency,
+    choose **WFM** in the Radio panel) until you hear it from the Mac's
+    speaker or see a strong signal. Then in BabelFishR choose the **Audio
+    input** *SDR receiver — SDR++ with the RTL-SDR* and press **Start
     monitoring** *without* using Tune receiver. *Good:* the bottom line and
     **Receiver status…** show the frequency you set in SDR++ - BabelFishR
     read it rather than putting its own back - and "Audio arriving from the
-    receiver: yes". Speech from the station appears as messages (music will
-    produce odd transcripts; that is expected). Each message's details show
-    the frequency SDR++ confirmed. *Bad:* the frequency jumping to a value
-    you did not set; nothing appearing while SDR++ clearly plays audio; or
-    BabelFishR recording the room (it must never fall back to the
-    microphone - say something near the Mac and check it does not appear).
+    receiver: yes". Speech from the station appears as messages with a
+    transcript (music produces odd transcripts; that is expected). Each
+    message's details show the frequency SDR++ confirmed. *Bad:* the
+    frequency jumping to a value you did not set; nothing appearing while
+    SDR++ clearly plays audio; or BabelFishR recording the room (it must
+    never fall back to the microphone - say something near the Mac and
+    check it does not appear).
 60. While monitoring, retune in SDR++'s window to a second station. *Good:*
     within a second or two the bottom line notes the new frequency, and the
     messages before the change keep the old frequency while those after
@@ -491,30 +513,38 @@ step 62 needs a known digital channel or a digital radio you do not yet have.
     **FM**, leave *Digital voice* unticked, press OK. *Good:* the bottom
     line says "SDR++ confirms 162.5500 MHz FM" and SDR++'s window shows it;
     the continuous weather voice appears as messages.
-61. Only if DSD-neo is installed: open **Tune receiver…**, tick **Digital
+61. **Switching between analog and digital: always Stop first.** Press
+    **Stop monitoring** and wait until the button reads **Start monitoring**
+    and the activity indicator reads **○ Idle**; only then change the
+    **Digital voice** tick in **Tune receiver…**, press OK, and press
+    **Start monitoring** again. Do this in both directions.
+    Only if DSD-neo is installed: open **Tune receiver…**, tick **Digital
     voice**. *Good:* the **Filter width** changes to 20 kHz by itself. Press
     OK. Press **Start monitoring** on a frequency with no digital traffic
     (the weather channel is fine). *Good:* no messages appear from the
-    analog speech (DSD-neo decodes only digital voice), the bottom line
-    does not report the receiver lost, and **Receiver status…** says
-    "Audio arriving from the receiver: no" (nothing decoded) while SDR++
-    still shows the signal. *Bad:* garbage text presented as messages.
+    analog speech (DSD-neo decodes only digital voice); the bottom line
+    does not report the receiver lost; **Receiver status…** says "Audio
+    arriving from the receiver: yes" (SDR++'s audio is reaching DSD-neo)
+    while no message is produced. *Bad:* garbage text presented as
+    messages. Then Stop, untick **Digital voice**, Start again: *Good:* the
+    weather voice appears as messages once more.
 62. Only with a known DMR or P25 channel in range (or a digital handheld
-    once you have one): keep **Digital voice** ticked, choose the protocol,
-    tune to that channel, **Start monitoring**. *Good:* speech from the
-    digital radio appears as messages; noise and encrypted traffic produce
-    nothing. Note the protocol you tried. Nothing is assumed about which
-    protocol a BTECH or Baofeng will use.
+    once you have one): Stop first, keep **Digital voice** ticked, choose
+    the protocol, tune to that channel, **Start monitoring**. *Good:* speech
+    from the digital radio appears as messages; noise and encrypted traffic
+    produce nothing. Note the protocol you tried. Nothing is assumed about
+    which protocol a BTECH or Baofeng will use.
 63. While monitoring (analog is fine), quit SDR++ from its own menu. *Good:*
     BabelFishR shows a warning that the receiver stopped, keeps every
     message already recorded, and does not switch to another input - say
     something near the Mac and check it is not transcribed. Press **Stop
     monitoring**, reopen the receiver window, start again. Repeat once with
-    **Digital voice** ticked (if DSD-neo is installed): *Good:* the same
-    warning, and **Receiver status…** reports DSD-neo no longer running -
-    it ends together with the receiver's audio and never listens to
-    anything else. Then, while monitoring, unplug the RTL-SDR and write
-    down what SDR++ and BabelFishR each say.
+    **Digital voice** ticked (if DSD-neo is installed; Stop first): *Good:*
+    the same warning. (The DSD-neo line in **Receiver status…** shows where
+    the program is and its version; it does not say whether it is running,
+    so it cannot confirm this - the warning is the check.) Then, while
+    monitoring, unplug the RTL-SDR and write down what SDR++ and BabelFishR
+    each say.
 64. While monitoring, press **Stop monitoring**. *Good:* the button changes
     at once (no pause, no beachball) and SDR++ stays open as you left it.
     Start monitoring again and choose **Quit** in BabelFishR. *Good:*

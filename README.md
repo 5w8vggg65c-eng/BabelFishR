@@ -408,13 +408,22 @@ checked from here):
    System Settings › Privacy & Security › **Open Anyway**, once per program.
 
 **Receiver › Receiver status…** then shows, separately: whether the SDR++
-software was found, whether an RTL-SDR is on the USB bus, whether SDR++ is
-running and answering, and whether audio is actually arriving. Those are
-four different things, and the window never runs them together.
+software was found, whether an RTL-SDR is on the USB bus (the first look
+may say *still checking* - reopen the box a few seconds later), whether
+SDR++ is running, whether BabelFishR currently holds a control connection
+to it (only during a run or a tune; *not connected* between runs is
+normal and no reason to wait before Start), and whether audio is arriving.
+*Audio arriving* means SDR++'s audio is reaching BabelFishR - with Digital
+voice ticked, the audio going into DSD-neo, not decoded speech. The DSD-neo
+line names the program and its version; it is not a running indicator.
+Those are different things, and the window never runs them together.
 
 **Using it.** Plug in the RTL-SDR, choose *SDR receiver* in the Audio input
 list, open the receiver window, tune - in SDR++'s own window or with
-Receiver › Tune receiver - then press **Start monitoring**. Start reads what
+Receiver › Tune receiver - then press **Start monitoring**. To switch
+between analog and digital decoding, press Stop monitoring, wait for the
+activity indicator to read Idle, change the Digital voice tick, then Start
+again. Start reads what
 SDR++ is tuned to *now* and uses that; tuning you did in the SDR++ window is
 respected, and a change you make there while monitoring is picked up within
 a second and marked on the messages. Each message records what SDR++
