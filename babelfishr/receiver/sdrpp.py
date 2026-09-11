@@ -168,7 +168,9 @@ class RigctlClient:
     """One TCP line connection to SDR++'s rigctl server. Not thread-safe:
     the controller serialises its use."""
 
-    def __init__(self, host: str, port: int, timeout: float = 3.0):
+    DEFAULT_TIMEOUT = 3.0
+
+    def __init__(self, host: str, port: int, timeout: float = DEFAULT_TIMEOUT):
         self.host, self.port, self.timeout = host, int(port), float(timeout)
         self._sock: Optional[socket.socket] = None
         self._buffer = b""

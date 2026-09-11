@@ -5122,3 +5122,162 @@ The stale footer ("every step uses microphone audio") is corrected.
 - Run 21 cannot test any of this; the next Mac candidate must be built from
   this commit and remain non-publishing. No tag or release was created or
   moved.
+
+---
+
+# SDR receiver: the remaining transition faults, closed
+
+Codex reproduced six faults on `5bfa6a3` (its environment: Linux, Python
+3.12, PySide6 6.8.3 offscreen, stand-ins, no radio, no Mac) and asked for
+each to be closed at its boundary with fail-before/pass-after tests. This
+section records the reproductions, the changes, what ran against the real
+decoder, and what is still unknown.
+
+## Identifiers
+
+| | |
+|---|---|
+| Base | `5bfa6a340bb575581c4109587bf679df11d35b7d` (verified equal to the remote tip, worktree clean before editing) |
+| Commit | the commit carrying this section |
+| Branch | `claude/radio-decoder-translator-0oslya` |
+| Workflow / tag / release / packaging | nothing dispatched, tagged or published; no packaging change; run 21 cannot test this |
+
+## Faults, causes and changes
+
+- **A1 (input identity).** Codex fed zero PCM, stopped the fake sink for
+  good, held the handling of "Connection to TCP Server Disconnected." for
+  1.2 s while stdout reading went on, and the fake decoder's substitute tone
+  was saved as a 1.46 s SDR++/DSD-neo recording. Read in
+  `dsd_symbol.c symbol_read_sample_tcp()`: dsd-neo opens its alternate audio
+  input *before* printing that line, so no diagnostic handling can prevent
+  the transition. **Change:** BabelFishR owns the SDR++ network-sink
+  connection and feeds dsd-neo through stdin (`-i -`, raw s16le mono at
+  `-s`, docs/cli.md line 80). `symbol_read_sample_stdin()` requests
+  shutdown on end-of-file and has no other input. The pump reconnects to
+  the sink for `RECONNECT_SECONDS` (5 s; dsd-neo merely waits on its pipe)
+  and otherwise closes the pipe: dsd-neo ends, the stream ends
+  (`receiver-lost`), nothing else is decoded. `_watch_stderr` only reports.
+  `receiving` for the digital source now means PCM arriving at the pump
+  (the receiver's audio), `decoding` means dsd-neo produced speech.
+- **B1 (ordinary journey).** Open → the operator tunes SDR++ to 162.55 →
+  Start restored the stored 155.1 because `pending_tune` stayed set from
+  the launch. **Change:** the stored choice is applied *at launch*, once
+  SDR++ answers (`_apply_stored_tuning`), and consumed there; Start reads
+  back and adopts whatever SDR++ is tuned to; an explicit Tune receiver
+  request while SDR++ runs is applied at once; `pending_tune` survives only
+  when the launch-time tune failed and only for an SDR++ we launched; an
+  attached SDR++ is read back, never retuned. The rigctl connection is held
+  only while a run is on (SDR++ serves one client), closed with the run.
+- **B2 (backdated recordings).** `detector.reset()` restarted the sample
+  count while `AudioBlock.offset` stayed stream-relative, so `stream_start =
+  timestamp - offset` restored the old origin and the next recording was
+  dated 0.74 s after stream start again. **Change:** the detector
+  re-anchors its origin on every block (`stream_start = block.timestamp -
+  (samples_seen + pending)/rate`), so a reset, and the decoded path's
+  wall-clock offsets with gaps, keep recordings at their true times. Stored
+  `started_at`/`duration` are checked across three retunes on both paths.
+- **B3 (a second boundary erased the first).** `_boundary()` cleared the
+  buffer including earlier markers, and `read()` skipped anything from an
+  older generation. **Change:** the buffer is a deque under a condition;
+  a retune drops the *audio* of the ending epoch and keeps every marker;
+  `read()` delivers markers regardless of generation; overflow drops the
+  oldest audio block, never a marker; and the capture drains what the
+  source still holds (audio and markers, in order) before its final flush,
+  so a retune just before Stop still closes the open transmission under
+  the tuning it was heard on. Two retunes before a drain, a held consumer
+  and 12 s of overflow pressure are tested.
+- **C1 (Stop waited on the poller's lock).** `release_source()` took the
+  controller lock that `read_back()` holds across rigctl I/O; with a reply
+  delayed 1.2 s, Stop took 1.2 s and the 20 ms heartbeat saw no tick.
+  **Change:** a separate state lock for handoffs (never held across I/O);
+  the poller is bound to a run id and to its source, and a loop whose run
+  ended does nothing to the next run's source even when its read outlives
+  it; `_stop_polling` never joins; the shutdown thread joins the poller
+  with the rigctl timeout as bound; closing the run's rigctl socket is not
+  waited on. Tested with a real window, a 20 ms heartbeat, a fake SDR++
+  delaying every reply 1.2 s, two Stop rounds, a restart and Quit.
+- **C2 (cleanup exceptions lost ownership).** `begin_shutdown()` took the
+  resources out of the controller first; an exception from
+  `process.terminate()` skipped the restoration, so the second close found
+  nothing and reported done while SDR++ lived. **Change:** nothing is
+  taken up front; each resource is cleared only after its own step
+  succeeded (source settled, rigctl closed, process ended); an exception,
+  a termination that returns with the process alive, or a settle that
+  fails leaves that resource owned and the handle errored; the next
+  begin_shutdown works on what is left and does not repeat what ended;
+  `app.receiver_error` is shown by the window while Quit retries. Tested
+  with an injected OSError, a no-op termination and a failing settle.
+- **The exact-PID assertion** in
+  `test_a_running_sdrpp_whose_rigctl_is_off_is_neither_duplicated_nor_rewritten`
+  matched by identity or by `NSpid` (Codex's container showed another PID
+  namespace's numbers in `/proc`); the refusal/no-second-launch checks are
+  unchanged.
+
+## Real decoder (this container; dsd-neo 2.9.0 built from `630a123e`)
+
+- Fed raw s16le at 48 kHz on stdin (`-i - -s 48000 -fs -V 1 -o -`) from
+  the DMR discriminator fixture: 63 sync lines, decoded speech on stdout;
+  a 2.5 s pause with no data: still alive, still waiting (no fallback,
+  no "Interrupted"/"Disconnected" lines); stdin closed: exit 0 after
+  0.42 s, "NOTICE: Exiting." on stderr.
+- `test_real_dsd_neo_decodes_from_stdin_and_ends_on_end_of_file` (skipped
+  without `BABELFISHR_DSD_NEO`/`BABELFISHR_DSD_FIXTURE_WAV`; run here):
+  through `DecodedVoiceSource` with the fake sink stopping for good after
+  4 s - speech blocks arrived, `receiver-lost` reported, dsd-neo exited 0
+  with "Exiting", no TCP loss lines. The existing real-decoder end-to-end
+  test also passes through the new pump.
+- Not repeated in this pass: the SDR++ File Source runs of the previous
+  section (the pump's socket side is the same `PcmTcpSource` recv path they
+  exercised; the stdin side is the run above).
+
+## Tests
+
+`tests/test_sdr_receiver_transitions.py` (11 + 1 real-decoder): A1 identity
+with delayed diagnostics; B1 journey through `MainWindow._open_receiver()`,
+the fake's window-tuning control and `app.start_session()` without flags,
+plus the explicit-request and attach cases; B2 stored times on the analog
+and decoded paths across three retunes; B3 two retunes before a drain,
+overflow pressure, a held consumer through the real capture; C1 heartbeat
+Stop ×2, restart, Quit against a 1.2 s rigctl delay, and an old poll loop
+against a new run; C2 exception, timeout and failed settle. Existing tests
+updated for the stdin command line, the buffer API (`buffered`/`capacity`),
+the launch-time tuning (requested_hz recorded, epoch counts), `receiving`
+vs `decoding`, and the wording of `receiver-lost`.
+
+## Evidence
+
+| Check | Result |
+|---|---|
+| `tests/test_sdr_receiver_transitions.py` | 11 passed, 1 skipped without the real-decoder env (passes with it) |
+| The same tests against `5bfa6a3` in a worktree with the new stand-ins, one test per process, 150 s limit | B1: "the stored choice is applied when we start SDR++" (the baseline applied nothing at launch and restored it at Start); B2 analog and decoded: "stored started_at went backwards"; B3 buffer: `no attribute 'buffered'` (no marker-keeping buffer existed); B3 held audio: "voice heard on 155.100 MHz was saved under a later frequency" (155.16); C1: "Stop waited 1.87 s for the receiver lock"; C2 exception: "the live SDR++ was forgotten after the exception"; C2 failed settle: "SDR++ was ended although the decoder had not settled". Two pass on the baseline as guards (the old-polling-loop test; the no-op termination case, which the previous pass already handled). **A1 on the baseline fails only at the command-line check (`-i tcp:` vs `-i -`)**: under the schedule this test imposes (the "Disconnected" line held 1.2 s) the baseline saved no recording here, so Codex's 1.46 s substitute recording was **not** reproduced in this container; the closure rests on the decoder now having no other input (source-read and verified on the real binary below), not on a reproduced failure |
+| `tests/test_sdr_receiver.py` + `tests/test_sdr_receiver_corrections.py` + transitions, together | 44 passed, 2 skipped (the two real-decoder tests without env) |
+| Both real-decoder tests with `BABELFISHR_DSD_NEO`/`BABELFISHR_DSD_FIXTURE_WAV` set | 2 passed (14.9 s) |
+| Full suite, nothing else running | **1021 passed, 13 skipped, 0 failed**, 342 s |
+| Skips (13) | QtMultimedia ×2, CoreAudio, PlistBuddy, Whisper model ×5, Argos ×2, the two real-decoder tests when their env is unset |
+| `git diff --check`, `compileall` | clean |
+| Seen once, not reproduced | one run of the two B2 tests ended in a Python fatal-error traceback at interpreter exit (numpy extension frames, after the assertions had already failed for the timing reason since fixed); the same tests then ran clean three times and in the full suite |
+
+Environment: Linux container, Python 3.11, PySide6 offscreen, no audio backend, no receiver, no Mac; dsd-neo 2.9.0 built from `630a123e`. Mock ASR/translation throughout.
+
+## Installation names (from Codex's release-listing check)
+
+`sdrpp_macos_arm.zip` under SDR++'s *nightly* release (mutable; note the
+date) and `dsd-neo-macos-arm64-portable-v2.9.0.dmg` under dsd-neo v2.9.0.
+Verified as names in release metadata only - not contents, compatibility,
+signing or installation. README and checklist S name them and the Finder
+routes (**Receiver › Choose SDR++ application…** / **Choose DSD-neo
+program…**).
+
+## Still unknown
+
+- Everything on a Mac and with the RTL-SDR: the macOS SDR++ build, the
+  nightly's contents, Gatekeeper, the dongle, over-the-air signals.
+- File replay is not reception; the filter-width finding is one DMR
+  fixture; mock recognition is not recognition.
+- dsd-neo waiting on an empty pipe indefinitely is what the pinned source
+  does; a receiver that streams nothing for a long time therefore keeps
+  the decoder waiting rather than ending it - the poll and status lines
+  say whether audio is arriving.
+- Eric's acoustic radio test stands (work radio speaker → laptop
+  microphone → BabelFishR); direct RTL-SDR reception and FalconClaw/PTT
+  remain unverified.

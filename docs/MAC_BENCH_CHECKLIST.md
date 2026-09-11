@@ -435,15 +435,19 @@ step 62 needs a known digital channel or a digital radio you do not yet have.
 **Installing the two programs (once, by clicking):**
 
 - SDR++: from https://github.com/AlexandreRouma/SDRPlusPlus/releases take
-  the macOS download and put **SDR++.app** in **Applications**. Open it once
-  on its own (System Settings › Privacy & Security › **Open Anyway** if
-  macOS objects), confirm its window appears, then quit it.
+  **`sdrpp_macos_arm.zip`** from the *nightly* release (write down the date
+  shown next to it: nightlies change), open the zip and put **SDR++.app** in
+  **Applications**. Open it once on its own (System Settings › Privacy &
+  Security › **Open Anyway** if macOS objects), confirm its window appears,
+  then quit it.
 - DSD-neo (digital voice only): from https://github.com/arancormonk/dsd-neo/releases
-  take the macOS `arm64` `.dmg`, open it, drag **dsd-neo** to a folder you
-  can find again (Applications is fine). In BabelFishR choose **Receiver ›
-  Choose DSD-neo program…** and pick that `dsd-neo` file.
-- The exact file names on those pages could not be checked from where this
-  was written; if what you see differs, note the names you found.
+  take version **v2.9.0**, file **`dsd-neo-macos-arm64-portable-v2.9.0.dmg`**,
+  open it, drag **dsd-neo** to a folder you can find again (Applications is
+  fine). In BabelFishR choose **Receiver › Choose DSD-neo program…** and pick
+  that `dsd-neo` file.
+- Those two file names were read from GitHub's release listings by an
+  independent review; nothing about their contents or installation has been
+  tried on a Mac. If what you see differs, note the names you found.
 
 57. Choose **Receiver › Receiver status…** with the RTL-SDR plugged in and
     SDR++ *not* running. *Good:* four separate lines: "SDR++ software:
@@ -505,9 +509,12 @@ step 62 needs a known digital channel or a digital radio you do not yet have.
     BabelFishR shows a warning that the receiver stopped, keeps every
     message already recorded, and does not switch to another input - say
     something near the Mac and check it is not transcribed. Press **Stop
-    monitoring**, reopen the receiver window, start again. Then, while
-    monitoring, unplug the RTL-SDR and write down what SDR++ and BabelFishR
-    each say.
+    monitoring**, reopen the receiver window, start again. Repeat once with
+    **Digital voice** ticked (if DSD-neo is installed): *Good:* the same
+    warning, and **Receiver status…** reports DSD-neo no longer running -
+    it ends together with the receiver's audio and never listens to
+    anything else. Then, while monitoring, unplug the RTL-SDR and write
+    down what SDR++ and BabelFishR each say.
 64. While monitoring, press **Stop monitoring**. *Good:* the button changes
     at once (no pause, no beachball) and SDR++ stays open as you left it.
     Start monitoring again and choose **Quit** in BabelFishR. *Good:*

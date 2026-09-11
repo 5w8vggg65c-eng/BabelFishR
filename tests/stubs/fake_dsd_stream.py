@@ -3,8 +3,9 @@
 
 Reproduces the interface observed on the real binary (docs/cli.md,
 docs/network-audio.md and the run recorded in babelfishr/receiver/contract.py):
-"-i tcp:host:port" connects to the PCM producer as a client, "-s" is the
-input rate, "-o -" writes decoded audio to stdout as s16le 8000 Hz two
+"-i -" reads raw s16le mono from stdin and ends at end of file (the
+input BabelFishR uses); "-i tcp:host:port" connects to the PCM producer as
+a client; "-s" is the input rate, "-o -" writes decoded audio to stdout as s16le 8000 Hz two
 channels (left slot 1, right slot 2), decoder events go to stderr as
 "Sync: +DMR  [SLOT1]  slot2  | Color Code=02 | VC1", connection refused
 exits 0 at once, and a producer that closes leaves dsd-neo running: it
@@ -28,8 +29,11 @@ import time
 def main():
     args = sys.argv[1:]
     host, port, rate, slot = "localhost", 7355, 48000, 3
+    use_stdin = False
     for index, arg in enumerate(args):
-        if arg == "-i" and args[index + 1].startswith("tcp"):
+        if arg == "-i" and args[index + 1] == "-":
+            use_stdin = True
+        elif arg == "-i" and args[index + 1].startswith("tcp"):
             parts = args[index + 1].split(":")
             if len(parts) == 3:
                 host, port = parts[1], int(parts[2])
@@ -38,13 +42,8 @@ def main():
         if arg == "-V":
             slot = int(args[index + 1])
     sys.stderr.write("dsd-neo 2.9.0-fake-stream\n")
+    sys.stderr.write(f"NOTICE: WAV input sample rate: {rate} Hz (interp=1)\n")
     sys.stderr.flush()
-    try:
-        conn = socket.create_connection((host, port), timeout=5)
-    except OSError as exc:
-        sys.stderr.write(f"tcp connect failed: {exc}\nNOTICE: Exiting.\n")
-        sys.stderr.flush()
-        return 0
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     delay = float(os.environ.get("FAKE_DSD_SIGTERM_DELAY") or 0)
     if delay:
@@ -52,17 +51,44 @@ def main():
             time.sleep(delay)
             sys.exit(0)
         signal.signal(signal.SIGTERM, slow_exit)
+    conn = None
+    if use_stdin:
+        # "-i -": raw s16le mono on stdin (docs/cli.md line 80). Observed on
+        # the real binary: a gap with no data only blocks the read; end of
+        # file ends the program (exit 0, "NOTICE: Exiting.") - it never opens
+        # another input. The same here.
+        sys.stderr.write("Audio In/Out Device: -\n")
+        sys.stderr.flush()
+        source = sys.stdin.buffer
+        def read_chunk():
+            try:
+                return source.read1(rate * 2 // 50)
+            except (OSError, ValueError):
+                return b""
+    else:
+        try:
+            conn = socket.create_connection((host, port), timeout=5)
+        except OSError as exc:
+            sys.stderr.write(f"tcp connect failed: {exc}\nNOTICE: Exiting.\n")
+            sys.stderr.flush()
+            return 0
+        def read_chunk():
+            try:
+                return conn.recv(rate * 2 // 50)
+            except OSError:
+                return b""
     step = rate // 8000
     out = sys.stdout.buffer
     frames_emitted = 0
     pending = b""
     while True:
-        try:
-            chunk = conn.recv(rate * 2 // 50)
-        except OSError:
-            chunk = b""
+        chunk = read_chunk()
         if not chunk:
-            # Producer gone: like the real dsd-neo, stay alive, say so, retry.
+            if use_stdin:
+                sys.stderr.write("NOTICE: Exiting.\n")
+                sys.stderr.flush()
+                return 0
+            # TCP mode: producer gone. Like the real dsd-neo, stay alive, say so, retry once.
             sys.stderr.write("\nConnection to TCP Server Interrupted. Trying again in 300 ms.\n")
             sys.stderr.flush()
             time.sleep(0.3)
@@ -74,9 +100,10 @@ def main():
                 # Observed on the real binary (dsd_symbol.c, symbol_read_sample_tcp):
                 # one retry after 300 ms; when that fails too it prints this
                 # line, gives the TCP input up for good and opens its own
-                # audio input instead (a sound device, when it has one). From
-                # here on whatever it decodes is NOT the receiver. This
-                # stand-in plays the part with a loud tone, in real time.
+                # audio input instead (a sound device, when it has one) -
+                # BEFORE printing the line. From here on whatever it decodes
+                # is NOT the receiver. This stand-in plays the part with a
+                # loud tone, in real time.
                 sys.stderr.write("Connection to TCP Server Disconnected.\n")
                 sys.stderr.flush()
                 import math

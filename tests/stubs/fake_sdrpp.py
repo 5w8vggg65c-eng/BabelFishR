@@ -23,7 +23,8 @@ FAKE_SDRPP_NO_RIGCTL=1 (run without the rigctl server, whatever the config),
 FAKE_SDRPP_AUDIO_STOP_AFTER=<seconds> (close the audio client and stop
 listening for good after that long; rigctl stays up), FAKE_SDRPP_TUNE_FILE
 (a file whose contents "<hz> [<mode> [<bw>]]" are applied as if the operator
-tuned in the SDR++ window, then removed).
+tuned in the SDR++ window, then removed), FAKE_SDRPP_RIGCTL_DELAY=<seconds>
+(every rigctl reply is delayed that long).
 """
 
 import json
@@ -125,6 +126,7 @@ def rigctl_server(host, port, state):
     srv.listen(4)
     log(f"rigctl listening {host}:{port}")
     refuse = os.environ.get("FAKE_SDRPP_REFUSE_TUNE") == "1"
+    delay = float(os.environ.get("FAKE_SDRPP_RIGCTL_DELAY") or 0)
 
     def serve(conn):
         buffer = b""
@@ -170,6 +172,8 @@ def rigctl_server(host, port, state):
                         return
                     else:
                         reply = "RPRT 1\n"
+                    if delay:
+                        time.sleep(delay)          # a slow or busy SDR++ answering late
                     conn.sendall(reply.encode("ascii"))
 
     # One client at a time, as upstream's clientHandler does: the next

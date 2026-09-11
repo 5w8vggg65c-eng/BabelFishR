@@ -463,8 +463,15 @@ class RadioActivityDetector(TransmissionDetector):
 
     # -- streaming -------------------------------------------------------
     def push(self, block: AudioBlock) -> List[DetectedTransmission]:
-        if self.stream_start is None:
-            self.stream_start = block.timestamp - _dt.timedelta(seconds=block.offset)
+        # Time follows the blocks, not this detector's own sample count: the
+        # origin is re-anchored on every block so that the sample position
+        # where this block begins maps to the block's timestamp. A reset (a
+        # tuning boundary) starts the count again, and the next block anchors
+        # it again - recordings after a boundary keep their true times. A
+        # source whose offsets are wall-clock with gaps (the decoded path)
+        # is followed the same way.
+        ahead = (self._samples_seen + self._pending.size) / float(self.sample_rate)
+        self.stream_start = block.timestamp - _dt.timedelta(seconds=ahead)
         samples = np.asarray(block.samples, dtype=np.float64).ravel()
         self._pending = (np.concatenate([self._pending, samples])
                          if self._pending.size else samples)

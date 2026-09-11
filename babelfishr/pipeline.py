@@ -738,6 +738,7 @@ class CaptureService:
             if self._finished:
                 return
             self._finished = True
+        self._drain_source()
         for detected in self.detector.flush():
             self._capture(detected)
         self.safety.close()
@@ -786,6 +787,29 @@ class CaptureService:
                 self._handle_block(block)
             else:
                 self._boundary(block)
+
+    def _drain_source(self) -> None:
+        """What the source still holds when the run ends was received before
+        the end: audio goes to the detector and every tuning-boundary marker
+        is honoured in order, so a transmission open across a retune made
+        just before Stop closes under the tuning it was heard on rather than
+        under whatever the receiver reports now. Bounded by the source's own
+        buffer; a source without a buffer has nothing to drain."""
+        read = getattr(self.source, "read", None)
+        limit = getattr(self.source, "capacity", 0)
+        if read is None or not limit:
+            return
+        for _ in range(limit + 8):
+            try:
+                item = read(timeout=0.0)
+            except Exception:  # noqa: BLE001 - a closed source has nothing more
+                return
+            if item is None:
+                return
+            if isinstance(item, AudioBlock):
+                self._handle_block(item)
+            else:
+                self._boundary(item)
 
     def _handle_block(self, block: AudioBlock) -> None:
         reading = self.meter.update(block)

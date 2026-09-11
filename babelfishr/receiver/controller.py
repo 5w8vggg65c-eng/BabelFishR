@@ -172,7 +172,8 @@ class ReceiverController:
         self.on_status = on_status
         self.tuning = TuningState()
         self.discovery = Discovery(config)
-        self._lock = threading.RLock()
+        self._lock = threading.RLock()        # held across rigctl I/O only
+        self._state_lock = threading.Lock()   # the cheap handoffs: never held across I/O
         self._rigctl: Optional[RigctlClient] = None
         self._process: Optional[SdrppProcess] = None
         self.source = None
@@ -181,6 +182,7 @@ class ReceiverController:
         self.pending_tune = False
         self._poller: Optional[threading.Thread] = None
         self._polling = False
+        self._poll_run = 0
         self.shutdown_handle: Optional[ReceiverShutdown] = None
 
     # -- status -------------------------------------------------------------
@@ -277,12 +279,10 @@ class ReceiverController:
             self._process = SdrppProcess(executable, root=root if receiver.sdrpp_root else None,
                                          autostart=True)
             self._process.launch()
-            # Freshly started by us with a frequency the operator chose in
-            # Tune receiver: that choice is applied once SDR++ answers.
-            self.pending_tune = self.pending_tune or bool(receiver.frequency_hz)
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 if rigctl_reachable(receiver.rigctl_host, receiver.rigctl_port):
+                    self._apply_stored_tuning()
                     return
                 if not self._process.alive:
                     raise ReceiverUnavailable(
@@ -296,13 +296,38 @@ class ReceiverController:
                 f"enable its Rigctl Server module (BabelFishR sets this up when it "
                 f"starts SDR++ itself).")
 
+    def _apply_stored_tuning(self) -> None:
+        """A fresh SDR++ that we started gets the operator's stored choice
+        (the last Tune receiver request) at once, before they can touch it.
+        From then on the SDR++ window's own tuning is what counts: Start
+        reads it back rather than putting an older preference over it."""
+        if not self.receiver.frequency_hz:
+            self.pending_tune = False
+            return
+        try:
+            self.tune()
+        except ReceiverError as exc:
+            # Applied at Start instead; the failure is not hidden.
+            log.warning("stored tuning not applied at launch: %s", exc)
+            self.pending_tune = True
+
     def _rig(self) -> RigctlClient:
-        # One connection, held: upstream serves one rigctl client at a time,
-        # so a second connection would wait behind this one.
+        # One connection, held while a source runs: upstream serves one
+        # rigctl client at a time, so a second connection would wait behind
+        # this one. Between runs it is closed (see _release_rig_if_idle), so
+        # nothing else the operator points at SDR++'s rigctl is locked out.
         if self._rigctl is None or not self._rigctl.connected:
             self._rigctl = RigctlClient(self.receiver.rigctl_host, self.receiver.rigctl_port)
             self._rigctl.connect()
         return self._rigctl
+
+    def _release_rig_if_idle(self) -> None:
+        if self.source is None and self._rigctl is not None:
+            rigctl, self._rigctl = self._rigctl, None
+            try:
+                rigctl.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     # -- tuning -----------------------------------------------------------------
     def read_back(self) -> Dict[str, Any]:
@@ -317,7 +342,9 @@ class ReceiverController:
             except RigctlError as exc:
                 self._rigctl = None
                 raise ReceiverError(str(exc)) from exc
-            return self._confirm(confirmed, mode, bandwidth)
+            result = self._confirm(confirmed, mode, bandwidth)
+            self._release_rig_if_idle()
+            return result
 
     def _confirm(self, confirmed: float, mode: str, bandwidth: int) -> Dict[str, Any]:
         from ..models import utcnow
@@ -368,6 +395,7 @@ class ReceiverController:
             self.pending_tune = False
             self._report("tuned", f"SDR++ reports {confirmed / 1e6:.4f} MHz {actual_mode}")
             result["requested_hz"] = self.tuning.requested_hz
+            self._release_rig_if_idle()
             return result
 
     def request_start(self) -> None:
@@ -384,31 +412,39 @@ class ReceiverController:
     start_radio = request_start
 
     # -- watching the receiver while a source runs -----------------------------
-    def _poll(self) -> None:
+    def _poll(self, run: int, source) -> None:
+        """Follow the receiver's tuning while *source* runs. Bound to one
+        run: a loop whose run has ended (Stop, then a new Start) does nothing
+        to the next run's source, even if a read it began outlives it."""
+        def current() -> bool:
+            return self._polling and self._poll_run == run
+
         receiver_lost = None
-        while self._polling:
+        while current():
             time.sleep(self.POLL_SECONDS)
-            if not self._polling:
+            if not current():
                 break
             try:
                 self.read_back()
             except ReceiverError as exc:
                 receiver_lost = str(exc)
                 break
-        if receiver_lost and self._polling:
-            source = self.source
-            if source is not None and source.running:
-                source.end(f"SDR++ stopped answering ({receiver_lost}); the stream is over. "
-                           f"Nothing else is recorded in its place.")
-        self._polling = False
+        if receiver_lost and current() and source is self.source and source.running:
+            source.end(f"SDR++ stopped answering ({receiver_lost}); the stream is over. "
+                       f"Nothing else is recorded in its place.")
 
-    def _start_polling(self) -> None:
+    def _start_polling(self, source) -> None:
+        self._poll_run += 1
         self._polling = True
-        self._poller = threading.Thread(target=self._poll, daemon=True, name="receiver poll")
+        self._poller = threading.Thread(target=self._poll, args=(self._poll_run, source),
+                                        daemon=True, name=f"receiver poll {self._poll_run}")
         self._poller.start()
 
     def _stop_polling(self) -> None:
+        """Ask the poller to end; never waits for it (it may be inside a
+        rigctl read). The shutdown thread joins it."""
         self._polling = False
+        self._poll_run += 1
 
     # -- the source -------------------------------------------------------------
     def open_source(self):
@@ -420,10 +456,10 @@ class ReceiverController:
         different input."""
         receiver = self.receiver
         self.ensure_sdrpp()
-        if self.pending_tune:
-            self.tune()
+        if self.pending_tune and self._process is not None and self._process.alive:
+            self.tune()                    # an explicit request that could not be applied yet
         else:
-            self.read_back()
+            self.read_back()               # the SDR++ window's own tuning, whoever set it
         self.request_start()
         if receiver.digital:
             analyser = DsdNeoAnalyser.from_config(self.config)
@@ -435,13 +471,14 @@ class ReceiverController:
                 executable, receiver.audio_host, receiver.audio_port, self.tuning,
                 protocol_flag=preset.flag, slot=receiver.digital_slot,
                 input_sample_rate=receiver.sample_rate, on_status=self.on_status,
-                extra_args=list(self.config.analysis.dsd_args or []))
+                extra_args=list(self.config.analysis.dsd_args or []),
+                connect_timeout=receiver.connect_timeout_s)
         else:
             self.source = PcmTcpSource(
                 receiver.audio_host, receiver.audio_port, self.tuning,
                 sample_rate=receiver.sample_rate, on_status=self.on_status,
                 connect_timeout=receiver.connect_timeout_s)
-        self._start_polling()
+        self._start_polling(self.source)
         return self.source
 
     def release_source(self) -> None:
@@ -450,10 +487,20 @@ class ReceiverController:
         that never reached a capture is stopped directly, which is cheap.
         SDR++ keeps running so the operator's receiver window stays as it is."""
         self._stop_polling()
-        with self._lock:
+        with self._state_lock:
             source, self.source = self.source, None
         if source is not None and source.running and getattr(source, "_reader", None) is None:
             source.stop()
+        # The held rigctl connection goes with the run so that SDR++'s one
+        # rigctl slot is free between runs. Closing a socket is cheap and is
+        # not waited on: a poll read still in flight on it fails at once, and
+        # that loop, bound to the run that just ended, does nothing with it.
+        rigctl, self._rigctl = self._rigctl, None
+        if rigctl is not None:
+            try:
+                rigctl.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def settle_source(self, source, timeout: float = 5.0) -> bool:
         """Wait for a stopped source's process to end. For the capture
@@ -463,34 +510,48 @@ class ReceiverController:
         return True
 
     def begin_shutdown(self) -> ReceiverShutdown:
-        """Application exit. Returns the handle the application waits for."""
-        if self.shutdown_handle is not None and not self.shutdown_handle.settled:
-            return self.shutdown_handle
+        """Application exit. Returns the handle the application waits for.
+
+        Nothing is taken away from the controller up front: each resource is
+        released only when its own step has succeeded, so an exception, a
+        timeout or a settle that fails leaves that resource owned, and the
+        next begin_shutdown (the application retries a failed close) works
+        on it again instead of forgetting it. What has already ended is not
+        ended twice. Never waits on the caller's thread: the poller's
+        outstanding read is joined on the shutdown thread.
+        """
+        handle = self.shutdown_handle
+        if handle is not None and not handle.settled:
+            return handle
         self._stop_polling()
-        with self._lock:
-            source, self.source = self.source, None
-            rigctl, self._rigctl = self._rigctl, None
-            process, self._process = self._process, None
+        poller = self._poller
 
         def work() -> None:
-            # What does not end is kept, so the next begin_shutdown (the
-            # application retries a failed close) tries it again rather than
-            # forgetting it.
+            if poller is not None and poller.is_alive():
+                # Its read has a bounded timeout; account for it.
+                poller.join(timeout=RigctlClient.DEFAULT_TIMEOUT + 1.0)
+            with self._state_lock:
+                source = self.source
             if source is not None:
                 if source.running:
                     source.stop()
                 if not self.settle_source(source):
-                    with self._lock:
-                        self.source = source
                     raise RuntimeError("dsd-neo did not end when asked")
+                with self._state_lock:
+                    if self.source is source:
+                        self.source = None
+            rigctl = self._rigctl
             if rigctl is not None:
-                rigctl.close()
+                try:
+                    rigctl.close()
+                finally:
+                    self._rigctl = None            # a socket that will not close is closed enough
+            process = self._process
             if process is not None:
-                process.terminate()
+                process.terminate()                # raises → still owned, retried next time
                 if process.alive:
-                    with self._lock:
-                        self._process = process
                     raise RuntimeError("the SDR++ that BabelFishR started did not end")
+                self._process = None
 
         self.shutdown_handle = ReceiverShutdown(work)
         return self.shutdown_handle

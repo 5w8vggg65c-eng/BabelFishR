@@ -233,16 +233,14 @@ def test_a_retune_drops_audio_buffered_under_the_previous_frequency(receiver_con
     try:
         source = controller.open_source()
         source.start()
-        assert wait_for(lambda: source._queue.qsize() >= 3, timeout=5)
-        buffered = source._queue.qsize()
-        assert buffered >= 3
+        assert wait_for(lambda: source.buffered >= 3, timeout=5)
         result = controller.tune(frequency_hz=155.16e6)
         assert result["confirmed_hz"] == 155160000.0
         # Whatever was queued is gone; what arrives next is under the new tuning.
         block = source.read(timeout=2.0)
         assert block is not None
         assert source.metadata().tuned_frequency_hz == 155160000.0
-        assert source._queue.qsize() <= 2
+        assert source.buffered <= 2
     finally:
         controller.shutdown()
 
@@ -342,8 +340,8 @@ def test_digital_reception_runs_through_the_decoder_and_takes_one_slot(receiver_
     try:
         source = app._signal_source
         assert isinstance(source, DecodedVoiceSource) and source.sample_rate == DSD_NEO.output_sample_rate
-        assert source.command()[1:8] == ["-i", f"tcp:127.0.0.1:{receiver_config.receiver.audio_port}",
-                                         "-s", "48000", "-fs", "-V", "1"]
+        assert source.command()[1:8] == ["-i", "-", "-s", "48000", "-fs", "-V", "1"], \
+            "dsd-neo must read the receiver's audio from BabelFishR (stdin), never fetch it itself"
         app.begin_capture()
         assert wait_for(lambda: source.process is not None and source.process.poll() is None, timeout=5)
         pid = source.process.pid

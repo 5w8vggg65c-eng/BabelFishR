@@ -16,10 +16,10 @@ under, and only then does audio under the new tuning flow.
 
 from __future__ import annotations
 
+import collections
 import datetime as _dt
 import logging
 import os
-import queue
 import re
 import socket
 import subprocess
@@ -190,8 +190,16 @@ class _Reader(threading.Thread):
 
 
 class _StreamSource(SignalSource):
-    """The shared machinery: a bounded queue, a generation counter, boundary
-    markers, status reports, and a record of when audio last arrived."""
+    """The shared machinery: a bounded buffer, a generation counter, boundary
+    markers that are never lost, status reports, and a record of when audio
+    last arrived.
+
+    The buffer holds audio blocks and boundary markers in arrival order. A
+    retune drops the *audio* buffered under the ending tuning but keeps every
+    marker, so a consumer that drains late still receives each boundary in
+    order and closes what it holds under the tuning it was really received
+    on. Overflow drops the oldest audio, never a marker.
+    """
 
     measures_rf = True
 
@@ -202,8 +210,9 @@ class _StreamSource(SignalSource):
         self.name = name
         self.on_status = on_status
         self.block_frames = max(1, int(self.sample_rate * block_ms / 1000))
-        self._queue: "queue.Queue" = queue.Queue(
-            maxsize=max(4, int(QUEUE_SECONDS * 1000 / block_ms)))
+        self.capacity = max(4, int(QUEUE_SECONDS * 1000 / block_ms))
+        self._items: "collections.deque" = collections.deque()
+        self._cond = threading.Condition()
         self._running = False
         self._finished = False
         self._generation = 0
@@ -211,61 +220,66 @@ class _StreamSource(SignalSource):
         self._start_mono = time.monotonic()
         self._last_offset = 0.0
         self._reader: Optional[_Reader] = None
-        self._lock = threading.Lock()
         self.last_block_at: Optional[float] = None
         self.dropped_frames = 0
         self._dropping = False
 
-    # -- queue ----------------------------------------------------------------
+    # -- the buffer -----------------------------------------------------------
+    @property
+    def buffered(self) -> int:
+        """Audio blocks waiting for the consumer (markers not counted)."""
+        with self._cond:
+            return sum(1 for _, item in self._items if isinstance(item, AudioBlock))
+
     def _enqueue(self, generation: int, item, frames: int) -> None:
         if frames > 0:
             # Audio arrived from the receiver's side (a socket read, decoded
             # output) - whether or not a consumer has taken it yet. Silence
             # this source synthesises passes frames=0 and does not count.
             self.last_block_at = time.monotonic()
-        while True:
-            try:
-                self._queue.put_nowait((generation, item))
-                if self._dropping:
-                    self._dropping = False
-                    self._report("audio-resumed", f"{self.name}: buffering caught up "
-                                                  f"({self.dropped_frames} frames lost so far)")
-                return
-            except queue.Full:
-                try:
-                    old_generation, old = self._queue.get_nowait()
-                except queue.Empty:
-                    continue
-                if isinstance(old, AudioBlock):
-                    self.dropped_frames += int(old.samples.size)
+        with self._cond:
+            if isinstance(item, AudioBlock):
+                audio = sum(1 for _, other in self._items if isinstance(other, AudioBlock))
+                if audio >= self.capacity:
+                    # Drop the oldest audio block; markers stay where they are.
+                    for index, (_, other) in enumerate(self._items):
+                        if isinstance(other, AudioBlock):
+                            del self._items[index]
+                            self.dropped_frames += int(other.samples.size)
+                            break
                     if not self._dropping:
                         self._dropping = True
+                        self._cond.notify_all()
                         self._report("audio-dropped", f"{self.name}: the consumer is not "
                                                       f"keeping up; the oldest buffered audio "
                                                       f"is being dropped")
+                elif self._dropping:
+                    self._dropping = False
+                    self._report("audio-resumed", f"{self.name}: buffering caught up "
+                                                  f"({self.dropped_frames} frames lost so far)")
+            self._items.append((generation, item))
+            self._cond.notify_all()
 
     def _boundary(self, reason: str) -> None:
-        """A tuning change: drop what was buffered, then hand the consumer a
-        marker carrying the metadata of the epoch that just ended."""
+        """A tuning change: drop the audio buffered under the ending tuning,
+        keep every earlier marker, and add one carrying the ending epoch's
+        metadata (taken now, before the new values are written)."""
         ending = self.metadata()
-        with self._lock:
+        with self._cond:
             self._generation += 1
-            while True:
-                try:
-                    self._queue.get_nowait()
-                except queue.Empty:
-                    break
-            self._queue.put((self._generation, StreamBoundary(ending, reason)))
+            kept = [(g, item) for g, item in self._items if isinstance(item, StreamBoundary)]
+            self._items.clear()
+            self._items.extend(kept)
+            self._items.append((self._generation, StreamBoundary(ending, reason)))
+            self._cond.notify_all()
 
     def flush(self) -> None:
-        """Drop everything buffered so far (a retune with no consumer)."""
-        with self._lock:
+        """Drop the audio buffered so far; markers stay."""
+        with self._cond:
             self._generation += 1
-            while True:
-                try:
-                    self._queue.get_nowait()
-                except queue.Empty:
-                    break
+            kept = [(g, item) for g, item in self._items if isinstance(item, StreamBoundary)]
+            self._items.clear()
+            self._items.extend(kept)
 
     def retuned(self, reason: str = "retune") -> None:
         """The controller confirmed a new tuning: mark the boundary."""
@@ -283,19 +297,20 @@ class _StreamSource(SignalSource):
     def read(self, timeout: float = 1.0):
         deadline = time.monotonic() + timeout
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return None
-            try:
-                generation, item = self._queue.get(timeout=remaining)
-            except queue.Empty:
-                return None
+            with self._cond:
+                while not self._items:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not self._cond.wait(remaining):
+                        return None
+                generation, item = self._items.popleft()
+                current = self._generation
             if item is None:
                 return None                    # a wake-up, not audio
-            if generation != self._generation:
+            if isinstance(item, StreamBoundary):
+                return item                    # every marker reaches the consumer
+            if generation != current:
                 continue                       # buffered under an earlier tuning
-            if isinstance(item, AudioBlock):
-                self._last_offset = item.offset
+            self._last_offset = item.offset
             return item
 
     @property
@@ -320,10 +335,9 @@ class _StreamSource(SignalSource):
         self.read_wake()
 
     def read_wake(self) -> None:
-        try:
-            self._queue.put_nowait((-1, None))
-        except queue.Full:
-            pass
+        with self._cond:
+            self._items.append((-1, None))
+            self._cond.notify_all()
 
     def end(self, reason: str) -> None:
         """The controller lost the receiver: the stream is over."""
@@ -470,25 +484,40 @@ class CallTracker:
 
 
 class DecodedVoiceSource(_StreamSource):
-    """dsd-neo between the receiver and the pipeline.
+    """dsd-neo between the receiver and the pipeline - with BabelFishR
+    owning the receiver connection.
 
-    dsd-neo connects to SDR++'s network sink itself (``-i tcp:host:port``),
-    decodes with the chosen profile and writes the decoded speech to its
-    stdout (``-o -``: 8 kHz, two channels, left = slot 1, right = slot 2).
-    One slot is taken: two simultaneous conversations must not be mixed into
-    one transcript. dsd-neo writes audio only while decoding voice
-    (observed), so this source keeps time by the clock and fills the gaps
-    with silence, and the detector sees each call end. Its stderr says when
-    the producer went away ("Connection to TCP Server Interrupted") and when
-    it came back, which is how a broken input is told from an idle channel.
-    Encrypted or unsupported traffic yields no speech from dsd-neo, so it
-    yields no transmission here - it is never presented as decoded.
+    BabelFishR connects to SDR++'s network sink itself and pumps the raw PCM
+    into dsd-neo's standard input (``-i -``: raw s16le mono at ``-s`` Hz,
+    docs/cli.md line 80). dsd-neo then has exactly one possible input: when
+    that pipe reaches end-of-file it requests its own shutdown
+    (dsd_symbol.c symbol_read_sample_stdin(): sf_read_short returning 0 →
+    dsd_request_shutdown) instead of opening a sound device, as its TCP
+    input does after a failed reconnect (symbol_read_sample_tcp()). Verified
+    on the pinned binary here: a 2.5 s gap with no data only blocks it; EOF
+    ends it (exit 0) within half a second. So nothing but the receiver can
+    ever reach the decoder, whatever the timing of its diagnostic lines.
+
+    The decoded speech comes back on stdout (8 kHz, two channels, left =
+    slot 1, right = slot 2); one slot is taken. dsd-neo writes audio only
+    while decoding voice (observed), so this source keeps time by the clock
+    and fills the gaps with silence, and the detector sees each call end.
+    A producer that goes away is reconnected for a short while (dsd-neo
+    waits on its pipe meanwhile); one that does not come back ends the
+    stream, and the pipe is closed so the decoder ends too. Encrypted or
+    unsupported traffic yields no speech from dsd-neo, so it yields no
+    transmission here - it is never presented as decoded.
     """
+
+    #: How long the pump tries to get SDR++'s sink back after losing it
+    #: before declaring the receiver lost.
+    RECONNECT_SECONDS = 5.0
 
     def __init__(self, executable: str, host: str, port: int, tuning: TuningState,
                  protocol_flag: str = "-fa", slot: int = 1,
                  input_sample_rate: int = DSD_NEO.input_sample_rate,
                  on_status: StatusCallback = None, extra_args: Optional[List[str]] = None,
+                 connect_timeout: float = 5.0,
                  name: str = "SDR++ receiver → DSD-neo (digital)"):
         super().__init__(tuning, DSD_NEO.output_sample_rate, name, on_status)
         self.executable = executable
@@ -497,24 +526,36 @@ class DecodedVoiceSource(_StreamSource):
         self.slot = 1 if int(slot) not in (1, 2) else int(slot)
         self.input_sample_rate = int(input_sample_rate)
         self.extra_args = list(extra_args or [])
+        self.connect_timeout = connect_timeout
         self.process: Optional[subprocess.Popen] = None
+        self._sock: Optional[socket.socket] = None
+        self._pump: Optional[threading.Thread] = None
         self._stderr_thread: Optional[threading.Thread] = None
         self._filler: Optional[threading.Thread] = None
         self.calls = CallTracker(self.slot)
         self.stderr_tail: List[str] = []
         self._last_audio_mono: Optional[float] = None
+        self._last_pcm_mono: Optional[float] = None
+        self.pcm_bytes_in = 0
         self._filled_until: float = 0.0
         self.exit_code: Optional[int] = None
         self._stopped_by_us = False
+        self._producer_ended = False
+        self._stdin_lock = threading.Lock()
 
     def command(self) -> List[str]:
-        return [self.executable, "-i", f"tcp:{self.host}:{self.port}",
+        return [self.executable, "-i", "-",
                 "-s", str(self.input_sample_rate), self.protocol_flag,
                 "-V", str(self.slot), "-o", "-", *self.extra_args]
 
     def start(self) -> None:
+        # The receiver connection first: without a producer no decoder is
+        # started at all, and there is nothing else it could listen to.
+        self._sock = socket.create_connection((self.host, self.port),
+                                              timeout=self.connect_timeout)
+        self._sock.settimeout(None)
         self.process = subprocess.Popen(
-            self.command(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            self.command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, env=dict(os.environ), start_new_session=True)
         self._running = True
         self._finished = False
@@ -531,9 +572,90 @@ class DecodedVoiceSource(_StreamSource):
         self._filler = threading.Thread(target=self._fill_silence, daemon=True,
                                         name="dsd-neo idle fill")
         self._filler.start()
+        self._pump = threading.Thread(target=self._pump_pcm, daemon=True,
+                                      name="receiver → dsd-neo pump")
+        self._pump.start()
         self._report("connected", f"dsd-neo (pid {self.process.pid}) decoding "
-                                  f"{self.protocol_flag} slot {self.slot} from "
-                                  f"SDR++ at {self.host}:{self.port}")
+                                  f"{self.protocol_flag} slot {self.slot}; BabelFishR feeds it "
+                                  f"SDR++'s audio from {self.host}:{self.port}")
+
+    # -- the receiver → decoder pump ---------------------------------------------
+    def _recv(self) -> bytes:
+        sock = self._sock
+        if sock is None:
+            return b""
+        try:
+            return sock.recv(8192)
+        except OSError:
+            return b""
+
+    def _pump_pcm(self) -> None:
+        stdin = self.process.stdin
+        while self._running:
+            data = self._recv()
+            if not data:
+                if not self._running or not self._reconnect():
+                    break
+                continue
+            self.pcm_bytes_in += len(data)
+            self._last_pcm_mono = time.monotonic()
+            with self._stdin_lock:
+                try:
+                    stdin.write(data)
+                    stdin.flush()
+                except (BrokenPipeError, OSError, ValueError):
+                    break                          # the decoder is gone; its watcher says so
+        # Whatever ended it, the decoder's one input is closed now: it reads
+        # end-of-file and ends itself (verified), so nothing else can be
+        # decoded in the receiver's place.
+        self._close_stdin()
+        if self._running and not self._stopped_by_us:
+            self._producer_ended = True
+            self._running = False
+            self._finished = True
+            self._report("receiver-lost",
+                         f"SDR++'s audio stopped arriving at {self.host}:{self.port} and did "
+                         f"not come back within {self.RECONNECT_SECONDS:.0f}s; the stream is "
+                         f"over and dsd-neo was closed with it. Nothing else is recorded in "
+                         f"the receiver's place. Check SDR++ is running with its radio "
+                         f"started, then start again.")
+            self.read_wake()
+
+    def _reconnect(self) -> bool:
+        """The producer went away: try to get it back for a bounded time.
+        dsd-neo simply waits on its pipe meanwhile."""
+        self._report("upstream-lost", f"SDR++'s audio at {self.host}:{self.port} stopped; "
+                                      f"reconnecting for up to {self.RECONNECT_SECONDS:.0f}s")
+        self.calls.upstream_lost = True
+        old, self._sock = self._sock, None
+        if old is not None:
+            try:
+                old.close()
+            except OSError:
+                pass
+        deadline = time.monotonic() + self.RECONNECT_SECONDS
+        while self._running and time.monotonic() < deadline:
+            try:
+                sock = socket.create_connection((self.host, self.port), timeout=1.0)
+            except OSError:
+                time.sleep(0.3)
+                continue
+            sock.settimeout(None)
+            self._sock = sock
+            self.calls.upstream_lost = False
+            self._report("upstream-restored", "SDR++'s audio is arriving again")
+            return True
+        return False
+
+    def _close_stdin(self) -> None:
+        process = self.process
+        if process is None or process.stdin is None:
+            return
+        with self._stdin_lock:
+            try:
+                process.stdin.close()
+            except (OSError, ValueError):
+                pass
 
     def _read_stdout(self, size: int) -> bytes:
         try:
@@ -575,14 +697,12 @@ class DecodedVoiceSource(_StreamSource):
                 self.stderr_tail.append(line)
                 del self.stderr_tail[:-200]
                 kind = self.calls.note(line)
-                if kind == "upstream-lost":
-                    self._report("upstream-lost", f"dsd-neo lost its audio from SDR++: {line.strip()}")
-                elif kind == "upstream-abandoned":
-                    self._abandoned(line.strip())
-                elif kind == "upstream-restored":
-                    self._report("upstream-restored", "dsd-neo is receiving audio from SDR++ again")
-                elif kind == "input-level-low":
+                if kind == "input-level-low":
                     self._report("input-level-low", "dsd-neo hears nothing on the channel (input level low)")
+                elif kind in ("upstream-lost", "upstream-abandoned"):
+                    # Cannot happen with a pipe input (there is no TCP input to
+                    # lose) - reported all the same, never relied on.
+                    self._report("decoder-warning", f"dsd-neo: {line.strip()}")
         except (OSError, ValueError):
             pass
         process = self.process
@@ -593,30 +713,26 @@ class DecodedVoiceSource(_StreamSource):
             except subprocess.TimeoutExpired:
                 code = None
         self.exit_code = code
-        if not self._stopped_by_us:
-            # dsd-neo exits at once when there is no producer to connect to
-            # (observed: exit 0 on connection refused), and otherwise only
-            # when stopped or killed. Either way, nothing more will be decoded
-            # - said in its own words, whichever pipe closed first.
+        if not self._stopped_by_us and not self._producer_ended:
+            # dsd-neo ended on its own (killed, crashed): nothing more will be
+            # decoded - said in its own words, whichever pipe closed first.
             self._report("decoder-exited", f"dsd-neo ended (exit {code}); "
                                            f"last output: {self.stderr_tail[-1] if self.stderr_tail else ''}")
             self._on_stream_end()
 
-    def _abandoned(self, line: str) -> None:
-        """dsd-neo gave the receiver up and turned to its own audio input.
-        Nothing it produces from here on is receiver audio, so the stream
-        ends now and dsd-neo is stopped; no other input takes its place."""
-        self._running = False                # the reader enqueues nothing more
-        self._report("receiver-lost",
-                     f"dsd-neo lost its audio from SDR++ and gave up reconnecting ({line}); "
-                     f"it was stopped so that nothing else is recorded in the receiver's place. "
-                     f"Check SDR++ is running and its radio is started, then start again.")
-        self.stop()
-        self._finished = True
-        self.read_wake()
-
     def _note_event(self, line: str) -> None:            # kept for tests and callers
         self.calls.note(line)
+
+    @property
+    def receiving(self) -> bool:
+        """PCM from SDR++ arrived at the pump within the last two seconds -
+        the receiver's audio, decoded or not."""
+        return self._last_pcm_mono is not None and time.monotonic() - self._last_pcm_mono < 2.0
+
+    @property
+    def decoding(self) -> bool:
+        """dsd-neo produced speech within the last two seconds."""
+        return self._last_audio_mono is not None and time.monotonic() - self._last_audio_mono < 2.0
 
     @property
     def decoder(self) -> Dict[str, object]:
@@ -628,15 +744,25 @@ class DecodedVoiceSource(_StreamSource):
                 "talkgroup": current.get("talkgroup"), "unit_id": current.get("unit_id"),
                 "color_code": current.get("color_code"), "nac": current.get("nac"),
                 "upstream_lost": self.calls.upstream_lost,
-                "upstream_abandoned": self.calls.upstream_abandoned,
+                "producer_ended": self._producer_ended,
+                "pcm_bytes_in": self.pcm_bytes_in, "decoding": self.decoding,
                 "level_low": self.calls.level_low}
 
     def stop(self) -> None:
-        """Ask dsd-neo to end and return at once. The process is waited for
-        by whoever called stop (the capture's stopper thread), never the GUI
-        thread: settle() does the waiting."""
+        """Return at once: the receiver socket and the decoder's input are
+        closed (it ends itself on end-of-file) and it is asked to end. The
+        process is waited for by whoever called stop (the capture's stopper
+        thread), never the GUI thread: settle() does the waiting."""
         self._running = False
         self._stopped_by_us = True
+        sock, self._sock = self._sock, None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+        self._close_stdin()
         process = self.process
         if process is not None and process.poll() is None:
             try:
@@ -675,6 +801,7 @@ class DecodedVoiceSource(_StreamSource):
         meta = self.tuning.metadata(
             "sdrpp+dsd-neo", self.sample_rate, path="digital",
             decoder_flag=self.protocol_flag, slot=self.slot,
+            decoder_input="stdin",
             encrypted=bool(call.get("encrypted", False)),
             color_code=call.get("color_code"),
             nac=call.get("nac"),

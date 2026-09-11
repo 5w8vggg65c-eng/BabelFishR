@@ -375,26 +375,35 @@ radio work and BabelFishR does the recording, transcription and translation.
   on in.
 - **DSD-neo** decodes digital voice (DMR, P25, NXDN, D-STAR, YSF, ...). When
   *Digital voice* is ticked in Tune receiver, BabelFishR runs DSD-neo between
-  SDR++ and itself and records the decoded speech. One TDMA slot is
-  transcribed at a time, chosen in the same dialog; two simultaneous
-  conversations are never mixed into one transcript.
+  SDR++ and itself and records the decoded speech. BabelFishR itself holds
+  the connection to SDR++ and feeds DSD-neo the audio through a pipe (its
+  `-i -` input), so the decoder has exactly one possible input: when the
+  receiver's audio ends, the pipe closes and DSD-neo ends with it. (Given a
+  network address instead, DSD-neo would turn to a sound device of its own
+  after losing that connection - read in its source and reproduced with a
+  stand-in; that route is no longer used.) One TDMA slot is transcribed at
+  a time, chosen in the same dialog; two simultaneous conversations are
+  never mixed into one transcript.
 
 **Installing, without Terminal.** Both programs come from their projects'
 GitHub *Releases* pages (BabelFishR bundles neither; both are GPL-licensed
-and are installed and updated on their own terms). Those pages could not be
-reached from the machine this was written on, so the file names below are
-the projects' documented ones, not ones seen downloaded:
+and are installed and updated on their own terms). The file names below
+were read from GitHub's release listings by an independent review (the
+listing names them; their contents, signing and installation were not
+checked from here):
 
 1. SDR++: https://github.com/AlexandreRouma/SDRPlusPlus/releases - the
-   macOS download is a `.pkg` or `.zip` containing **SDR++.app**. Put it in
-   **Applications**. BabelFishR looks for `/Applications/SDR++.app`; if it is
-   somewhere else, use **Receiver › Choose SDR++ application…** and pick it.
+   macOS download is **`sdrpp_macos_arm.zip`** under the *nightly* release
+   (a nightly is rebuilt over time, so note the date you downloaded). Open
+   the zip and put **SDR++.app** in **Applications**. BabelFishR looks for
+   `/Applications/SDR++.app`; if it is somewhere else, use **Receiver ›
+   Choose SDR++ application…** and pick it.
 2. DSD-neo (only for digital voice): https://github.com/arancormonk/dsd-neo/releases
-   - the macOS Apple-silicon download is a `.dmg` whose name contains
-   `macos-arm64`. Open it and drag the **dsd-neo** program (or its folder) to
-   a place you can find again, such as **Applications**. Then use **Receiver ›
-   Choose DSD-neo program…** and pick the `dsd-neo` file. (Nothing needs to be
-   "on the PATH".)
+   - version **v2.9.0**, file **`dsd-neo-macos-arm64-portable-v2.9.0.dmg`**
+   (2.9.0 is the version BabelFishR was tested against). Open it and drag
+   the **dsd-neo** program (or its folder) to a place you can find again,
+   such as **Applications**. Then use **Receiver › Choose DSD-neo program…**
+   and pick the `dsd-neo` file. (Nothing needs to be "on the PATH".)
 3. On first launch of either, macOS may say it cannot verify the developer:
    System Settings › Privacy & Security › **Open Anyway**, once per program.
 
@@ -415,8 +424,11 @@ transmission is being heard closes that transmission under the frequency it
 was heard on before audio under the new one is taken. If SDR++ is not
 running, cannot be started or stops during a watch, monitoring refuses or
 stops and says so - BabelFishR never records from the laptop microphone in
-the receiver's place, and if DSD-neo loses SDR++'s audio and gives up on it,
-DSD-neo is stopped too (left to itself it would turn to a sound device).
+the receiver's place, and when SDR++'s audio stops for good the pipe into
+DSD-neo is closed, so DSD-neo ends rather than listening to anything else.
+Stop and Quit never wait on the receiver: a slow or silent SDR++ cannot hold
+the window, and a shutdown step that fails is reported and retried rather
+than counted done.
 
 **Filter width for digital voice.** Tune receiver has a *Filter width*
 choice. Ticking *Digital voice* moves it from 12.5 kHz to **20 kHz**: with
@@ -438,7 +450,9 @@ That was measured with one DMR recording; other protocols were not tried.
   tuned over rigctl, and its network sink fed the real DSD-neo, which decoded
   DMR voice; BabelFishR's receiver controller attached to that SDR++, adopted
   its tuning, took the decoded speech, marked a retune boundary and shut down
-  in order. Also observed there: `--autostart` alone produced no audio from
+  in order. The real DSD-neo was also fed through the pipe BabelFishR now
+  uses: it decoded, merely waited through a gap with no data, and ended by
+  itself when the pipe closed. Also observed there: `--autostart` alone produced no audio from
   the File Source until a stop/start over rigctl (a File-Source quirk, not
   seen with hardware, which was absent), and that source runs unpaced.
 - *Not yet:* an RTL-SDR, over-the-air reception, the macOS SDR++ build,
