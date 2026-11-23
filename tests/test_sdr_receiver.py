@@ -287,11 +287,30 @@ def test_the_stream_ending_is_reported_and_never_replaced(receiver_config):
         source = controller.open_source()
         source.start()
         assert source.read(timeout=5.0) is not None
+        assert wait_for(lambda: source.buffered >= 3, timeout=5), "no audio queued to keep"
+        queued = source.buffered
         controller._process.terminate()                      # SDR++ quits under us
         assert wait_for(lambda: source.finished, timeout=5)
         assert not source.running
         assert any(kind == "disconnected" for kind, _ in statuses)
-        assert source.read(timeout=0.2) is None
+        # Audio received before the stream ended is still handed out, in
+        # order (the capture drains it); once the reader has gone, nothing
+        # more arrives and no other source takes over.
+        source._reader.join(timeout=5)
+        assert not source._reader.is_alive(), "the reader did not end with the stream"
+        drained = []
+        for _ in range(source.capacity + 8):    # bounded: the buffer is bounded
+            item = source.read(timeout=0.05)
+            if item is not None:
+                drained.append(item)
+            elif source.buffered == 0:
+                break
+        assert len(drained) >= queued, f"the stream's end discarded audio: kept {len(drained)} of {queued}"
+        assert all(isinstance(item, AudioBlock) for item in drained)
+        offsets = [item.offset for item in drained]
+        assert offsets == sorted(set(offsets)), "pre-disconnect audio must stay in order"
+        assert source.buffered == 0 and source.read(timeout=0.2) is None
+        assert not source.running and source.finished     # still ended: nothing replaced it
     finally:
         controller.shutdown()
 
