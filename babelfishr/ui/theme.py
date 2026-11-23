@@ -1,14 +1,25 @@
-"""Semantic, appearance-adaptive styling.
+"""Semantic, appearance-adaptive styling: the field console.
 
-The previous UI hard-coded a GitHub-dark palette, which looked wrong in macOS
-light appearance and ignored the operator's system setting entirely.  This
-module derives every colour from the Qt palette the platform hands us, so the
-window follows macOS light/dark automatically and inherits the system font.
+The window follows the operator's system appearance, as before. What changes
+with this pass is the look in each:
 
-Design intent: native-feeling and restrained rather than branded. Neutral
-surfaces, one accent colour, generous spacing, rounded cards, and status
-carried by an icon and a word as well as a colour - never by colour alone,
-which matters both for accessibility and for daylight legibility in the field.
+* **Dark appearance - the field console.** A fixed, high-contrast navy
+  palette (influenced by OpenDMR's status-band layouts and the UV-5RM
+  firmware's direct rectangular menus): navy ground, slightly lighter panels,
+  off-white text, cyan for the primary control and the selection, amber for
+  anything that needs review. It is applied as the window's own palette, so
+  native-drawn widgets (fields, menus, tabs, scroll bars) match rather than
+  showing the operating system's grey.
+* **Light appearance - daylight.** Colours still derive from the system
+  palette, for legibility outdoors and for the platform's own accessibility
+  settings.
+
+Both share the same structure: a compact header band and footer band, square
+rectangular controls with a minimal corner radius, strong readable text for
+the original transcript and its translation, and status carried by a symbol
+and a word as well as a colour - never by colour alone.
+
+No web fonts, no animation. The system UI font is used.
 """
 
 from __future__ import annotations
@@ -17,9 +28,21 @@ from typing import Dict
 
 from PySide6 import QtGui, QtWidgets
 
-#: One accent, used for interactive emphasis only.
+#: One accent, used for the primary control and the selection.
 ACCENT_LIGHT = "#0a6cff"
-ACCENT_DARK = "#4d9dff"
+ACCENT_DARK = "#00B4D8"
+
+#: The field console palette (dark appearance).
+CONSOLE = {
+    "window": "#07131F",
+    "surface": "#0E2A44",
+    "surface_raised": "#123756",
+    "border": "#1C3448",
+    "text": "#F4FAFF",
+    "text_muted": "#9DB4C8",
+    "accent": ACCENT_DARK,
+    "on_accent": "#07131F",
+}
 
 #: Status colours, chosen to stay distinguishable for common colour-vision
 #: deficiencies. Every use is paired with a text label or symbol.
@@ -28,15 +51,22 @@ STATUS_LIGHT = {
     "working": "#9a6700", "error": "#cf222e", "ok": "#1a7f37",
 }
 STATUS_DARK = {
-    "idle": "#9aa0a6", "listening": "#3fb950", "receiving": "#4d9dff",
-    "working": "#d29922", "error": "#ff7b72", "ok": "#3fb950",
+    "idle": "#9DB4C8", "listening": "#3FD68B", "receiving": "#00B4D8",
+    "working": "#FFC145", "error": "#FF6B6B", "ok": "#3FD68B",
 }
+
+#: Corner radius for every rectangle: square, deliberate, not rounded cards.
+RADIUS = 3
 
 
 def is_dark(widget: QtWidgets.QWidget = None) -> bool:
-    """True when the current appearance is dark, per the system palette."""
-    palette = widget.palette() if widget is not None else \
-        QtWidgets.QApplication.palette()
+    """True when the operator's *system* appearance is dark.
+
+    Read from the application palette - the system's - not from a widget's,
+    because the window sets its own palette for the field console and must
+    still notice when the system switches back to light.
+    """
+    palette = QtWidgets.QApplication.palette()
     window = palette.color(QtGui.QPalette.Window)
     # Perceived luminance; the system palette is the source of truth.
     luminance = (0.299 * window.red() + 0.587 * window.green()
@@ -54,15 +84,19 @@ def status_color(name: str, widget: QtWidgets.QWidget = None) -> str:
 
 
 def tokens(widget: QtWidgets.QWidget = None) -> Dict[str, str]:
-    """Colour tokens derived from the live system palette."""
-    palette = widget.palette() if widget is not None else \
-        QtWidgets.QApplication.palette()
-    dark = is_dark(widget)
+    """Colour tokens: the field console in dark appearance, the system
+    palette in light."""
+    if is_dark(widget):
+        return dict(CONSOLE, error=STATUS_DARK["error"],
+                    warning=STATUS_DARK["working"], ok=STATUS_DARK["ok"],
+                    dark="1")
+
+    palette = QtWidgets.QApplication.palette()
     window = palette.color(QtGui.QPalette.Window)
     text = palette.color(QtGui.QPalette.WindowText)
 
     def shift(color: QtGui.QColor, amount: int) -> str:
-        factor = 1 + (amount / 100.0) * (1 if dark else -1)
+        factor = 1 - amount / 100.0
         return QtGui.QColor(
             max(0, min(255, int(color.red() * factor))),
             max(0, min(255, int(color.green() * factor))),
@@ -70,18 +104,50 @@ def tokens(widget: QtWidgets.QWidget = None) -> Dict[str, str]:
 
     return {
         "window": window.name(),
-        "surface": shift(window, 8),
-        "surface_raised": shift(window, 16),
-        "border": shift(window, 30),
+        "surface": shift(window, 4),
+        "surface_raised": shift(window, 8),
+        "border": shift(window, 22),
         "text": text.name(),
-        "text_muted": palette.color(QtGui.QPalette.Disabled,
-                                    QtGui.QPalette.WindowText).name(),
-        "accent": accent(widget),
-        "error": status_color("error", widget),
-        "warning": status_color("working", widget),
-        "ok": status_color("ok", widget),
-        "dark": "1" if dark else "0",
+        # A fixed secondary grey rather than the system's disabled colour,
+        # which is too faint for labels an operator has to read outdoors.
+        "text_muted": "#4b5563",
+        "accent": ACCENT_LIGHT,
+        "on_accent": "#ffffff",
+        "error": STATUS_LIGHT["error"],
+        "warning": STATUS_LIGHT["working"],
+        "ok": STATUS_LIGHT["ok"],
+        "dark": "0",
     }
+
+
+def palette(widget: QtWidgets.QWidget = None) -> QtGui.QPalette:
+    """The palette the window should use: the console's in dark appearance,
+    the system's (unchanged) in light."""
+    if not is_dark(widget):
+        return QtGui.QPalette()          # nothing set: inherit the system's
+    t = tokens(widget)
+    p = QtGui.QPalette(QtWidgets.QApplication.palette())
+    c = QtGui.QColor
+    for group in (QtGui.QPalette.Active, QtGui.QPalette.Inactive):
+        p.setColor(group, QtGui.QPalette.Window, c(t["window"]))
+        p.setColor(group, QtGui.QPalette.WindowText, c(t["text"]))
+        p.setColor(group, QtGui.QPalette.Base, c(t["surface"]))
+        p.setColor(group, QtGui.QPalette.AlternateBase, c(t["surface_raised"]))
+        p.setColor(group, QtGui.QPalette.Text, c(t["text"]))
+        p.setColor(group, QtGui.QPalette.Button, c(t["surface"]))
+        p.setColor(group, QtGui.QPalette.ButtonText, c(t["text"]))
+        p.setColor(group, QtGui.QPalette.Highlight, c(t["accent"]))
+        p.setColor(group, QtGui.QPalette.HighlightedText, c(t["on_accent"]))
+        p.setColor(group, QtGui.QPalette.ToolTipBase, c(t["surface_raised"]))
+        p.setColor(group, QtGui.QPalette.ToolTipText, c(t["text"]))
+        p.setColor(group, QtGui.QPalette.PlaceholderText, c(t["text_muted"]))
+        p.setColor(group, QtGui.QPalette.Link, c(t["accent"]))
+    for role in (QtGui.QPalette.WindowText, QtGui.QPalette.Text,
+                 QtGui.QPalette.ButtonText):
+        p.setColor(QtGui.QPalette.Disabled, role, c(t["text_muted"]))
+    p.setColor(QtGui.QPalette.Disabled, QtGui.QPalette.Base, c(t["window"]))
+    p.setColor(QtGui.QPalette.Disabled, QtGui.QPalette.Button, c(t["window"]))
+    return p
 
 
 def stylesheet(widget: QtWidgets.QWidget = None) -> str:
@@ -91,33 +157,72 @@ def stylesheet(widget: QtWidgets.QWidget = None) -> str:
     operator's light/dark setting instead of imposing one.
     """
     t = tokens(widget)
+    r = RADIUS
     return f"""
 QWidget {{ color: {t['text']}; }}
+QMainWindow, #centralRoot {{ background: {t['window']}; }}
 
-/* --- cards: one rounded surface per received transmission ------------- */
+/* --- header band: start, state, mode, readiness, level ----------------- */
+#headerBand {{
+    background: {t['surface']};
+    border: 1px solid {t['border']};
+    border-radius: {r}px;
+}}
+#stateBadge {{ font-size: 15px; font-weight: 700; padding: 4px 10px; }}
+#primaryButton {{
+    background: {t['accent']}; color: {t['on_accent']}; border: none;
+    border-radius: {r}px; padding: 9px 22px; font-size: 14px; font-weight: 700;
+}}
+#primaryButton:hover {{ background: {t['accent']}; }}
+#primaryButton:focus {{ border: 2px solid {t['text']}; }}
+#primaryButton:disabled {{ background: {t['border']}; color: {t['text_muted']}; }}
+#modeButton {{
+    border: 1px solid {t['border']}; border-radius: {r}px;
+    background: {t['window']}; padding: 6px 10px;
+    font-size: 12px; font-weight: 700;
+}}
+#modeButton[mode="field-offline"] {{ border: 1px solid {t['ok']}; color: {t['ok']}; }}
+#modeButton[mode="record-only"] {{ border: 1px solid {t['warning']}; color: {t['warning']}; }}
+#modeButton[mode="online-setup"] {{ border: 1px solid {t['accent']}; color: {t['accent']}; }}
+#modeButton:focus {{ border-width: 2px; }}
+
+/* --- footer band: the status bar --------------------------------------- */
+QStatusBar {{
+    background: {t['surface']}; border-top: 1px solid {t['border']};
+    color: {t['text_muted']}; font-size: 11px;
+}}
+
+/* --- message cards: one per received transmission ---------------------- */
 #bubble {{
     background: {t['surface']};
     border: 1px solid {t['border']};
-    border-radius: 12px;
+    border-left: 3px solid {t['border']};
+    border-radius: {r}px;
 }}
-#bubble[state="failed"] {{ border: 1px solid {t['error']}; }}
-#bubble[review="true"] {{ border: 1px solid {t['warning']}; }}
+#bubble[review="true"] {{ border-left: 3px solid {t['warning']}; }}
+#bubble[state="failed"] {{ border: 1px solid {t['error']};
+                           border-left: 3px solid {t['error']}; }}
 #bubble[skipped="true"] {{ background: {t['window']}; }}
 
-#bubbleHeader {{ color: {t['text_muted']}; font-size: 11px; }}
-#originalText {{ color: {t['text']}; font-size: 13px; }}
-#translatedText {{ color: {t['accent']}; font-size: 13px; }}
+#bubbleHeader {{ color: {t['text_muted']}; font-size: 11px; font-weight: 600; }}
+#originalText {{ color: {t['text']}; font-size: 15px; font-weight: 600; }}
+#translatedText {{ color: {t['accent']}; font-size: 15px; }}
 #errorText {{ color: {t['error']}; font-size: 12px; }}
 #noteText {{ color: {t['warning']}; font-size: 12px; }}
 #provisional {{ color: {t['text_muted']}; font-style: italic; }}
 #statusText {{ color: {t['text_muted']}; font-size: 11px; }}
 #emptyState {{ color: {t['text_muted']}; padding: 48px 24px; font-size: 13px; }}
+#playButton {{
+    border: 1px solid {t['accent']}; color: {t['accent']}; border-radius: {r}px;
+    padding: 4px 12px; font-weight: 700;
+}}
+#playButton:focus {{ border-width: 2px; }}
 
 /* --- metadata chips ---------------------------------------------------- */
 #chip {{
     background: {t['surface_raised']};
     border: 1px solid {t['border']};
-    border-radius: 9px;
+    border-radius: {r}px;
     padding: 2px 8px;
     font-size: 11px;
     color: {t['text_muted']};
@@ -126,38 +231,46 @@ QWidget {{ color: {t['text']}; }}
 #chip[tone="warning"] {{ color: {t['warning']}; border-color: {t['warning']}; }}
 #chip[tone="error"] {{ color: {t['error']}; border-color: {t['error']}; }}
 
-/* --- toolbar ----------------------------------------------------------- */
-#modeBadge {{
-    border-radius: 10px; padding: 4px 12px; font-size: 11px; font-weight: 600;
-    border: 1px solid {t['border']}; background: {t['surface_raised']};
-}}
-#stateBadge {{ font-size: 13px; font-weight: 600; padding: 4px 10px; }}
-#primaryButton {{
-    background: {t['accent']}; color: white; border: none; border-radius: 8px;
-    padding: 8px 20px; font-size: 13px; font-weight: 600;
-}}
-#primaryButton:hover {{ background: {t['accent']}; }}
-#primaryButton:disabled {{ background: {t['border']}; color: {t['text_muted']}; }}
+/* --- the selected input: always visible, always legible ---------------- */
+#inputStatus {{ font-size: 14px; }}
 
 /* --- banners ----------------------------------------------------------- */
 #warningBanner, #privacyBanner, #readyBanner {{
-    border-radius: 8px; padding: 9px 12px; font-size: 12px;
-    border: 1px solid {t['border']};
+    border-radius: {r}px; padding: 9px 12px; font-size: 12px;
+    border: 1px solid {t['border']}; background: {t['surface']};
 }}
 #warningBanner {{ color: {t['warning']}; border-color: {t['warning']}; }}
 #privacyBanner {{ color: {t['accent']}; border-color: {t['accent']}; }}
 #readyBanner {{ color: {t['ok']}; border-color: {t['ok']}; }}
 
-/* --- setup panel ------------------------------------------------------- */
-#setupPanel {{
+/* --- panels: input, session options ------------------------------------ */
+#setupPanel, #inputPanel {{
     background: {t['surface']}; border: 1px solid {t['border']};
-    border-radius: 12px;
+    border-radius: {r}px;
 }}
 #sectionLabel {{ color: {t['text_muted']}; font-size: 11px; font-weight: 600; }}
-QGroupBox {{ border: 1px solid {t['border']}; border-radius: 10px;
-             margin-top: 10px; padding-top: 8px; }}
-QGroupBox::title {{ subcontrol-origin: margin; left: 10px;
-                    color: {t['text_muted']}; }}
+QGroupBox {{ border: 1px solid {t['border']}; border-radius: {r}px;
+             margin-top: 12px; padding-top: 8px; }}
+QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px;
+                    color: {t['text_muted']}; font-weight: 700; }}
+
+/* --- sessions: rectangular tabs, the selected one in the accent -------- */
+#sessionTabs::tab {{
+    background: {t['surface']}; border: 1px solid {t['border']};
+    border-bottom: none; border-radius: 0; padding: 6px 12px; margin-right: 2px;
+}}
+#sessionTabs::tab:selected {{
+    background: {t['surface_raised']}; border-top: 3px solid {t['accent']};
+    font-weight: 700;
+}}
+
+/* --- menus: a solid selection bar ------------------------------------- */
+QMenuBar {{ background: {t['window']}; }}
+QMenuBar::item:selected, QMenu::item:selected {{
+    background: {t['accent']}; color: {t['on_accent']};
+}}
+QMenu {{ background: {t['surface']}; border: 1px solid {t['border']}; }}
+QMenu::item {{ padding: 5px 18px; }}
 """
 
 

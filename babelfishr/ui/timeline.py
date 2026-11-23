@@ -187,6 +187,7 @@ class TransmissionBubble(QtWidgets.QFrame):
         # bottom of this bubble while they play; short ones play straight
         # through. Still a text chat bubble: no waveform, no analyser.
         self.play_button = QtWidgets.QToolButton()
+        self.play_button.setObjectName("playButton")
         self.play_button.setText("\u25b6 Play")
         self.play_button.setToolTip("Play this recording")
         self.play_button.setAccessibleName("Play recording")

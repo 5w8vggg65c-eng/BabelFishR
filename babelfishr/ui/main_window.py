@@ -130,6 +130,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._theming = True
         try:
+            # The field console in dark appearance is the window's own
+            # palette, so natively drawn controls match it; in light
+            # appearance this resets to the system palette.
+            self.setPalette(theme.palette(self))
             self.setStyleSheet(theme.stylesheet(self))
         finally:
             self._theming = False
@@ -146,12 +150,20 @@ class MainWindow(QtWidgets.QMainWindow):
     # -- construction ----------------------------------------------------
     def _build_ui(self) -> None:
         central = QtWidgets.QWidget()
+        central.setObjectName("centralRoot")
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 
-        root.addLayout(self._build_header())
+        # The header band: start/stop, state, operating mode, readiness and
+        # level in one compact strip, the first thing the eye lands on.
+        self.header_band = QtWidgets.QFrame()
+        self.header_band.setObjectName("headerBand")
+        header = self._build_header()
+        header.setContentsMargins(8, 6, 8, 6)
+        self.header_band.setLayout(header)
+        root.addWidget(self.header_band)
 
         # Deliberately outside the collapsible panel below: the operator must
         # be able to see which input is live at every moment of a watch,
@@ -1369,6 +1381,10 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         mode = self.app.mode
         self.mode_button.setText(f"Operating mode: {mode.label}  \u25be")
+        # Styling only, from the mode the application is actually in.
+        self.mode_button.setProperty("mode", mode.value)
+        self.mode_button.style().unpolish(self.mode_button)
+        self.mode_button.style().polish(self.mode_button)
         self.mode_button.setToolTip(
             f"{mode.describe()}\n\nChoose the operating mode. Disabled while "
             f"monitoring is running.")
