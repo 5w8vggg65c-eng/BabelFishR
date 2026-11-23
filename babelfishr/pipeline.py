@@ -641,6 +641,14 @@ class ProcessingPipeline:
                 or getattr(self.translation, "auto_install", False)
                 or supports(source, target)):
             return ""
+        # A pair can also look missing because the engine itself is broken
+        # (Argos not importable, or no packs readable at all): report that,
+        # with the engine's own reason, rather than blame one language pack.
+        available = getattr(self.translation, "available", None)
+        if callable(available) and not available():
+            reason = getattr(self.translation, "unavailable_reason", None)
+            raise EngineUnavailable((reason() if callable(reason) else "")
+                                    or "the translation engine is not available")
         confidence = tx.language_confidence
         if (tx.source_language_mode is not SourceLanguageMode.SPECIFIED
                 and (confidence is None or confidence < LANGUAGE_CERTAIN)):

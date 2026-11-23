@@ -819,3 +819,26 @@ def test_a_failing_pack_lookup_is_a_handled_translation_failure(
     assert tx.state is ProcessingState.FAILED
     assert tx.error.stage == "translation"
     assert "language pack index could not be read" in tx.error.message
+
+
+def test_a_broken_translation_engine_is_not_reported_as_a_missing_pack(
+        config, store, tmp_path):
+    """Argos that cannot import or read any pack lists no pairs, so every
+    pair looks missing. The real reason is reported, not "install es->en"."""
+
+    class Broken(PairTranslation):
+        def available(self):
+            return False
+
+        def unavailable_reason(self):
+            return "Argos Translate is not installed."
+
+    app, tx = run_one(config, store, tmp_path,
+                      ScriptedTranscription(result("Equipo en posición.", ratio=0.6,
+                                                   language="es")),
+                      Broken(pairs=()), target_language="en")
+    assert tx.state is ProcessingState.FAILED and tx.error.stage == "translation"
+    assert "Argos Translate is not installed" in tx.error.message
+    assert "language pack is installed" not in tx.error.message
+    assert "uncertain" not in tx.error.message
+    assert tx.transcript == "Equipo en posición."
