@@ -214,36 +214,141 @@ def test_the_idle_filler_covers_elapsed_time_when_its_wakes_come_late(monkeypatc
     assert abs(source._timeline - covered) < 1e-3          # frames are whole samples
 
 
-def test_the_fake_receiver_streams_at_the_sink_rate_when_its_wakes_come_late(monkeypatch, tmp_path):
+class _LateWakeClock:
+    """The stand-in's clock, made deterministic: time stands still except
+    when the stand-in sleeps, and every sleep wakes 0.5 s late whatever was
+    asked for. A sleep also waits (in real time) until the client has taken
+    every byte sent so far, so the virtual time at which the client holds N
+    bytes is exactly the virtual time at which the stand-in sent them -
+    independent of how loaded the machine running the test is."""
+
+    LATE = 0.5
+
+    def __init__(self):
+        self.now = 1000.0
+        self.sent = 0
+        self.received = 0
+        self.closed = False
+        self._cond = threading.Condition()
+
+    def time(self):
+        with self._cond:
+            return self.now
+
+    def sleep(self, _requested):
+        with self._cond:
+            self._cond.wait_for(lambda: self.closed or self.received >= self.sent, timeout=5)
+            self.now += self.LATE
+
+    def count_sent(self, n):
+        with self._cond:
+            self.sent += n
+
+    def count_received(self, n):
+        with self._cond:
+            self.received += n
+            self._cond.notify_all()
+
+    def close(self):
+        with self._cond:
+            self.closed = True
+            self._cond.notify_all()
+
+
+def test_the_fake_receiver_streams_at_the_sink_rate_when_its_wakes_come_late(monkeypatch):
     spec = importlib.util.spec_from_file_location("fake_sdrpp_for_pacing", FAKE_SDRPP)
     fake = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fake)
-    monkeypatch.setattr(fake.time, "sleep", forced_sleep(0.5))
     monkeypatch.delenv("FAKE_SDRPP_WAV", raising=False)
+    clock = _LateWakeClock()
+    # Only this module's view of time and sockets is replaced; the global
+    # time.sleep and socket module stay untouched for everything else.
+    monkeypatch.setattr(fake, "time", types.SimpleNamespace(time=clock.time, sleep=clock.sleep))
+    servers = []
+    stopping = threading.Event()
+
+    class _CountingConn:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def sendall(self, data):
+            self._conn.sendall(data)
+            clock.count_sent(len(data))
+
+        def close(self):
+            self._conn.close()
+
+    class _OwnedSocket(socket.socket):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            servers.append(self)
+
+        def accept(self):
+            conn, address = super().accept()
+            if stopping.is_set():
+                conn.close()
+                raise OSError("the test is over")
+            return _CountingConn(conn), address
+
+    monkeypatch.setattr(fake, "socket", types.SimpleNamespace(
+        socket=_OwnedSocket, SOL_SOCKET=socket.SOL_SOCKET, SO_REUSEADDR=socket.SO_REUSEADDR))
+
+    def serve():
+        try:
+            fake.audio_sink("127.0.0.1", port, RATE, state)
+        except OSError:
+            pass                                 # the test closed the listening socket
+
     port = free_port()
     state = fake.State()
     state.playing = True
-    threading.Thread(target=fake.audio_sink, args=("127.0.0.1", port, RATE, state), daemon=True).start()
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline and socket.socket().connect_ex(("127.0.0.1", port)) != 0:
-        REAL_SLEEP(0.05)
-    client = socket.create_connection(("127.0.0.1", port), timeout=5)
-    client.settimeout(0.2)
-    # How long does 2.5 s of audio take to arrive when every wake is 0.5 s
-    # late? Paced by the clock: about 2.5 s plus one late wake. Paced by
-    # sleep (the previous stand-in): 125 pieces × 0.5 s, over a minute.
-    wanted = int(2.5 * RATE) * 2
-    received = 0
-    began = time.monotonic()
-    while received < wanted and time.monotonic() - began < 12.0:
+    server = threading.Thread(target=serve, daemon=True)
+    server.start()
+    client = None
+    try:
+        deadline = time.monotonic() + 5
+        while client is None and time.monotonic() < deadline:
+            try:
+                client = socket.create_connection(("127.0.0.1", port), timeout=0.2)
+            except OSError:
+                REAL_SLEEP(0.05)
+        assert client is not None, "the stand-in's audio sink never listened"
+        client.settimeout(0.2)
+        # 2.5 s of audio with every wake 0.5 s late. Paced by the clock, it
+        # has all been sent once the clock reads 2.5 s (five late wakes).
+        # Paced by sleep (the stand-in before 0b3d4ad): one 20 ms piece per
+        # wake, 125 wakes, 62.5 s of virtual time.
+        wanted = int(2.5 * RATE) * 2
+        began = clock.time()
+        received = 0
+        real_deadline = time.monotonic() + 20          # a hang guard, not the measurement
+        while (received < wanted and clock.time() - began < 10.0
+               and time.monotonic() < real_deadline):
+            try:
+                data = client.recv(65536)
+            except socket.timeout:
+                continue
+            if not data:
+                break
+            received += len(data)
+            clock.count_received(len(data))
+        took = clock.time() - began
+        assert received >= wanted, \
+            f"only {received / (RATE * 2):.2f}s of audio arrived in {took:.1f}s of stand-in time"
+        assert took <= 2.5 + _LateWakeClock.LATE, \
+            f"2.5 s of audio took {took:.2f}s of stand-in time with 0.5 s wakes"
+    finally:
+        # Wind the stand-in down: its current client goes away, and the
+        # accept() it returns to is woken by one last connection, refused.
+        stopping.set()
+        clock.close()
+        if client is not None:
+            client.close()
         try:
-            data = client.recv(65536)
-        except socket.timeout:
-            continue
-        if not data:
-            break
-        received += len(data)
-    took = time.monotonic() - began
-    client.close()
-    assert received >= wanted, f"only {received / (RATE * 2):.2f}s of audio arrived in {took:.1f}s"
-    assert took <= 3.6, f"2.5 s of audio took {took:.2f}s to arrive with 0.5 s wakes"
+            socket.create_connection(("127.0.0.1", port), timeout=1).close()
+        except OSError:
+            pass
+        server.join(timeout=5)
+        for sock in servers:
+            sock.close()
+    assert not server.is_alive(), "the stand-in's audio sink did not stop"

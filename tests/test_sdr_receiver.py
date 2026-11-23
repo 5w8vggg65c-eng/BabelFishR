@@ -25,6 +25,7 @@ import numpy as np
 import pytest
 
 from babelfishr.app import BabelFishRApp
+from babelfishr.audio.source import AudioBlock
 from babelfishr.models import ProcessingState, Provenance
 from babelfishr.providers.mock import MockTranscriptionEngine, MockTranslationEngine
 from babelfishr.receiver import (DSD_NEO, SDRPP, ReceiverController, ReceiverError,
@@ -224,9 +225,39 @@ def test_the_pcm_stream_arrives_as_float_blocks_at_the_sink_rate_and_stops_clean
         assert meta.extra["requested_frequency_hz"] == 462.5625e6 and meta.extra["receiver_confirmed"]
         assert meta.modulation == "FM" and meta.rssi_dbm is None and meta.snr_db is None
         assert "connected" in statuses and "tuned" in statuses
+
+        # Stop keeps what arrived before it: CaptureService._drain_source
+        # hands buffered pre-stop audio to the detector after stop(), so the
+        # contract is "drain, then nothing", not "nothing at once". Let a
+        # few blocks queue up unread, so there is always something to keep.
+        last = blocks[-1].offset
+        assert wait_for(lambda: source.buffered >= 3, timeout=5), "no audio queued to keep"
+        queued = source.buffered
         source.stop()
         assert not source.running
-        assert source.read(timeout=0.2) is None
+        kept = []
+        for _ in range(source.capacity + 2):    # bounded: the buffer is bounded
+            item = source.read(timeout=0.2)
+            if item is None:
+                break                            # the stop's wake-up, after the audio
+            kept.append(item)
+        assert len(kept) >= queued, f"stop discarded audio: kept {len(kept)} of {queued}"
+        # The reader ends once its socket is closed, and nothing is added
+        # after it has: what is left (a block read across the stop, extra
+        # wake-ups) drains to an empty buffer within the same bound.
+        source._reader.join(timeout=5)
+        assert not source._reader.is_alive(), "the reader did not end after stop()"
+        for _ in range(source.capacity + 8):
+            item = source.read(timeout=0.05)
+            if item is not None:
+                kept.append(item)
+            elif source.buffered == 0:
+                break
+        assert source.buffered == 0 and source.read(timeout=0.2) is None
+        assert all(isinstance(item, AudioBlock) for item in kept)
+        offsets = [item.offset for item in kept]
+        assert offsets[0] > last and offsets == sorted(set(offsets)), \
+            "kept audio must continue the stream in order"
     finally:
         controller.shutdown()
 
