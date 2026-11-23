@@ -978,11 +978,15 @@ class BabelFishRApp:
             return ("Monitoring is running with engines chosen for a "
                     "different operating mode. Stop monitoring, then try "
                     "again.")
-        if self._processing_pipeline() is None:
+        pipeline = self._processing_pipeline()
+        if pipeline is None:
             summary = self.select_engines()
             detail = "; ".join(summary.warnings) or "no transcription engine"
             return (f"No transcription engine is available in "
                     f"{self.mode.label}: {detail}")
+        if pipeline.is_in_flight(tx_id):
+            return ("This message is still being processed. Try again when it "
+                    "has finished.")
         return ""
 
     def _processing_pipeline(self, for_shutdown: bool = False

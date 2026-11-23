@@ -780,10 +780,12 @@ class Transmission:
             return True
         if self.reviewed:
             return False
-        metadata = self.signal_metadata or {}
-        check = metadata.get("speech_check") or {}
-        if (check.get("verdict") in ("likely_noise", "uncertain")
-                and not metadata.get("speech_confirmed")):
+        # Confirming a message is speech (Retry as speech in...) lifts the
+        # translation hold only; it does not verify the new words, so the
+        # flag stays until the message is marked Reviewed or a fresh check
+        # clears it.
+        check = (self.signal_metadata or {}).get("speech_check") or {}
+        if check.get("verdict") in ("likely_noise", "uncertain"):
             return True
         thresholds = [v for v in (self.transcript_confidence,
                                   self.language_confidence) if v is not None]

@@ -982,9 +982,8 @@ class Store:
                       AND t.transcript_confidence < ?)
                   OR (t.language_confidence IS NOT NULL
                       AND t.language_confidence < ?)
-                  OR (json_extract(t.signal_metadata, '$.speech_check.verdict')
-                      IN ('likely_noise', 'uncertain')
-                      AND json_extract(t.signal_metadata, '$.speech_confirmed') IS NULL))
+                  OR json_extract(t.signal_metadata, '$.speech_check.verdict')
+                     IN ('likely_noise', 'uncertain'))
                ORDER BY t.started_at DESC LIMIT ?""",
             tuple(params)).fetchall()
         return [_from_row(r) for r in rows]

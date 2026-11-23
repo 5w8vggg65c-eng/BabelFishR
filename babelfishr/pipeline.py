@@ -156,10 +156,11 @@ class Recorder:
             return None
 
 
-#: Below this much voiced audio (local VAD, seconds), a transcript is treated
-#: as probably not speech. An absolute figure, not a share: one short real
-#: phrase in a long noisy recording is still speech. Faint or short speech
-#: above it keeps its translation and is at most marked for review.
+#: Below this much voiced audio (local VAD, seconds), the detector heard no
+#: speech. An absolute figure, not a share: one short real phrase in a long
+#: noisy recording is still speech. On its own this only marks the message
+#: for review; translation is held back only when the speech engine agrees
+#: (see assess_speech).
 NO_SPEECH_VAD_SECONDS = 0.25
 #: Used instead when the detector reports only a share.
 NO_SPEECH_VAD_RATIO = 0.02
@@ -168,9 +169,6 @@ NO_SPEECH_VAD_RATIO = 0.02
 #: only together with a low transcript confidence.
 NO_SPEECH_PROBABILITY = 0.6
 NO_SPEECH_CONFIDENCE = 0.5
-#: Under this share, or above NO_SPEECH_PROBABILITY, the transcript is kept
-#: and translated but marked for review.
-UNCERTAIN_VAD_RATIO = 0.2
 #: An automatically detected language below this probability is reported as
 #: uncertain rather than as a missing language pack.
 LANGUAGE_CERTAIN = 0.8
@@ -181,9 +179,10 @@ def assess_speech(result) -> Optional[dict]:
 
     Returns None when there is nothing to say (no text, or no evidence).
     Otherwise a small record for ``signal_metadata["speech_check"]``:
-    ``verdict`` is ``"likely_noise"`` (strong evidence of no speech: the
-    transcript is kept, translation is not attempted, the message is marked
-    for review), ``"uncertain"`` (kept, translated, marked for review) or
+    ``verdict`` is ``"likely_noise"`` (strong evidence of no speech - two
+    independent signals agree: the transcript is kept, translation is not
+    attempted, the message is marked for review), ``"uncertain"`` (one
+    signal doubts it: kept, translated, marked for review) or
     ``"speech"``. The recording itself is never touched.
     """
     if not (getattr(result, "text", "") or "").strip():
@@ -194,11 +193,15 @@ def assess_speech(result) -> Optional[dict]:
     confidence = getattr(result, "confidence", None)
     if ratio is None and nsp is None:
         return None
+    engine_doubts = nsp is not None and nsp >= NO_SPEECH_PROBABILITY
+    engine_unsure = confidence is not None and confidence < NO_SPEECH_CONFIDENCE
     if ratio is not None:
-        likely_noise = (seconds < NO_SPEECH_VAD_SECONDS if seconds is not None
-                        else ratio < NO_SPEECH_VAD_RATIO)
-        uncertain = ratio < UNCERTAIN_VAD_RATIO or (nsp is not None
-                                                    and nsp >= NO_SPEECH_PROBABILITY)
+        vad_heard_none = (seconds < NO_SPEECH_VAD_SECONDS if seconds is not None
+                          else ratio < NO_SPEECH_VAD_RATIO)
+        # Strong evidence only: the local detector heard no speech AND the
+        # speech engine itself doubts it. Either alone means "review".
+        likely_noise = vad_heard_none and (engine_doubts or engine_unsure)
+        uncertain = vad_heard_none or engine_doubts
     else:
         likely_noise = (nsp >= NO_SPEECH_PROBABILITY and confidence is not None
                         and confidence < NO_SPEECH_CONFIDENCE)
@@ -451,6 +454,32 @@ class ProcessingPipeline:
         speech check would otherwise have held the translation back. The
         check is still recorded, for the record.
         """
+        # Admission first, atomically, before the row is read or changed: a
+        # message in flight (the worker would save its own copy over any
+        # change) or a processor shutting down is refused, and nothing about
+        # the message is altered. Returns whether it was really queued.
+        with self._active_lock:
+            if not self._accepting or tx_id in self._in_flight:
+                return False
+            self._in_flight.add(tx_id)
+            self._idle.clear()
+        queued = False
+        try:
+            queued = self._prepare_retry(tx_id, source_language)
+        finally:
+            if queued:
+                self._queue.put(tx_id)
+            else:
+                self._release(tx_id)
+        return queued
+
+    def _release(self, tx_id: str) -> None:
+        with self._active_lock:
+            self._in_flight.discard(tx_id)
+            if not self._in_flight:
+                self._idle.set()
+
+    def _prepare_retry(self, tx_id: str, source_language: Optional[str]) -> bool:
         tx = self.store.get_transmission(tx_id)
         if tx is None:
             return False
@@ -460,14 +489,12 @@ class ProcessingPipeline:
             tx.signal_metadata = dict(tx.signal_metadata or {}, speech_confirmed={
                 "source_language": source_language, "by": "operator"})
             tx.skip_reason = ""
+            # New words, not yet checked: an earlier review was of the old ones.
+            tx.reviewed = False
         tx.clear_error()
         tx.state = ProcessingState.CAPTURED
         self.store.save_transmission(tx)
         self.events.publish("updated", tx)
-        try:
-            self.submit(tx_id)
-        except ProcessingStopped:
-            return False
         return True
 
     # -- worker ----------------------------------------------------------
@@ -489,10 +516,7 @@ class ProcessingPipeline:
             except Exception:  # noqa: BLE001 - a worker must never die
                 log.exception("unhandled error processing %s", tx_id)
             finally:
-                with self._active_lock:
-                    self._in_flight.discard(tx_id)
-                    if not self._in_flight:
-                        self._idle.set()
+                self._release(tx_id)
 
     def _engine_gate(self, stage: str) -> None:
         """Refuse an engine call once this processor has been told to stop.
@@ -602,6 +626,33 @@ class ProcessingPipeline:
             return False
         return True
 
+    def _missing_pair(self, tx: Transmission, target: str) -> str:
+        """Why this pair cannot be translated, in words, or "".
+
+        Tells an uncertain automatic language guess apart from a language
+        pack that is really missing. Skipped when the engine installs packs
+        itself (Online / Setup), which must get its chance. A capability
+        lookup that raises EngineError/EngineUnavailable propagates to the
+        caller's handled translation-failure path.
+        """
+        source = tx.source_language
+        supports = getattr(self.translation, "supports_pair", None)
+        if (not source or source == target or not callable(supports)
+                or getattr(self.translation, "auto_install", False)
+                or supports(source, target)):
+            return ""
+        confidence = tx.language_confidence
+        if (tx.source_language_mode is not SourceLanguageMode.SPECIFIED
+                and (confidence is None or confidence < LANGUAGE_CERTAIN)):
+            shown = f"{confidence:.0%}" if confidence is not None else "unknown certainty"
+            return (f"language uncertain: automatic detection guessed '{source}' "
+                    f"({shown}), and no {source}->{target} pack is installed. "
+                    f"If the speech is another language, choose it with this "
+                    f"message's Retry as speech in... (Session options > "
+                    f"Source language sets it for new recordings).")
+        return (f"no {source}->{target} language pack is installed. Install "
+                f"it in Online / Setup (Tools > Setup assistant), then Retry.")
+
     def _translate(self, tx: Transmission) -> None:
         if self.translation is None:
             return
@@ -620,30 +671,6 @@ class ProcessingPipeline:
             tx.translation = ""
             tx.translation_engine = ""
             return
-        source = tx.source_language
-        supports = getattr(self.translation, "supports_pair", None)
-        if (source and source != target and callable(supports)
-                and not getattr(self.translation, "auto_install", False)
-                and not supports(source, target)):
-            confidence = tx.language_confidence
-            if (tx.source_language_mode is not SourceLanguageMode.SPECIFIED
-                    and (confidence is None or confidence < LANGUAGE_CERTAIN)):
-                shown = f"{confidence:.0%}" if confidence is not None else "unknown certainty"
-                message = (f"language uncertain: automatic detection guessed '{source}' "
-                           f"({shown}), and no {source}->{target} pack is installed. "
-                           f"If the speech is another language, choose it with this "
-                           f"message's Retry as speech in... (Session options > "
-                           f"Source language sets it for new recordings).")
-            else:
-                message = (f"no {source}->{target} language pack is installed. Install "
-                           f"it in Online / Setup (Tools > Setup assistant), then Retry.")
-            tx.fail("translation", message)
-            self.store.save_transmission(tx)
-            self.events.publish("updated", tx)
-            self.events.publish("error", {"transmission": tx.id, "stage": "translation",
-                                          "message": message})
-            return
-
         tx.state = ProcessingState.TRANSLATING
         self.store.save_transmission(tx)
         self.events.publish("updated", tx)
@@ -651,6 +678,15 @@ class ProcessingPipeline:
 
         try:
             self._engine_gate("translation")
+            missing = self._missing_pair(tx, target)
+            if missing:
+                tx.fail("translation", missing)
+                self.store.save_transmission(tx)
+                self.events.publish("updated", tx)
+                self.events.publish("error", {"transmission": tx.id,
+                                              "stage": "translation",
+                                              "message": missing})
+                return
             result = self.translation.translate(
                 tx.transcript, target, source_language=tx.source_language,
                 glossary=self.glossary.mapping(tx.source_language) or None,

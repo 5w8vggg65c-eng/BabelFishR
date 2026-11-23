@@ -108,7 +108,7 @@ class DetectorSettings:
     """A stuck transmitter is split rather than filling the disk."""
 
     segment_seconds: float = 15.0
-    """Processing latency, separate from max_duration (the archival cap).
+    """Processing latency for continuous audio.
 
     A radio burst ends when the channel goes quiet; continuous audio - a
     microphone in a room, an open carrier - may never be quiet for
@@ -116,8 +116,12 @@ class DetectorSettings:
     gate stays open past this length the recording is cut into consecutive
     parts at the quietest frame in the last ``segment_search_seconds``, each
     handed on as soon as it is cut. Nothing is dropped, trimmed or repeated
-    at a cut: the parts join sample for sample. 0 disables segmenting.
-    Bursts shorter than this are unaffected."""
+    at a cut: the parts join sample for sample, and each part records that
+    it continues (signal_metadata["segment"]). 0 disables segmenting.
+    Bursts shorter than this are unaffected. While segmenting is on and
+    shorter than max_duration, no part reaches max_duration, so a stuck
+    carrier becomes a chain of parts rather than one truncated recording;
+    max_duration applies when segmenting is off or not shorter."""
 
     segment_search_seconds: float = 3.0
     """How far back from the segment length to look for the quietest frame."""
@@ -197,6 +201,8 @@ class DetectorSettings:
             raise ValueError("segment_seconds must be 0 (off) or at least 2 seconds")
         if self.segment_search_seconds < 0:
             raise ValueError("segment_search_seconds must be >= 0")
+        if self.segment_seconds and self.segment_search_seconds >= self.segment_seconds:
+            raise ValueError("segment_search_seconds must be shorter than segment_seconds")
         return self
 
 
@@ -536,7 +542,10 @@ class RadioActivityDetector(TransmissionDetector):
         if self._open:
             if self._pending.size:
                 self._buffer.append(self._pending.copy())
-            found = self._close()
+            # Stop (or a break in the stream) ends the audio, not the
+            # transmitter: a recording already handed on in parts keeps its
+            # last samples rather than losing them to squelch-tail trimming.
+            found = self._close(keep_tail=self._continues_previous)
             if found is not None:
                 out.append(found)
         self._pending = np.zeros(0, dtype=np.float64)
@@ -577,7 +586,8 @@ class RadioActivityDetector(TransmissionDetector):
         if loud:
             self._active_frames += 1
 
-        if level < self.close_threshold():
+        holding = level >= self.close_threshold()
+        if not holding:
             self._hang_remaining -= self.frame_dt
             if self._hang_remaining <= 0:
                 completed = self._close()
@@ -588,7 +598,13 @@ class RadioActivityDetector(TransmissionDetector):
         # Processing segments only below the archival cap: a max_duration
         # shorter than segment_seconds still closes as a truncated stuck
         # transmitter, exactly as before.
-        if (completed is None and self.settings.segment_seconds
+        # Cut only on a frame that holds the gate open (at or above the close
+        # threshold, not just the open one - room noise between the two keeps
+        # the gate open and must still be cut): the part left open then
+        # holds signal, so a cut never strands a silent remainder as a
+        # message of its own. While the gate is only counting down its hang,
+        # it closes by itself. Latency is at most segment_seconds + hang_time.
+        if (completed is None and holding and self._open and self.settings.segment_seconds
                 and self.settings.segment_seconds < self.settings.max_duration
                 and self._duration() >= self.settings.segment_seconds):
             completed = self._cut_segment()
@@ -676,7 +692,8 @@ class RadioActivityDetector(TransmissionDetector):
         self._last_active_samples = self._pre_samples
         self._continues_previous = False
 
-    def _close(self, truncated: bool = False) -> Optional[DetectedTransmission]:
+    def _close(self, truncated: bool = False,
+               keep_tail: bool = False) -> Optional[DetectedTransmission]:
         audio = np.concatenate(self._buffer) if self._buffer else np.zeros(0)
         stats = list(self._frame_stats)
         pre_samples = self._pre_samples
@@ -700,7 +717,7 @@ class RadioActivityDetector(TransmissionDetector):
         audio = audio[:keep]
 
         trimmed = 0.0
-        if self.settings.trim_squelch_tail:
+        if self.settings.trim_squelch_tail and not keep_tail:
             audio, trimmed = self._trim_tail(audio, stats)
 
         duration = audio.size / float(self.sample_rate)

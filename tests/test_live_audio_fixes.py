@@ -99,7 +99,8 @@ def test_continuous_speech_in_room_noise_is_handed_on_while_monitoring():
     assert first_at <= 15.0 + 0.5, f"first part only reached processing at {first_at} s"
     parts = [p for _, p in events]
     for at, part in live:
-        assert part.duration <= 15.0 + 0.05
+        # Cut on a loud frame at or after 15 s: at most a hang time later.
+        assert part.duration <= 15.0 + 0.8 + 0.05
         # Bounded latency: a part is handed on as soon as it is cut, and the
         # cut lies at most segment_search_seconds back.
         assert at - (part.start_offset + part.duration) <= 3.0 + 0.1
@@ -159,8 +160,10 @@ def test_short_tail_at_stop_is_kept():
     audio = loud_speech(15.1) + room(15.1)
     parts = [p for _, p in stream(audio, gate(min_duration=0.5))]
     assert parts[-1].continues_previous
-    total = sum(p.audio.size for p in parts)
-    assert total >= audio.size - int(0.5 * SR)
+    first, length = assert_contiguous(parts, audio)
+    # Stop ends the audio, not a transmitter: no squelch-tail trim on the
+    # last part of a recording already handed on in parts.
+    assert first + length == audio.size
 
 
 def test_long_noise_is_also_segmented_and_recorded():
@@ -169,7 +172,7 @@ def test_long_noise_is_also_segmented_and_recorded():
     audio = room(40.0, -10.0, seed=9)
     parts = [p for _, p in stream(audio, gate())]
     assert len(parts) >= 3
-    assert all(p.duration <= 15.05 for p in parts)
+    assert all(p.duration <= 15.85 for p in parts)
     assert_contiguous(parts, audio)
 
 
@@ -184,6 +187,8 @@ def test_segmenting_can_be_turned_off_and_max_duration_still_applies():
 def test_segment_setting_is_validated():
     with pytest.raises(ValueError):
         DetectorSettings(segment_seconds=1.0).validate()
+    with pytest.raises(ValueError):
+        DetectorSettings(segment_seconds=3.0, segment_search_seconds=3.0).validate()
     DetectorSettings(segment_seconds=0).validate()
 
 
@@ -231,13 +236,21 @@ def result(text="Thank you for watching.", ratio=None, nsp=None, confidence=0.9,
 
 
 @pytest.mark.parametrize("kwargs,verdict", [
-    (dict(ratio=0.0, nsp=0.2), "likely_noise"),          # VAD found no voice
+    # Held back only when both signals agree there was no speech.
+    (dict(ratio=0.0, nsp=0.8), "likely_noise"),
     (dict(ratio=0.03, nsp=0.9, duration=4.0), "likely_noise"),   # 0.12 s
-    (dict(ratio=0.12, nsp=0.1), "uncertain"),            # little voice
-    # One short real phrase in a long noisy part: 0.6 s of 15 s is 4%, but
-    # it is speech - kept and translated, marked for review, never held.
-    (dict(ratio=0.04, nsp=0.3, duration=15.0), "uncertain"),
-    (dict(ratio=0.01, seconds=None), "likely_noise"),    # share only
+    (dict(ratio=0.0, nsp=0.2, confidence=0.3), "likely_noise"),
+    # The detector alone, against a confident engine: review, not held. A
+    # short radio reply ("Copy.") can be under the detector's limit.
+    (dict(ratio=0.05, nsp=0.1, duration=4.0), "uncertain"),     # 0.2 s
+    (dict(ratio=0.0, nsp=0.2), "uncertain"),
+    (dict(ratio=0.01, seconds=None), "uncertain"),       # share only
+    (dict(ratio=0.01, seconds=None, nsp=0.7), "likely_noise"),
+    # One short real phrase in a long noisy part (0.6 s of 15 s) is speech:
+    # a low share alone flags nothing, or continuous audio would flood the
+    # review queue.
+    (dict(ratio=0.04, nsp=0.3, duration=15.0), "speech"),
+    (dict(ratio=0.12, nsp=0.1), "speech"),
     (dict(ratio=0.6, nsp=0.7), "uncertain"),             # engine doubts it
     (dict(ratio=0.3, nsp=0.1), "speech"),                # faint but real speech
     (dict(ratio=None, nsp=0.8, confidence=0.3), "likely_noise"),
@@ -302,7 +315,7 @@ def test_noise_transcript_is_kept_not_translated_and_marked_for_review(
     translation = PairTranslation(pairs=(("es", "en"),))
     app, tx = run_one(config, store, tmp_path,
                       ScriptedTranscription(result("Gracias por ver el video.", ratio=0.01,
-                                                   nsp=0.4, language="es")),
+                                                   nsp=0.8, language="es")),
                       translation, target_language="en")
     assert tx.transcript == "Gracias por ver el video."      # kept, never deleted
     assert tx.translation == "" and translation.calls == 0
@@ -328,8 +341,8 @@ def test_faint_real_speech_is_still_translated(config, store, tmp_path):
 def test_uncertain_speech_is_translated_but_marked_for_review(config, store, tmp_path):
     translation = PairTranslation(pairs=(("es", "en"),))
     app, tx = run_one(config, store, tmp_path,
-                      ScriptedTranscription(result("Equipo en posición.", ratio=0.1,
-                                                   nsp=0.3, language="es")),
+                      ScriptedTranscription(result("Equipo en posición.", ratio=0.6,
+                                                   nsp=0.7, language="es")),
                       translation, target_language="en")
     assert tx.translation and tx.needs_review
     assert tx.id in {t.id for t in store.review_queue()}
@@ -436,7 +449,7 @@ def test_retry_as_speech_lifts_the_noise_hold_and_translates(config, store, tmp_
     """"Retry as speech in...": transcribed again in the chosen language and
     translated, which editing the text by hand would not do."""
     transcription = ScriptedTranscription(result("Gracias por ver el video.", ratio=0.01,
-                                                 nsp=0.4, language="es"))
+                                                 nsp=0.8, language="es"))
     translation = PairTranslation(pairs=(("es", "en"),))
     app, tx = run_one(config, store, tmp_path, transcription, translation,
                       target_language="en")
@@ -451,8 +464,14 @@ def test_retry_as_speech_lifts_the_noise_hold_and_translates(config, store, tmp_
     assert tx.translation and translation.calls == 1
     assert tx.signal_metadata["speech_check"]["verdict"] == "likely_noise"  # still on record
     assert tx.signal_metadata["speech_confirmed"]["source_language"] == "es"
-    assert not tx.needs_review
-    assert tx.id not in {t.id for t in store.review_queue()}
+    # Confirming it is speech is not checking the new words: still flagged.
+    assert tx.needs_review
+    assert tx.id in {t.id for t in store.review_queue()}
+    # Saving the operator's check (Edit transcript and translation) clears it.
+    app = BabelFishRApp(config=config, store=store)
+    app.correct(tx.id, transcript=tx.transcript, translation=tx.translation)
+    tx = store.get_transmission(tx.id)
+    assert not tx.needs_review and tx.id not in {t.id for t in store.review_queue()}
 
 
 def test_retry_as_speech_fixes_a_wrong_automatic_language(config, store, tmp_path):
@@ -474,7 +493,8 @@ def test_retry_as_speech_fixes_a_wrong_automatic_language(config, store, tmp_pat
 def test_plain_retry_keeps_the_noise_hold(config, store, tmp_path):
     """Retry without a language re-runs the same evidence and holds again:
     the note does not promise otherwise."""
-    transcription = ScriptedTranscription(result("Gracias.", ratio=0.0, language="es"))
+    transcription = ScriptedTranscription(result("Gracias.", ratio=0.0, nsp=0.8,
+                                                 language="es"))
     translation = PairTranslation(pairs=(("es", "en"),))
     app, tx = run_one(config, store, tmp_path, transcription, translation,
                       target_language="en")
@@ -617,3 +637,185 @@ def test_held_message_explains_itself_and_offers_retry_as_speech(config, store, 
     finally:
         window.close()
         qt.processEvents()
+
+
+# --- review findings ------------------------------------------------------------
+
+@pytest.mark.parametrize("seconds", [14.0, 14.5])
+def test_a_burst_just_under_the_segment_length_is_one_message(seconds):
+    """The cut used to land in the hang after the burst, leaving a silent
+    0.2 s "last part" for speech recognition to invent words from."""
+    from babelfishr.testing import tone
+
+    audio = np.concatenate([silence(1.0, SR), tone(seconds, 1000.0, SR, -12.0),
+                            silence(3.0, SR)])
+    parts = [p for _, p in stream(audio, gate())]
+    assert len(parts) == 1, [round(p.duration, 2) for p in parts]
+    assert not parts[0].continued
+
+
+def test_every_part_holds_signal():
+    """No part is pure quiet: each holds at least one frame above the gate."""
+    from babelfishr.detect import dbfs, rms
+
+    audio = np.concatenate([loud_speech(31.0) + room(31.0), silence(3.0, SR)])
+    frame = int(0.02 * SR)
+    for part in (p for _, p in stream(audio, gate())):
+        levels = [dbfs(rms(part.audio[i:i + frame]))
+                  for i in range(0, part.audio.size - frame + 1, frame)]
+        assert max(levels) >= -24.0          # at least one frame held the gate
+
+
+def test_retry_as_speech_while_processing_is_refused_and_changes_nothing(
+        config, store, tmp_path):
+    from babelfishr.pipeline import EventBus, ProcessingPipeline
+
+    transcription = ScriptedTranscription(result("Gracias.", ratio=0.0, nsp=0.8,
+                                                 language="es"))
+    app, tx = run_one(config, store, tmp_path, transcription,
+                      PairTranslation(pairs=(("es", "en"),)), target_language="en")
+    pipeline = ProcessingPipeline(store=store, transcription=transcription,
+                                  translation=None, config=config, events=EventBus())
+    pipeline._in_flight.add(tx.id)                     # the worker has it
+    assert not pipeline.retry(tx.id, source_language="en")
+    after = store.get_transmission(tx.id)
+    assert "speech_confirmed" not in after.signal_metadata
+    assert after.source_language == "es" and after.needs_review
+
+
+def test_the_confirmation_note_says_only_what_happened():
+    pytest.importorskip("PySide6")
+    from babelfishr.models import Transmission, utcnow
+    from babelfishr.ui.timeline import _speech_check_note
+
+    meta = {"speech_check": {"verdict": "likely_noise"},
+            "speech_confirmed": {"source_language": "en"}}
+    tx = Transmission(session_id="s", started_at=utcnow(), source_language="en",
+                      target_language="en", signal_metadata=meta,
+                      state=ProcessingState.CAPTURED)
+    assert "queued" in _speech_check_note(tx)
+    tx.state = ProcessingState.COMPLETE
+    assert "not translated" in _speech_check_note(tx)
+    tx.source_language, tx.translation = "es", "Thanks."
+    assert "and translated" in _speech_check_note(tx)
+    assert "Edit transcript and translation marks it reviewed" in _speech_check_note(tx)
+    from babelfishr.models import ErrorInfo
+    tx.state = ProcessingState.FAILED
+    tx.error = ErrorInfo(stage="transcription", message="engine unavailable")
+    assert "Transcribing it again failed" in _speech_check_note(tx)
+    tx.error = ErrorInfo(stage="translation", message="no pack")
+    assert "the translation failed" in _speech_check_note(tx)
+    tx.state, tx.error = ProcessingState.SKIPPED, None
+    assert "not transcribed again" in _speech_check_note(tx)
+
+
+def test_room_noise_between_close_and_open_thresholds_is_still_cut():
+    """Speech opens the gate; room noise then sits above the close
+    threshold (-24) but below the open one (-20). The gate never closes and
+    no frame is "loud": parts must still be handed on while it runs."""
+    audio = np.concatenate([loud_speech(1.0), room(60.0, -22.0, seed=11)])
+    events = stream(audio, gate())
+    live = [(at, p) for at, p in events if at != "stop"]
+    assert live and live[0][0] <= 15.0 + 0.8 + 0.5, [round(a, 1) for a, _ in live]
+    assert len(live) >= 3
+    assert_contiguous([p for _, p in events], audio)
+
+
+def _blocking_engine():
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+
+    class Blocking(ScriptedTranscription):
+        def transcribe(self, audio, sample_rate, *, language=None, vocabulary=None):
+            started.set()
+            release.wait(10)
+            return super().transcribe(audio, sample_rate, language=language,
+                                      vocabulary=vocabulary)
+
+    return Blocking(result("Gracias.", ratio=0.0, nsp=0.8, language="es")), started, release
+
+
+def _snapshot(store, tx_id):
+    tx = store.get_transmission(tx_id)
+    return (tx.state, tx.source_language, tx.source_language_mode, tx.reviewed,
+            dict(tx.signal_metadata or {}), tx.error)
+
+
+def test_retry_refused_while_the_worker_has_the_message_changes_nothing(
+        config, store, tmp_path):
+    from babelfishr.pipeline import EventBus, ProcessingPipeline
+
+    engine, started, release = _blocking_engine()
+    app, tx = run_one(config, store, tmp_path,
+                      ScriptedTranscription(result("Gracias.", ratio=0.0, nsp=0.8,
+                                                   language="es")),
+                      PairTranslation(pairs=(("es", "en"),)), target_language="en")
+    pipeline = ProcessingPipeline(store=store, transcription=engine,
+                                  translation=PairTranslation(pairs=(("es", "en"),)),
+                                  config=config, events=EventBus())
+    pipeline.start(None)
+    try:
+        assert pipeline.retry(tx.id)                 # really queued
+        assert started.wait(5)                       # the worker is inside it
+        before = _snapshot(store, tx.id)
+        assert not pipeline.retry(tx.id, source_language="en")
+        assert not pipeline.retry(tx.id)
+        assert _snapshot(store, tx.id) == before, "a refused retry changed the row"
+    finally:
+        release.set()
+        pipeline.wait_until_idle(10)
+        pipeline.stop()
+    after = store.get_transmission(tx.id)
+    assert after.source_language == "es" and "speech_confirmed" not in after.signal_metadata
+
+
+def test_retry_refused_by_a_stopped_processor_changes_nothing(config, store, tmp_path):
+    from babelfishr.pipeline import EventBus, ProcessingPipeline
+
+    transcription = ScriptedTranscription(result("Gracias.", ratio=0.0, nsp=0.8,
+                                                 language="es"))
+    app, tx = run_one(config, store, tmp_path, transcription,
+                      PairTranslation(pairs=(("es", "en"),)), target_language="en")
+    pipeline = ProcessingPipeline(store=store, transcription=transcription,
+                                  translation=None, config=config, events=EventBus())
+    pipeline.start(None)
+    pipeline.stop()
+    before = _snapshot(store, tx.id)
+    assert not pipeline.retry(tx.id, source_language="en")
+    assert _snapshot(store, tx.id) == before
+    assert not pipeline.is_in_flight(tx.id)
+
+
+def test_retry_of_a_missing_message_reports_failure_and_releases_it(config, store):
+    from babelfishr.pipeline import EventBus, ProcessingPipeline
+
+    pipeline = ProcessingPipeline(store=store, transcription=MockTranscriptionEngine(),
+                                  translation=None, config=config, events=EventBus())
+    pipeline.start(None)
+    try:
+        assert not pipeline.retry("tx_gone", source_language="en")
+        assert not pipeline.is_in_flight("tx_gone")
+    finally:
+        pipeline.stop()
+
+
+@pytest.mark.parametrize("error", ["EngineError", "EngineUnavailable"])
+def test_a_failing_pack_lookup_is_a_handled_translation_failure(
+        config, store, tmp_path, error):
+    from babelfishr.providers import base
+
+    exc_type = getattr(base, error)
+
+    class Broken(PairTranslation):
+        def supports_pair(self, source, target):
+            raise exc_type("language pack index could not be read")
+
+    app, tx = run_one(config, store, tmp_path,
+                      ScriptedTranscription(result("Equipo en posición.", ratio=0.6,
+                                                   language="es")),
+                      Broken(), target_language="en")
+    assert tx.transcript == "Equipo en posición."            # preserved
+    assert tx.state is ProcessingState.FAILED
+    assert tx.error.stage == "translation"
+    assert "language pack index could not be read" in tx.error.message

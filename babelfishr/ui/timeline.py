@@ -76,8 +76,31 @@ def _speech_check_note(tx: Transmission) -> str:
         return ""
     confirmed = metadata.get("speech_confirmed") or {}
     if confirmed:
-        return (f"You confirmed this is speech ({confirmed.get('source_language', '?')}); "
-                f"it was transcribed and translated again in that language.")
+        language = confirmed.get("source_language", "?")
+        said = f"You marked this as speech in {language}"
+        check_words = (" Check the new transcript against the audio; saving it with "
+                       "Edit transcript and translation marks it reviewed.")
+        stage = tx.error.stage if tx.error else ""
+        if tx.state is ProcessingState.FAILED:
+            if stage == "translation":
+                return (f"{said}. It was transcribed again; the translation failed "
+                        f"(see the error below).{check_words}")
+            return f"{said}. Transcribing it again failed (see the error below)."
+        if tx.state is ProcessingState.CAPTURED:
+            return f"{said}. It is queued to be transcribed again in that language."
+        if tx.state in (ProcessingState.TRANSCRIBING, ProcessingState.TRANSLATING,
+                        ProcessingState.TRANSCRIBED):
+            return f"{said}. It is being processed again in that language."
+        if tx.state is not ProcessingState.COMPLETE:
+            return f"{said}. It was not transcribed again ({tx.state.value})."
+        if tx.translation:
+            return (f"{said}. It was transcribed again in that language and "
+                    f"translated.{check_words}")
+        if not _differs(tx.source_language, tx.target_language):
+            return (f"{said}. It was transcribed again in that language; it is "
+                    f"already in the target language, so it was not "
+                    f"translated.{check_words}")
+        return f"{said}. It was transcribed again in that language.{check_words}"
     ratio = check.get("speech_ratio")
     seconds = check.get("speech_seconds")
     nsp = check.get("no_speech_probability")
