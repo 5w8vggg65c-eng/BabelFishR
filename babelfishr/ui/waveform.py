@@ -369,8 +369,18 @@ class RecordingWaveform(QtWidgets.QWidget):
         if not self.current_path:
             return ""
         name = os.path.basename(self.current_path)
-        if self.envelope is not None:
-            return f"{name} · {format_duration(self.envelope.duration_s)}"
+        env = self.envelope
+        if env is not None:
+            text = f"{name} · {format_duration(env.duration_s)}"
+            # Say what the drawing is not: the file's true level, or all of it.
+            if env.truncated and (self.max_frames is None
+                                  or env.analysed_frames < min(env.frames, self.max_frames)):
+                readable = env.analysed_frames / float(env.sample_rate or 1)
+                text += f" · file shorter than its header: {readable:.1f} s readable"
+            gain = env.display_gain
+            if gain > 1.05:
+                text += f" · shown \u00d7{gain:.0f}"
+            return text
         return name
 
     def sizeHint(self) -> QtCore.QSize:  # noqa: N802

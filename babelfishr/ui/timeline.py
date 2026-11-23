@@ -311,6 +311,7 @@ class TransmissionBubble(QtWidgets.QFrame):
         bar.addStretch(1)
         self.playback_bar.hide()
         grid.addWidget(self.playback_bar, 1, 1, 1, 3)
+        self._watch_children_for_selection()
 
         self.update_from(tx)
 
@@ -565,6 +566,20 @@ class TransmissionBubble(QtWidgets.QFrame):
             self.selectRequested.emit(self.tx.id)
         super().mousePressEvent(event)
 
+    def _watch_children_for_selection(self) -> None:
+        """A selectable transcript label or a button takes the click and the
+        focus itself, so the row never saw them: watch the children too."""
+        for child in self.findChildren(QtWidgets.QWidget):
+            child.installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        kind = event.type()
+        if kind == QtCore.QEvent.FocusIn or (
+                kind == QtCore.QEvent.MouseButtonPress
+                and event.button() == QtCore.Qt.LeftButton):
+            self.selectRequested.emit(self.tx.id)
+        return False
+
     def focusInEvent(self, event: QtGui.QFocusEvent) -> None:  # noqa: N802
         self.selectRequested.emit(self.tx.id)
         super().focusInEvent(event)
@@ -755,6 +770,8 @@ class TimelineView(QtWidgets.QScrollArea):
     #: The selected row's transmission changed in place (bookmark, review,
     #: text): the same row, new content.
     selectedUpdated = QtCore.Signal(str)
+    #: set_playback() installed a different controller.
+    playbackReplaced = QtCore.Signal(object)
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
@@ -841,6 +858,7 @@ class TimelineView(QtWidgets.QScrollArea):
         controller.positionChanged.connect(self._on_playback_position)
         for bubble in self._bubbles.values():
             bubble._player = controller
+        self.playbackReplaced.emit(controller)
 
     def _on_playback_changed(self, affected) -> None:
         # Expanding or collapsing a control bar changes a bubble's height, so

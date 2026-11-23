@@ -155,7 +155,11 @@ def test_ready_state_title_and_accessibility(widget, tmp_path):
     assert widget.wait_until_loaded(5)
     assert widget.state == "ready" and widget.current_tx_id == "tx1"
     assert widget.envelope.frames == int(12.4 * SR)
-    assert widget.title_text() == "clip_a.wav · 00:12"
+    title = widget.title_text()
+    assert title.startswith("clip_a.wav · 00:12")
+    # Drawn louder than recorded? The title says so (reviewer finding 5).
+    gain = widget.envelope.display_gain
+    assert ("shown \u00d7" in title) == (gain > 1.05), (title, gain)
     assert "clip_a.wav" in widget.accessibleDescription()
     assert "00:12" in widget.accessibleDescription()
 

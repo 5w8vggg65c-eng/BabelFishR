@@ -306,3 +306,82 @@ def test_the_window_resizes_down_to_its_minimum_and_back(qt_app, console):
         pump(qt_app)
         assert not window.grab().isNull()
     assert window.minimumSizeHint().width() <= 1000
+
+
+# ---- reviewer findings (each failed before its fix) -----------------------------
+
+def test_clicking_a_transcript_selects_its_row(qt_app, console):
+    """The selectable transcript label takes the click itself; the row must
+    still become the selected one, or Play original plays another message."""
+    from PySide6.QtTest import QTest
+
+    window, _, made = console
+    window.timeline.select(made[1].id)
+    QTest.mouseClick(window.timeline.bubble(made[0].id).original_label,
+                     QtCore.Qt.LeftButton)
+    pump(qt_app)
+    assert window.timeline.selected_id == made[0].id
+
+
+def test_the_radio_profile_line_is_visible_with_session_options_closed(console):
+    window, _, _ = console
+    window._refresh_context_lines()
+    assert not window.setup_box.isVisible()
+    assert window.profile_line.isVisible()
+    assert window.profile_line.text() == window.channel_label.text()
+    assert window.profile_line.text(), "the profile (or its absence) is stated"
+
+
+def test_pressing_the_current_filter_keeps_playback_and_selection(qt_app, console,
+                                                                 monkeypatch):
+    window, _, made = console
+    window.timeline.select(made[0].id)
+    stopped = []
+    monkeypatch.setattr(window.timeline.playback, "stop", lambda: stopped.append(1))
+    window.filter_all.click()                  # already the view on screen
+    pump(qt_app)
+    assert window.timeline.selected_id == made[0].id
+    assert stopped == []
+    assert window.filter_all.isChecked()
+
+
+def test_a_replaced_playback_controller_is_followed(qt_app, console):
+    from babelfishr.ui.playback import PlaybackController
+
+    window, _, _ = console
+    replacement = PlaybackController(parent=window)
+    window.timeline.set_playback(replacement)
+    assert window.waveform._controller is replacement
+
+
+def test_the_waveform_title_admits_display_gain_and_a_short_file(qt_app, tmp_path):
+    import struct
+    import wave
+
+    from babelfishr.audio.wavefile import write_wav
+    from babelfishr.testing import speech_like
+    from babelfishr.ui.waveform import RecordingWaveform
+
+    quiet = write_wav(str(tmp_path / "quiet.wav"), speech_like(1.0, 48_000, level_dbfs=-30), 48_000)
+    widget = RecordingWaveform()
+    widget.show_recording("q", quiet)
+    assert widget.wait_until_loaded(10.0)
+    assert "shown ×" in widget.title_text(), widget.title_text()
+
+    # A header promising 8000 frames over 1000 frames of data.
+    short = tmp_path / "short.wav"
+    with wave.open(str(short), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(8000)
+        handle.writeframes(struct.pack("<1000h", *([1000] * 1000)))
+    data = bytearray(short.read_bytes())
+    data[40:44] = struct.pack("<I", 8000 * 2)            # data chunk size
+    short.write_bytes(bytes(data))
+    widget.show_recording("s", str(short))
+    widget.wait_until_loaded(10.0)
+    if widget.state == "ready":
+        assert "file shorter than its header" in widget.title_text(), widget.title_text()
+    else:
+        assert widget.state == "error"                   # refused outright is also honest
+    widget.clear()

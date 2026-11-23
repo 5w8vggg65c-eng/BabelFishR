@@ -197,7 +197,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Navigation: the window's own menu bar, below the band as in the
         # approved layout. menuBar() returns this bar, so every menu, action
         # and shortcut is the same object as before.
-        self._nav_bar = QtWidgets.QMenuBar()
+        self._nav_bar = QtWidgets.QMenuBar(central)
         root.addWidget(self._nav_bar)
 
         # -- the two panes --------------------------------------------------
@@ -298,6 +298,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.language_line.setObjectName("paneLine")
         self.language_line.setAccessibleName("Languages")
         left_layout.addWidget(self.language_line)
+        # The radio profile - or the warning that there is none, so no
+        # channel or frequency is stamped - is always in view, not only in
+        # the Session Options panel.
+        self.profile_line = QtWidgets.QLabel("")
+        self.profile_line.setObjectName("paneLine")
+        self.profile_line.setWordWrap(True)
+        self.profile_line.setAccessibleName("Radio profile")
+        left_layout.addWidget(self.profile_line)
         self.receiver_line = QtWidgets.QLabel("")
         self.receiver_line.setObjectName("mutedLine")
         self.receiver_line.setWordWrap(True)
@@ -408,9 +416,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timeline.restoreRequested.connect(self._on_restore_message)
         self.timeline.selectionChanged.connect(self._on_selection_changed)
         self.timeline.selectedUpdated.connect(lambda _id: self._refresh_selected_panel())
-        self.waveform.set_playback(self.timeline.playback)
-        self.timeline.playback.changed.connect(
-            lambda _affected: self._refresh_selected_panel())
+        self._follow_playback(self.timeline.playback)
+        self.timeline.playbackReplaced.connect(self._follow_playback)
         right_layout.addWidget(self.timeline, 1)
 
         # Session Options: the existing panel, shown by its button.
@@ -590,6 +597,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.selected_panel = panel
         return panel
 
+    def _follow_playback(self, controller) -> None:
+        """The waveform marker and Selected Audio follow whichever playback
+        controller the list is using - including one installed later."""
+        previous = getattr(self, "_followed_playback", None)
+        if previous is not None and previous is not controller:
+            try:
+                previous.changed.disconnect(self._on_playback_changed_for_panel)
+            except (RuntimeError, TypeError):
+                pass
+        self._followed_playback = controller
+        self.waveform.set_playback(controller)
+        controller.changed.connect(self._on_playback_changed_for_panel)
+
+    def _on_playback_changed_for_panel(self, _affected) -> None:
+        self._refresh_selected_panel()
+
     def _wire_pane_links(self) -> None:
         """Left-pane links run the real View actions, nothing of their own."""
         self.hidden_sessions_link.setChecked(
@@ -599,9 +622,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.show_hidden_sessions_action.toggled.connect(
             self.hidden_sessions_link.setChecked)
         self.search_link.clicked.connect(self._focus_search)
-        self.filter_all.clicked.connect(self.show_all_action.trigger)
-        self.filter_review.clicked.connect(self.review_action.trigger)
-        self.filter_bookmarked.clicked.connect(self._show_bookmarked)
+        self.filter_all.clicked.connect(
+            lambda: self._filter_clicked("thread", self.show_all_action.trigger))
+        self.filter_review.clicked.connect(
+            lambda: self._filter_clicked("review", self.review_action.trigger))
+        self.filter_bookmarked.clicked.connect(
+            lambda: self._filter_clicked("bookmarked", self._show_bookmarked))
+
+    def _filter_clicked(self, kind: str, show) -> None:
+        """Pressing the filter already on screen changes nothing - rebuilding
+        it would stop playback and drop the selection for no reason."""
+        if self._view_kind != kind:
+            show()
+        self._sync_filters()
 
     def _build_header(self, row: QtWidgets.QHBoxLayout) -> None:
         """The teal status band: operating mode, source, monitoring state."""
@@ -2284,6 +2317,9 @@ class MainWindow(QtWidgets.QMainWindow):
         line = f"{source_language} > {target}"
         if self.language_line.text() != line:
             self.language_line.setText(line)
+        profile = self.channel_label.text()
+        if self.profile_line.text() != profile:
+            self.profile_line.setText(profile)
         code = self.target_language_box.currentData() or ""
         heading = f"TRANSLATION / {code.upper()}" if code else "TRANSLATION"
         if self.translation_heading.text() != heading:
@@ -2509,8 +2545,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sync_filters()
 
     def _bookmarked_results(self):
-        return [tx for tx in self.app.search("", bookmarked=True)
-                if self._showing_removed() or not getattr(tx, "hidden", False)]
+        # Store.search never returns removed messages; nor does this view.
+        return self.app.search("", bookmarked=True)
 
     def _focus_search(self) -> None:
         self.search_field.setFocus(QtCore.Qt.ShortcutFocusReason)

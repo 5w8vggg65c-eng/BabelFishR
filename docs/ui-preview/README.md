@@ -50,7 +50,7 @@ is sample data.
 | Monitor · Sessions · Models · Settings · Help | The app's real menus: **File · View · Receiver · Tools · Help** (see deviations). |
 | SESSIONS list | The named Sessions (the former tab row), drawn as a list. Rename, colours, context menu and hide/remove work as before. |
 | Saved sessions · Search | **Hidden sessions** (View ▸ Show hidden Sessions) and **Search** (focuses the search field). |
-| INPUT | The real input chooser and status, the `source > target` language line, the receiver status line, and Calibrate. |
+| INPUT | The real input chooser and status, the `source > target` language line, the radio profile (or the warning that none is selected, so no channel or frequency is recorded), the receiver status line, and Calibrate. |
 | LOCAL ENGINES | `Speech:` / `Translation:` as the app selected them, plus field readiness (click for the report). |
 | RECORDING WAVEFORM | The selected message's **own** recording, drawn from its PCM samples (see below). |
 | All messages · Needs review · Bookmarked · Search | Show all, the Review queue, a Bookmarked view, and Search: all real store queries. They stay true as traffic arrives. |
@@ -67,7 +67,11 @@ is sample data.
   the file is.
 - **Fidelity:** each of up to 1,200 buckets keeps its true signed minimum
   and maximum, so transients survive and silence stays flat. A display gain
-  applies only above −40 dBFS, so hiss is never inflated into "signal".
+  (at most ×20) applies only above −40 dBFS, so hiss is never inflated into
+  "signal". When a clip is drawn larger than recorded, the title says so
+  ("shown ×N").
+- **Short files:** a file shorter than its own header is labelled "file
+  shorter than its header: N s readable".
 - **Off the UI thread:** loading runs on a background thread. A result for
   a message that is no longer selected is discarded.
 - **Honest states:** no selection, no recording, missing file, unreadable
@@ -77,6 +81,9 @@ is sample data.
   recording, so no session clock or session range is shown.
 - **Playback marker:** appears only while *this* recording is playing or
   paused, through the existing playback controller.
+- **Selection:** clicking anywhere in a row, including its transcript text
+  or its buttons, selects that row. Pressing the filter that is already on
+  screen does nothing, so playback and the selection survive.
 - **Read-only:** no click-to-seek. A truthful read-only waveform was
   preferred over interaction the playback service doesn't fully support
   yet.
