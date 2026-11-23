@@ -408,6 +408,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timeline.tagsChanged.connect(self._on_tags)
         self.timeline.bookmarkToggled.connect(self._on_bookmark)
         self.timeline.retryRequested.connect(self._on_retry)
+        self.timeline.retryAsSpeechRequested.connect(self._on_retry_as_speech)
         self.timeline.exportRequested.connect(self._on_export_clip)
         self.timeline.noteChanged.connect(self._on_note)
         self.timeline.transcribeAnywayRequested.connect(self._on_transcribe_anyway)
@@ -1892,6 +1893,35 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         QtWidgets.QMessageBox.information(
             self, "Retry",
+            (self.app.processing_problem(tx_id)
+             or "The recording could not be queued again.")
+            + "\n\nThe recording itself is safe.")
+
+    def _on_retry_as_speech(self, tx_id: str) -> None:
+        """Re-run one message as speech in a language the operator chooses.
+
+        For a message held back as probably-not-speech, or one whose language
+        was guessed wrongly: the session's own source-language setting only
+        applies to new recordings.
+        """
+        tx = self.app.store.get_transmission(tx_id)
+        if tx is None:
+            return
+        labels = [f"{name} ({code})" for code, name in COMMON_LANGUAGES]
+        codes = [code for code, _ in COMMON_LANGUAGES]
+        current = codes.index(tx.source_language) if tx.source_language in codes else 0
+        label, ok = QtWidgets.QInputDialog.getItem(
+            self, "Retry as speech",
+            "Transcribe this recording again as speech in:", labels, current, False)
+        if not ok:
+            return
+        code = codes[labels.index(label)]
+        if self.app.retry(tx_id, source_language=code):
+            self.status.showMessage(
+                f"Transcribing the saved recording again as {label}...", 8000)
+            return
+        QtWidgets.QMessageBox.information(
+            self, "Retry as speech",
             (self.app.processing_problem(tx_id)
              or "The recording could not be queued again.")
             + "\n\nThe recording itself is safe.")

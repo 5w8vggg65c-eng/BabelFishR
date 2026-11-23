@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import enum
 import pathlib
-from typing import Any, List, Optional, Sequence
+from typing import Any, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -319,6 +319,21 @@ class FasterWhisperEngine(TranscriptionEngine):
             float(np.mean(logprobs)) if logprobs else None)
         no_speech = bool(no_speech_probs and float(np.mean(no_speech_probs)) > 0.6
                          and not full_text)
+        # Evidence about whether this was speech at all, for the pipeline to
+        # weigh - nothing is dropped here. Whisper's no-speech estimate,
+        # weighted by how long each segment is...
+        no_speech_probability = None
+        weights = [max(0.0, p.end - p.start) for p in parts]
+        if no_speech_probs and len(no_speech_probs) == len(weights) and sum(weights) > 0:
+            no_speech_probability = round(float(np.average(no_speech_probs,
+                                                           weights=weights)), 3)
+        elif no_speech_probs:
+            no_speech_probability = round(float(np.mean(no_speech_probs)), 3)
+        # ...and an independent opinion: the voice-activity model bundled
+        # with faster-whisper (Silero, local, no download).
+        speech_ratio = speech_seconds = None
+        if full_text:
+            speech_ratio, speech_seconds = local_speech_activity(samples)
 
         return TranscriptionResult(
             text=full_text,
@@ -327,6 +342,8 @@ class FasterWhisperEngine(TranscriptionEngine):
                 getattr(info, "language_probability", None)),
             confidence=overall, segments=parts, engine=self.id,
             engine_version=self.version, no_speech=no_speech,
+            no_speech_probability=no_speech_probability, speech_ratio=speech_ratio,
+            speech_seconds=speech_seconds,
         )
 
     def _prepare(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
@@ -340,6 +357,56 @@ class FasterWhisperEngine(TranscriptionEngine):
         if peak > 1.0:
             data = data / peak
         return data.astype(np.float32)
+
+
+_telemetry_disabled = False
+
+
+def _disable_onnx_telemetry() -> None:
+    """Switch off onnxruntime's optional telemetry events, once, before the
+    VAD creates its first ONNX session. Uses onnxruntime's own public switch
+    (``onnxruntime.disable_telemetry_events``); where it does not exist this
+    does nothing."""
+    global _telemetry_disabled
+    if _telemetry_disabled:
+        return
+    _telemetry_disabled = True
+    try:
+        import onnxruntime
+
+        switch = getattr(onnxruntime, "disable_telemetry_events", None)
+        if callable(switch):
+            switch()
+    except Exception as exc:  # noqa: BLE001 - optional, never fatal
+        log.debug("could not switch off onnxruntime telemetry: %s", exc)
+
+
+def local_speech_activity(samples: np.ndarray, sample_rate: int = TARGET_RATE
+                          ) -> Tuple[Optional[float], Optional[float]]:
+    """How much of *samples* (16 kHz float) the bundled Silero VAD calls speech.
+
+    Returns ``(share of the clip, seconds)``, or ``(None, None)`` when the
+    detector cannot run - never a guess. Uses faster-whisper's own
+    voice-activity detector and its packaged model
+    (faster_whisper/assets/silero_vad_v6.onnx): local, nothing to download.
+    The speech chunks are measured unpadded, so the figure is what the model
+    heard, not what faster-whisper would keep around it for transcription.
+    """
+    data = np.asarray(samples, dtype=np.float32).ravel()
+    if data.size == 0:
+        return None, None
+    try:
+        _disable_onnx_telemetry()
+        from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+        chunks = get_speech_timestamps(data, VadOptions(speech_pad_ms=0),
+                                       sampling_rate=sample_rate)
+    except Exception as exc:  # noqa: BLE001 - optional evidence, never fatal
+        log.debug("local VAD unavailable: %s", exc)
+        return None, None
+    voiced = sum(max(0, int(c["end"]) - int(c["start"])) for c in chunks)
+    voiced = min(voiced, data.size)
+    return round(voiced / float(data.size), 3), round(voiced / float(sample_rate), 2)
 
 
 def _logprob_to_confidence(avg_logprob: Optional[float]) -> Optional[float]:

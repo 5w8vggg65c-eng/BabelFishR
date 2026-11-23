@@ -107,6 +107,21 @@ class DetectorSettings:
     max_duration: float = 300.0
     """A stuck transmitter is split rather than filling the disk."""
 
+    segment_seconds: float = 15.0
+    """Processing latency, separate from max_duration (the archival cap).
+
+    A radio burst ends when the channel goes quiet; continuous audio - a
+    microphone in a room, an open carrier - may never be quiet for
+    hang_time, and used to reach speech recognition only at Stop. While the
+    gate stays open past this length the recording is cut into consecutive
+    parts at the quietest frame in the last ``segment_search_seconds``, each
+    handed on as soon as it is cut. Nothing is dropped, trimmed or repeated
+    at a cut: the parts join sample for sample. 0 disables segmenting.
+    Bursts shorter than this are unaffected."""
+
+    segment_search_seconds: float = 3.0
+    """How far back from the segment length to look for the quietest frame."""
+
     frame_ms: float = 20.0
     open_frames: int = 2
     """Consecutive loud frames required to open - rejects single clicks."""
@@ -178,6 +193,10 @@ class DetectorSettings:
             raise ValueError("pre_roll and post_roll must be >= 0")
         if self.min_duration <= 0:
             raise ValueError("min_duration must be > 0")
+        if self.segment_seconds and self.segment_seconds < 2.0:
+            raise ValueError("segment_seconds must be 0 (off) or at least 2 seconds")
+        if self.segment_search_seconds < 0:
+            raise ValueError("segment_search_seconds must be >= 0")
         return self
 
 
@@ -223,6 +242,13 @@ class DetectedTransmission:
     truncated: bool = False
     trimmed_tail: float = 0.0
     """Seconds of squelch tail removed from the end."""
+
+    continued: bool = False
+    """Cut while the audio went on: the next part starts at the very next
+    sample (see DetectorSettings.segment_seconds)."""
+
+    continues_previous: bool = False
+    """This part starts exactly where the previous part was cut."""
 
     @property
     def snr_db(self) -> float:
@@ -438,6 +464,7 @@ class RadioActivityDetector(TransmissionDetector):
         self._start_offset = 0.0
         self._hang_remaining = 0.0
         self._last_active_samples = 0
+        self._continues_previous = False
         self.stream_start: Optional[_dt.datetime] = None
 
     # -- thresholds ------------------------------------------------------
@@ -545,6 +572,7 @@ class RadioActivityDetector(TransmissionDetector):
             "kurtosis": amplitude_kurtosis(frame),
             "crest": crest_factor(frame),
             "samples": int(sum(b.size for b in self._buffer)),
+            "loud": bool(loud),
         })
         if loud:
             self._active_frames += 1
@@ -557,9 +585,76 @@ class RadioActivityDetector(TransmissionDetector):
             self._hang_remaining = self.settings.hang_time
             self._last_active_samples = sum(b.size for b in self._buffer)
 
+        # Processing segments only below the archival cap: a max_duration
+        # shorter than segment_seconds still closes as a truncated stuck
+        # transmitter, exactly as before.
+        if (completed is None and self.settings.segment_seconds
+                and self.settings.segment_seconds < self.settings.max_duration
+                and self._duration() >= self.settings.segment_seconds):
+            completed = self._cut_segment()
         if completed is None and self._duration() >= self.settings.max_duration:
             completed = self._close(truncated=True)
         return completed
+
+    def _cut_segment(self) -> Optional[DetectedTransmission]:
+        """Hand on what has been heard so far, and keep listening.
+
+        The cut falls at the end of the quietest frame in the last
+        ``segment_search_seconds`` (a pause, if there is one), never inside the
+        pre-roll. The part before it is emitted untrimmed; the part after it
+        stays in the open gate as the start of the next part, with its time
+        offset advanced by exactly the samples handed on.
+        """
+        audio = np.concatenate(self._buffer) if self._buffer else np.zeros(0)
+        stats = self._frame_stats
+        total = audio.size
+        earliest = max(self._pre_samples + self.frame_size,
+                       total - int(self.settings.segment_search_seconds * self.sample_rate))
+        candidates = [i for i, st in enumerate(stats) if earliest <= st["samples"] <= total]
+        if not candidates:
+            return None
+        quietest = min(candidates, key=lambda i: (stats[i]["level"], -i))
+        cut = int(stats[quietest]["samples"])
+        part, rest = audio[:cut], audio[cut:]
+        part_stats, rest_stats = stats[:quietest + 1], stats[quietest + 1:]
+
+        verdict = self._classify(part_stats,
+                                 sum(1 for st in part_stats if st.get("loud")),
+                                 len(part_stats))
+        assert self.stream_start is not None
+        start_offset = self._start_offset
+        part_peak = float(np.max(np.abs(part))) if part.size else 0.0
+        found = DetectedTransmission(
+            audio=part, sample_rate=self.sample_rate,
+            started_at=self.stream_start + _dt.timedelta(seconds=start_offset),
+            start_offset=start_offset, duration=part.size / float(self.sample_rate),
+            peak_dbfs=dbfs(part_peak), rms_dbfs=dbfs(rms(part)),
+            noise_floor_dbfs=self._floor_at_open,
+            active_ratio=(sum(1 for st in part_stats if st.get("loud"))
+                          / len(part_stats)) if part_stats else 0.0,
+            confidence=verdict.confidence,
+            clipped=bool(part.size and np.any(np.abs(part) >= 0.999)),
+            content_class=verdict.content_class,
+            likely_noise=verdict.likely_noise, likely_tone=verdict.likely_tone,
+            likely_digital=verdict.likely_digital,
+            modulation_db=verdict.modulation_db, flatness=verdict.flatness,
+            kurtosis=verdict.kurtosis, crest=verdict.crest,
+            truncated=False, trimmed_tail=0.0,
+            continued=True, continues_previous=self._continues_previous,
+        )
+
+        # The remainder is the start of the next part, gate still open.
+        self._buffer = [rest] if rest.size else []
+        self._frame_stats = [dict(st, samples=int(st["samples"]) - cut) for st in rest_stats]
+        self._active_frames = sum(1 for st in self._frame_stats if st.get("loud"))
+        self._total_frames = len(self._frame_stats)
+        self._peak = float(np.max(np.abs(rest))) if rest.size else 0.0
+        self._clipped = bool(rest.size and np.any(np.abs(rest) >= 0.999))
+        self._pre_samples = 0
+        self._start_offset = start_offset + cut / float(self.sample_rate)
+        self._last_active_samples = max(0, self._last_active_samples - cut)
+        self._continues_previous = True
+        return found
 
     def _duration(self) -> float:
         return sum(b.size for b in self._buffer) / float(self.sample_rate)
@@ -579,6 +674,7 @@ class RadioActivityDetector(TransmissionDetector):
         self._floor_at_open = self.floor.value
         self._hang_remaining = self.settings.hang_time
         self._last_active_samples = self._pre_samples
+        self._continues_previous = False
 
     def _close(self, truncated: bool = False) -> Optional[DetectedTransmission]:
         audio = np.concatenate(self._buffer) if self._buffer else np.zeros(0)
@@ -589,6 +685,8 @@ class RadioActivityDetector(TransmissionDetector):
         floor_at_open = self._floor_at_open
         active, total = self._active_frames, self._total_frames
         last_active = self._last_active_samples
+        continues_previous = self._continues_previous
+        self._continues_previous = False
 
         self._open = False
         self._buffer = []
@@ -609,7 +707,12 @@ class RadioActivityDetector(TransmissionDetector):
         signal_duration = max(
             0.0, duration - pre_samples / float(self.sample_rate)
             - self.settings.post_roll)
-        if signal_duration < self.settings.min_duration:
+        if signal_duration < self.settings.min_duration and not continues_previous:
+            # Crackle. A short last part of a segmented recording is not
+            # crackle - it is the end of audio already partly handed on, and
+            # dropping it would leave a hole in the recording.
+            return None
+        if audio.size == 0:
             return None
 
         verdict = self._classify(stats, active, total)
@@ -631,6 +734,7 @@ class RadioActivityDetector(TransmissionDetector):
             modulation_db=verdict.modulation_db, flatness=verdict.flatness,
             kurtosis=verdict.kurtosis, crest=verdict.crest,
             truncated=truncated, trimmed_tail=trimmed,
+            continues_previous=continues_previous,
         )
 
     def _trim_tail(self, audio: np.ndarray, stats: List[dict]):

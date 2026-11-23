@@ -780,6 +780,11 @@ class Transmission:
             return True
         if self.reviewed:
             return False
+        metadata = self.signal_metadata or {}
+        check = metadata.get("speech_check") or {}
+        if (check.get("verdict") in ("likely_noise", "uncertain")
+                and not metadata.get("speech_confirmed")):
+            return True
         thresholds = [v for v in (self.transcript_confidence,
                                   self.language_confidence) if v is not None]
         return any(v < 0.6 for v in thresholds)

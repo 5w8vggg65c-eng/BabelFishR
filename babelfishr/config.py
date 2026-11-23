@@ -108,6 +108,11 @@ class DetectorConfig:
     post_roll: float = 0.20
     min_duration: float = 0.30
     max_duration: float = 300.0
+    segment_seconds: float = 15.0
+    """Continuous audio is handed to processing in parts of about this length
+    while monitoring goes on (0 = only when the gate closes). See
+    DetectorSettings.segment_seconds."""
+    segment_search_seconds: float = 3.0
     trim_squelch_tail: bool = True
 
     # Automatic-processing routing. None of these can stop a recording being

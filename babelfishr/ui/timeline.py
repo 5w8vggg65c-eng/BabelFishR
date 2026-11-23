@@ -67,6 +67,39 @@ _FREQUENCY_SUFFIX = {
 }
 
 
+def _speech_check_note(tx: Transmission) -> str:
+    """Plain words for the speech check (pipeline.assess_speech), or ""."""
+    metadata = tx.signal_metadata or {}
+    check = metadata.get("speech_check") or {}
+    verdict = check.get("verdict")
+    if verdict not in ("likely_noise", "uncertain"):
+        return ""
+    confirmed = metadata.get("speech_confirmed") or {}
+    if confirmed:
+        return (f"You confirmed this is speech ({confirmed.get('source_language', '?')}); "
+                f"it was transcribed and translated again in that language.")
+    ratio = check.get("speech_ratio")
+    seconds = check.get("speech_seconds")
+    nsp = check.get("no_speech_probability")
+    evidence = []
+    if ratio is not None:
+        found = (f"{seconds:.1f} s of speech" if seconds is not None
+                 else f"speech in {ratio:.0%} of it")
+        evidence.append(f"the local voice detector found {found}")
+    if nsp is not None:
+        evidence.append(f"the speech engine's no-speech estimate is {nsp:.2f}")
+    said = "; ".join(evidence)
+    if verdict == "likely_noise":
+        return (f"Probably not speech ({said}). The transcript may be words "
+                f"invented from noise, so it was not translated automatically. "
+                f"Check it against the original audio. If it is speech, choose "
+                f"Retry as speech in... from the message menu: it is transcribed "
+                f"again in the language you pick, then translated.")
+    return (f"Speech uncertain ({said}). Check the transcript against the "
+            f"original audio; Retry as speech in... re-runs it in a language "
+            f"you choose.")
+
+
 def _local_stamp(when) -> str:
     """``2026-09-07 10:41:20``: the local date and time of one transmission.
 
@@ -111,6 +144,7 @@ class TransmissionBubble(QtWidgets.QFrame):
     tagsChanged = QtCore.Signal(str, list)
     bookmarkToggled = QtCore.Signal(str, bool)
     retryRequested = QtCore.Signal(str)
+    retryAsSpeechRequested = QtCore.Signal(str)       # tx_id: choose a language
     exportRequested = QtCore.Signal(str)
     noteChanged = QtCore.Signal(str, str)
     transcribeAnywayRequested = QtCore.Signal(str)
@@ -355,6 +389,8 @@ class TransmissionBubble(QtWidgets.QFrame):
         menu.addSeparator()
         menu.addAction("Retry processing",
                        lambda: self.retryRequested.emit(self.tx.id))
+        menu.addAction("Retry as speech in...",
+                       lambda: self.retryAsSpeechRequested.emit(self.tx.id))
         menu.addAction("Export audio...", self._export)
         menu.addSeparator()
         # Two different things, named as two different things. Removing
@@ -442,6 +478,9 @@ class TransmissionBubble(QtWidgets.QFrame):
         details: List[str] = []
         if tx.skip_reason:
             details.append(_escape(tx.skip_reason))
+        speech_note = _speech_check_note(tx)
+        if speech_note:
+            details.append(_escape(speech_note))
         attempt = tx.latest_analysis
         if attempt is not None:
             line = (f"Digital analysis ({attempt.engine} "
@@ -533,6 +572,13 @@ class TransmissionBubble(QtWidgets.QFrame):
             chips.append((f"confidence {tx.transcript_confidence:.0%}", tone))
         if tx.clipped:
             chips.append(("clipped", "error"))
+        segment = (tx.signal_metadata or {}).get("segment") or {}
+        if segment.get("continues_previous") and segment.get("continued"):
+            chips.append(("continuous audio: middle part", "plain"))
+        elif segment.get("continued"):
+            chips.append(("continuous audio: continues in the next message", "plain"))
+        elif segment.get("continues_previous"):
+            chips.append(("continuous audio: last part", "plain"))
         for tag in tx.tags:
             chips.append((f"#{tag}", "accent"))
         if tx.bookmarked:
@@ -759,6 +805,7 @@ class TimelineView(QtWidgets.QScrollArea):
     tagsChanged = QtCore.Signal(str, list)
     bookmarkToggled = QtCore.Signal(str, bool)
     retryRequested = QtCore.Signal(str)
+    retryAsSpeechRequested = QtCore.Signal(str)       # tx_id: choose a language
     exportRequested = QtCore.Signal(str)
     noteChanged = QtCore.Signal(str, str)
     transcribeAnywayRequested = QtCore.Signal(str)
@@ -988,6 +1035,7 @@ class TimelineView(QtWidgets.QScrollArea):
         bubble.tagsChanged.connect(self.tagsChanged)
         bubble.bookmarkToggled.connect(self.bookmarkToggled)
         bubble.retryRequested.connect(self.retryRequested)
+        bubble.retryAsSpeechRequested.connect(self.retryAsSpeechRequested)
         bubble.exportRequested.connect(self.exportRequested)
         bubble.noteChanged.connect(self.noteChanged)
         bubble.transcribeAnywayRequested.connect(self.transcribeAnywayRequested)

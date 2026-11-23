@@ -156,6 +156,61 @@ class Recorder:
             return None
 
 
+#: Below this much voiced audio (local VAD, seconds), a transcript is treated
+#: as probably not speech. An absolute figure, not a share: one short real
+#: phrase in a long noisy recording is still speech. Faint or short speech
+#: above it keeps its translation and is at most marked for review.
+NO_SPEECH_VAD_SECONDS = 0.25
+#: Used instead when the detector reports only a share.
+NO_SPEECH_VAD_RATIO = 0.02
+#: Whisper's own no-speech estimate at which it would skip a window by
+#: itself (its default), used only when no VAD opinion is available, and
+#: only together with a low transcript confidence.
+NO_SPEECH_PROBABILITY = 0.6
+NO_SPEECH_CONFIDENCE = 0.5
+#: Under this share, or above NO_SPEECH_PROBABILITY, the transcript is kept
+#: and translated but marked for review.
+UNCERTAIN_VAD_RATIO = 0.2
+#: An automatically detected language below this probability is reported as
+#: uncertain rather than as a missing language pack.
+LANGUAGE_CERTAIN = 0.8
+
+
+def assess_speech(result) -> Optional[dict]:
+    """Was this recording speech at all? Evidence, not a filter.
+
+    Returns None when there is nothing to say (no text, or no evidence).
+    Otherwise a small record for ``signal_metadata["speech_check"]``:
+    ``verdict`` is ``"likely_noise"`` (strong evidence of no speech: the
+    transcript is kept, translation is not attempted, the message is marked
+    for review), ``"uncertain"`` (kept, translated, marked for review) or
+    ``"speech"``. The recording itself is never touched.
+    """
+    if not (getattr(result, "text", "") or "").strip():
+        return None
+    ratio = getattr(result, "speech_ratio", None)
+    seconds = getattr(result, "speech_seconds", None)
+    nsp = getattr(result, "no_speech_probability", None)
+    confidence = getattr(result, "confidence", None)
+    if ratio is None and nsp is None:
+        return None
+    if ratio is not None:
+        likely_noise = (seconds < NO_SPEECH_VAD_SECONDS if seconds is not None
+                        else ratio < NO_SPEECH_VAD_RATIO)
+        uncertain = ratio < UNCERTAIN_VAD_RATIO or (nsp is not None
+                                                    and nsp >= NO_SPEECH_PROBABILITY)
+    else:
+        likely_noise = (nsp >= NO_SPEECH_PROBABILITY and confidence is not None
+                        and confidence < NO_SPEECH_CONFIDENCE)
+        uncertain = nsp >= NO_SPEECH_PROBABILITY
+    verdict = "likely_noise" if likely_noise else ("uncertain" if uncertain else "speech")
+    return {"verdict": verdict, "speech_ratio": ratio, "speech_seconds": seconds,
+            "no_speech_probability": nsp,
+            "transcript_confidence": confidence,
+            "method": "local VAD + engine estimate" if ratio is not None
+                      else "engine estimate only"}
+
+
 def _skip_reason(detected: DetectedTransmission) -> str:
     """Plain-language note explaining why automatic ASR was not attempted.
 
@@ -387,11 +442,24 @@ class ProcessingPipeline:
             return False
         return True
 
-    def retry(self, tx_id: str) -> bool:
-        """Retry a failed transmission. The audio was never lost."""
+    def retry(self, tx_id: str, source_language: Optional[str] = None) -> bool:
+        """Retry a failed transmission. The audio was never lost.
+
+        With *source_language* the operator is saying "this is speech, in
+        this language": the message is transcribed again in that language
+        (as if the session had specified it) and translated even if the
+        speech check would otherwise have held the translation back. The
+        check is still recorded, for the record.
+        """
         tx = self.store.get_transmission(tx_id)
         if tx is None:
             return False
+        if source_language:
+            tx.source_language = source_language
+            tx.source_language_mode = SourceLanguageMode.SPECIFIED
+            tx.signal_metadata = dict(tx.signal_metadata or {}, speech_confirmed={
+                "source_language": source_language, "by": "operator"})
+            tx.skip_reason = ""
         tx.clear_error()
         tx.state = ProcessingState.CAPTURED
         self.store.save_transmission(tx)
@@ -516,6 +584,12 @@ class ProcessingPipeline:
         if result.language:
             tx.source_language = result.language
             tx.language_confidence = result.language_confidence
+        check = assess_speech(result)
+        metadata = dict(tx.signal_metadata or {})
+        metadata.pop("speech_check", None)
+        if check is not None:
+            metadata["speech_check"] = check
+        tx.signal_metadata = metadata
         tx.state = ProcessingState.TRANSCRIBED
         tx.clear_error()
         self.store.save_transmission(tx)
@@ -536,6 +610,38 @@ class ProcessingPipeline:
                 and tx.source_language and tx.source_language == target):
             tx.translation = ""
             tx.translation_engine = ""
+            return
+        metadata = tx.signal_metadata or {}
+        check = metadata.get("speech_check") or {}
+        if check.get("verdict") == "likely_noise" and not metadata.get("speech_confirmed"):
+            # Probably not speech: translating it would only add a confident
+            # sentence about noise. The transcript stays, marked for review.
+            # "Retry as speech in..." (retry with a source language) lifts this.
+            tx.translation = ""
+            tx.translation_engine = ""
+            return
+        source = tx.source_language
+        supports = getattr(self.translation, "supports_pair", None)
+        if (source and source != target and callable(supports)
+                and not getattr(self.translation, "auto_install", False)
+                and not supports(source, target)):
+            confidence = tx.language_confidence
+            if (tx.source_language_mode is not SourceLanguageMode.SPECIFIED
+                    and (confidence is None or confidence < LANGUAGE_CERTAIN)):
+                shown = f"{confidence:.0%}" if confidence is not None else "unknown certainty"
+                message = (f"language uncertain: automatic detection guessed '{source}' "
+                           f"({shown}), and no {source}->{target} pack is installed. "
+                           f"If the speech is another language, choose it with this "
+                           f"message's Retry as speech in... (Session options > "
+                           f"Source language sets it for new recordings).")
+            else:
+                message = (f"no {source}->{target} language pack is installed. Install "
+                           f"it in Online / Setup (Tools > Setup assistant), then Retry.")
+            tx.fail("translation", message)
+            self.store.save_transmission(tx)
+            self.events.publish("updated", tx)
+            self.events.publish("error", {"transmission": tx.id, "stage": "translation",
+                                          "message": message})
             return
 
         tx.state = ProcessingState.TRANSLATING
@@ -923,6 +1029,11 @@ class CaptureService:
         if metadata is None and tuning is not None:
             metadata = self._metadata_under(tuning)
         self._apply_measured_metadata(tx, metadata)
+        if detected.continued or detected.continues_previous:
+            # One stretch of continuous audio, handed on in consecutive parts.
+            tx.signal_metadata = dict(tx.signal_metadata or {}, segment={
+                "continued": bool(detected.continued),
+                "continues_previous": bool(detected.continues_previous)})
 
         # --- persistence, before any classification-driven decision ---------
         tx.audio_path = self.recorder.write(tx, self.session, detected.audio,

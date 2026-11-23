@@ -44,6 +44,14 @@ class TranscriptionResult:
     engine_version: str = ""
     no_speech: bool = False
     """True when the engine believes there was no speech at all."""
+    no_speech_probability: Optional[float] = None
+    """The engine's own estimate (0-1) that the audio holds no speech, when
+    it has one: Whisper's per-segment no_speech_prob, duration-weighted."""
+    speech_ratio: Optional[float] = None
+    """Share of the clip a local voice-activity detector judged to be speech
+    (0-1), or None when no detector was available."""
+    speech_seconds: Optional[float] = None
+    """The same detector's speech, in seconds."""
 
     def to_dict(self) -> Dict[str, Any]:
         d = dataclasses.asdict(self)

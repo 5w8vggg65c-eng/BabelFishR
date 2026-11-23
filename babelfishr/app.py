@@ -1215,10 +1215,16 @@ class BabelFishRApp:
         filters.setdefault("conversation_id", self.conversation_id)
         return self.store.search(query, **filters)
 
-    def retry(self, tx_id: str) -> bool:
-        """Retry a failed recording - monitoring or not."""
+    def retry(self, tx_id: str, source_language: Optional[str] = None) -> bool:
+        """Retry a recording - monitoring or not. With *source_language*, the
+        operator confirms it is speech in that language (see
+        ProcessingPipeline.retry)."""
         pipeline = self._processing_pipeline()
-        return pipeline.retry(tx_id) if pipeline is not None else False
+        if pipeline is None:
+            return False
+        if source_language:
+            return pipeline.retry(tx_id, source_language=source_language)
+        return pipeline.retry(tx_id)
 
     def transcribe_anyway(self, tx_id: str) -> bool:
         """Force transcription of a recording the classifier routed away.
