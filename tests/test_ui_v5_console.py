@@ -151,7 +151,8 @@ def test_engine_lines_and_counts_come_from_the_application(console):
     review = sum(1 for i in order if window.timeline.bubble(i).tx.needs_review)
     assert window.counts_label.text().startswith(f"{len(order)} messages")
     assert f"{review} need" in window.counts_label.text()
-    assert "Original audio retained" in window.counts_label.text()
+    # The setting, not a claim that every recording still exists.
+    assert "Keep original audio: on" in window.counts_label.text()
 
 
 # ---- selection drives the waveform and Selected Audio ------------------------
@@ -203,7 +204,8 @@ def test_play_original_uses_the_shared_playback_controller(qt_app, console,
                                                          monkeypatch):
     window, _, made = console
     calls = []
-    monkeypatch.setattr(window.timeline.playback, "toggle",
+    # Nothing is playing, so Play original starts the ORIGINAL file.
+    monkeypatch.setattr(window.timeline.playback, "play",
                         lambda tx_id, path: calls.append((tx_id, path)))
     window.timeline.select(made[1].id)
     window.selected_play_button.click()
@@ -385,3 +387,188 @@ def test_the_waveform_title_admits_display_gain_and_a_short_file(qt_app, tmp_pat
     else:
         assert widget.state == "error"                   # refused outright is also honest
     widget.clear()
+
+
+# ---- Codex review: replay source, audio-file ownership -------------------------
+
+def _wire_microphone(monkeypatch, window):
+    """A Mac whose only input is the built-in microphone, and it is selected."""
+    from test_audio_source_selection import builtin_mic
+
+    from babelfishr.audio import devices as devices_module
+    from babelfishr.ui import input_panel as panel_module
+
+    mic = builtin_mic()
+    for module in (devices_module, panel_module):
+        monkeypatch.setattr(module, "list_input_devices", lambda: [mic])
+    monkeypatch.setattr(panel_module, "backend_available", lambda: True)
+    panel = window.input_panel
+    panel.refresh_devices()
+    index = panel.device_box.findData({"kind": panel_module.DEVICE, "index": mic.index})
+    assert index > 0
+    panel.device_box.setCurrentIndex(index)
+    window._refresh_context_lines()
+    return mic
+
+
+def test_replay_is_shown_as_the_recorded_file_never_the_selected_microphone(
+        qt_app, console, monkeypatch, tmp_path):
+    from babelfishr.audio.wavefile import write_wav
+    from babelfishr.testing import speech_like
+
+    window, app, _ = console
+    mic = _wire_microphone(monkeypatch, window)
+    assert mic.name in window.source_label.toolTip()
+
+    # A long, non-ASCII file name.
+    name = "répétition_très_longue_" + "ж" * 40 + "_канал_7.wav"
+    wav = write_wav(str(tmp_path / name), speech_like(0.6, 48_000), 48_000)
+    window._start_monitoring(replay_path=wav)
+    pump(qt_app)
+    window._refresh_context_lines()
+    tip = window.source_label.toolTip()
+    assert tip.startswith("SOURCE: RECORDED FILE") and name in tip, tip
+    assert mic.name not in tip and "Microphone" not in window.source_label.text()
+    # Nothing claims the microphone is recording the room during a replay.
+    assert "recording the room" not in window.input_panel.alert_label.text()
+    # The band keeps its mode and state in view however long the name is.
+    band = window.status_band.rect()
+    for child in (window.mode_button, window.source_label, window.state_badge):
+        geometry = child.geometry()
+        assert band.contains(geometry), (child.objectName(), geometry, band)
+
+    # End of file: still the recorded file, now marked ended.
+    deadline = QtCore.QDeadlineTimer(8000)
+    while not deadline.hasExpired():
+        source = getattr(app.capture, "source", None)
+        if source is None or getattr(source, "finished", False):
+            break
+        pump(qt_app)
+        QtCore.QThread.msleep(20)
+    window._refresh_context_lines()
+    assert window.source_label.toolTip().endswith("ended"), window.source_label.toolTip()
+
+    # Stopped: back to the selected live input.
+    window._stop_monitoring()
+    pump(qt_app)
+    assert mic.name in window.source_label.toolTip()
+    assert "RECORDED FILE" not in window.source_label.toolTip()
+
+
+def test_a_replay_that_fails_to_start_leaves_the_selected_input_shown(
+        qt_app, console, monkeypatch, tmp_path):
+    window, app, _ = console
+    mic = _wire_microphone(monkeypatch, window)
+
+    def refuse(**_kwargs):
+        raise RuntimeError("the file could not be opened")
+
+    monkeypatch.setattr(app, "start_session", refuse)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "critical",
+                        staticmethod(lambda *a, **k: None))
+    window._start_monitoring(replay_path=str(tmp_path / "unreadable.wav"))
+    pump(qt_app)
+    window._refresh_context_lines()
+    assert app.session is None
+    assert mic.name in window.source_label.toolTip()
+    assert "RECORDED FILE" not in window.source_label.toolTip()
+    assert window.start_button.text() == "Start monitoring"
+
+
+def _scripted(window):
+    from test_alpha5_playback import make_scripted_backend
+
+    from babelfishr.ui.playback import PlaybackController
+
+    backend = make_scripted_backend()
+    controller = PlaybackController(backend, parent=window)
+    window.timeline.set_playback(controller)
+    return backend, controller
+
+
+def test_the_waveform_marker_belongs_to_the_original_file_only(qt_app, console,
+                                                              tmp_path):
+    """Same message, two files: its decoded audio playing must not move the
+    ORIGINAL's playhead."""
+    from babelfishr.audio.wavefile import write_wav
+    from babelfishr.testing import tone
+
+    window, _, made = console
+    backend, controller = _scripted(window)
+    decoded = write_wav(str(tmp_path / "decoded.wav"), tone(1.0, 700.0, 8000), 8000)
+    window.timeline.select(made[0].id)
+    assert window.waveform.wait_until_loaded(10.0)
+
+    controller.play(made[0].id, decoded)          # the message's decoded audio
+    backend.advance(500)
+    pump(qt_app)
+    assert not window.waveform.marker_visible, "the original's playhead followed another file"
+    assert window.selected_play_button.text() == "Play original"
+
+    controller.play(made[0].id, made[0].audio_path)
+    backend.advance(500)
+    pump(qt_app)
+    assert window.waveform.marker_visible
+
+
+def test_play_original_replaces_the_decoded_audio_and_never_pauses_it(
+        qt_app, console, tmp_path):
+    from babelfishr.audio.wavefile import write_wav
+    from babelfishr.testing import tone
+
+    window, _, made = console
+    backend, controller = _scripted(window)
+    decoded = write_wav(str(tmp_path / "decoded.wav"), tone(1.0, 700.0, 8000), 8000)
+    window.timeline.select(made[0].id)
+    controller.play(made[0].id, decoded)
+    assert controller.state_for(made[0].id) == "playing"
+
+    window.selected_play_button.click()           # Play original
+    pump(qt_app)
+    assert ("pause",) not in backend.calls, "Play original paused the decoded audio"
+    assert controller.path == made[0].audio_path
+    assert controller.state_for(made[0].id) == "playing"
+    assert window.selected_play_button.text() == "Pause"
+
+    window.selected_play_button.click()           # now it is the original: pause
+    pump(qt_app)
+    assert controller.state_for(made[0].id) == "paused"
+
+
+def test_play_original_over_decoded_audio_keeps_control_with_a_real_style_player(
+        qt_app, console, tmp_path):
+    """QMediaPlayer reports Stopped as a new file loads. With the decoded
+    audio of the same message playing, Play original must still end up
+    owning - and able to pause and stop - the original."""
+    from test_alpha5_playback import make_scripted_backend
+
+    from babelfishr.audio.wavefile import write_wav
+    from babelfishr.testing import tone
+    from babelfishr.ui.playback import STOPPED, PlaybackController
+
+    window, _, made = console
+    backend = make_scripted_backend()
+    original_load = backend.load
+
+    def load_like_qt(path):
+        if backend.state() != STOPPED:
+            backend._set(STOPPED)                 # what setSource does
+        original_load(path)
+
+    backend.load = load_like_qt
+    controller = PlaybackController(backend, parent=window)
+    window.timeline.set_playback(controller)
+    decoded = write_wav(str(tmp_path / "decoded.wav"), tone(1.0, 700.0, 8000), 8000)
+    window.timeline.select(made[0].id)
+    controller.play(made[0].id, decoded)
+    assert controller.state_for(made[0].id) == "playing"
+
+    window.selected_play_button.click()           # Play original
+    pump(qt_app)
+    assert controller.owner == made[0].id
+    assert controller.path == made[0].audio_path
+    assert controller.state_for(made[0].id) == "playing"
+    assert window.selected_play_button.text() == "Pause"
+
+    controller.stop()
+    assert backend.state() == STOPPED, "the original could not be stopped"

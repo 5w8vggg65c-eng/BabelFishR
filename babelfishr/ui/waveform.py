@@ -23,18 +23,23 @@ Design notes
 
 from __future__ import annotations
 
+import collections
 import os
 import threading
 import wave
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
+import shiboken6
 from PySide6 import QtCore, QtGui, QtWidgets
 
 DEFAULT_BUCKETS = 1200
-#: Frames read per ``readframes`` call while streaming.
+#: Frames read per ``readframes`` call while streaming...
 CHUNK_FRAMES = 65_536
+#: ...but never more bytes than this per read, whatever the header claims:
+#: frames alone would let an extreme channel count ask for gigabytes.
+MAX_CHUNK_BYTES = 4 * 1024 * 1024
 #: Display gain is applied only when the clip's peak exceeds this level.
 DISPLAY_GAIN_FLOOR_DBFS = -40.0
 #: Never lift a clip by more than this factor (about +26 dB).
@@ -58,6 +63,20 @@ _FALLBACK_COLOURS = {
     "accent": "#2ec4b6", "warning": "#e0a526", "error": "#e05a4f",
     "ok": "#3fb950",
 }
+
+
+def same_audio(a: Optional[str], b: Optional[str]) -> bool:
+    """Do two recording paths name the same file?"""
+    if not a or not b:
+        return False
+    try:
+        return os.path.realpath(str(a)) == os.path.realpath(str(b))
+    except (OSError, ValueError):
+        return str(a) == str(b)
+
+
+class WaveformCancelled(Exception):
+    """The envelope was no longer wanted; reading stopped at a chunk boundary."""
 
 
 class WaveformError(ValueError):
@@ -117,11 +136,14 @@ def _decode(raw: bytes, width: int) -> np.ndarray:
 
 def compute_envelope(path: str, buckets: int = DEFAULT_BUCKETS,
                      max_frames: Optional[int] = None,
-                     chunk_frames: int = CHUNK_FRAMES) -> Envelope:
+                     chunk_frames: int = CHUNK_FRAMES,
+                     cancelled: Optional[Callable[[], bool]] = None) -> Envelope:
     """Stream ``path`` and return its signed min/max envelope.
 
     Raises FileNotFoundError for a missing file and :class:`WaveformError`
-    for anything that is not a readable 8/16/24/32-bit PCM WAV.
+    for anything that is not a readable 8/16/24/32-bit PCM WAV. *cancelled*
+    is asked before every chunk; when it answers True reading stops there and
+    :class:`WaveformCancelled` is raised - no partial envelope is returned.
     """
     if not os.path.isfile(path):
         raise FileNotFoundError(path)
@@ -152,9 +174,12 @@ def compute_envelope(path: str, buckets: int = DEFAULT_BUCKETS,
         mins = np.zeros(nb, dtype=np.float32)
         maxs = np.zeros(nb, dtype=np.float32)
         seen = np.zeros(nb, dtype=bool)
-        chunk = max(1, int(chunk_frames))
+        frame_bytes = width * channels
+        chunk = max(1, min(int(chunk_frames), MAX_CHUNK_BYTES // frame_bytes))
         start = 0
         while start < target:
+            if cancelled is not None and cancelled():
+                raise WaveformCancelled(path)
             want = min(chunk, target - start)
             try:
                 raw = handle.readframes(want)
@@ -243,9 +268,130 @@ class _Bridge(QtCore.QObject):
     done = QtCore.Signal(int, object)
 
 
-def _compute_for_widget(path: str, max_frames: Optional[int]) -> Envelope:
+def _compute_for_widget(path: str, max_frames: Optional[int],
+                        cancelled: Optional[Callable[[], bool]] = None) -> Envelope:
     # Looked up at call time so tests can monkeypatch compute_envelope.
-    return compute_envelope(path, max_frames=max_frames)
+    return compute_envelope(path, max_frames=max_frames, cancelled=cancelled)
+
+
+class _Loader:
+    """One worker per waveform, one pending request, cooperative cancellation.
+
+    - At most one envelope is being computed at any moment.
+    - A new request replaces any request still waiting (only the latest is
+      kept) and cancels the one running: it stops at its next chunk.
+    - clear() and shutdown() cancel too. shutdown() also ends the worker
+      thread; nothing waits for it on the GUI thread - it notices within one
+      chunk read and exits.
+    - The worker holds the loader and the bridge, never the widget, so a
+      closed window is not kept alive by a read in progress. When the widget
+      is gone (deleted, or collected without shutdown()) its bridge stops
+      being valid: a read in progress stops at its next chunk and an idle
+      worker leaves within a second. No signal from the dying widget is
+      needed, so nothing is called on a half-collected object.
+
+    Not a cap: whatever is wanted last is always read in full.
+    """
+
+    def __init__(self, bridge: "_Bridge"):
+        self._bridge = bridge
+        self._cond = threading.Condition()
+        self._wanted = 0                     # token of the latest request
+        self._pending: Optional[Tuple[int, str, Optional[int]]] = None
+        self._closed = False
+        self._thread: Optional[threading.Thread] = None
+        #: Bookkeeping for tests and diagnostics (bounded).
+        self.running_token: Optional[int] = None
+        self.started: "collections.deque[int]" = collections.deque(maxlen=64)
+        self.cancelled_tokens: "collections.deque[int]" = collections.deque(maxlen=64)
+        self.completed: "collections.deque[int]" = collections.deque(maxlen=64)
+
+    # -- requests (GUI thread) ---------------------------------------------
+    def request(self, token: int, path: str, max_frames: Optional[int]) -> bool:
+        """Queue *token* as the one wanted. False once shut down."""
+        with self._cond:
+            if self._closed:
+                return False
+            self._wanted = token
+            self._pending = (token, path, max_frames)
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run, name="waveform-loader",
+                                                daemon=True)
+                self._thread.start()
+            self._cond.notify_all()
+        return True
+
+    def cancel(self, token: int) -> None:
+        """Nothing before *token* is wanted any more."""
+        with self._cond:
+            self._wanted = token
+            self._pending = None
+            self._cond.notify_all()
+
+    def shutdown(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._pending = None
+            self._wanted += 1
+            self._cond.notify_all()
+
+    @property
+    def alive(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    def join(self, timeout: float) -> bool:
+        thread = self._thread
+        if thread is None:
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
+
+    def idle(self) -> bool:
+        with self._cond:
+            return self._pending is None and self.running_token is None
+
+    # -- the worker -------------------------------------------------------------
+    def _widget_gone(self) -> bool:
+        try:
+            return not shiboken6.isValid(self._bridge)
+        except Exception:  # noqa: BLE001 - treat anything odd as gone
+            return True
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                while self._pending is None and not self._closed:
+                    if self._widget_gone():
+                        self._closed = True
+                        break
+                    self._cond.wait(1.0)
+                if self._closed:
+                    return
+                token, path, max_frames = self._pending
+                self._pending = None
+                self.running_token = token
+                self.started.append(token)
+
+            def obsolete(token=token) -> bool:
+                return self._closed or self._wanted != token or self._widget_gone()
+
+            try:
+                result: object = _compute_for_widget(path, max_frames, cancelled=obsolete)
+            except WaveformCancelled:
+                result = None
+            except BaseException as exc:  # noqa: BLE001 - reported, not raised
+                result = exc
+            with self._cond:
+                self.running_token = None
+                if result is None or obsolete():
+                    self.cancelled_tokens.append(token)
+                    continue
+                self.completed.append(token)
+            try:
+                self._bridge.done.emit(token, result)
+            except RuntimeError:
+                return                       # the widget is gone
 
 
 class RecordingWaveform(QtWidgets.QWidget):
@@ -281,9 +427,9 @@ class RecordingWaveform(QtWidgets.QWidget):
         self._marker_dur_ms = 0
 
         self._token = 0
-        self._threads: List[threading.Thread] = []
         self._bridge = _Bridge(self)
         self._bridge.done.connect(self._on_done, QtCore.Qt.QueuedConnection)
+        self._loader = _Loader(self._bridge)
         self._controller = None
         #: Optional cap on frames analysed per clip (None = whole file).
         self.max_frames: Optional[int] = None
@@ -295,6 +441,9 @@ class RecordingWaveform(QtWidgets.QWidget):
     def show_recording(self, tx_id: str, path: Optional[str]) -> None:
         self._token += 1
         token = self._token
+        # Whatever is read now is no longer wanted - even when this message
+        # needs no read at all (no recording, missing file).
+        self._loader.cancel(token)
         self.current_tx_id = tx_id
         self.current_path = path or None
         self.envelope = None
@@ -307,19 +456,26 @@ class RecordingWaveform(QtWidgets.QWidget):
             self._set_state(STATE_MISSING, self._missing_text(path))
             return
         self._set_state(STATE_LOADING, LOADING_TEXT, terminal=False)
-        thread = threading.Thread(target=self._work, args=(token, path, self.max_frames),
-                                  name=f"waveform-{token}", daemon=True)
-        self._threads = [t for t in self._threads if t.is_alive()] + [thread]
-        thread.start()
+        # Replaces any request still waiting and cancels the one running.
+        if not self._loader.request(token, path, self.max_frames):
+            self._set_state(STATE_ERROR, "Waveform loading has stopped "
+                                         "(the window is closing).")
 
     def clear(self, message: str = NO_SELECTION_TEXT) -> None:
         self._token += 1  # any in-flight load is now stale
+        self._loader.cancel(self._token)   # and stops at its next chunk
         self.current_tx_id = None
         self.current_path = None
         self.envelope = None
         self._column_cache = None
         self.marker_visible = False
         self._set_state(STATE_EMPTY, message, terminal=False)
+
+    def shutdown(self) -> None:
+        """Stop loading for good: cancel any read and end the worker. Does
+        not wait - the worker leaves at its next chunk boundary."""
+        self._token += 1
+        self._loader.shutdown()
 
     def set_playback(self, controller) -> None:
         """Follow ``controller`` (PlaybackController-like); None detaches."""
@@ -347,14 +503,16 @@ class RecordingWaveform(QtWidgets.QWidget):
             if timer.elapsed() > timeout * 1000:
                 return False
             app.processEvents(QtCore.QEventLoop.AllEvents, 20)
-            for t in list(self._threads):
-                t.join(0.005)
+            self._loader.join(0.005)
         return True
 
     def wait_idle(self, timeout: float = 5.0) -> None:
-        """Join every worker (stale ones too) and deliver their results."""
-        for t in list(self._threads):
-            t.join(timeout)
+        """Wait until the worker has nothing running or pending, then deliver
+        any result. For tests; the application never waits on it."""
+        timer = QtCore.QElapsedTimer()
+        timer.start()
+        while not self._loader.idle() and timer.elapsed() < timeout * 1000:
+            self._loader.join(0.01)
         QtWidgets.QApplication.instance().processEvents()
         QtCore.QCoreApplication.sendPostedEvents()
         QtWidgets.QApplication.instance().processEvents()
@@ -388,16 +546,6 @@ class RecordingWaveform(QtWidgets.QWidget):
 
     # -- loading ------------------------------------------------------------
 
-    def _work(self, token: int, path: str, max_frames: Optional[int]) -> None:
-        try:
-            result: object = _compute_for_widget(path, max_frames)
-        except BaseException as exc:  # noqa: BLE001 - reported, not raised
-            result = exc
-        try:
-            self._bridge.done.emit(token, result)
-        except RuntimeError:
-            pass  # widget destroyed meanwhile
-
     def _on_done(self, token: int, result: object) -> None:
         if token != self._token:
             return  # stale: the selection moved on
@@ -427,7 +575,12 @@ class RecordingWaveform(QtWidgets.QWidget):
             state = c.state_for(self.current_tx_id)
         except Exception:  # noqa: BLE001
             return False
-        return state in ("playing", "paused")
+        if state not in ("playing", "paused"):
+            return False
+        # The same message can be playing a *different* file (its decoded
+        # audio): this waveform is the original's, so it owns the marker
+        # only when the file playing is the one drawn.
+        return same_audio(getattr(c, "path", None), self.current_path)
 
     def _sync_marker(self) -> None:
         visible = self._owns_playback()

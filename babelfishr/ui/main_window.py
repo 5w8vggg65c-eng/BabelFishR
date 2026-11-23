@@ -1350,7 +1350,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_capture_tab_label()
         self.start_button.setText("Stop monitoring")
         self._set_controls_enabled(False)
-        self.input_panel.set_monitoring(True)
+        self.input_panel.set_monitoring(True, replay=bool(replay_path))
+        self._refresh_context_lines()
 
     def _resolve_input_problem(self, message: str) -> None:
         """Refuse to start, say exactly why, and offer the real options.
@@ -1397,6 +1398,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_capture_tab_label()
         # Inputs can be changed again, but only once the watch has stopped.
         self.input_panel.set_monitoring(False)
+        self._refresh_context_lines()
         outstanding = self.app.outstanding_work()
         if outstanding:
             # Counts work still being processed and, as one, a capture that
@@ -2243,10 +2245,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.selected_range.setText(
             f"{start:%H:%M:%S}\u2013{end:%H:%M:%S}  ({float(tx.duration or 0.0):.1f} s)")
         self.selected_play_button.setEnabled(bool(tx.audio_path))
-        state = self.timeline.playback.state_for(tx.id)
         self.selected_play_button.setText(
-            "Pause" if state == "playing" and self.timeline.playback.controllable
-            else "Play original")
+            "Pause" if self._original_state(tx) == "playing"
+            and self.timeline.playback.controllable else "Play original")
         blocked = self.selected_bookmark_button.blockSignals(True)
         self.selected_bookmark_button.setChecked(bool(tx.bookmarked))
         self.selected_bookmark_button.setText(
@@ -2267,10 +2268,29 @@ class MainWindow(QtWidgets.QMainWindow):
         tx = self.timeline.selected_transmission()
         if tx is None:
             return
-        # The same controller, ownership and pause/resume rules as the
-        # message's own Play button.
-        self.timeline.playback.toggle(tx.id, tx.audio_path)
+        # The same controller as the message's own Play button - but this is
+        # the ORIGINAL: pause/resume only when the original itself is what is
+        # playing. The message's decoded audio (same id, other file) is
+        # replaced by the original, never paused by this button.
+        controller = self.timeline.playback
+        if self._original_state(tx) == "playing":
+            controller.pause()
+        else:
+            # Resumes a paused original; replaces anything else playing,
+            # including this message's decoded audio (the controller stops
+            # the other file first).
+            controller.play(tx.id, tx.audio_path)
         self._refresh_selected_panel()
+
+    def _original_state(self, tx) -> str:
+        """stopped / playing / paused - for this message's original file."""
+        from .waveform import same_audio
+
+        controller = self.timeline.playback
+        state = controller.state_for(tx.id)
+        if state != "stopped" and same_audio(controller.path, tx.audio_path):
+            return state
+        return "stopped"
 
     def _bookmark_selected(self) -> None:
         tx = self.timeline.selected_transmission()
@@ -2294,22 +2314,47 @@ class MainWindow(QtWidgets.QMainWindow):
         review = sum(1 for tx in shown if tx.needs_review)
         parts = [f"{len(shown)} message{'s' if len(shown) != 1 else ''}",
                  f"{review} need{'s' if review == 1 else ''} review"]
+        # The setting, not a claim about every old file: recordings can have
+        # been removed since.
         if getattr(self.app.config.recording, "enabled", True):
-            parts.append("Original audio retained")
+            parts.append("Keep original audio: on")
         else:
-            parts.append("Original audio NOT retained")
+            parts.append("Keep original audio: off")
         text = "  |  ".join(parts)
         if self.counts_label.text() != text:
             self.counts_label.setText(text)
 
-    def _refresh_context_lines(self) -> None:
-        """Band source, language and count lines, from the live state."""
+    def _source_text(self) -> str:
+        """What is really being read: the running session's own source when
+        there is one (a recorded file during replay), else the selected input."""
+        session = getattr(self.app, "session", None)
+        device = getattr(session, "audio_device", "") if session is not None else ""
+        if device.startswith("replay:"):
+            name = pathlib.Path(device[len("replay:"):]).name
+            capture = getattr(self.app, "capture", None)
+            source = getattr(capture, "source", None)
+            thread = getattr(capture, "_thread", None)
+            ended = (capture is None or bool(getattr(source, "finished", False))
+                     # A capture that failed mid-file has stopped reading too.
+                     or (thread is not None and not thread.is_alive()))
+            return f"SOURCE: RECORDED FILE \u00b7 {name}" + (" \u00b7 ended" if ended else "")
         status = self.input_panel.status_label.text().strip()
         source = status[len("INPUT:"):].strip() if status.upper().startswith("INPUT:") else status
-        text = f"SOURCE: {source or 'none selected'}"
-        if self.source_label.text() != text:
-            self.source_label.setText(text)
+        return f"SOURCE: {source or 'none selected'}"
+
+    def _refresh_context_lines(self) -> None:
+        """Band source, language and count lines, from the live state."""
+        text = self._source_text()
+        if self.source_label.toolTip() != text:
+            self.source_label.setToolTip(text)
             self.source_label.setAccessibleDescription(text)
+        # Long or non-ASCII file names are elided to the band's middle, never
+        # pushing the mode or the state off it; the full text is the tooltip.
+        room = max(160, self.status_band.width() // 2)
+        shown = self.source_label.fontMetrics().elidedText(
+            text, QtCore.Qt.ElideMiddle, room)
+        if self.source_label.text() != shown:
+            self.source_label.setText(shown)
         source_language = (self.source_language_box.currentText().split(" (")[0]
                            if self.source_mode_box.currentData() == "specified"
                            else "Detect language")
@@ -2741,6 +2786,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # -- shutdown --------------------------------------------------------
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         if self._shutdown_complete or self._finish_shutdown():
+            # Stop any waveform read; its worker leaves at the next chunk.
+            self.waveform.shutdown()
             super().closeEvent(event)
             return
         # Work is still outstanding, a capture is still finishing, an

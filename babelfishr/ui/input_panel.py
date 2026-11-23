@@ -423,7 +423,8 @@ class InputPanel(QtWidgets.QWidget):
             device = status["device"]
             self._set_status(f"INPUT: {device.name} — CONNECTED", "listening")
             note = ""
-            if device.is_builtin and self._monitoring:
+            if device.is_builtin and self._monitoring and not getattr(
+                    self, "_replaying", False):
                 note = ("This is the microphone built into this Mac. It is "
                         "recording the room, not a radio.")
             self._show_alert(note)
@@ -447,9 +448,15 @@ class InputPanel(QtWidgets.QWidget):
             f"color: {theme.status_color('error', self)}; font-weight: 600;")
         self.alert_label.show()
 
-    def set_monitoring(self, monitoring: bool) -> None:
-        """Freeze the input controls for the duration of a watch."""
+    def set_monitoring(self, monitoring: bool, replay: bool = False) -> None:
+        """Freeze the input controls for the duration of a watch.
+
+        *replay*: the watch reads a recorded file, not the selected input -
+        nothing about that input (such as "it is recording the room") is
+        true while it runs.
+        """
         self._monitoring = bool(monitoring)
+        self._replaying = bool(monitoring and replay)
         for widget in (self.device_box, self.rescan_button,
                        self.profile_check):
             widget.setEnabled(not self._monitoring)

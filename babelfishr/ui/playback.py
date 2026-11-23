@@ -262,9 +262,16 @@ class PlaybackController(QtCore.QObject):
             # version returned True here regardless.
             return tx_id not in self.last_error
         previous = self.owner
-        if previous is not None and previous != tx_id:
-            # One recording at a time. Retire the previous owner outright.
+        if previous is not None:
+            # One recording at a time. Retire whatever is playing outright -
+            # another message, another file of the same message (its
+            # original vs its decoded audio), or this same file being started
+            # again. (A paused same file resumed above and never gets here.)
+            # Stopped first, so the stop a real player reports as a file
+            # loads (QMediaPlayer does, synchronously) retires the OLD
+            # playback, not the new owner.
             self.backend.stop()
+            self._retire()
         self.owner = tx_id
         self.path = str(path)
         self.last_error.pop(tx_id, None)

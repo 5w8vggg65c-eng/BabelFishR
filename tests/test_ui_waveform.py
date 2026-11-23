@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import wave
 
 import numpy as np
@@ -190,27 +191,198 @@ def test_missing_corrupt_and_empty(widget, tmp_path):
     assert widget.state == "empty" and widget.current_tx_id is None
 
 
-def test_stale_completion_is_discarded(widget, tmp_path, monkeypatch):
-    path_a = _wav(tmp_path, "a.wav", np.zeros(SR))
-    path_b = _wav(tmp_path, "b.wav", speech_like(2.0))
-    real = waveform.compute_envelope
-    release = threading.Event()
+class _SlowCompute:
+    """A stand-in for compute_envelope that reads in many small "chunks",
+    honours cancellation at each one, and records what really ran."""
 
-    def slow(path, *a, **k):
-        if path == path_a:
-            release.wait(5)
-        return real(path, *a, **k)
+    def __init__(self, chunks=400, delay=0.005):
+        self.real = waveform.compute_envelope
+        self.chunks, self.delay = chunks, delay
+        self.lock = threading.Lock()
+        self.running = 0
+        self.max_running = 0
+        self.started: list = []
+        self.read: dict = {}
+        self.finished: list = []
+        self.first_started = threading.Event()
 
-    monkeypatch.setattr(waveform, "compute_envelope", slow)
-    widget.show_recording("A", path_a)
-    widget.show_recording("B", path_b)
-    assert widget.wait_until_loaded(5)
-    assert widget.current_tx_id == "B" and widget.state == "ready"
-    env_b = widget.envelope
-    release.set()
-    widget.wait_idle()  # deliver A's late result
-    assert widget.current_tx_id == "B"
-    assert widget.envelope is env_b and env_b.frames == 2 * SR
+    def __call__(self, path, *a, cancelled=None, **k):
+        name = os.path.basename(path)
+        with self.lock:
+            self.running += 1
+            self.max_running = max(self.max_running, self.running)
+            self.started.append(name)
+        self.first_started.set()
+        try:
+            if name.startswith("slow"):
+                for n in range(self.chunks):
+                    if cancelled is not None and cancelled():
+                        self.read[name] = n
+                        raise waveform.WaveformCancelled(path)
+                    time.sleep(self.delay)
+                self.read[name] = self.chunks
+            env = self.real(path, *a, cancelled=cancelled, **k)
+            self.finished.append(name)
+            return env
+        finally:
+            with self.lock:
+                self.running -= 1
+
+
+def test_rapid_selection_cancels_obsolete_reads_and_the_latest_wins(
+        widget, tmp_path, monkeypatch):
+    """Holding Down through a long Session: the read in progress stops at its
+    next chunk, the requests in between are never started, at most one read
+    runs at a time, and the last selection is the one shown."""
+    fake = _SlowCompute()
+    monkeypatch.setattr(waveform, "compute_envelope", fake)
+    paths = {n: _wav(tmp_path, f"{n}.wav", speech_like(0.5))
+             for n in ("slow_a", "slow_b", "slow_c")}
+    last = _wav(tmp_path, "last.wav", speech_like(2.0))
+
+    widget.show_recording("A", paths["slow_a"])
+    assert fake.first_started.wait(5)
+    widget.show_recording("B", paths["slow_b"])
+    widget.show_recording("C", paths["slow_c"])
+    widget.show_recording("D", last)
+    assert widget.wait_until_loaded(10)
+
+    assert widget.current_tx_id == "D" and widget.state == "ready"
+    assert widget.envelope.frames == 2 * SR
+    assert fake.max_running == 1, "more than one read ran at once"
+    # The first and the last ran; anything in between was either never
+    # started or stopped early - none of it ran to the end.
+    assert fake.started[0] == "slow_a.wav" and fake.started[-1] == "last.wav", fake.started
+    assert len(fake.started) <= 3, fake.started
+    for name in fake.started[:-1]:
+        assert fake.read[name] < fake.chunks, f"the obsolete read {name} ran to the end"
+        assert name not in fake.finished
+
+
+def test_clear_stops_the_read_in_progress(widget, tmp_path, monkeypatch):
+    fake = _SlowCompute()
+    monkeypatch.setattr(waveform, "compute_envelope", fake)
+    widget.show_recording("A", _wav(tmp_path, "slow_a.wav", speech_like(0.5)))
+    assert fake.first_started.wait(5)
+    widget.clear()
+    widget.wait_idle(5)
+    assert fake.read["slow_a.wav"] < fake.chunks
+    assert fake.finished == []
+    assert widget.state == "empty" and widget.envelope is None
+
+
+def test_shutdown_and_deletion_end_the_worker(qt_app, tmp_path, monkeypatch):
+    fake = _SlowCompute()
+    monkeypatch.setattr(waveform, "compute_envelope", fake)
+
+    first = RecordingWaveform()
+    first.show_recording("A", _wav(tmp_path, "slow_a.wav", speech_like(0.5)))
+    assert fake.first_started.wait(5)
+    first.shutdown()                       # returns at once; nothing waits
+    assert first._loader.join(2.0), "the worker did not leave after shutdown"
+    assert fake.read["slow_a.wav"] < fake.chunks
+
+    fake.first_started.clear()
+    second = RecordingWaveform()
+    loader = second._loader
+    second.show_recording("B", _wav(tmp_path, "slow_b.wav", speech_like(0.5)))
+    assert fake.first_started.wait(5)
+    second.deleteLater()                   # a widget destroyed without shutdown()
+    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+    qt_app.processEvents()
+    assert loader.join(3.0), "the worker outlived its widget"
+    assert fake.read["slow_b.wav"] < fake.chunks
+    # A request after shutdown is refused visibly, never stuck "loading".
+    first.show_recording("late", _wav(tmp_path, "late.wav", speech_like(0.2)))
+    assert first.state == "error"
+    first.deleteLater()
+
+
+def test_a_collected_widget_stops_its_worker_without_crashing(qt_app, tmp_path,
+                                                             monkeypatch):
+    """Dropped and garbage-collected mid-read, no shutdown(), no deleteLater:
+    the read stops at its next chunk and the idle worker leaves - nothing is
+    called on the half-collected widget."""
+    import gc
+
+    fake = _SlowCompute()
+    monkeypatch.setattr(waveform, "compute_envelope", fake)
+
+    def make():
+        w = RecordingWaveform()
+        w.show_recording("A", _wav(tmp_path, "slow_gc.wav", speech_like(0.5)))
+        return w._loader, w
+
+    loader, w = make()
+    assert fake.first_started.wait(5)
+    del w
+    gc.collect()
+    qt_app.processEvents()
+    assert loader.join(4.0), "the worker outlived a collected widget"
+    assert fake.read["slow_gc.wav"] < fake.chunks
+
+
+def test_selecting_a_message_without_audio_cancels_the_read(widget, tmp_path,
+                                                            monkeypatch):
+    fake = _SlowCompute()
+    monkeypatch.setattr(waveform, "compute_envelope", fake)
+    widget.show_recording("A", _wav(tmp_path, "slow_a.wav", speech_like(0.5)))
+    assert fake.first_started.wait(5)
+    widget.show_recording("B", None)                      # no recording
+    widget.wait_idle(5)
+    assert fake.read["slow_a.wav"] < fake.chunks
+    assert widget.state == "none"
+    widget.show_recording("C", str(tmp_path / "gone.wav"))  # missing file
+    assert widget.state == "missing"
+
+
+def test_the_real_reader_stops_at_a_chunk_boundary(tmp_path, monkeypatch):
+    path = _wav(tmp_path, "long.wav", speech_like(10.0))
+    reads = []
+    real_open = wave.open
+
+    def spying_open(*a, **k):
+        handle = real_open(*a, **k)
+        original = handle.readframes
+        handle.readframes = lambda n: reads.append(n) or original(n)
+        return handle
+
+    monkeypatch.setattr(wave, "open", spying_open)
+    asked = []
+
+    def cancelled():
+        asked.append(1)
+        return len(asked) > 3
+
+    with pytest.raises(waveform.WaveformCancelled):
+        compute_envelope(path, chunk_frames=4096, cancelled=cancelled)
+    assert len(reads) == 3, "reading went past the cancellation"
+
+
+def test_chunk_bytes_are_bounded_whatever_the_channel_count(tmp_path, monkeypatch):
+    """65,536 frames is fine for mono; for 2,000 channels of 32-bit it would
+    be half a gigabyte per read. The read size is bounded in bytes."""
+    path = tmp_path / "many.wav"
+    channels, frames = 2000, 600
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(channels)
+        handle.setsampwidth(4)
+        handle.setframerate(SR)
+        handle.writeframes(bytes(channels * 4 * frames))
+    reads = []
+    real_open = wave.open
+
+    def spying_open(*a, **k):
+        handle = real_open(*a, **k)
+        original = handle.readframes
+        handle.readframes = lambda n: reads.append(n) or original(n)
+        return handle
+
+    monkeypatch.setattr(wave, "open", spying_open)
+    env = compute_envelope(str(path))
+    assert env.frames == frames and env.channels == channels
+    assert max(reads) * channels * 4 <= waveform.MAX_CHUNK_BYTES
+    assert len(reads) >= 2
 
 
 def test_resize_does_not_reread_file(widget, tmp_path, monkeypatch):
@@ -265,6 +437,8 @@ class FakeController(QtCore.QObject):
         self.owner = None
         self.state = "stopped"
         self.pos = (0, 0)
+        #: The file playing, as PlaybackController.path.
+        self.path = None
 
     def state_for(self, tx_id):
         return self.state if tx_id == self.owner else "stopped"
@@ -283,6 +457,7 @@ def test_playback_marker_follows_selected_clip_only(widget, tmp_path):
     widget.show_recording("sel", path)
     widget.wait_until_loaded(5)
     ctl = FakeController()
+    ctl.path = path
     widget.set_playback(ctl)
     assert not widget.marker_visible
 
@@ -318,3 +493,22 @@ def test_playback_marker_follows_selected_clip_only(widget, tmp_path):
     assert widget.marker_visible
     widget.show_recording("x", path)
     assert not widget.marker_visible
+
+
+def test_the_marker_needs_the_same_file_not_just_the_same_message(widget, tmp_path):
+    """A message's decoded audio shares its id; the ORIGINAL's waveform must
+    not show a playhead for it."""
+    original = _wav(tmp_path, "orig.wav", speech_like(4.0))
+    decoded = _wav(tmp_path, "decoded.wav", speech_like(4.0))
+    widget.show_recording("sel", original)
+    widget.wait_until_loaded(5)
+    ctl = FakeController()
+    widget.set_playback(ctl)
+    ctl.path = decoded
+    ctl.set("sel", "playing", 1000, 4000)
+    ctl.positionChanged.emit("sel", 1000, 4000)
+    assert not widget.marker_visible
+    ctl.path = original
+    ctl.set("sel", "playing", 1500, 4000)
+    ctl.positionChanged.emit("sel", 1500, 4000)
+    assert widget.marker_visible
