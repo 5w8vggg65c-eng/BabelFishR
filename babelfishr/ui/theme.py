@@ -3,11 +3,13 @@
 The window follows the operator's system appearance, as before. What changes
 with this pass is the look in each:
 
-* **Dark appearance - the field console.** A fixed, high-contrast navy
-  palette (influenced by OpenDMR's status-band layouts and the UV-5RM
-  firmware's direct rectangular menus): navy ground, slightly lighter panels,
-  off-white text, cyan for the primary control and the selection, amber for
-  anything that needs review. It is applied as the window's own palette, so
+* **Dark appearance - the field console.** A fixed, high-contrast palette
+  whose primary reference is OpenDMR: its cool navy blues and turquoise, and
+  its status bands. The UV-5RM firmware contributes compact, terse structure
+  only, not its colours. Navy ground, slightly lighter blue panels, off-white
+  text, turquoise-cyan for the primary control and the selection, amber for
+  anything that needs review. Red appears only as the semantic error colour.
+  It is applied as the window's own palette, so
   native-drawn widgets (fields, menus, tabs, scroll bars) match rather than
   showing the operating system's grey.
 * **Light appearance - daylight.** Colours still derive from the system
