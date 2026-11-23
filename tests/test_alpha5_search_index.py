@@ -452,13 +452,25 @@ def test_a_replayed_recording_writes_each_index_entry_only_when_its_text_changes
     trace = Trace(store)
     app.start_session(replay_path=fixture_wav, name="run")
     app.run_replay()
+
+    def settled():
+        # Read under the store's lock while the trace callback is installed.
+        # The pipeline worker writes under that lock; an unlocked read from
+        # this thread can deadlock with it in native code (the worker holds
+        # SQLite's connection mutex and waits for the GIL to run the Python
+        # callback; this thread holds the GIL and waits for the mutex), which
+        # stalled macOS run 29 silently. Waiting on the lock releases the GIL.
+        with store._lock:
+            return all(tx.state in (ProcessingState.COMPLETE, ProcessingState.FAILED,
+                                    ProcessingState.SKIPPED)
+                       for tx in app.recent_transmissions())
+
     deadline = time.time() + 30
-    while time.time() < deadline and not all(
-            tx.state in (ProcessingState.COMPLETE, ProcessingState.FAILED, ProcessingState.SKIPPED)
-            for tx in app.recent_transmissions()):
+    while time.time() < deadline and not settled():
         time.sleep(0.05)
+    with store._lock:
+        store._conn.set_trace_callback(None)
     app.stop_session()
-    store._conn.set_trace_callback(None)
     txs = app.recent_transmissions()
     assert len(txs) >= 3 and all(tx.state is ProcessingState.COMPLETE for tx in txs)
     saves = [x for x in trace.statements if x.startswith("INSERT INTO transmissions (")]

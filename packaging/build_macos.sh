@@ -76,6 +76,13 @@ else
   # though its output goes through tee.
   # --timeout turns a hung test into a failure naming the test, rather than a
   # build step that sits there. --durations shows the slow ones either way.
+  # BABELFISHR_HANG_DUMP_*: a test still running after that many seconds
+  # (well past --timeout) is taken to be stuck in native code holding the
+  # GIL, where pytest-timeout cannot report it; tests/conftest.py then dumps
+  # every thread's stack to hang-dump.txt (which also lists each test as it
+  # starts) and ends the run, so the step fails and the reports upload.
+  BABELFISHR_HANG_DUMP_SECONDS="${BABELFISHR_HANG_DUMP_SECONDS:-240}" \
+  BABELFISHR_HANG_DUMP_FILE="$REPORT_DIR/hang-dump.txt" \
   BABELFISHR_HOME="$(mktemp -d)/BabelFishR-buildtest" python -m pytest -q -rs \
     --timeout="${BABELFISHR_TEST_TIMEOUT:-120}" --timeout-method=thread \
     --durations=15 \
