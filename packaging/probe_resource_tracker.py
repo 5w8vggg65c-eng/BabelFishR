@@ -9,8 +9,10 @@ child only when they match. The child gets the read end of a real pipe, the
 write end is closed before launch, so a tracker reads EOF straight away and
 exits 0. An entry point without multiprocessing.freeze_support() hands these
 arguments to the CLI instead, and argparse exits 2 with "invalid choice".
-Runs from / with a scrubbed environment and a throwaway HOME: no models, no
-network, nothing written to the operator's Application Support.
+Runs from / with a scrubbed environment that keeps the existing HOME, and
+BABELFISHR_HOME set to a throwaway probe directory so any app data the child
+might write stays out of the operator's Application Support. No models, no
+network.
 """
 
 from __future__ import annotations
@@ -26,9 +28,12 @@ def main() -> int:
     binary, flags = sys.argv[1], json.loads(sys.argv[2])
     read_fd, write_fd = os.pipe()
     os.close(write_fd)                       # the tracker will read EOF at once
-    with tempfile.TemporaryDirectory(prefix="bfr-tracker-probe-") as home:
-        env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": home,
-               "TMPDIR": os.environ.get("TMPDIR", "/tmp")}
+    with tempfile.TemporaryDirectory(prefix="bfr-tracker-probe-") as probe_root:
+        env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+               "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+               "BABELFISHR_HOME": probe_root}
+        if os.environ.get("HOME"):
+            env["HOME"] = os.environ["HOME"]
         command = [binary, *flags, "-c",
                    f"from multiprocessing.resource_tracker import main;main({read_fd})"]
         try:
