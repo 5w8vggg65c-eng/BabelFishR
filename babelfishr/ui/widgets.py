@@ -168,3 +168,90 @@ class TagEditor(QtWidgets.QDialog):
 
     def tags(self) -> List[str]:
         return [t.strip() for t in self.field.text().split(",") if t.strip()]
+
+
+class SessionListBar(QtWidgets.QTabBar):
+    """The named Sessions as a vertical list, one row each.
+
+    Still a QTabBar - current index, tab data, icons, tooltips, double-click
+    and the context menu behave exactly as the horizontal tab row did - but
+    laid out down the left pane and drawn as rows: horizontal text, the
+    Session's colour swatch, the selected row filled with the accent and
+    marked with a chevron. Keyboard: Up/Down (and Left/Right) move between
+    Sessions, as on any tab bar.
+    """
+
+    ROW_PADDING = 7
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        self.setShape(QtWidgets.QTabBar.RoundedWest)
+        self.setDrawBase(False)
+        self.setExpanding(False)
+        self.setUsesScrollButtons(True)
+        self.setElideMode(QtCore.Qt.ElideRight)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                           QtWidgets.QSizePolicy.Maximum)
+
+    def tabSizeHint(self, index: int) -> QtCore.QSize:  # noqa: N802
+        height = self.fontMetrics().height() + 2 * self.ROW_PADDING
+        return QtCore.QSize(max(self.width(), 160), height)
+
+    def minimumTabSizeHint(self, index: int) -> QtCore.QSize:  # noqa: N802
+        return QtCore.QSize(120, self.tabSizeHint(index).height())
+
+    def sizeHint(self) -> QtCore.QSize:  # noqa: N802
+        # Exactly the rows: no empty band below the last Session.
+        rows = sum(self.tabSizeHint(i).height() for i in range(self.count()))
+        return QtCore.QSize(max(self.width(), 160), max(rows, 1))
+
+    def minimumSizeHint(self) -> QtCore.QSize:  # noqa: N802
+        return QtCore.QSize(120, self.sizeHint().height())
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        # Row width follows the pane; ask for a relayout of the rows.
+        self.updateGeometry()
+        self.update()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802
+        from . import theme
+
+        t = theme.tokens(self)
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.TextAntialiasing)
+        metrics = self.fontMetrics()
+        for index in range(self.count()):
+            rect = self.tabRect(index)
+            rect.setLeft(0)
+            rect.setRight(self.width() - 1)
+            selected = index == self.currentIndex()
+            if selected:
+                painter.fillRect(rect, QtGui.QColor(t["accent"]))
+                colour = QtGui.QColor(t["on_accent"])
+            else:
+                colour = QtGui.QColor(t["text"])
+            if self.hasFocus() and selected:
+                painter.setPen(QtGui.QPen(QtGui.QColor(t["text"]), 1,
+                                          QtCore.Qt.DotLine))
+                painter.drawRect(rect.adjusted(0, 0, -1, -1))
+            x = rect.left() + 10
+            icon = self.tabIcon(index)
+            if not icon.isNull():
+                size = min(12, rect.height() - 6)
+                icon.paint(painter, QtCore.QRect(
+                    x, rect.center().y() - size // 2, size, size))
+                x += size + 8
+            chevron = "›" if selected else ""
+            chevron_width = metrics.horizontalAdvance(" >") if selected else 0
+            text_rect = QtCore.QRect(x, rect.top(), rect.right() - x - 8 - chevron_width,
+                                     rect.height())
+            painter.setPen(colour)
+            painter.drawText(text_rect, QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft,
+                             metrics.elidedText(self.tabText(index),
+                                                QtCore.Qt.ElideRight, text_rect.width()))
+            if chevron:
+                painter.drawText(QtCore.QRect(rect.right() - 8 - chevron_width, rect.top(),
+                                              chevron_width, rect.height()),
+                                 QtCore.Qt.AlignVCenter | QtCore.Qt.AlignRight, ">")
+        painter.end()

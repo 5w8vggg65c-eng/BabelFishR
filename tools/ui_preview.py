@@ -206,7 +206,15 @@ def main(argv=None) -> int:
     app.select_conversation(conversation.id)
     window = MainWindow(app)
     window.setWindowTitle(TITLE)
+    # The identity row says this is sample data, as the concept did.
+    window.title_note.setText("UI PREVIEW / SAMPLE DATA")
     window.show()
+    # Select the French sample, so the waveform shows its own recording.
+    for tx_id in window.timeline.order():
+        if window.timeline.bubble(tx_id).tx.source_language == "fr":
+            window.timeline.select(tx_id)
+            break
+    window.waveform.wait_until_loaded(10.0)
     status = 0
     if args.screenshot:
         out = pathlib.Path(args.screenshot)

@@ -149,113 +149,252 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # -- construction ----------------------------------------------------
     def _build_ui(self) -> None:
+        """The v5 field console: identity row, teal status band, the in-window
+        menu as navigation, then two panes - Sessions, input and local
+        engines on the left; waveform, review list and the selected
+        recording's actions on the right - over a footer status band.
+
+        Every control is an existing one, re-homed; every label shows a real
+        state. Nothing here is sample data.
+        """
+        from .waveform import RecordingWaveform
+        from .widgets import SessionListBar
+
         central = QtWidgets.QWidget()
         central.setObjectName("centralRoot")
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(10)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        # The header band: start/stop, state, operating mode, readiness and
-        # level in one compact strip, the first thing the eye lands on.
-        self.header_band = QtWidgets.QFrame()
-        self.header_band.setObjectName("headerBand")
-        header = self._build_header()
-        header.setContentsMargins(8, 6, 8, 6)
-        self.header_band.setLayout(header)
-        root.addWidget(self.header_band)
+        # -- identity row --------------------------------------------------
+        self.title_bar = QtWidgets.QFrame()
+        self.title_bar.setObjectName("titleBar")
+        title_row = QtWidgets.QHBoxLayout(self.title_bar)
+        title_row.setContentsMargins(14, 4, 14, 4)
+        self.app_title = QtWidgets.QLabel("BabelFishR")
+        self.app_title.setObjectName("appTitle")
+        title_row.addWidget(self.app_title)
+        title_row.addStretch(1)
+        #: Empty in the application. A preview or demonstration sets it so
+        #: sample data can never be mistaken for real traffic.
+        self.title_note = QtWidgets.QLabel("")
+        self.title_note.setObjectName("titleNote")
+        title_row.addWidget(self.title_note)
+        root.addWidget(self.title_bar)
 
-        # Deliberately outside the collapsible panel below: the operator must
-        # be able to see which input is live at every moment of a watch,
-        # without expanding anything to find out.
-        self.input_box = QtWidgets.QGroupBox("Audio input")
-        self.input_box.setObjectName("inputPanel")
-        self.input_panel = InputPanel(self.app)
-        self.input_panel.selectionChanged.connect(self._on_input_selection)
-        input_layout = QtWidgets.QVBoxLayout(self.input_box)
-        input_layout.setContentsMargins(10, 6, 10, 8)
-        input_layout.addWidget(self.input_panel)
-        root.addWidget(self.input_box)
+        # -- status band: operating mode | source | state ------------------
+        self.status_band = QtWidgets.QFrame()
+        self.status_band.setObjectName("statusBand")
+        band = QtWidgets.QHBoxLayout(self.status_band)
+        band.setContentsMargins(10, 4, 14, 4)
+        band.setSpacing(12)
+        self._build_header(band)
+        root.addWidget(self.status_band)
+        # Kept under its old name: the header row is now the status band.
+        self.header_band = self.status_band
 
-        self.setup_box = QtWidgets.QGroupBox("Session Options")
-        self.setup_box.setObjectName("setupPanel")
-        self.setup_box.setCheckable(True)
-        self.setup_box.setChecked(True)
-        self.setup_box.setToolTip("Collapse Session Options to give the "
-                                  "message thread more room")
-        self.setup_box.setAccessibleName("Session Options")
-        # One child widget holds every control, and collapsing hides that one
-        # widget. The previous version walked findChildren(QWidget) and called
-        # setVisible on all of them - which reaches inside the combo boxes to
-        # their popup views and inside the scroll areas to their scrollbars,
-        # so expanding again made dropdowns and stray scrollbars appear.
-        self.setup_content = QtWidgets.QWidget(self.setup_box)
-        self.setup_content.setObjectName("setupPanelContent")
-        self.setup_content.setLayout(self._build_controls())
-        outer = QtWidgets.QVBoxLayout(self.setup_box)
-        outer.setContentsMargins(10, 6, 10, 8)
-        outer.addWidget(self.setup_content)
-        self.setup_box.toggled.connect(self._toggle_setup_panel)
-        root.addWidget(self.setup_box)
+        # Navigation: the window's own menu bar, below the band as in the
+        # approved layout. menuBar() returns this bar, so every menu, action
+        # and shortcut is the same object as before.
+        self._nav_bar = QtWidgets.QMenuBar()
+        root.addWidget(self._nav_bar)
 
-        self.warning_banner = QtWidgets.QLabel()
-        self.warning_banner.setObjectName("warningBanner")
-        self.warning_banner.setWordWrap(True)
-        self.warning_banner.hide()
-        root.addWidget(self.warning_banner)
+        # -- the two panes --------------------------------------------------
+        panes = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        panes.setObjectName("paneSplitter")
+        panes.setChildrenCollapsible(False)
+        panes.setHandleWidth(1)
+        root.addWidget(panes, 1)
+        self.pane_splitter = panes
 
-        self.privacy_banner = QtWidgets.QLabel()
-        self.privacy_banner.setObjectName("privacyBanner")
-        self.privacy_banner.setWordWrap(True)
-        self.privacy_banner.hide()
-        root.addWidget(self.privacy_banner)
+        left = QtWidgets.QFrame()
+        left.setObjectName("leftPane")
+        left.setMinimumWidth(240)
+        left_layout = QtWidgets.QVBoxLayout(left)
+        left_layout.setContentsMargins(8, 8, 8, 8)
+        left_layout.setSpacing(4)
+        left_scroll = QtWidgets.QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        left_scroll.setWidget(left)
+        left_scroll.setMinimumWidth(250)
+        panes.addWidget(left_scroll)
 
+        right = QtWidgets.QFrame()
+        right.setObjectName("rightPane")
+        right_layout = QtWidgets.QVBoxLayout(right)
+        right_layout.setContentsMargins(10, 8, 10, 0)
+        right_layout.setSpacing(6)
+        panes.addWidget(right)
+        panes.setStretchFactor(0, 0)
+        panes.setStretchFactor(1, 1)
+        panes.setSizes([320, 900])
+
+        # -- left: SESSIONS --------------------------------------------------
+        left_layout.addWidget(self._section_header("SESSIONS"))
         # Named Session threads. The database still records one Session per
         # monitoring run; this groups those runs into the continuous log an
         # operator actually thinks in.
-        self.session_tabs = QtWidgets.QTabBar()
+        self.session_tabs = SessionListBar()
         self.session_tabs.setObjectName("sessionTabs")
-        self.session_tabs.setExpanding(False)
-        self.session_tabs.setDrawBase(True)
         self.session_tabs.setAccessibleName("Sessions")
         self.session_tabs.setToolTip(
             "Named Sessions. Monitoring can be started and stopped many "
             "times inside one Session; the thread continues.\n\n"
-            "To rename a Session: double-click its tab, right-click its tab, "
+            "To rename a Session: double-click it, right-click it, "
             "or select it and press Rename.")
         self.session_tabs.currentChanged.connect(self._on_session_tab)
         self.session_tabs.tabBarDoubleClicked.connect(self._rename_session_tab)
-        # A right-click menu as well. Double-click on a trackpad is easy to
-        # miss, and a small toolbar button is easy to overlook; a menu on the
-        # tab itself is where a Mac user expects to find "rename".
         self.session_tabs.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.session_tabs.customContextMenuRequested.connect(
             self._session_tab_menu)
+        left_layout.addWidget(self.session_tabs)
 
-        tab_row = QtWidgets.QHBoxLayout()
-        tab_row.setSpacing(6)
-        tab_row.addWidget(self.session_tabs)
+        session_buttons = QtWidgets.QHBoxLayout()
+        session_buttons.setContentsMargins(0, 2, 0, 2)
+        session_buttons.setSpacing(6)
         self.new_session_button = QtWidgets.QToolButton()
-        self.new_session_button.setText("+")
+        self.new_session_button.setText("+ New")
         self.new_session_button.setToolTip("Create a new named Session")
         self.new_session_button.setAccessibleName("New Session")
         self.new_session_button.clicked.connect(self._new_session_tab)
-        tab_row.addWidget(self.new_session_button)
+        session_buttons.addWidget(self.new_session_button)
         self.rename_session_button = QtWidgets.QToolButton()
-        self.rename_session_button.setText("Rename\u2026")
+        self.rename_session_button.setText("Rename…")
         self.rename_session_button.setToolTip(
             "Rename the selected Session. Its messages and recordings are "
             "kept; only the name changes.")
         self.rename_session_button.setAccessibleName("Rename Session")
         self.rename_session_button.clicked.connect(
             lambda: self._rename_session_tab(self.session_tabs.currentIndex()))
-        tab_row.addWidget(self.rename_session_button)
-        tab_row.addStretch(1)
+        session_buttons.addWidget(self.rename_session_button)
+        session_buttons.addStretch(1)
+        left_layout.addLayout(session_buttons)
+        # The concept's "Saved sessions" and "Search": the real View actions.
+        self.hidden_sessions_link = self._pane_link("Hidden sessions",
+                                                    checkable=True)
+        self.search_link = self._pane_link("Search")
+        self.search_link.setToolTip("Search this Session's original and "
+                                    "translated text (Ctrl+F)")
+        left_layout.addWidget(self.hidden_sessions_link)
+        left_layout.addWidget(self.search_link)
+        left_layout.addWidget(self._rule())
+
+        # -- left: INPUT ------------------------------------------------------
+        left_layout.addWidget(self._section_header("INPUT"))
+        # Deliberately always visible: the operator must be able to see which
+        # input is live at every moment of a watch.
+        self.input_box = QtWidgets.QFrame()
+        self.input_box.setObjectName("inputArea")
+        self.input_panel = InputPanel(self.app)
+        self.input_panel.selectionChanged.connect(self._on_input_selection)
+        input_layout = QtWidgets.QVBoxLayout(self.input_box)
+        input_layout.setContentsMargins(4, 2, 4, 2)
+        input_layout.addWidget(self.input_panel)
+        left_layout.addWidget(self.input_box)
+        self.language_line = QtWidgets.QLabel("")
+        self.language_line.setObjectName("paneLine")
+        self.language_line.setAccessibleName("Languages")
+        left_layout.addWidget(self.language_line)
+        self.receiver_line = QtWidgets.QLabel("")
+        self.receiver_line.setObjectName("mutedLine")
+        self.receiver_line.setWordWrap(True)
+        self.receiver_line.setContentsMargins(10, 0, 10, 0)
+        left_layout.addWidget(self.receiver_line)
+        level_row = QtWidgets.QHBoxLayout()
+        level_row.setContentsMargins(10, 2, 0, 2)
+        # The input's own meter (above) is the visible one; this one is kept
+        # for the calibration and capture code that feeds it.
+        self.meter = LevelMeterWidget()
+        self.meter.hide()
+        level_row.addWidget(self.meter, 1)
+        level_row.addStretch(1)
+        self.clip_label = QtWidgets.QLabel("")
+        level_row.addWidget(self.clip_label)
+        self.calibrate_button = QtWidgets.QPushButton("Calibrate")
+        self.calibrate_button.setToolTip(
+            "Listen to the idle channel for a few seconds and suggest a "
+            "detection threshold.")
+        self.calibrate_button.clicked.connect(self._calibrate)
+        level_row.addWidget(self.calibrate_button)
+        left_layout.addLayout(level_row)
+        left_layout.addWidget(self._rule())
+
+        # -- left: LOCAL ENGINES ---------------------------------------------
+        left_layout.addWidget(self._section_header("LOCAL ENGINES"))
+        self.speech_engine_line = QtWidgets.QLabel("Speech: …")
+        self.speech_engine_line.setObjectName("engineLine")
+        self.translation_engine_line = QtWidgets.QLabel("Translation: …")
+        self.translation_engine_line.setObjectName("engineLine")
+        left_layout.addWidget(self.speech_engine_line)
+        left_layout.addWidget(self.translation_engine_line)
+        self.ready_badge = QtWidgets.QLabel()
+        self.ready_badge.setObjectName("readinessLink")
+        self.ready_badge.setCursor(QtCore.Qt.PointingHandCursor)
+        self.ready_badge.setToolTip("Field readiness - click for the full report")
+        self.ready_badge.setAccessibleName("Field readiness")
+        self.ready_badge.mousePressEvent = lambda event: self._show_readiness()
+        left_layout.addWidget(self.ready_badge)
+        left_layout.addStretch(1)
+
+        # -- right: header, banners --------------------------------------------
+        header = QtWidgets.QFrame()
+        header.setObjectName("paneHeader")
+        header_row = QtWidgets.QHBoxLayout(header)
+        header_row.setContentsMargins(0, 0, 0, 0)
+        heading = QtWidgets.QLabel("Transcript and translation")
+        heading.setObjectName("paneHeading")
+        header_row.addWidget(heading)
+        header_row.addStretch(1)
         self.capture_tab_label = QtWidgets.QLabel("")
         self.capture_tab_label.setObjectName("sectionLabel")
-        tab_row.addWidget(self.capture_tab_label)
-        root.addLayout(tab_row)
+        header_row.addWidget(self.capture_tab_label)
+        right_layout.addWidget(header)
 
+        self.warning_banner = QtWidgets.QLabel()
+        self.warning_banner.setObjectName("warningBanner")
+        self.warning_banner.setWordWrap(True)
+        self.warning_banner.hide()
+        right_layout.addWidget(self.warning_banner)
+
+        self.privacy_banner = QtWidgets.QLabel()
+        self.privacy_banner.setObjectName("privacyBanner")
+        self.privacy_banner.setWordWrap(True)
+        self.privacy_banner.hide()
+        right_layout.addWidget(self.privacy_banner)
+
+        # -- right: the selected recording's waveform ---------------------------
+        self.waveform = RecordingWaveform()
+        right_layout.addWidget(self.waveform)
+
+        # -- right: filters and search ------------------------------------------
+        filter_row = QtWidgets.QHBoxLayout()
+        filter_row.setSpacing(6)
+        self.filter_group = QtWidgets.QButtonGroup(self)
+        self.filter_group.setExclusive(True)
+        self.filter_all = self._filter_button("All messages")
+        self.filter_review = self._filter_button("Needs review")
+        self.filter_bookmarked = self._filter_button("Bookmarked")
+        for button in (self.filter_all, self.filter_review, self.filter_bookmarked):
+            self.filter_group.addButton(button)
+            filter_row.addWidget(button)
+        self.filter_all.setChecked(True)
+        filter_row.addStretch(1)
+        self.search_field = QtWidgets.QLineEdit()
+        self.search_field.setObjectName("searchField")
+        self.search_field.setPlaceholderText("Search...")
+        self.search_field.setClearButtonEnabled(True)
+        self.search_field.setAccessibleName("Search this Session")
+        self.search_field.setMinimumWidth(180)
+        self.search_field.returnPressed.connect(
+            lambda: self._run_search(self.search_field.text()))
+        filter_row.addWidget(self.search_field, 1)
+        right_layout.addLayout(filter_row)
+
+        # -- right: the review list ---------------------------------------------
+        right_layout.addWidget(self._column_header())
         self.timeline = TimelineView()
         self.timeline.correctionRequested.connect(self._on_correction)
         self.timeline.tagsChanged.connect(self._on_tags)
@@ -267,35 +406,208 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timeline.analyzeDigitalRequested.connect(self._on_analyze_digital)
         self.timeline.removeRequested.connect(self._on_remove_message)
         self.timeline.restoreRequested.connect(self._on_restore_message)
-        root.addWidget(self.timeline, 1)
+        self.timeline.selectionChanged.connect(self._on_selection_changed)
+        self.timeline.selectedUpdated.connect(lambda _id: self._refresh_selected_panel())
+        self.waveform.set_playback(self.timeline.playback)
+        self.timeline.playback.changed.connect(
+            lambda _affected: self._refresh_selected_panel())
+        right_layout.addWidget(self.timeline, 1)
 
-        self.status = self.statusBar()
-        self.status.showMessage(backend_status())
-        self._build_menu()
+        # Session Options: the existing panel, shown by its button.
+        self.setup_box = QtWidgets.QGroupBox("Session Options")
+        self.setup_box.setObjectName("setupPanel")
+        self.setup_box.setCheckable(True)
+        self.setup_box.setChecked(True)
+        self.setup_box.setToolTip("Collapse Session Options to give the "
+                                  "message list more room")
+        self.setup_box.setAccessibleName("Session Options")
+        # One child widget holds every control, and collapsing hides that one
+        # widget (see _toggle_setup_panel).
+        self.setup_content = QtWidgets.QWidget(self.setup_box)
+        self.setup_content.setObjectName("setupPanelContent")
+        self.setup_content.setLayout(self._build_controls())
+        outer = QtWidgets.QVBoxLayout(self.setup_box)
+        outer.setContentsMargins(10, 6, 10, 8)
+        outer.addWidget(self.setup_content)
+        self.setup_box.toggled.connect(self._toggle_setup_panel)
+        self.setup_box.hide()
+        right_layout.addWidget(self.setup_box)
 
-    def _build_header(self) -> QtWidgets.QHBoxLayout:
-        row = QtWidgets.QHBoxLayout()
-        row.setSpacing(10)
+        # -- right: SELECTED AUDIO ------------------------------------------------
+        right_layout.addWidget(self._build_selected_panel())
 
+        # -- right: actions -------------------------------------------------------
+        actions = QtWidgets.QFrame()
+        actions.setObjectName("actionRow")
+        action_row = QtWidgets.QHBoxLayout(actions)
+        action_row.setContentsMargins(0, 8, 0, 8)
+        action_row.setSpacing(12)
+        self.open_recording_button = QtWidgets.QPushButton("Open recording")
+        self.open_recording_button.setObjectName("primaryAction")
+        self.open_recording_button.setToolTip(
+            "Run a WAV recording through the pipeline (File ▸ Replay WAV file)")
+        self.open_recording_button.clicked.connect(self._replay_file)
+        action_row.addWidget(self.open_recording_button)
         self.start_button = QtWidgets.QPushButton("Start monitoring")
         self.start_button.setObjectName("primaryButton")
-        self.start_button.setMinimumWidth(170)
-        self.start_button.setDefault(True)
+        self.start_button.setMinimumWidth(190)
         self.start_button.setShortcut("Ctrl+R")
         self.start_button.setToolTip("Start or stop monitoring (Ctrl+R)")
         self.start_button.setAccessibleName("Start or stop monitoring")
         self.start_button.clicked.connect(self._toggle_monitoring)
-        row.addWidget(self.start_button)
+        action_row.addWidget(self.start_button)
+        self.session_options_button = QtWidgets.QPushButton("Session options")
+        self.session_options_button.setObjectName("secondaryAction")
+        self.session_options_button.setCheckable(True)
+        self.session_options_button.setToolTip(
+            "Radio profile, source language and translation language")
+        self.session_options_button.toggled.connect(self.setup_box.setVisible)
+        action_row.addWidget(self.session_options_button)
+        self.export_button = QtWidgets.QPushButton("Export")
+        self.export_button.setObjectName("secondaryAction")
+        self.export_button.setToolTip(
+            "Export this Session (File ▸ Export session bundle)")
+        self.export_button.clicked.connect(self._export_session)
+        action_row.addWidget(self.export_button)
+        action_row.addStretch(1)
+        right_layout.addWidget(actions)
 
-        self.state_badge = QtWidgets.QLabel("\u25cb Idle")
-        self.state_badge.setObjectName("stateBadge")
-        self.state_badge.setAccessibleName("Current state")
-        row.addWidget(self.state_badge)
+        # -- footer status band ---------------------------------------------------
+        self.status = self.statusBar()
+        self.status.setSizeGripEnabled(True)
+        self.counts_label = QtWidgets.QLabel("")
+        self.counts_label.setObjectName("countsLine")
+        self.counts_label.setAccessibleName("Message counts")
+        self.status.addPermanentWidget(self.counts_label)
+        self.status.showMessage(backend_status())
+        self._build_menu()
+        self._wire_pane_links()
+        # Nothing is selected yet: the panel and waveform say so.
+        self._refresh_selected_panel()
 
+    def menuBar(self) -> QtWidgets.QMenuBar:  # noqa: N802
+        """The in-window navigation bar (see _build_ui), not a bar QMainWindow
+        would put above the identity row."""
+        bar = getattr(self, "_nav_bar", None)
+        return bar if bar is not None else super().menuBar()
+
+    # -- v5 construction helpers ---------------------------------------------
+    def _section_header(self, text: str) -> QtWidgets.QLabel:
+        label = QtWidgets.QLabel(text)
+        label.setObjectName("sectionHeader")
+        label.setAccessibleName(text.title())
+        return label
+
+    def _rule(self) -> QtWidgets.QFrame:
+        rule = QtWidgets.QFrame()
+        rule.setObjectName("rule")
+        rule.setFixedHeight(1)
+        return rule
+
+    def _pane_link(self, text: str, checkable: bool = False) -> QtWidgets.QPushButton:
+        button = QtWidgets.QPushButton(text)
+        button.setObjectName("paneLink")
+        button.setCheckable(checkable)
+        button.setFlat(True)
+        button.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                             QtWidgets.QSizePolicy.Fixed)
+        return button
+
+    def _filter_button(self, text: str) -> QtWidgets.QPushButton:
+        button = QtWidgets.QPushButton(text)
+        button.setObjectName("filterButton")
+        button.setCheckable(True)
+        button.setAccessibleName(f"Show {text.lower()}")
+        return button
+
+    def _column_header(self) -> QtWidgets.QFrame:
+        from .timeline import REVIEW_COLUMN_WIDTH, TIME_COLUMN_WIDTH
+
+        frame = QtWidgets.QFrame()
+        frame.setObjectName("columnHeader")
+        row = QtWidgets.QHBoxLayout(frame)
+        # The rows' own margins and spacing, so the headings sit over them.
+        row.setContentsMargins(14, 4, 10, 4)
+        row.setSpacing(16)
+        time = QtWidgets.QLabel("TIME")
+        time.setFixedWidth(TIME_COLUMN_WIDTH)
+        row.addWidget(time)
+        self.original_heading = QtWidgets.QLabel("ORIGINAL")
+        row.addWidget(self.original_heading, 1)
+        self.translation_heading = QtWidgets.QLabel("TRANSLATION")
+        row.addWidget(self.translation_heading, 1)
+        review = QtWidgets.QLabel("REVIEW")
+        review.setFixedWidth(REVIEW_COLUMN_WIDTH)
+        review.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        row.addWidget(review)
+        return frame
+
+    def _build_selected_panel(self) -> QtWidgets.QFrame:
+        """SELECTED AUDIO: the chosen message's own recording and actions.
+
+        The range shown is the clip's own start and end time on this
+        computer's clock - each message is its own recording, so there is no
+        longer session recording to place it in.
+        """
+        panel = QtWidgets.QFrame()
+        panel.setObjectName("selectedAudio")
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(4, 8, 4, 4)
+        layout.setSpacing(6)
+        title_row = QtWidgets.QHBoxLayout()
+        title_row.setSpacing(24)
+        title = QtWidgets.QLabel("SELECTED AUDIO")
+        title.setObjectName("selectedTitle")
+        title_row.addWidget(title)
+        self.selected_range = QtWidgets.QLabel("")
+        self.selected_range.setObjectName("selectedTitle")
+        self.selected_range.setAccessibleName("Selected recording time")
+        title_row.addWidget(self.selected_range)
+        title_row.addStretch(1)
+        layout.addLayout(title_row)
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.setSpacing(12)
+        self.selected_play_button = QtWidgets.QPushButton("Play original")
+        self.selected_play_button.setObjectName("primaryAction")
+        self.selected_play_button.setAccessibleName("Play the selected original recording")
+        self.selected_play_button.clicked.connect(self._play_selected)
+        buttons.addWidget(self.selected_play_button)
+        self.selected_bookmark_button = QtWidgets.QPushButton("Bookmark")
+        self.selected_bookmark_button.setObjectName("textAction")
+        self.selected_bookmark_button.setCheckable(True)
+        self.selected_bookmark_button.clicked.connect(self._bookmark_selected)
+        buttons.addWidget(self.selected_bookmark_button)
+        self.selected_note_button = QtWidgets.QPushButton("Add note")
+        self.selected_note_button.setObjectName("textAction")
+        self.selected_note_button.clicked.connect(self._note_selected)
+        buttons.addWidget(self.selected_note_button)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+        self.selected_hint = QtWidgets.QLabel("")
+        self.selected_hint.setObjectName("selectedHint")
+        self.selected_hint.setWordWrap(True)
+        layout.addWidget(self.selected_hint)
+        self.selected_panel = panel
+        return panel
+
+    def _wire_pane_links(self) -> None:
+        """Left-pane links run the real View actions, nothing of their own."""
+        self.hidden_sessions_link.setChecked(
+            self.show_hidden_sessions_action.isChecked())
+        self.hidden_sessions_link.toggled.connect(
+            self.show_hidden_sessions_action.setChecked)
+        self.show_hidden_sessions_action.toggled.connect(
+            self.hidden_sessions_link.setChecked)
+        self.search_link.clicked.connect(self._focus_search)
+        self.filter_all.clicked.connect(self.show_all_action.trigger)
+        self.filter_review.clicked.connect(self.review_action.trigger)
+        self.filter_bookmarked.clicked.connect(self._show_bookmarked)
+
+    def _build_header(self, row: QtWidgets.QHBoxLayout) -> None:
+        """The teal status band: operating mode, source, monitoring state."""
         # A real control, not a label that happens to react to a click. It
         # looks pressable, it takes focus, it opens on Space or Return, and a
-        # screen reader announces it as a button - none of which a QLabel with
-        # a mousePressEvent does.
+        # screen reader announces it as a button.
         self.mode_button = QtWidgets.QToolButton()
         self.mode_button.setObjectName("modeButton")
         self.mode_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
@@ -317,28 +629,23 @@ class MainWindow(QtWidgets.QMainWindow):
             self.mode_actions[mode.value] = action
         self.mode_button.setMenu(self.mode_menu)
         row.addWidget(self.mode_button)
+        row.addStretch(1)
 
-        self.ready_badge = QtWidgets.QLabel()
-        self.ready_badge.setObjectName("chip")
-        self.ready_badge.setCursor(QtCore.Qt.PointingHandCursor)
-        self.ready_badge.setToolTip("Field readiness - click for the full report")
-        self.ready_badge.setAccessibleName("Field readiness")
-        self.ready_badge.mousePressEvent = lambda event: self._show_readiness()
-        row.addWidget(self.ready_badge)
+        self.source_label = QtWidgets.QLabel("SOURCE: …")
+        self.source_label.setObjectName("sourceLabel")
+        self.source_label.setAccessibleName("Source")
+        row.addWidget(self.source_label)
+        row.addStretch(1)
 
-        self.meter = LevelMeterWidget()
-        row.addWidget(self.meter, 1)
-
-        self.clip_label = QtWidgets.QLabel("")
-        row.addWidget(self.clip_label)
-
-        self.calibrate_button = QtWidgets.QPushButton("Calibrate")
-        self.calibrate_button.setToolTip(
-            "Listen to the idle channel for a few seconds and suggest a "
-            "detection threshold.")
-        self.calibrate_button.clicked.connect(self._calibrate)
-        row.addWidget(self.calibrate_button)
-        return row
+        self.state_badge = QtWidgets.QLabel("○ Idle")
+        self.state_badge.setObjectName("stateBadge")
+        self.state_badge.setAccessibleName("Current state")
+        # Shown in capitals, as the band's other words; the text itself is
+        # the state's ordinary name.
+        font = self.state_badge.font()
+        font.setCapitalization(QtGui.QFont.AllUppercase)
+        self.state_badge.setFont(font)
+        row.addWidget(self.state_badge)
 
     def _build_controls(self) -> QtWidgets.QGridLayout:
         grid = QtWidgets.QGridLayout()
@@ -640,6 +947,8 @@ class MainWindow(QtWidgets.QMainWindow):
             text += (f" · recorded IQ: {legacy['detail']}" if legacy["available"]
                      else f" · recorded IQ unavailable: {legacy['reason'][:40]}")
         self.sdr_label.setText(text)
+        if hasattr(self, "receiver_line"):
+            self.receiver_line.setText(text)
 
     # -- the SDR receiver ---------------------------------------------------
     def _receiver_blocked(self) -> bool:
@@ -869,6 +1178,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status.showMessage(
             f"Transcription: {summary.transcription}  |  "
             f"Translation: {summary.translation}  |  {backend_status()}")
+        # LOCAL ENGINES: what select_engines actually chose, by name.
+        self.speech_engine_line.setText(f"Speech: {summary.transcription}")
+        self.translation_engine_line.setText(f"Translation: {summary.translation}")
+        self._refresh_context_lines()
 
     # -- diagnostics -----------------------------------------------------
     def diagnostic_report_path(self) -> pathlib.Path:
@@ -1198,6 +1511,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if touched:
             # One query for the whole drained batch, not one per event.
             self._refresh_view(touched)
+        self._refresh_context_lines()
 
     def _admit(self, tx, arrival: bool) -> bool:
         """Show a live transmission or update as the current view allows.
@@ -1263,6 +1577,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return self.app.search(self._view_query)
         if self._view_kind == "review":
             return self.app.review_queue()
+        if self._view_kind == "bookmarked":
+            return self._bookmarked_results()
         return []
 
     def _view_summary(self, count: int) -> str:
@@ -1270,6 +1586,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return f"{count} match(es) for {self._view_query!r}"
         if self._view_kind == "review":
             return f"{count} transmission(s) need review"
+        if self._view_kind == "bookmarked":
+            return f"{count} bookmarked transmission(s)"
         return ""
 
     def _announce_view(self, count: int) -> None:
@@ -1369,7 +1687,10 @@ class MainWindow(QtWidgets.QMainWindow):
             state, (str(state).title(), "idle", "\u25cb"))
         # Symbol plus word, so the state is never carried by colour alone.
         self.state_badge.setText(f"{symbol} {text}")
-        self.state_badge.setStyleSheet(f"color: {theme.status_color(tone, self)};")
+        # On the teal band the state is read by its word (and symbol), in
+        # the band's own high-contrast text colour.
+        self.state_badge.setStyleSheet("")
+        self.state_badge.setProperty("tone", tone)
         self.state_badge.setAccessibleDescription(text)
 
     def _refresh_mode_badge(self) -> None:
@@ -1380,7 +1701,7 @@ class MainWindow(QtWidgets.QMainWindow):
         two different things, no longer two identical-looking labels.
         """
         mode = self.app.mode
-        self.mode_button.setText(f"Operating mode: {mode.label}  \u25be")
+        self.mode_button.setText(f"{mode.label}  \u25be")
         # Styling only, from the mode the application is actually in.
         self.mode_button.setProperty("mode", mode.value)
         self.mode_button.style().unpolish(self.mode_button)
@@ -1852,6 +2173,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._view_kind, self._view_query = "thread", ""
         self.timeline.set_transmissions(self.app.recent_transmissions(
             include_hidden=self._showing_removed()))
+        self._sync_filters()
 
     def _showing_removed(self) -> bool:
         action = getattr(self, "show_removed_action", None)
@@ -1860,6 +2182,113 @@ class MainWindow(QtWidgets.QMainWindow):
     def _showing_hidden_sessions(self) -> bool:
         action = getattr(self, "show_hidden_sessions_action", None)
         return bool(action is not None and action.isChecked())
+
+    # -- v5: selection, selected audio, context lines -------------------------
+    def _on_selection_changed(self, tx_id) -> None:
+        """Show the selected message's own recording, or say why there is none."""
+        tx = self.timeline.selected_transmission()
+        if tx is None:
+            self.waveform.clear()
+        else:
+            self.waveform.show_recording(tx.id, tx.audio_path)
+        self._refresh_selected_panel()
+
+    def _refresh_selected_panel(self) -> None:
+        tx = self.timeline.selected_transmission()
+        has = tx is not None
+        for button in (self.selected_play_button, self.selected_bookmark_button,
+                       self.selected_note_button):
+            button.setEnabled(has)
+        if not has:
+            self.selected_range.setText("")
+            self.selected_hint.setText("Select a message to review its original audio.")
+            self.selected_bookmark_button.setChecked(False)
+            self.selected_play_button.setText("Play original")
+            return
+        start = tx.started_at.astimezone()
+        end = (tx.ended_at or tx.started_at).astimezone()
+        self.selected_range.setText(
+            f"{start:%H:%M:%S}\u2013{end:%H:%M:%S}  ({float(tx.duration or 0.0):.1f} s)")
+        self.selected_play_button.setEnabled(bool(tx.audio_path))
+        state = self.timeline.playback.state_for(tx.id)
+        self.selected_play_button.setText(
+            "Pause" if state == "playing" and self.timeline.playback.controllable
+            else "Play original")
+        blocked = self.selected_bookmark_button.blockSignals(True)
+        self.selected_bookmark_button.setChecked(bool(tx.bookmarked))
+        self.selected_bookmark_button.setText(
+            "Bookmarked" if tx.bookmarked else "Bookmark")
+        self.selected_bookmark_button.blockSignals(blocked)
+        self.selected_note_button.setText("Edit note" if tx.notes else "Add note")
+        if not tx.audio_path:
+            hint = "This message has no recording."
+        elif tx.state is ProcessingState.FAILED:
+            hint = "Processing failed. The original audio is kept; Retry is in the message's menu."
+        elif tx.needs_review:
+            hint = "Check uncertain wording against the original audio."
+        else:
+            hint = ""
+        self.selected_hint.setText(hint)
+
+    def _play_selected(self) -> None:
+        tx = self.timeline.selected_transmission()
+        if tx is None:
+            return
+        # The same controller, ownership and pause/resume rules as the
+        # message's own Play button.
+        self.timeline.playback.toggle(tx.id, tx.audio_path)
+        self._refresh_selected_panel()
+
+    def _bookmark_selected(self) -> None:
+        tx = self.timeline.selected_transmission()
+        bubble = self.timeline.bubble(tx.id) if tx is not None else None
+        if bubble is not None:
+            # Exactly the message menu's Bookmark: the same action and signal.
+            bubble.bookmark_action.setChecked(not tx.bookmarked)
+            bubble._toggle_bookmark()
+        self._refresh_selected_panel()
+
+    def _note_selected(self) -> None:
+        tx = self.timeline.selected_transmission()
+        bubble = self.timeline.bubble(tx.id) if tx is not None else None
+        if bubble is not None:
+            bubble._edit_note()
+
+    def _refresh_counts(self) -> None:
+        """Footer: counts of what is on screen, and whether originals are kept."""
+        shown = [self.timeline.bubble(tx_id).tx for tx_id in self.timeline.order()
+                 if self.timeline.bubble(tx_id) is not None]
+        review = sum(1 for tx in shown if tx.needs_review)
+        parts = [f"{len(shown)} message{'s' if len(shown) != 1 else ''}",
+                 f"{review} need{'s' if review == 1 else ''} review"]
+        if getattr(self.app.config.recording, "enabled", True):
+            parts.append("Original audio retained")
+        else:
+            parts.append("Original audio NOT retained")
+        text = "  |  ".join(parts)
+        if self.counts_label.text() != text:
+            self.counts_label.setText(text)
+
+    def _refresh_context_lines(self) -> None:
+        """Band source, language and count lines, from the live state."""
+        status = self.input_panel.status_label.text().strip()
+        source = status[len("INPUT:"):].strip() if status.upper().startswith("INPUT:") else status
+        text = f"SOURCE: {source or 'none selected'}"
+        if self.source_label.text() != text:
+            self.source_label.setText(text)
+            self.source_label.setAccessibleDescription(text)
+        source_language = (self.source_language_box.currentText().split(" (")[0]
+                           if self.source_mode_box.currentData() == "specified"
+                           else "Detect language")
+        target = self.target_language_box.currentText().split(" (")[0]
+        line = f"{source_language} > {target}"
+        if self.language_line.text() != line:
+            self.language_line.setText(line)
+        code = self.target_language_box.currentData() or ""
+        heading = f"TRANSLATION / {code.upper()}" if code else "TRANSLATION"
+        if self.translation_heading.text() != heading:
+            self.translation_heading.setText(heading)
+        self._refresh_counts()
 
     # -- removing messages ---------------------------------------------------
     def _choose(self, title: str, text: str, informative: str,
@@ -2050,12 +2479,61 @@ class MainWindow(QtWidgets.QMainWindow):
     def _search(self) -> None:
         text, ok = QtWidgets.QInputDialog.getText(
             self, "Search", "Search original and translated text:")
-        if not ok or self._store_gone():
+        if not ok:
+            return
+        self._run_search(text)
+
+    def _run_search(self, text: str) -> None:
+        """Search this Session's original and translated text - the same
+        store query View \u25b8 Search runs. An empty search shows everything."""
+        if self._store_gone():
+            return
+        if not text.strip():
+            self._reload_timeline()
             return
         results = self.app.search(text)
         self._view_kind, self._view_query = "search", text
         self.timeline.set_transmissions(results)
         self._announce_view(len(results))
+        self._sync_filters()
+
+    def _show_bookmarked(self) -> None:
+        """Only this Session's bookmarked messages - a store query, like
+        Search and Review, and kept true as traffic arrives."""
+        if self._store_gone():
+            return
+        results = self._bookmarked_results()
+        self._view_kind, self._view_query = "bookmarked", ""
+        self.timeline.set_transmissions(results)
+        self._announce_view(len(results))
+        self._sync_filters()
+
+    def _bookmarked_results(self):
+        return [tx for tx in self.app.search("", bookmarked=True)
+                if self._showing_removed() or not getattr(tx, "hidden", False)]
+
+    def _focus_search(self) -> None:
+        self.search_field.setFocus(QtCore.Qt.ShortcutFocusReason)
+        self.search_field.selectAll()
+
+    def _sync_filters(self) -> None:
+        """The filter buttons say which view is on screen - none for Search."""
+        buttons = {"thread": self.filter_all, "review": self.filter_review,
+                   "bookmarked": self.filter_bookmarked}
+        target = buttons.get(self._view_kind)
+        self.filter_group.setExclusive(False)
+        for button in buttons.values():
+            button.setChecked(button is target)
+        self.filter_group.setExclusive(True)
+        if self._view_kind != "search" and self.search_field.text():
+            blocked = self.search_field.blockSignals(True)
+            self.search_field.clear()
+            self.search_field.blockSignals(blocked)
+        elif self._view_kind == "search":
+            blocked = self.search_field.blockSignals(True)
+            self.search_field.setText(self._view_query)
+            self.search_field.blockSignals(blocked)
+        self._refresh_counts()
 
     def _show_review_queue(self) -> None:
         if self._store_gone():
@@ -2064,6 +2542,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._view_kind, self._view_query = "review", ""
         self.timeline.set_transmissions(results)
         self._announce_view(len(results))
+        self._sync_filters()
 
     def _show_assistant(self) -> None:
         from .setup_assistant import SetupAssistant

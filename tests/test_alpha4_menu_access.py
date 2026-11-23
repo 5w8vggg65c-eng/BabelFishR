@@ -165,8 +165,15 @@ def test_the_menu_bar_is_drawn_inside_the_window(qt_app, config, store):
     bar = window.menuBar()
     assert bar.isVisible() and bar.isEnabled()
     assert bar.height() > 0 and bar.width() > 0
-    assert window.rect().contains(bar.geometry()), "the bar is outside the window"
-    assert window.centralWidget().geometry().top() >= bar.geometry().bottom(), (
+    from PySide6 import QtCore
+
+    # v5: the bar is the navigation row inside the window's own layout,
+    # under the identity row and the status band - not QMainWindow's slot.
+    top_left = bar.mapTo(window, QtCore.QPoint(0, 0))
+    on_window = QtCore.QRect(top_left, bar.size())
+    assert window.rect().contains(on_window), "the bar is outside the window"
+    panes = window.pane_splitter
+    assert panes.mapTo(window, QtCore.QPoint(0, 0)).y() >= on_window.bottom(), (
         "the content is drawn over the menu bar")
     assert menu_titles(window) == ["File", "View", "Receiver", "Tools", "Help"]
     for title in menu_titles(window):

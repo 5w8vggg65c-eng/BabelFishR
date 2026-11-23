@@ -160,7 +160,9 @@ def test_a_bubble_growing_above_the_viewport_preserves_the_anchor(qt_app):
     for state, transcript, translation in (
             (ProcessingState.TRANSCRIBING, "", ""),
             (ProcessingState.TRANSLATING, "hola " * 30, ""),
-            (ProcessingState.COMPLETE, "hola " * 30, "hello " * 30)):
+            # v5: the translation sits beside the original, in its own
+            # column; it must be the longer one for the row to grow.
+            (ProcessingState.COMPLETE, "hola " * 30, "hello " * 90)):
         before = _viewport_y(view, anchor_id)
         height_before = view._bubbles[above].height()
         grown = tx(int(above.split("_")[1]))
@@ -745,8 +747,9 @@ def test_the_mode_control_is_interactive_and_keyboard_reachable(qt_app, config,
     assert isinstance(button, QtWidgets.QToolButton), (
         "the operating mode is still a label pretending to be a control")
     assert button.focusPolicy() != QtCore.Qt.NoFocus
-    assert "Operating mode" in button.text()
-    assert button.accessibleName()
+    # v5: the band shows the mode alone; what the control is, is announced.
+    assert button.accessibleName() == "Operating mode"
+    assert window.app.mode.label in button.text()
     # Readiness stays a separate control, and is not the same widget.
     assert window.ready_badge is not button
     assert "readiness" in window.ready_badge.toolTip().lower()
@@ -767,6 +770,10 @@ def test_collapsing_and_expanding_opens_no_popups_and_keeps_values(qt_app,
     window.resize(1000, 800)
     window.show()
     pump(qt_app)
+    # v5: Session Options is opened by its own button in the action row.
+    window.session_options_button.click()
+    pump(qt_app)
+    assert window.setup_box.isVisible()
 
     assert window.setup_box.title() == "Session Options"
     combos = window.setup_box.findChildren(QtWidgets.QComboBox)

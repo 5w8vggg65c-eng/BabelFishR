@@ -68,11 +68,15 @@ class InputPanel(QtWidgets.QWidget):
         layout.setSpacing(6)
 
         chooser = QtWidgets.QHBoxLayout()
-        chooser.setSpacing(8)
-        chooser.addWidget(QtWidgets.QLabel("Audio input"))
+        chooser.setSpacing(6)
+        # The window's INPUT heading names this section; the chooser fills
+        # a narrow pane, so it carries no label of its own.
 
         self.device_box = QtWidgets.QComboBox()
-        self.device_box.setMinimumWidth(340)
+        self.device_box.setMinimumWidth(140)
+        self.device_box.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.device_box.setMinimumContentsLength(12)
         self.device_box.setAccessibleName("Audio input device")
         self.device_box.setToolTip(
             "The input BabelFishR records from. Choose the MacBook microphone "
@@ -96,18 +100,19 @@ class InputPanel(QtWidgets.QWidget):
         # and does not is worse than no control, so every explicitly chosen
         # device is now pinned to its identity, always, and the only way to
         # follow the system default is to choose that option by name.
-        self.profile_check = QtWidgets.QCheckBox(
-            "Remember this input for the selected radio profile")
+        self.profile_check = QtWidgets.QCheckBox("Remember for profile")
         self.profile_check.setToolTip(
-            "Selecting that profile will select this input again.")
+            "Remember this input for the selected radio profile: selecting "
+            "that profile will select this input again.")
         self.profile_check.toggled.connect(self._on_profile_link)
         options.addWidget(self.profile_check)
         options.addStretch(1)
         layout.addLayout(options)
 
-        status = QtWidgets.QHBoxLayout()
-        status.setSpacing(10)
+        status = QtWidgets.QVBoxLayout()
+        status.setSpacing(4)
         self.status_label = QtWidgets.QLabel()
+        self.status_label.setWordWrap(True)
         self.status_label.setObjectName("inputStatus")
         self.status_label.setAccessibleName("Selected audio input")
         self.status_label.setTextInteractionFlags(

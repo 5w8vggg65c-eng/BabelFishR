@@ -1,27 +1,23 @@
-"""Semantic, appearance-adaptive styling: the field console.
+"""Semantic, appearance-adaptive styling: the BabelFishR field console (v5).
 
-The window follows the operator's system appearance, as before. What changes
-with this pass is the look in each:
+The approved v5 concept (docs/ui-preview/README.md): a black/charcoal ground,
+a teal identity/status band, turquoise rectangular selections, thin grey
+rules, compact controls, and regular-weight monospaced technical type. Two
+panes: Sessions, input and local engines on the left; the recording
+waveform, the original/translation review list and the selected-audio
+actions on the right.
 
-* **Dark appearance - the field console.** A fixed, high-contrast palette
-  whose primary reference is OpenDMR: its cool navy blues and turquoise, and
-  its status bands. The UV-5RM firmware contributes compact, terse structure
-  only, not its colours. Navy ground, slightly lighter blue panels, off-white
-  text, turquoise-cyan for the primary control and the selection, amber for
-  anything that needs review. Red appears only as the semantic error colour.
-  It is applied as the window's own palette, so
-  native-drawn widgets (fields, menus, tabs, scroll bars) match rather than
-  showing the operating system's grey.
-* **Light appearance - daylight.** Colours still derive from the system
-  palette, for legibility outdoors and for the platform's own accessibility
-  settings.
+The window still follows the operator's system appearance:
 
-Both share the same structure: a compact header band and footer band, square
-rectangular controls with a minimal corner radius, strong readable text for
-the original transcript and its translation, and status carried by a symbol
-and a word as well as a colour - never by colour alone.
+* **Dark appearance** - the console as approved, applied as the window's own
+  palette so natively drawn controls match.
+* **Light appearance** - the same structure on a light ground, for daylight
+  legibility; the teal band, turquoise selection and amber review marker keep
+  their meaning.
 
-No web fonts, no animation. The system UI font is used.
+Status is carried by a word as well as a colour - never by colour alone. Red
+is the semantic error colour and nothing else. No web fonts: the platform's
+own monospace face (Menlo on macOS) with a system fixed-pitch fallback.
 """
 
 from __future__ import annotations
@@ -30,47 +26,73 @@ from typing import Dict
 
 from PySide6 import QtGui, QtWidgets
 
-#: One accent, used for the primary control and the selection.
-ACCENT_LIGHT = "#0a6cff"
-ACCENT_DARK = "#00B4D8"
+#: Turquoise, for the selection and the primary action - both appearances.
+ACCENT_DARK = "#34CACD"
+ACCENT_LIGHT = "#34CACD"
 
-#: The field console palette (dark appearance).
+#: The approved v5 console (dark appearance). The band is a little deeper
+#: than the concept's #338F99 so its off-white text reaches 4.7:1.
 CONSOLE = {
-    "window": "#07131F",
-    "surface": "#0E2A44",
-    "surface_raised": "#123756",
-    "border": "#1C3448",
-    "text": "#F4FAFF",
-    "text_muted": "#9DB4C8",
+    "window": "#0A0E11",
+    "surface": "#0E1418",          # panes
+    "surface_raised": "#1D282B",   # section and column header strips
+    "band": "#287882",
+    "on_band": "#F2F7F8",
+    "border": "#2E3B40",           # thin rules
+    "rule_strong": "#5E7076",      # pane divider, outlined buttons
+    "text": "#E6ECEE",
+    "text_muted": "#8E9BA1",
     "accent": ACCENT_DARK,
-    "on_accent": "#07131F",
+    "on_accent": "#0A0E11",
+    "disabled_bg": "#303E42",
+    "disabled_text": "#7A898E",
+    "statusbar": "#131B1E",
 }
 
-#: Status colours, chosen to stay distinguishable for common colour-vision
-#: deficiencies. Every use is paired with a text label or symbol.
+DAYLIGHT = {
+    "window": "#F4F6F6",
+    "surface": "#FFFFFF",
+    "surface_raised": "#E1E7E8",
+    "band": "#1F6F78",
+    "on_band": "#FFFFFF",
+    "border": "#C5CFD2",
+    "rule_strong": "#7E8E93",
+    "text": "#0A0E11",
+    "text_muted": "#4B5A60",
+    "accent": ACCENT_LIGHT,
+    "on_accent": "#0A0E11",
+    "disabled_bg": "#DDE3E4",
+    "disabled_text": "#6B7A80",
+    "statusbar": "#E9EDEE",
+}
+
+#: Status colours. Every use is paired with a text label or symbol.
 STATUS_LIGHT = {
-    "idle": "#6b7280", "listening": "#1a7f37", "receiving": "#0a6cff",
-    "working": "#9a6700", "error": "#cf222e", "ok": "#1a7f37",
+    "idle": "#4B5A60", "listening": "#1A7F37", "receiving": "#1F6F78",
+    "working": "#8A5A00", "error": "#C62828", "ok": "#1A7F37",
 }
 STATUS_DARK = {
-    "idle": "#9DB4C8", "listening": "#3FD68B", "receiving": "#00B4D8",
-    "working": "#FFC145", "error": "#FF6B6B", "ok": "#3FD68B",
+    "idle": "#8E9BA1", "listening": "#3FD68B", "receiving": "#34CACD",
+    "working": "#EFC062", "error": "#FF6B6B", "ok": "#3FD68B",
 }
 
-#: Corner radius for every rectangle: square, deliberate, not rounded cards.
-RADIUS = 3
+#: Square, deliberate rectangles.
+RADIUS = 0
+
+#: Monospaced faces, in order of preference. Platform fonts only.
+MONOSPACE = ("Menlo", "SF Mono", "Monaco", "DejaVu Sans Mono",
+             "Liberation Mono", "Consolas")
 
 
 def is_dark(widget: QtWidgets.QWidget = None) -> bool:
     """True when the operator's *system* appearance is dark.
 
     Read from the application palette - the system's - not from a widget's,
-    because the window sets its own palette for the field console and must
-    still notice when the system switches back to light.
+    because the window sets its own palette for the console and must still
+    notice when the system switches back to light.
     """
     palette = QtWidgets.QApplication.palette()
     window = palette.color(QtGui.QPalette.Window)
-    # Perceived luminance; the system palette is the source of truth.
     luminance = (0.299 * window.red() + 0.587 * window.green()
                  + 0.114 * window.blue()) / 255.0
     return luminance < 0.5
@@ -86,55 +108,43 @@ def status_color(name: str, widget: QtWidgets.QWidget = None) -> str:
 
 
 def tokens(widget: QtWidgets.QWidget = None) -> Dict[str, str]:
-    """Colour tokens: the field console in dark appearance, the system
-    palette in light."""
-    if is_dark(widget):
-        return dict(CONSOLE, error=STATUS_DARK["error"],
-                    warning=STATUS_DARK["working"], ok=STATUS_DARK["ok"],
-                    dark="1")
+    """Colour tokens for the current system appearance."""
+    dark = is_dark(widget)
+    base = CONSOLE if dark else DAYLIGHT
+    status = STATUS_DARK if dark else STATUS_LIGHT
+    return dict(base, error=status["error"], warning=status["working"],
+                ok=status["ok"], dark="1" if dark else "0")
 
-    palette = QtWidgets.QApplication.palette()
-    window = palette.color(QtGui.QPalette.Window)
-    text = palette.color(QtGui.QPalette.WindowText)
 
-    def shift(color: QtGui.QColor, amount: int) -> str:
-        factor = 1 - amount / 100.0
-        return QtGui.QColor(
-            max(0, min(255, int(color.red() * factor))),
-            max(0, min(255, int(color.green() * factor))),
-            max(0, min(255, int(color.blue() * factor)))).name()
-
-    return {
-        "window": window.name(),
-        "surface": shift(window, 4),
-        "surface_raised": shift(window, 8),
-        "border": shift(window, 22),
-        "text": text.name(),
-        # A fixed secondary grey rather than the system's disabled colour,
-        # which is too faint for labels an operator has to read outdoors.
-        "text_muted": "#4b5563",
-        "accent": ACCENT_LIGHT,
-        "on_accent": "#ffffff",
-        "error": STATUS_LIGHT["error"],
-        "warning": STATUS_LIGHT["working"],
-        "ok": STATUS_LIGHT["ok"],
-        "dark": "0",
-    }
+def monospace_font(point_size: int = 0) -> QtGui.QFont:
+    """The platform monospace face, regular width and weight."""
+    families = set(QtGui.QFontDatabase.families())
+    for family in MONOSPACE:
+        if family in families:
+            font = QtGui.QFont(family)
+            break
+    else:
+        font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
+    font.setStyleHint(QtGui.QFont.Monospace)
+    font.setFixedPitch(True)
+    font.setWeight(QtGui.QFont.Normal)
+    font.setStretch(QtGui.QFont.Unstretched)
+    if point_size:
+        font.setPointSize(point_size)
+    return font
 
 
 def palette(widget: QtWidgets.QWidget = None) -> QtGui.QPalette:
-    """The palette the window should use: the console's in dark appearance,
-    the system's (unchanged) in light."""
-    if not is_dark(widget):
-        return QtGui.QPalette()          # nothing set: inherit the system's
+    """The window's palette: the console's in dark appearance, the daylight
+    variant's in light. Both are set explicitly so native controls match."""
     t = tokens(widget)
     p = QtGui.QPalette(QtWidgets.QApplication.palette())
     c = QtGui.QColor
     for group in (QtGui.QPalette.Active, QtGui.QPalette.Inactive):
         p.setColor(group, QtGui.QPalette.Window, c(t["window"]))
         p.setColor(group, QtGui.QPalette.WindowText, c(t["text"]))
-        p.setColor(group, QtGui.QPalette.Base, c(t["surface"]))
-        p.setColor(group, QtGui.QPalette.AlternateBase, c(t["surface_raised"]))
+        p.setColor(group, QtGui.QPalette.Base, c(t["window"]))
+        p.setColor(group, QtGui.QPalette.AlternateBase, c(t["surface"]))
         p.setColor(group, QtGui.QPalette.Text, c(t["text"]))
         p.setColor(group, QtGui.QPalette.Button, c(t["surface"]))
         p.setColor(group, QtGui.QPalette.ButtonText, c(t["text"]))
@@ -146,151 +156,203 @@ def palette(widget: QtWidgets.QWidget = None) -> QtGui.QPalette:
         p.setColor(group, QtGui.QPalette.Link, c(t["accent"]))
     for role in (QtGui.QPalette.WindowText, QtGui.QPalette.Text,
                  QtGui.QPalette.ButtonText):
-        p.setColor(QtGui.QPalette.Disabled, role, c(t["text_muted"]))
+        p.setColor(QtGui.QPalette.Disabled, role, c(t["disabled_text"]))
     p.setColor(QtGui.QPalette.Disabled, QtGui.QPalette.Base, c(t["window"]))
-    p.setColor(QtGui.QPalette.Disabled, QtGui.QPalette.Button, c(t["window"]))
+    p.setColor(QtGui.QPalette.Disabled, QtGui.QPalette.Button, c(t["disabled_bg"]))
     return p
 
 
 def stylesheet(widget: QtWidgets.QWidget = None) -> str:
-    """Application stylesheet built from the current appearance.
+    """Application stylesheet for the current appearance.
 
-    Regenerated when the system appearance changes, so the window follows the
-    operator's light/dark setting instead of imposing one.
+    Regenerated when the system appearance changes. Normal weight throughout:
+    hierarchy comes from strips, rules, case and colour, not bold type.
     """
     t = tokens(widget)
-    r = RADIUS
     return f"""
-QWidget {{ color: {t['text']}; }}
+QWidget {{ color: {t['text']}; font-weight: normal; }}
 QMainWindow, #centralRoot {{ background: {t['window']}; }}
 
-/* --- header band: start, state, mode, readiness, level ----------------- */
-#headerBand {{
-    background: {t['surface']};
-    border: 1px solid {t['border']};
-    border-radius: {r}px;
+/* --- identity row and teal status band -------------------------------- */
+#titleBar {{ background: {t['window']}; }}
+#appTitle, #titleNote {{ font-size: 15px; }}
+#statusBand {{ background: {t['band']}; }}
+#statusBand QLabel, #statusBand QToolButton {{
+    color: {t['on_band']}; font-size: 15px; background: transparent;
 }}
-#stateBadge {{ font-size: 15px; font-weight: 700; padding: 4px 10px; }}
-#primaryButton {{
-    background: {t['accent']}; color: {t['on_accent']}; border: none;
-    border-radius: {r}px; padding: 9px 22px; font-size: 14px; font-weight: 700;
-}}
-#primaryButton:hover {{ background: {t['accent']}; }}
-#primaryButton:focus {{ border: 2px solid {t['text']}; }}
-#primaryButton:disabled {{ background: {t['border']}; color: {t['text_muted']}; }}
-#modeButton {{
-    border: 1px solid {t['border']}; border-radius: {r}px;
-    background: {t['window']}; padding: 6px 10px;
-    font-size: 12px; font-weight: 700;
-}}
-#modeButton[mode="field-offline"] {{ border: 1px solid {t['ok']}; color: {t['ok']}; }}
-#modeButton[mode="record-only"] {{ border: 1px solid {t['warning']}; color: {t['warning']}; }}
-#modeButton[mode="online-setup"] {{ border: 1px solid {t['accent']}; color: {t['accent']}; }}
-#modeButton:focus {{ border-width: 2px; }}
-/* Disabled (e.g. while monitoring runs): no mode colour, so it can't look live. */
-#modeButton:disabled, #playButton:disabled {{
-    border: 1px dashed {t['border']}; color: {t['text_muted']};
-    background: {t['window']};
-}}
+#modeButton {{ border: 1px solid transparent; padding: 2px 6px; }}
+#modeButton:hover, #modeButton:focus {{ border: 1px solid {t['on_band']}; }}
+#modeButton:disabled {{ color: {t['on_band']}; }}
+#modeButton::menu-indicator {{ image: none; width: 0; }}
 
-/* --- footer band: the status bar --------------------------------------- */
-QStatusBar {{
-    background: {t['surface']}; border-top: 1px solid {t['border']};
-    color: {t['text_muted']}; font-size: 11px;
+/* --- navigation: the in-window menu bar -------------------------------- */
+QMenuBar {{
+    background: {t['window']}; border-bottom: 1px solid {t['border']};
+    font-size: 14px; padding: 2px 6px;
 }}
+QMenuBar::item {{ padding: 6px 14px; background: transparent;
+                  border-bottom: 3px solid transparent; }}
+QMenuBar::item:selected, QMenuBar::item:pressed {{
+    border-bottom: 3px solid {t['accent']}; background: transparent;
+}}
+QMenu {{ background: {t['surface']}; border: 1px solid {t['rule_strong']}; }}
+QMenu::item {{ padding: 5px 18px; }}
+QMenu::item:selected {{ background: {t['accent']}; color: {t['on_accent']}; }}
+QMenu::item:disabled {{ color: {t['disabled_text']}; }}
 
-/* --- message cards: one per received transmission ---------------------- */
+/* --- panes -------------------------------------------------------------- */
+#leftPane {{ background: {t['window']};
+            border-right: 1px solid {t['rule_strong']}; }}
+#rightPane {{ background: {t['window']}; }}
+#sectionHeader, #paneHeader, #columnHeader {{
+    background: {t['surface_raised']}; padding: 6px 10px; font-size: 14px;
+}}
+#columnHeader QLabel {{ background: transparent; font-size: 13px; }}
+#rule {{ background: {t['border']}; max-height: 1px; min-height: 1px; }}
+#paneLine, #engineLine {{ padding: 1px 10px; }}
+#mutedLine, #sectionLabel {{ color: {t['text_muted']}; }}
+#paneLink {{ border: none; text-align: left; padding: 4px 10px;
+            background: transparent; }}
+#paneLink:hover, #paneLink:focus {{ color: {t['accent']}; }}
+#paneLink:checked {{ color: {t['accent']}; }}
+
+/* --- sessions list ------------------------------------------------------ */
+#sessionTabs {{ background: transparent; }}
+
+/* --- recording waveform -------------------------------------------------- */
+#recordingWaveform {{ border: 1px solid {t['border']}; }}
+
+/* --- filter row ----------------------------------------------------------- */
+#filterButton {{
+    border: none; padding: 4px 14px; background: transparent;
+}}
+#filterButton:checked {{ background: {t['accent']}; color: {t['on_accent']}; }}
+#filterButton:hover:!checked, #filterButton:focus:!checked {{ color: {t['accent']}; }}
+#searchField {{
+    border: 1px solid {t['rule_strong']}; padding: 4px 8px;
+    background: {t['window']}; selection-background-color: {t['accent']};
+    selection-color: {t['on_accent']};
+}}
+#searchField:focus {{ border: 1px solid {t['accent']}; }}
+
+/* --- message rows ---------------------------------------------------------- */
 #bubble {{
-    background: {t['surface']};
-    border: 1px solid {t['border']};
-    border-left: 3px solid {t['border']};
-    border-radius: {r}px;
+    background: {t['window']}; border: none;
+    border-bottom: 1px solid {t['border']};
+    border-left: 4px solid transparent;
 }}
-#bubble[review="true"] {{ border-left: 3px solid {t['warning']}; }}
-#bubble[state="failed"] {{ border: 1px solid {t['error']};
-                           border-left: 3px solid {t['error']}; }}
-#bubble[skipped="true"] {{ background: {t['window']}; }}
+#bubble[review="true"] {{ border-left: 4px solid {t['warning']}; }}
+#bubble[state="failed"] {{ border-left: 4px solid {t['error']}; }}
+#bubble[skipped="true"] #originalText {{ color: {t['text_muted']}; }}
+#bubble:focus {{ border-bottom: 1px solid {t['accent']}; }}
+#bubble[selected="true"] {{ background: {t['accent']}; }}
+#bubble[selected="true"] QLabel {{ color: {t['on_accent']}; }}
+#bubble[selected="true"] #reviewMark[tone="check"] {{
+    background: {t['window']}; color: {t['warning']};
+}}
+#bubble[selected="true"] QToolButton {{ color: {t['on_accent']};
+                                       border-color: {t['on_accent']}; }}
 
-#bubbleHeader {{ color: {t['text_muted']}; font-size: 11px; font-weight: 600; }}
-#originalText {{ color: {t['text']}; font-size: 15px; font-weight: 600; }}
-#translatedText {{ color: {t['accent']}; font-size: 15px; }}
+#timeCell {{ font-size: 14px; }}
+#bubbleHeader {{ color: {t['text_muted']}; font-size: 11px; }}
+#originalText {{ color: {t['text']}; font-size: 14px; }}
+#translatedText {{ color: {t['text']}; font-size: 14px; }}
 #errorText {{ color: {t['error']}; font-size: 12px; }}
 #noteText {{ color: {t['warning']}; font-size: 12px; }}
 #provisional {{ color: {t['text_muted']}; font-style: italic; }}
 #statusText {{ color: {t['text_muted']}; font-size: 11px; }}
 #emptyState {{ color: {t['text_muted']}; padding: 48px 24px; font-size: 13px; }}
+#reviewMark {{ padding: 2px 8px; font-size: 13px; }}
+#reviewMark[tone="check"] {{ color: {t['warning']}; background: {t['surface_raised']}; }}
+#reviewMark[tone="failed"] {{ color: {t['error']}; }}
 #playButton {{
-    border: 1px solid {t['accent']}; color: {t['accent']}; border-radius: {r}px;
-    padding: 4px 12px; font-weight: 700;
+    border: none; color: {t['text_muted']}; padding: 2px 0; background: transparent;
+    font-size: 13px; text-align: left;
 }}
-#playButton:focus {{ border-width: 2px; }}
+#bubble QToolButton {{ padding: 1px 6px; }}
+#bubble QToolButton::menu-indicator {{ image: none; width: 0; }}
+#bubble QToolButton#menuButton {{ border: none; font-size: 16px; }}
+#playButton:hover, #playButton:focus {{ color: {t['accent']}; }}
+#playButton:disabled {{ color: {t['disabled_text']}; }}
 
-/* --- metadata chips ---------------------------------------------------- */
+/* --- chips ------------------------------------------------------------------ */
 #chip {{
-    background: {t['surface_raised']};
-    border: 1px solid {t['border']};
-    border-radius: {r}px;
-    padding: 2px 8px;
-    font-size: 11px;
+    border: 1px solid {t['border']}; padding: 1px 6px; font-size: 11px;
     color: {t['text_muted']};
 }}
 #chip[tone="accent"] {{ color: {t['accent']}; border-color: {t['accent']}; }}
 #chip[tone="warning"] {{ color: {t['warning']}; border-color: {t['warning']}; }}
 #chip[tone="error"] {{ color: {t['error']}; border-color: {t['error']}; }}
 
-/* --- the selected input: always visible, always legible ---------------- */
-#inputStatus {{ font-size: 14px; }}
+/* --- selected audio and the action row ------------------------------------ */
+#selectedAudio {{ border-top: 1px solid {t['border']}; }}
+#selectedTitle {{ font-size: 14px; }}
+#primaryButton, #primaryAction {{
+    background: {t['accent']}; color: {t['on_accent']}; border: none;
+    padding: 7px 22px; font-size: 14px;
+}}
+#primaryButton:disabled, #primaryAction:disabled, #secondaryAction:disabled {{
+    background: {t['disabled_bg']}; color: {t['disabled_text']}; border: none;
+}}
+#primaryButton:focus, #primaryAction:focus {{ border: 2px solid {t['text']}; }}
+#secondaryAction {{
+    background: transparent; border: 1px solid {t['rule_strong']};
+    padding: 6px 22px; font-size: 14px;
+}}
+#secondaryAction:hover, #secondaryAction:focus {{ border: 1px solid {t['accent']}; }}
+#secondaryAction:checked {{ border: 1px solid {t['accent']}; color: {t['accent']}; }}
+#textAction {{ border: none; background: transparent; padding: 7px 16px;
+              font-size: 14px; }}
+#textAction:hover, #textAction:focus {{ color: {t['accent']}; }}
+#textAction:checked {{ color: {t['accent']}; }}
+#textAction:disabled {{ color: {t['disabled_text']}; }}
+#actionRow {{ border-top: 1px solid {t['border']}; }}
 
-/* --- banners ----------------------------------------------------------- */
+/* --- banners and panels ------------------------------------------------------- */
 #warningBanner, #privacyBanner, #readyBanner {{
-    border-radius: {r}px; padding: 9px 12px; font-size: 12px;
-    border: 1px solid {t['border']}; background: {t['surface']};
+    padding: 6px 10px; font-size: 12px; border: 1px solid {t['border']};
 }}
 #warningBanner {{ color: {t['warning']}; border-color: {t['warning']}; }}
-#privacyBanner {{ color: {t['accent']}; border-color: {t['accent']}; }}
+#privacyBanner {{ color: {t['text_muted']}; }}
 #readyBanner {{ color: {t['ok']}; border-color: {t['ok']}; }}
-
-/* --- panels: input, session options ------------------------------------ */
-#setupPanel, #inputPanel {{
-    background: {t['surface']}; border: 1px solid {t['border']};
-    border-radius: {r}px;
-}}
-#sectionLabel {{ color: {t['text_muted']}; font-size: 11px; font-weight: 600; }}
-QGroupBox {{ border: 1px solid {t['border']}; border-radius: {r}px;
-             margin-top: 12px; padding-top: 8px; }}
+#readinessLink {{ border: none; text-align: left; padding: 1px 10px;
+                 background: transparent; }}
+#readinessLink:hover, #readinessLink:focus {{ text-decoration: underline; }}
+#setupPanel, #inputPanel {{ border: 1px solid {t['border']}; }}
+QGroupBox {{ border: 1px solid {t['border']}; margin-top: 12px; padding-top: 8px; }}
 QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px;
-                    color: {t['text_muted']}; font-weight: 700; }}
+                    color: {t['text_muted']}; }}
+QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox {{
+    border: 1px solid {t['rule_strong']}; padding: 3px 6px;
+    background: {t['window']};
+}}
+QComboBox:focus, QLineEdit:focus {{ border: 1px solid {t['accent']}; }}
+QComboBox QAbstractItemView {{
+    background: {t['surface']}; selection-background-color: {t['accent']};
+    selection-color: {t['on_accent']};
+}}
+QPushButton, QToolButton {{
+    border: 1px solid {t['rule_strong']}; padding: 3px 10px; background: transparent;
+}}
+QPushButton:hover, QToolButton:hover {{ border: 1px solid {t['accent']}; }}
+QPushButton:disabled, QToolButton:disabled {{ color: {t['disabled_text']};
+                                             border-color: {t['border']}; }}
+QToolTip {{ background: {t['surface_raised']}; color: {t['text']};
+           border: 1px solid {t['rule_strong']}; }}
 
-/* --- sessions: rectangular tabs, the selected one in the accent -------- */
-#sessionTabs::tab {{
-    background: {t['surface']}; border: 1px solid {t['border']};
-    border-bottom: none; border-radius: 0; padding: 6px 12px; margin-right: 2px;
+/* --- footer status band ---------------------------------------------------- */
+QStatusBar {{
+    background: {t['statusbar']}; border-top: 1px solid {t['rule_strong']};
+    color: {t['text']}; font-size: 13px;
 }}
-#sessionTabs::tab:selected {{
-    background: {t['surface_raised']}; border-top: 3px solid {t['accent']};
-    font-weight: 700;
-}}
-
-/* --- menus: a solid selection bar ------------------------------------- */
-QMenuBar {{ background: {t['window']}; }}
-QMenuBar::item:selected, QMenu::item:selected {{
-    background: {t['accent']}; color: {t['on_accent']};
-}}
-QMenu {{ background: {t['surface']}; border: 1px solid {t['border']}; }}
-QMenu::item {{ padding: 5px 18px; }}
+QStatusBar QLabel, #countsLine {{ color: {t['text']}; padding: 2px 8px;
+                                font-size: 13px; }}
 """
 
 
 def apply(app: QtWidgets.QApplication) -> None:
-    """Use the platform font and let Qt follow the system appearance."""
+    """The platform monospace face at a readable size; Fusion for control."""
     app.setStyle("Fusion")
-    font = app.font()
-    # The system UI font, whatever the platform calls it.
-    for family in ("SF Pro Text", ".AppleSystemUIFont", "Helvetica Neue",
-                   "Segoe UI", "Inter"):
-        if family in QtGui.QFontDatabase.families():
-            font.setFamily(family)
-            break
-    if font.pointSize() < 12:
-        font.setPointSize(13)
-    app.setFont(font)
+    base = app.font()
+    size = base.pointSize() if base.pointSize() >= 12 else 13
+    app.setFont(monospace_font(size))

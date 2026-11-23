@@ -16,6 +16,11 @@ from .playback import (LONG_RECORDING_SECONDS, PAUSED, PLAYING, SKIP_MS,
                        PlaybackController, format_clock)
 from .widgets import TagEditor
 
+#: Fixed widths for the TIME and REVIEW columns, shared with the column
+#: header the window draws above the list so the two line up.
+TIME_COLUMN_WIDTH = 96
+REVIEW_COLUMN_WIDTH = 120
+
 CONTENT_LABELS = {
     "speech": "speech",
     "noise": "noise / static",
@@ -112,6 +117,8 @@ class TransmissionBubble(QtWidgets.QFrame):
     analyzeDigitalRequested = QtCore.Signal(str, str)   # tx_id, protocol
     removeRequested = QtCore.Signal(str)                # tx_id
     restoreRequested = QtCore.Signal(str)               # tx_id
+    #: The operator chose this row (click or keyboard focus).
+    selectRequested = QtCore.Signal(str)                # tx_id
 
     def __init__(self, tx: Transmission, player: PlaybackController,
                  parent: Optional[QtWidgets.QWidget] = None, *,
@@ -129,13 +136,48 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.setObjectName("bubble")
         self.setFrameShape(QtWidgets.QFrame.StyledPanel)
 
-        outer = QtWidgets.QVBoxLayout(self)
-        outer.setContentsMargins(12, 10, 12, 10)
-        outer.setSpacing(6)
+        self.setProperty("selected", False)
+        # A row in the review list: selectable by click or keyboard, and the
+        # selection is what the waveform and Selected Audio panel follow.
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.setAccessibleName("Message")
+
+        # Columns, as the v5 review list: TIME | ORIGINAL | TRANSLATION |
+        # REVIEW. The widgets are the same ones as before; only where they
+        # sit has changed. Row 1 spans the text columns for the playback bar.
+        grid = QtWidgets.QGridLayout(self)
+        grid.setContentsMargins(10, 8, 10, 8)
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(4)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
+
+        self.time_label = QtWidgets.QLabel()
+        self.time_label.setObjectName("timeCell")
+        self.time_label.setFixedWidth(TIME_COLUMN_WIDTH)
+        self.time_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        grid.addWidget(self.time_label, 0, 0, QtCore.Qt.AlignTop)
+
+        outer = QtWidgets.QVBoxLayout()
+        outer.setSpacing(4)
+        grid.addLayout(outer, 0, 1)
+        translation_column = QtWidgets.QVBoxLayout()
+        translation_column.setSpacing(4)
+        grid.addLayout(translation_column, 0, 2)
+        review_column = QtWidgets.QVBoxLayout()
+        review_column.setSpacing(4)
+        grid.addLayout(review_column, 0, 3)
+
+        self.review_label = QtWidgets.QLabel("\u2013")
+        self.review_label.setObjectName("reviewMark")
+        self.review_label.setAccessibleName("Review")
+        self.review_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.review_label.setFixedWidth(REVIEW_COLUMN_WIDTH)
+        review_column.addWidget(self.review_label, 0, QtCore.Qt.AlignRight)
 
         self.header = QtWidgets.QLabel()
         self.header.setObjectName("bubbleHeader")
-        outer.addWidget(self.header)
+        self.header.setWordWrap(True)
 
         self.provisional = QtWidgets.QLabel()
         self.provisional.setObjectName("provisional")
@@ -149,13 +191,17 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.original_label.setTextInteractionFlags(
             QtCore.Qt.TextSelectableByMouse)
         outer.addWidget(self.original_label)
+        # Date, duration, language and measured signal: one muted line under
+        # the original, where the concept has "Play original".
+        outer.addWidget(self.header)
 
         self.translated_label = QtWidgets.QLabel()
         self.translated_label.setObjectName("translatedText")
         self.translated_label.setWordWrap(True)
         self.translated_label.setTextInteractionFlags(
             QtCore.Qt.TextSelectableByMouse)
-        outer.addWidget(self.translated_label)
+        translation_column.addWidget(self.translated_label)
+        translation_column.addStretch(1)
 
         self.error_label = QtWidgets.QLabel()
         self.error_label.setObjectName("errorText")
@@ -188,7 +234,7 @@ class TransmissionBubble(QtWidgets.QFrame):
         # through. Still a text chat bubble: no waveform, no analyser.
         self.play_button = QtWidgets.QToolButton()
         self.play_button.setObjectName("playButton")
-        self.play_button.setText("\u25b6 Play")
+        self.play_button.setText("Play original")
         self.play_button.setToolTip("Play this recording")
         self.play_button.setAccessibleName("Play recording")
         self.play_button.clicked.connect(self._on_play_clicked)
@@ -215,15 +261,17 @@ class TransmissionBubble(QtWidgets.QFrame):
 
         self.status_label = QtWidgets.QLabel()
         self.status_label.setObjectName("statusText")
-        controls.addWidget(self.status_label)
+        review_column.addWidget(self.status_label, 0, QtCore.Qt.AlignRight)
 
         self.menu_button = QtWidgets.QToolButton()
+        self.menu_button.setObjectName("menuButton")
         self.menu_button.setText("\u22ef")
         self.menu_button.setToolTip("More actions")
         self.menu_button.setAccessibleName("More actions")
         self.menu_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         self.menu_button.setMenu(self._build_menu())
-        controls.addWidget(self.menu_button)
+        review_column.addWidget(self.menu_button, 0, QtCore.Qt.AlignRight)
+        review_column.addStretch(1)
         outer.addLayout(controls)
 
         # The expanded bar: Play/Pause, Stop, rewind, fast-forward, position.
@@ -262,7 +310,7 @@ class TransmissionBubble(QtWidgets.QFrame):
         bar.addWidget(self.position_label)
         bar.addStretch(1)
         self.playback_bar.hide()
-        outer.addWidget(self.playback_bar)
+        grid.addWidget(self.playback_bar, 1, 1, 1, 3)
 
         self.update_from(tx)
 
@@ -345,6 +393,10 @@ class TransmissionBubble(QtWidgets.QFrame):
         meta += [entry["display"] for entry in tx.signal_summary()
                  if entry["label"] not in ("channel", "frequency")]
         self.header.setText("  ·  ".join(_escape(part) for part in meta))
+        # TIME column: the local time of day this transmission began - the
+        # clock on this computer, the same value as the header's.
+        self.time_label.setText(tx.started_at.astimezone().strftime("%H:%M:%S"))
+        self.time_label.setAccessibleName(f"Time {_local_stamp(tx.started_at)}")
 
         # The transcript is the message. It is the primary content of the
         # bubble, in plain words, with no engine or language prefix competing
@@ -420,6 +472,20 @@ class TransmissionBubble(QtWidgets.QFrame):
         if tx.needs_review and tx.state is not ProcessingState.FAILED:
             status_bits.append("needs review")
         self.status_label.setText("  ·  ".join(status_bits))
+        # REVIEW column: the word, never only a colour.
+        if tx.state is ProcessingState.FAILED:
+            review, tone = "FAILED", "failed"
+        elif tx.needs_review:
+            review, tone = "CHECK", "check"
+        else:
+            review, tone = "\u2013", "none"
+        self.review_label.setText(review)
+        self.review_label.setProperty("tone", tone)
+        self.review_label.setAccessibleDescription(
+            {"failed": "Processing failed", "check": "Needs review",
+             "none": "No review needed"}[tone])
+        self.review_label.style().unpolish(self.review_label)
+        self.review_label.style().polish(self.review_label)
 
         self.bookmark_action.setChecked(tx.bookmarked)
         self.setProperty("state", tx.state.value)
@@ -482,6 +548,26 @@ class TransmissionBubble(QtWidgets.QFrame):
             chip.setProperty("tone", tone)
             chip.setAccessibleName(text)
             self.chip_row.insertWidget(index, chip)
+
+    def set_selected(self, selected: bool) -> None:
+        """Mark this row as the one the waveform and Selected Audio follow."""
+        if bool(self.property("selected")) == bool(selected):
+            return
+        self.setProperty("selected", bool(selected))
+        self.setAccessibleDescription("Selected" if selected else "")
+        for widget in [self] + self.findChildren(QtWidgets.QWidget):
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+        self.update()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
+        if event.button() == QtCore.Qt.LeftButton:
+            self.selectRequested.emit(self.tx.id)
+        super().mousePressEvent(event)
+
+    def focusInEvent(self, event: QtGui.QFocusEvent) -> None:  # noqa: N802
+        self.selectRequested.emit(self.tx.id)
+        super().focusInEvent(event)
 
     def set_provisional(self, text: str) -> None:
         """Show live partial text, visually marked as not final."""
@@ -563,7 +649,7 @@ class TransmissionBubble(QtWidgets.QFrame):
                                      else "Play original recording")
         else:
             self.playback_bar.hide()
-            self.play_button.setText("\u25b6 Play")
+            self.play_button.setText("Play original")
             self.play_button.setEnabled(True)
             self.play_button.show()
             self.play_action.setText("Play original recording")
@@ -664,16 +750,22 @@ class TimelineView(QtWidgets.QScrollArea):
     analyzeDigitalRequested = QtCore.Signal(str, str)
     removeRequested = QtCore.Signal(str)
     restoreRequested = QtCore.Signal(str)
+    #: The selected row changed: its transmission id, or None for none.
+    selectionChanged = QtCore.Signal(object)
+    #: The selected row's transmission changed in place (bookmark, review,
+    #: text): the same row, new content.
+    selectedUpdated = QtCore.Signal(str)
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
+        self.selected_id: Optional[str] = None
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
 
         self._container = QtWidgets.QWidget()
         self._layout = QtWidgets.QVBoxLayout(self._container)
-        self._layout.setContentsMargins(10, 10, 10, 10)
-        self._layout.setSpacing(8)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(0)
         self._layout.addStretch(1)
         self.setWidget(self._container)
 
@@ -708,6 +800,7 @@ class TimelineView(QtWidgets.QScrollArea):
         self._bubbles.clear()
         self._order.clear()
         self.empty_label.show()
+        self.select(None)
 
     def remove(self, tx_id: str) -> bool:
         """Take one bubble out of the thread. Its audio stops first."""
@@ -725,6 +818,8 @@ class TimelineView(QtWidgets.QScrollArea):
                 self._order.remove(tx_id)
         if not self._bubbles:
             self.empty_label.show()
+        if self.selected_id == tx_id:
+            self.select(None)
         return True
 
     def set_playback(self, controller: PlaybackController) -> None:
@@ -881,6 +976,7 @@ class TimelineView(QtWidgets.QScrollArea):
         bubble.analyzeDigitalRequested.connect(self.analyzeDigitalRequested)
         bubble.removeRequested.connect(self.removeRequested)
         bubble.restoreRequested.connect(self.restoreRequested)
+        bubble.selectRequested.connect(self.select)
         with self._anchored():
             self._layout.insertWidget(index, bubble)
             self._order.insert(index, tx.id)
@@ -928,6 +1024,8 @@ class TimelineView(QtWidgets.QScrollArea):
         # operator is reading, the text under their eyes would move.
         with self._anchored():
             bubble.update_from(tx)
+        if tx.id == self.selected_id:
+            self.selectedUpdated.emit(tx.id)
 
     def set_transmissions(self, transmissions: List[Transmission]) -> None:
         """Replace the thread. ``transmissions`` may be in either order.
@@ -943,6 +1041,55 @@ class TimelineView(QtWidgets.QScrollArea):
             self.append_older(tx)
         # Open at the newest transmission, which is the top.
         self.scroll_to_top()
+
+    # -- selection -----------------------------------------------------------
+    def select(self, tx_id: Optional[str], reveal: bool = False) -> None:
+        """Make *tx_id* the selected row (None: no selection).
+
+        Only rows that are shown can be selected; asking for one that is not
+        clears the selection rather than pointing at something invisible.
+        Selecting never scrolls - nothing in this view moves on its own -
+        unless *reveal* asks for it: the keyboard moving the selection to a
+        row that may be out of sight.
+        """
+        if tx_id is not None and tx_id not in self._bubbles:
+            tx_id = None
+        if tx_id == self.selected_id:
+            return
+        previous = self._bubbles.get(self.selected_id) if self.selected_id else None
+        if previous is not None:
+            previous.set_selected(False)
+        self.selected_id = tx_id
+        bubble = self._bubbles.get(tx_id) if tx_id else None
+        if bubble is not None:
+            bubble.set_selected(True)
+            if reveal:
+                self.ensureWidgetVisible(bubble, 0, 0)
+        self.selectionChanged.emit(tx_id)
+
+    def selected_transmission(self) -> Optional[Transmission]:
+        bubble = self._bubbles.get(self.selected_id) if self.selected_id else None
+        return bubble.tx if bubble is not None else None
+
+    def bubble(self, tx_id: str) -> Optional[TransmissionBubble]:
+        return self._bubbles.get(tx_id)
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:  # noqa: N802
+        """Up/Down move the selection through the list, newest at the top."""
+        key = event.key()
+        if key in (QtCore.Qt.Key_Up, QtCore.Qt.Key_Down) and self._order:
+            if self.selected_id in self._order:
+                index = self._order.index(self.selected_id)
+                index += -1 if key == QtCore.Qt.Key_Up else 1
+                index = max(0, min(len(self._order) - 1, index))
+            else:
+                index = 0
+            target = self._bubbles[self._order[index]]
+            self.select(self._order[index], reveal=True)
+            target.setFocus(QtCore.Qt.OtherFocusReason)
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def scroll_to_top(self) -> None:
         bar = self.verticalScrollBar()
