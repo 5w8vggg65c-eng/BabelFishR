@@ -195,8 +195,10 @@ def test_the_independence_check_scrubs_the_environment():
     assert "cd /" in body, "it must run from outside the repository"
     for flag in ("--version", "--help", "--selftest-import",
                  "--selftest-independence", "--selftest-gui",
-                 "--selftest-coreaudio", "--selftest-https"):
+                 "--selftest-coreaudio", "--selftest-https",
+                 "--selftest-resource-tracker"):
         assert flag in body
+    assert "probe_resource_tracker.py" in body
 
 
 def test_the_independence_check_looks_for_build_machine_library_paths():
@@ -224,10 +226,11 @@ def test_the_entry_point_supports_the_checks_the_scripts_run():
              if isinstance(node, ast.FunctionDef)}
     assert {"_selftest_independence", "_selftest_gui",
             "_selftest_coreaudio", "_selftest_https",
-            "_selftest_argos_paths"} <= names
+            "_selftest_argos_paths", "_selftest_resource_tracker"} <= names
     for flag in ("--selftest-import", "--selftest-independence",
                  "--selftest-gui", "--selftest-coreaudio",
-                 "--selftest-https", "--selftest-argos-paths"):
+                 "--selftest-https", "--selftest-argos-paths",
+                 "--selftest-resource-tracker"):
         assert flag in source
 
 

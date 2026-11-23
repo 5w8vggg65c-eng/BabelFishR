@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import pathlib
+import types
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .base import (EngineError, EngineUnavailable, PrivacyProfile,
@@ -21,6 +22,44 @@ from .base import (EngineError, EngineUnavailable, PrivacyProfile,
 from .glossary import protect_terms, restore_terms
 
 log = logging.getLogger(__name__)
+
+
+def keep_stanza_local() -> bool:
+    """Make argostranslate's stanza sentence splitter use only the pack's files.
+
+    argostranslate 1.11 builds ``stanza.Pipeline(lang, dir=<pack>/stanza,
+    processors="tokenize")`` (argostranslate/sbd.py) without a
+    ``download_method``. stanza's default, DOWNLOAD_RESOURCES, fetches
+    resources_<version>.json from raw.githubusercontent.com every time a
+    pipeline is built, and a local resources.json does not stop it (the check
+    compares an md5 that is never supplied). With no network that raises, and
+    every translation through a pack with a stanza/ directory fails. Argos
+    packs ship their own resources.json and tokenizer models, so the pipeline
+    is told to download nothing (stanza's DownloadMethod.NONE): it reads the
+    pack, and a missing file is a local FileNotFoundError, not a request.
+
+    Only argostranslate's view of stanza is changed (its module attribute), and
+    a download_method passed explicitly is respected. Returns True when the
+    splitter is pinned, False when argostranslate or stanza is not importable.
+    """
+    try:
+        import argostranslate.sbd as sbd
+        from stanza.pipeline.core import DownloadMethod
+    except Exception:  # noqa: BLE001 - no stanza, nothing to pin
+        return False
+    current = sbd.stanza.Pipeline
+    if getattr(current, "_babelfishr_local_only", False):
+        return True
+    real = current
+
+    def pipeline(*args, **kwargs):
+        kwargs.setdefault("download_method", DownloadMethod.NONE)
+        return real(*args, **kwargs)
+
+    pipeline._babelfishr_local_only = True
+    pipeline._babelfishr_real = real
+    sbd.stanza = types.SimpleNamespace(Pipeline=pipeline)
+    return True
 
 #: Argos reads this at *import* time (argostranslate.settings resolves
 #: package_data_dir once), so it has to be set before anything imports the
@@ -503,6 +542,7 @@ class ArgosTranslateEngine(TranslationEngine):
             import argostranslate.translate as translate
         except Exception as exc:  # noqa: BLE001
             raise EngineUnavailable(self.unavailable_reason()) from exc
+        keep_stanza_local()
 
         if not text.strip():
             return TranslationResult(text="", source_language=source_language,
@@ -532,6 +572,13 @@ class ArgosTranslateEngine(TranslationEngine):
         try:
             translated = translate.translate(protected, source_language,
                                              target_language)
+        except FileNotFoundError as exc:
+            # With the splitter pinned to the pack's own files, a missing one
+            # surfaces here rather than as a download attempt.
+            raise EngineError(
+                f"the {source_language}->{target_language} language pack is "
+                f"missing a file it needs to translate offline ({exc}). "
+                f"Reinstall that pack in Online / Setup mode.") from exc
         except Exception as exc:  # noqa: BLE001
             raise EngineError(f"argos translation failed: {exc}") from exc
 

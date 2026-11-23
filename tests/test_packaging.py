@@ -571,3 +571,17 @@ def test_docs_describe_the_gui_setup_workflow():
     text = (ROOT / "docs" / "FIELD_OPERATION.md").read_text(encoding="utf-8")
     assert "setup assistant" in text.lower()
     assert "In the app" in text
+
+
+def test_the_packaged_entry_calls_freeze_support_before_main():
+    """A frozen app must call multiprocessing.freeze_support() before anything
+    else, or the resource tracker multiprocessing starts on macOS (this
+    executable re-run with "-c from multiprocessing.resource_tracker import
+    main...") reaches main(), whose CLI rejects the arguments - seen on the
+    operator's Mac as "invalid command" and "resource_tracker ... died"."""
+    tree = ast.parse((PACKAGING / "app_entry.py").read_text())
+    guard = next(node for node in tree.body if isinstance(node, ast.If)
+                 and "__main__" in ast.unparse(node.test))
+    calls = [ast.unparse(node.func) for node in ast.walk(guard) if isinstance(node, ast.Call)]
+    assert "multiprocessing.freeze_support" in calls, calls
+    assert calls.index("multiprocessing.freeze_support") < calls.index("main"), calls

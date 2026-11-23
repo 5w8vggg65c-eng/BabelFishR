@@ -324,6 +324,53 @@ def _selftest_gui() -> int:
     return 0
 
 
+def _selftest_resource_tracker() -> int:
+    """Start multiprocessing's real resource tracker from the frozen app.
+
+    On macOS multiprocessing launches it by re-running this executable with
+    the interpreter flags this build reports, then "-c from
+    multiprocessing.resource_tracker import main;main(<fd>)", the read end of
+    a pipe passed down. PyInstaller diverts that to multiprocessing only when
+    freeze_support() ran first; otherwise main() hands the arguments to the
+    CLI, argparse refuses them, and the tracker exits at once with status 2.
+    A healthy tracker waits for its pipe and exits 0 when it is closed.
+    No models, no network. Prints the flags so the direct probe in
+    verify_independence.sh can launch the same child itself.
+    """
+    import json
+    import multiprocessing.resource_tracker as resource_tracker
+    import subprocess
+    import time
+
+    print("interpreter flags: " + json.dumps(subprocess._args_from_interpreter_flags()))
+    resource_tracker.ensure_running()
+    tracker = resource_tracker._resource_tracker
+    pid, fd = tracker._pid, tracker._fd
+    deadline = time.monotonic() + 3.0          # a misrouted child dies in well under this
+    while time.monotonic() < deadline:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            print(f"FAIL: the resource tracker exited before its pipe closed "
+                  f"(exit {os.waitstatus_to_exitcode(status)})")
+            return 1
+        time.sleep(0.1)
+    os.close(fd)                               # EOF: a healthy tracker ends now
+    tracker._fd = tracker._pid = None
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            code = os.waitstatus_to_exitcode(status)
+            if code != 0:
+                print(f"FAIL: the resource tracker exited {code} at EOF")
+                return 1
+            print("resource tracker ran under multiprocessing and exited 0 at EOF")
+            return 0
+        time.sleep(0.1)
+    print("FAIL: the resource tracker did not exit within 15 s of EOF")
+    return 1
+
+
 def main(argv=None) -> int:
     """Launch the GUI, or hand off to the CLI when arguments are supplied.
 
@@ -359,6 +406,9 @@ def main(argv=None) -> int:
     if argv == ["--selftest-gui"]:
         return _selftest_gui()
 
+    if argv == ["--selftest-resource-tracker"]:
+        return _selftest_resource_tracker()
+
     if argv:
         from babelfishr.cli import main as cli_main
 
@@ -384,4 +434,13 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    # First, before main(): on macOS, multiprocessing starts its resource
+    # tracker by re-running this executable with "-c from
+    # multiprocessing.resource_tracker import main...". PyInstaller's
+    # runtime hook only diverts that when freeze_support() is called;
+    # without it main() handed those arguments to the CLI, argparse refused
+    # them, and the tracker died.
+    import multiprocessing
+
+    multiprocessing.freeze_support()
     sys.exit(main())

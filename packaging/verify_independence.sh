@@ -125,6 +125,30 @@ else
 fi
 
 echo
+echo "== multiprocessing helpers reach multiprocessing, not the CLI =="
+# Fatal. Without multiprocessing.freeze_support() before main(), the resource
+# tracker multiprocessing starts on macOS (this executable re-run with "-c
+# from multiprocessing.resource_tracker import main...") reached the CLI and
+# died with an argparse error - seen on the operator's Mac during translation.
+# First the bundle starts a real tracker itself; then the same child is
+# launched directly, with the bundle's own interpreter flags and a real pipe.
+if OUTPUT=$(run_isolated_limited 60 --selftest-resource-tracker); then
+  echo "$OUTPUT"
+  pass "a resource tracker started by the bundle runs and exits 0 at EOF"
+  FLAGS=$(echo "$OUTPUT" | sed -n 's/^interpreter flags: //p' | head -n 1)
+  if OUTPUT=$(python3 "$(dirname "$0")/probe_resource_tracker.py" "$BINARY" "$FLAGS" 2>&1); then
+    echo "$OUTPUT"
+    pass "a directly launched resource-tracker child exits 0 at EOF"
+  else
+    echo "$OUTPUT"
+    fail "a directly launched resource-tracker child reached the CLI"
+  fi
+else
+  echo "$OUTPUT"
+  fail "the bundle's resource tracker did not run under multiprocessing"
+fi
+
+echo
 echo "== native libraries must not reference build-machine paths =="
 if command -v otool >/dev/null 2>&1; then
   # /usr/lib and /System are OS-provided and present on every Mac.
