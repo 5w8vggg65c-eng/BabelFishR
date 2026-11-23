@@ -185,6 +185,11 @@ QMainWindow, #centralRoot {{ background: {t['window']}; }}
 #modeButton[mode="record-only"] {{ border: 1px solid {t['warning']}; color: {t['warning']}; }}
 #modeButton[mode="online-setup"] {{ border: 1px solid {t['accent']}; color: {t['accent']}; }}
 #modeButton:focus {{ border-width: 2px; }}
+/* Disabled (e.g. while monitoring runs): no mode colour, so it can't look live. */
+#modeButton:disabled, #playButton:disabled {{
+    border: 1px dashed {t['border']}; color: {t['text_muted']};
+    background: {t['window']};
+}}
 
 /* --- footer band: the status bar --------------------------------------- */
 QStatusBar {{

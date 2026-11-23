@@ -102,6 +102,52 @@ def _seed(store, recordings: pathlib.Path):
     return conversation
 
 
+def _control_states(window):
+    """The window's own control styles side by side, normal and disabled.
+
+    A swatch, not product state: copies of the header's primary button, the
+    mode button and the message Play button, styled by the same stylesheet
+    and palette as the window, so their contrast can be checked in both
+    states without driving the application into them.
+    """
+    from PySide6 import QtWidgets
+
+    swatch = QtWidgets.QWidget()
+    swatch.setWindowTitle(TITLE + " — control states")
+    swatch.setPalette(window.palette())
+    swatch.setStyleSheet(window.styleSheet())
+    grid = QtWidgets.QGridLayout(swatch)
+    grid.setContentsMargins(16, 16, 16, 16)
+    grid.setHorizontalSpacing(16)
+    for column, heading in enumerate(("", "normal", "disabled")):
+        if heading:
+            label = QtWidgets.QLabel(heading.upper())
+            label.setObjectName("sectionLabel")
+            grid.addWidget(label, 0, column)
+    rows = (("Primary (Start monitoring)", QtWidgets.QPushButton, "primaryButton",
+             "Start monitoring", None),
+            ("Operating mode", QtWidgets.QToolButton, "modeButton",
+             window.mode_button.text(), ("mode", window.mode_button.property("mode"))),
+            ("Play recording", QtWidgets.QToolButton, "playButton", "\u25b6 Play", None),
+            ("Ordinary button", QtWidgets.QPushButton, "", "Calibrate", None))
+    for row, (title, kind, name, text, prop) in enumerate(rows, start=1):
+        grid.addWidget(QtWidgets.QLabel(title), row, 0)
+        for column, enabled in ((1, True), (2, False)):
+            control = kind()
+            control.setText(text)
+            if name:
+                control.setObjectName(name)
+            if prop:
+                control.setProperty(*prop)
+            control.setEnabled(enabled)
+            grid.addWidget(control, row, column)
+    swatch.resize(760, 230)
+    swatch.show()
+    for _ in range(10):
+        QtWidgets.QApplication.processEvents()
+    return swatch
+
+
 def _dark_palette():
     """A dark *system* palette, as macOS dark appearance would hand Qt."""
     from PySide6 import QtGui
@@ -172,17 +218,29 @@ def main(argv=None) -> int:
         while "Checking" in window.ready_badge.text() and time.monotonic() < deadline:
             qt_app.processEvents()
             time.sleep(0.05)
-        for name, size in ((f"main-{args.appearance}", (1240, 900)),
-                           (f"narrow-{args.appearance}", (620, 900))):
+        shots = [(f"main-{args.appearance}", (1240, 1180)),
+                 (f"narrow-{args.appearance}", (620, 900))]
+        for name, size in shots:
             window.resize(*size)
             for _ in range(20):
                 qt_app.processEvents()
+            if name.startswith("narrow"):
+                # Report the width the window really took: it will not go
+                # below its layout's minimum, whatever was asked for.
+                name = f"{name}-{window.width()}px"
             path = out / f"ui-preview-{name}.png"
             if not window.grab().save(str(path)):
                 print(f"could not write {path}", file=sys.stderr)
                 status = 1
             else:
-                print(path)
+                print(f"{path}  ({window.width()}x{window.height()})")
+        path = out / f"ui-preview-controls-{args.appearance}.png"
+        swatch = _control_states(window)
+        if not swatch.grab().save(str(path)):
+            status = 1
+        else:
+            print(path)
+        swatch.close()
     else:
         status = qt_app.exec()
     window.close()

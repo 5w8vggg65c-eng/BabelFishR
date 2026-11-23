@@ -89,3 +89,21 @@ def test_the_mode_styling_is_the_mode_the_application_is_in(qt_app, config, stor
     assert window.mode_button.property("mode") == app.mode.value
     assert app.mode.label in window.mode_button.text()
     window.close()
+
+
+def test_primary_text_is_navy_on_cyan_and_disabled_controls_lose_their_colour(
+        qt_app, system_palette):
+    """Off-white on the cyan fill is only 2.3:1; navy is 7.6:1. And a disabled
+    mode or Play button must not keep the colour that says it is live."""
+    from babelfishr.ui.theme import CONSOLE
+
+    assert CONSOLE["on_accent"] == CONSOLE["window"]
+    assert _contrast(CONSOLE["on_accent"], CONSOLE["accent"]) >= 7.0
+    assert _contrast(CONSOLE["text"], CONSOLE["accent"]) < 3.0   # why not off-white
+
+    system_palette(dark=True)
+    from babelfishr.ui import theme
+
+    css = theme.stylesheet()
+    assert "#modeButton:disabled, #playButton:disabled" in css
+    assert "#primaryButton:disabled" in css
