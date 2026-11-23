@@ -400,16 +400,12 @@ def test_the_operator_can_change_input_after_stopping(cfg, connected):
     assert cfg.audio.input.label == "Scarlett Solo USB"
 
 
-def test_input_controls_are_frozen_while_monitoring():
-    """Structural check on the window; the widget test covers the behaviour."""
-    import inspect
-
-    from babelfishr.ui import main_window
-
-    start = inspect.getsource(main_window.MainWindow._start_monitoring)
-    stop = inspect.getsource(main_window.MainWindow._stop_monitoring)
-    assert "self.input_panel.set_monitoring(True)" in start
-    assert "self.input_panel.set_monitoring(False)" in stop
+# The input controls being frozen while monitoring was checked here by
+# reading the window's source text for one exact call. That broke on a
+# correct change of the call's arguments and proved nothing about behaviour.
+# It is now proved on the real window: tests/test_ui_v5_console.py,
+# test_monitoring_freezes_the_input_controls_* (live start, replay start,
+# stop, and a start that fails).
 
 
 # ---- identical devices must still be distinguishable -------------------

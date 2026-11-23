@@ -572,3 +572,79 @@ def test_play_original_over_decoded_audio_keeps_control_with_a_real_style_player
 
     controller.stop()
     assert backend.state() == STOPPED, "the original could not be stopped"
+
+
+# ---- the input controls are frozen for the duration of a watch -------------------
+# Replaces a source-text check in test_audio_source_selection.py with the
+# behaviour itself, on the real window and its real input controls.
+
+def _input_controls(window):
+    panel = window.input_panel
+    return {"device": panel.device_box, "rescan": panel.rescan_button,
+            "profile": panel.profile_check}
+
+
+def _enabled(window):
+    return {name: widget.isEnabled() for name, widget in _input_controls(window).items()}
+
+
+def test_monitoring_freezes_the_input_controls_for_a_live_start(qt_app, console,
+                                                               monkeypatch):
+    window, app, _ = console
+    _wire_microphone(monkeypatch, window)
+    before = _enabled(window)
+    assert before["device"] and before["rescan"]
+
+    # The window's own start path; only the audio hardware is absent here.
+    started = []
+    monkeypatch.setattr(app, "start_session",
+                        lambda **kwargs: started.append(kwargs) or setattr(app, "session", object()))
+    monkeypatch.setattr(app, "begin_capture", lambda *a, **k: None)
+    window._start_monitoring()
+    pump(qt_app)
+    assert started and started[0]["identity"] is not None, "it did not start the live input"
+    assert not any(_enabled(window).values()), _enabled(window)
+
+    monkeypatch.setattr(app, "stop_session", lambda: setattr(app, "session", None))
+    window._stop_monitoring()
+    pump(qt_app)
+    assert _enabled(window) == before, "stopping did not restore the input controls"
+
+
+def test_monitoring_freezes_the_input_controls_for_a_replay(qt_app, console,
+                                                           monkeypatch, tmp_path):
+    from babelfishr.audio.wavefile import write_wav
+    from babelfishr.testing import speech_like
+
+    window, app, _ = console
+    _wire_microphone(monkeypatch, window)
+    before = _enabled(window)
+    wav = write_wav(str(tmp_path / "replay.wav"), speech_like(0.6, 48_000), 48_000)
+    window._start_monitoring(replay_path=wav)           # a real replay session
+    pump(qt_app)
+    assert app.session is not None
+    assert not any(_enabled(window).values()), _enabled(window)
+    window._stop_monitoring()
+    pump(qt_app)
+    assert _enabled(window) == before
+
+
+def test_a_start_that_fails_leaves_the_input_controls_usable(qt_app, console,
+                                                            monkeypatch, tmp_path):
+    window, app, _ = console
+    _wire_microphone(monkeypatch, window)
+    before = _enabled(window)
+
+    def refuse(**_kwargs):
+        raise RuntimeError("could not open")
+
+    monkeypatch.setattr(app, "start_session", refuse)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "critical",
+                        staticmethod(lambda *a, **k: None))
+    window._start_monitoring()                           # live
+    pump(qt_app)
+    assert _enabled(window) == before
+    window._start_monitoring(replay_path=str(tmp_path / "bad.wav"))   # replay
+    pump(qt_app)
+    assert _enabled(window) == before
+    assert app.session is None
