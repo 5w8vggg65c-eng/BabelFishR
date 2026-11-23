@@ -76,15 +76,18 @@ else
   # though its output goes through tee.
   # --timeout turns a hung test into a failure naming the test, rather than a
   # build step that sits there. --durations shows the slow ones either way.
-  # BABELFISHR_HANG_DUMP_*: a test still running after that many seconds
-  # (well past --timeout) is taken to be stuck in native code holding the
-  # GIL, where pytest-timeout cannot report it; tests/conftest.py then dumps
-  # every thread's stack to hang-dump.txt (which also lists each test as it
-  # starts) and ends the run, so the step fails and the reports upload.
-  BABELFISHR_HANG_DUMP_SECONDS="${BABELFISHR_HANG_DUMP_SECONDS:-240}" \
-  BABELFISHR_HANG_DUMP_FILE="$REPORT_DIR/hang-dump.txt" \
-  BABELFISHR_HOME="$(mktemp -d)/BabelFishR-buildtest" python -m pytest -q -rs \
+  # -v names each test as it starts, so a live log shows where a run is.
+  # pytest-timeout's thread method needs the GIL, so a test stuck in native
+  # code holding it is never reported (macOS run 29 sat silent until the job
+  # limit). pytest's own faulthandler_timeout dumps every thread's stack from
+  # a C thread instead, and faulthandler_exit_on_timeout then ends the run,
+  # so this step fails and the always() report upload keeps the evidence.
+  # It is set above --timeout, so ordinary timeouts are still reported by
+  # pytest-timeout first.
+  BABELFISHR_HOME="$(mktemp -d)/BabelFishR-buildtest" python -m pytest -v -rs \
     --timeout="${BABELFISHR_TEST_TIMEOUT:-120}" --timeout-method=thread \
+    -o faulthandler_timeout="${BABELFISHR_FAULTHANDLER_TIMEOUT:-240}" \
+    -o faulthandler_exit_on_timeout=true \
     --durations=15 \
     --junitxml="$REPORT_DIR/junit.xml" 2>&1 | tee "$REPORT_DIR/test-report.txt"
 fi
