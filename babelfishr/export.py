@@ -107,6 +107,17 @@ def to_markdown(transmissions: Sequence[Transmission],
                          f"{tx.display_translation}")
         if tx.state.value == "failed" and tx.error:
             lines.append(f"**Error ({tx.error.stage}):** {tx.error.message}")
+        unresolved = (tx.signal_metadata or {}).get("translation_unresolved") or {}
+        if unresolved:
+            # A COMPLETE row with no translation: say why, as the Error line
+            # did when this case was recorded as a failure.
+            lines.append("**Translation not attempted (language unresolved):** "
+                         + (unresolved.get("message") or
+                            f"automatic detection guessed "
+                            f"'{unresolved.get('guessed_language') or '?'}' and no "
+                            f"language pack is installed for it."))
+        if tx.needs_review:
+            lines.append("**Review:** needs review")
         if tx.notes:
             lines.append(f"**Notes:** {tx.notes}")
         if tx.audio_path:

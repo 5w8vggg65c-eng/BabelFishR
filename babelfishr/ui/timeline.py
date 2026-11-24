@@ -145,9 +145,11 @@ def _translation_unresolved_note(tx: Transmission) -> str:
              f"language pack is installed. ")
     if operator_checked(tx):
         return words + "You have since checked and saved this message."
-    return words + ("If this is speech, choose its language with Message > "
-                    "Retry as speech in... (Ctrl+L). The recording and "
-                    "transcript are kept.")
+    # No shortcut in the prose: Qt shows Ctrl as Command on macOS, and the
+    # menu item itself shows the right key.
+    return words + ("The recording and transcript are kept. If this is "
+                    "speech, choose its language with Message > Retry as "
+                    "speech in...")
 
 
 def operator_checked(tx: Transmission) -> bool:

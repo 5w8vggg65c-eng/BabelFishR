@@ -282,3 +282,61 @@ def test_the_bubble_says_translation_was_not_attempted(qt_app, config, store, tm
     assert "translation not attempted" in bubble.status_label.text()
     assert bubble.review_label.text() == "CHECK"
     assert bubble.error_label.isHidden(), "not shown as a failure"
+
+
+# --- the readable log and the session bundle ---------------------------------
+
+def test_markdown_explains_the_unattempted_translation(config, store, tmp_path):
+    from babelfishr.export import to_markdown
+
+    app, tx = run_one(config, store, tmp_path, ScriptedTranscription(field_case()),
+                      PairTranslation(pairs=()), target_language="en")
+    text = to_markdown([tx])
+    assert "**Translation not attempted (language unresolved):**" in text
+    assert "'nn' (52%)" in text and "no nn->en pack is installed" in text
+    assert "**Review:** needs review" in text
+    assert "**Error" not in text, "not reported as a failure"
+
+
+def test_markdown_for_an_ordinary_translated_row_is_unchanged(config, store, tmp_path):
+    from babelfishr.export import to_markdown
+
+    app, tx = run_one(config, store, tmp_path,
+                      ScriptedTranscription(result("Equipo en posición.", ratio=0.5,
+                                                   nsp=0.1, language="es")),
+                      PairTranslation(pairs=(("es", "en"),)), target_language="en")
+    text = to_markdown([tx])
+    assert "not attempted" not in text and "**Review:**" not in text
+
+
+def test_the_session_bundle_carries_it_and_leaves_the_audio_untouched(
+        config, store, tmp_path):
+    import hashlib
+
+    from babelfishr.export import export_session
+
+    app, tx = run_one(config, store, tmp_path, ScriptedTranscription(field_case()),
+                      PairTranslation(pairs=()), target_language="en")
+    original = pathlib.Path(tx.audio_path)
+    before = (hashlib.sha256(original.read_bytes()).hexdigest(),
+              original.stat().st_mtime_ns)
+    bundle = pathlib.Path(export_session(store, tx.session_id,
+                                         str(tmp_path / "bundle")))
+    markdown = next(bundle.rglob("transcript.md")).read_text(encoding="utf-8")
+    assert "Translation not attempted (language unresolved)" in markdown
+    assert "**Review:** needs review" in markdown
+    copied = next(bundle.rglob(f"{tx.id}.wav"))
+    assert hashlib.sha256(copied.read_bytes()).hexdigest() == before[0]
+    assert (hashlib.sha256(original.read_bytes()).hexdigest(),
+            original.stat().st_mtime_ns) == before, "the recording was changed"
+    assert store.get_transmission(tx.id).audio_path == tx.audio_path
+
+
+def test_the_note_names_no_platform_shortcut(qt_app, config, store, tmp_path):
+    from babelfishr.ui.timeline import _translation_unresolved_note
+
+    app, tx = run_one(config, store, tmp_path, ScriptedTranscription(field_case()),
+                      PairTranslation(pairs=()), target_language="en")
+    note = _translation_unresolved_note(tx)
+    assert "Message > Retry as speech in..." in note
+    assert "Ctrl" not in note and "⌘" not in note
