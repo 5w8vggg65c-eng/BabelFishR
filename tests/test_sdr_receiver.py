@@ -18,6 +18,7 @@ import pathlib
 import socket
 import subprocess
 import sys
+import threading
 import time
 import wave
 
@@ -292,12 +293,16 @@ def test_the_stream_ending_is_reported_and_never_replaced(receiver_config):
         controller._process.terminate()                      # SDR++ quits under us
         assert wait_for(lambda: source.finished, timeout=5)
         assert not source.running
-        assert any(kind == "disconnected" for kind, _ in statuses)
         # Audio received before the stream ended is still handed out, in
         # order (the capture drains it); once the reader has gone, nothing
         # more arrives and no other source takes over.
         source._reader.join(timeout=5)
         assert not source._reader.is_alive(), "the reader did not end with the stream"
+        # The reader thread reports the disconnect itself, just after it
+        # marks the stream finished (stream.py _on_stream_end): checked once
+        # that thread has ended, not the moment `finished` turns true. A
+        # loaded macOS runner (run 31) caught the callback still running.
+        assert any(kind == "disconnected" for kind, _ in statuses)
         drained = []
         for _ in range(source.capacity + 8):    # bounded: the buffer is bounded
             item = source.read(timeout=0.05)
@@ -312,6 +317,39 @@ def test_the_stream_ending_is_reported_and_never_replaced(receiver_config):
         assert source.buffered == 0 and source.read(timeout=0.2) is None
         assert not source.running and source.finished     # still ended: nothing replaced it
     finally:
+        controller.shutdown()
+
+
+
+def test_the_disconnect_is_reported_by_the_time_the_reader_has_ended(receiver_config):
+    """The contract the test above relies on, with the status callback held
+    at a gate (no sleep): `finished` can be true while the reader thread is
+    still inside the callback, and the disconnect is reported before that
+    thread ends."""
+    controller = ReceiverController(receiver_config)
+    statuses, entered, gate = [], threading.Event(), threading.Event()
+
+    def on_status(kind, message):
+        if kind == "disconnected":
+            entered.set()
+            gate.wait(10)
+        statuses.append((kind, message))
+
+    controller.on_status = on_status
+    try:
+        source = controller.open_source()
+        source.start()
+        assert source.read(timeout=5.0) is not None
+        controller._process.terminate()
+        assert wait_for(lambda: source.finished, timeout=5)
+        assert entered.wait(5), "the disconnect was never reported"
+        assert not any(kind == "disconnected" for kind, _ in statuses)   # still held
+        gate.set()
+        source._reader.join(timeout=5)
+        assert not source._reader.is_alive()
+        assert any(kind == "disconnected" for kind, _ in statuses)
+    finally:
+        gate.set()
         controller.shutdown()
 
 
