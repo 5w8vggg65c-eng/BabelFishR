@@ -24,5 +24,10 @@ kingfishr = "kingfishr.cli:main"
 [project.gui-scripts]
 kingfishr-gui = "kingfishr.ui:run"
 
+[tool.setuptools]
+# The same MIT notice as BabelFishR (a byte-for-byte copy of ../LICENSE,
+# checked by tests/test_product_separation.py), shipped in every build.
+license-files = ["LICENSE"]
+
 [tool.setuptools.packages.find]
 include = ["kingfishr*"]

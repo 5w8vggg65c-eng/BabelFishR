@@ -267,3 +267,14 @@ def test_the_input_panel_asks_for_an_input_and_cannot_start(qt_app, legacy,
         assert panel.selected_identity() is None
     finally:
         app.close()
+
+
+def test_kingfishr_ships_the_same_mit_notice():
+    """KingFishR is its own distribution: it carries the full MIT notice,
+    identical to BabelFishR's, and declares it so every build includes it
+    (checked in the built wheel: dist-info/licenses/LICENSE)."""
+    ours = (REPO / "LICENSE").read_bytes()
+    assert (REPO / "kingfishr" / "LICENSE").read_bytes() == ours
+    assert b"Copyright (c) 2026 BabelFishR contributors" in ours
+    kf = (REPO / "kingfishr" / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'license-files = ["LICENSE"]' in kf
