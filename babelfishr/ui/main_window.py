@@ -109,11 +109,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # store query that opened the view, so what arrives cannot widen it.
         self._view_kind = "thread"
         self._view_query = ""
-        #: Rows of a stopped monitoring run that the window did not show
-        #: (their events arrived after Stop). A filtered view's automatic
-        #: reconciliation leaves them out; an explicit open or View >
-        #: Refresh shows the store as it is, and clears this.
-        self._withheld: set = set()
+        #: Monitoring runs stopped in this session. A filtered view's
+        #: automatic reconciliation adds none of their rows (see _may_place)
+        #: except those an explicit open or View > Refresh has shown.
+        self._stopped_here: set = set()
+        #: Rows of those runs that an explicit open / refresh showed.
+        self._revealed_ids: set = set()
+        #: Rows the operator processed by hand (Retry, Transcribe anyway):
+        #: their results are theirs to see.
+        self._manual_ids: set = set()
         self._readiness = None
         self._theming = False
         self._readiness_worker = None
@@ -1202,6 +1206,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # added. Manual jobs carry on. Pressing Stop again is a no-op.
         session = self.app.stop_session()
         if session is not None:
+            self._stopped_here.add(session.id)
             self._mark_shown_rows_stopped(session.id)
         self.start_button.setText("Start monitoring")
         self._set_controls_enabled(True)
@@ -1324,6 +1329,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return                     # the store is closing or closed
         touched = set()             # ids whose row a filtered view must re-read
         for event in self.app.events.drain():
+            if self._from_stopped_run(event):
+                continue               # a stopped run's: nothing on screen changes
             if event.kind == "level":
                 reading = event.payload
                 self.meter.set_reading(reading.rms_fraction, reading.peak_fraction,
@@ -1333,8 +1340,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     reading.clipped, reading.clip_count)
                 self.clip_label.setText(
                     f"⚠ clipping ({reading.clip_count})" if reading.clip_count else "")
-            elif self._from_stopped_run(event):
-                continue
             elif event.kind == "state":
                 self._set_state(event.payload)
             elif event.kind in ("transmission", "updated"):
@@ -1385,24 +1390,29 @@ class MainWindow(QtWidgets.QMainWindow):
         """True when *event* belongs to a monitoring run already stopped.
 
         The operator's choice: Stop ends automatic chat updates at once.
-        Such an event - a late transcript, a translation, a new recording
-        from the final flush, a state change, even one queued before Stop -
-        adds nothing. The one thing it may do is flip a row already on
-        screen to its saved-not-processed indicator; any other row is
-        withheld until the operator opens or refreshes a view.
+        Such an event - a level reading, a state, a late transcript or
+        translation, a new recording from the final flush, even one queued
+        before Stop - changes nothing on screen, not even a row already
+        shown: the Stop action itself set those rows' indicator, and a late
+        event (which may carry words never shown, or be older than a manual
+        result since) must not repaint them. Manual work is untagged and
+        never matches.
         """
         run = getattr(event, "run", None)
-        if run is None or not self.app.run_stopped(run):
-            return False
-        tx = event.payload if event.kind in ("transmission", "updated") else None
-        if tx is not None:
-            from ..pipeline import is_processing_stopped
+        return run is not None and self.app.run_stopped(run)
 
-            if is_processing_stopped(tx) and tx.id in self.timeline.order():
-                self.timeline.update(tx)
-            elif tx.id not in self.timeline.order():
-                self._withheld.add(tx.id)
-        return True
+    def _may_place(self, row) -> bool:
+        """Whether a filtered view's automatic reconciliation may add *row*.
+
+        Not a row of a run stopped in this session that no explicit open or
+        refresh has shown - whether or not its event was received: such a
+        row can be committed before its event is published, even after the
+        view was opened. A row the operator processed by hand, or one an
+        explicit open showed, is theirs.
+        """
+        return (row.session_id not in self._stopped_here
+                or row.id in self._revealed_ids
+                or row.id in self._manual_ids)
 
     def _admit(self, tx, arrival: bool) -> bool:
         """Show a live transmission or update as the current view allows.
@@ -1457,8 +1467,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for tx_id in shown - set(wanted):
             self.timeline.remove(tx_id)            # stopped qualifying
         for row in results:
-            if row.id in self._withheld:
-                continue                           # a stopped run's, not shown: stays out
+            if row.id not in shown and not self._may_place(row):
+                continue                           # a stopped run's, not revealed: stays out
             if row.id not in shown:
                 self.timeline.place(row)           # newly qualifying, or a replacement
             elif row.id in touched:
@@ -1566,9 +1576,12 @@ class MainWindow(QtWidgets.QMainWindow):
         return resolved
 
     def _processing_active(self) -> bool:
-        """Is any processing pipeline holding queued or in-flight work?"""
+        """Is there processing the window should show? Manual jobs and the
+        current run's work - not an engine call abandoned at Stop, which
+        finishes unseen (it still counts for ownership: deletion, engine
+        changes and Quit use the pipelines' full accounting)."""
         for pipeline in (self.app.pipeline, self.app.standalone_pipeline):
-            if pipeline is not None and pipeline.pending:
+            if pipeline is not None and pipeline.visible_pending:
                 return True
         return False
 
@@ -1712,6 +1725,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_transcribe_anyway(self, tx_id: str) -> None:
         # A WAV on disk does not need a microphone. This works with monitoring
         # stopped, and after quitting and reopening the application.
+        self._manual_ids.add(tx_id)
         if self.app.transcribe_anyway(tx_id):
             self.status.showMessage("Transcribing the saved recording...", 8000)
             return
@@ -1722,6 +1736,7 @@ class MainWindow(QtWidgets.QMainWindow):
             + "\n\nThe recording itself is safe.")
 
     def _on_retry(self, tx_id: str) -> None:
+        self._manual_ids.add(tx_id)
         if self.app.retry(tx_id):
             self.status.showMessage("Retrying the saved recording...", 8000)
             return
@@ -1750,6 +1765,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not ok:
             return
         code = codes[labels.index(label)]
+        self._manual_ids.add(tx_id)
         if self.app.retry(tx_id, source_language=code):
             self.status.showMessage(
                 f"Transcribing the saved recording again as {label}...", 8000)
@@ -2070,7 +2086,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._store_gone():
             return
         self._view_kind, self._view_query = "thread", ""
-        self._withheld.clear()          # explicitly opened
         self.timeline.set_transmissions(self.app.recent_transmissions(
             include_hidden=self._showing_removed()))
         self._sync_filters()
@@ -2542,7 +2557,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         results = self.app.search(text)
         self._view_kind, self._view_query = "search", text
-        self._withheld.clear()          # explicitly opened
         self.timeline.set_transmissions(results)
         self._announce_view(len(results))
         self._sync_filters()
@@ -2558,7 +2572,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         results = self._bookmarked_results()
         self._view_kind, self._view_query = "bookmarked", ""
-        self._withheld.clear()          # explicitly opened
         self.timeline.set_transmissions(results)
         self._announce_view(len(results))
         self._sync_filters()
@@ -2572,7 +2585,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.search_field.selectAll()
 
     def _sync_filters(self) -> None:
-        """The filter buttons say which view is on screen - none for Search."""
+        """The filter buttons say which view is on screen - none for Search.
+
+        Reached only at the end of an explicit open (thread, Search, Review,
+        Bookmarked, View > Refresh), never from automatic reconciliation:
+        the rows shown now count as revealed (see _may_place)."""
+        self._revealed_ids |= set(self.timeline.order())
         buttons = {"thread": self.filter_all, "review": self.filter_review,
                    "bookmarked": self.filter_bookmarked}
         target = buttons.get(self._view_kind)
@@ -2595,7 +2613,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         results = self.app.review_queue()
         self._view_kind, self._view_query = "review", ""
-        self._withheld.clear()          # explicitly opened
         self.timeline.set_transmissions(results)
         self._announce_view(len(results))
         self._sync_filters()

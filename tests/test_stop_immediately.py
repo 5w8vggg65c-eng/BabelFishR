@@ -385,12 +385,12 @@ def test_a_final_flush_is_withheld_until_the_operator_refreshes(qt_app, config, 
         window._drain_events()
         (flushed,) = _rows(store, session.id)
         assert window.timeline.order() == before, "a late row was appended"
-        assert flushed.id in window._withheld
+        assert session.id in window._stopped_here
         # The explicit route: View > Refresh shows the saved recording.
         window.refresh_action.trigger()
         assert flushed.id in window.timeline.order()
         assert "saved, not processed" in window.timeline.bubble(flushed.id).status_label.text()
-        assert not window._withheld
+        assert flushed.id in window._revealed_ids
     finally:
         asr.release.set()
         window.close()
@@ -436,7 +436,7 @@ def test_a_later_event_does_not_pull_a_withheld_row_into_a_filtered_view(
             store.save_transmission(row)
             app.events.publish("updated", row, run=session.id)
         window._drain_events()
-        assert late.id in window._withheld
+        assert session.id in window._stopped_here
         assert late.id not in window.timeline.order()
 
         # A later manual job (an unrelated message) makes the view re-query.
@@ -811,4 +811,144 @@ def test_capture_activity_events_carry_their_run(config, store):
         assert activity
         assert all(e.run == session.id for e in activity)
     finally:
+        app.close()
+
+
+# --- root's UI review of d104cb5: controlled event ordering -------------------
+
+def _shown_thread_after_stop(qt_app, config, store):
+    """Window on a run with one completed message shown, then a second
+    message held in a slow engine call, then Stop. Returns app, window,
+    session, the completed id, the abandoned id and the engine."""
+    asr = SlowASR()
+    asr.release.set()
+    app, window, source, session = _window_monitoring(qt_app, config, store, asr)
+    _push(source, [{"gap": 0.5}, VOICE, QUIET])
+    assert _wait(lambda: _rows(store, session.id)
+                 and _rows(store, session.id)[0].state is ProcessingState.COMPLETE)
+    window._drain_events()
+    (done,) = _rows(store, session.id)
+    asr.release.clear()
+    asr.entered.clear()
+    _push(source, [VOICE, QUIET])
+    assert asr.entered.wait(15.0)
+    window._drain_events()
+    (held,) = [t for t in _rows(store, session.id) if t.id != done.id]
+    assert held.id in window.timeline.order()
+    window._stop_monitoring()
+    return app, window, session, done.id, held.id, asr
+
+
+def test_a_stale_level_event_does_not_repaint_the_meter(qt_app, config, store):
+    from babelfishr.audio.meter import LevelReading
+
+    app, window, session, done, held, asr = _shown_thread_after_stop(qt_app, config, store)
+    try:
+        assert window.clip_label.text() == ""
+        reading = LevelReading(rms_dbfs=-6.0, peak_dbfs=-0.1, peak_hold_dbfs=-0.1,
+                               clipped=True, clip_count=7)
+        app.events.publish("level", reading, run=session.id)
+        window._drain_events()
+        assert window.clip_label.text() == "", "a stopped run's level repainted the meter"
+    finally:
+        asr.release.set()
+        window.close()
+        app.close()
+
+
+def test_a_late_stopped_event_never_repaints_a_shown_row(qt_app, config, store):
+    from PySide6 import QtWidgets
+
+    from babelfishr.pipeline import mark_processing_stopped
+
+    app, window, session, done, held, asr = _shown_thread_after_stop(qt_app, config, store)
+    try:
+        asr.release.set()
+        assert _wait(lambda: app.outstanding_work() == 0)
+        app.wait_for_session_ends(10.0)
+        # The operator processes the stopped message by hand; its result shows.
+        window._on_transcribe_anyway(held)
+        assert _wait(lambda: store.get_transmission(held).state is ProcessingState.COMPLETE)
+        window._drain_events()
+        manual_words = store.get_transmission(held).transcript
+        assert window.timeline.bubble(held).tx.transcript == manual_words
+
+        # An old event of the stopped run, delivered only now: a marker
+        # payload carrying words that were never on screen.
+        stale = store.get_transmission(held)
+        stale.transcript, stale.translation = "words never shown", "jamais vus"
+        mark_processing_stopped(stale, session.id)
+        app.events.publish("updated", stale, run=session.id)
+        window._drain_events()
+        bubble = window.timeline.bubble(held)
+        assert bubble.tx.transcript == manual_words, "the manual result was clobbered"
+        texts = [w.toPlainText() for w in bubble.findChildren(QtWidgets.QTextEdit)]
+        assert not any("never shown" in t or "jamais" in t for t in texts)
+        assert not is_processing_stopped(bubble.tx)
+    finally:
+        asr.release.set()
+        window.close()
+        app.close()
+
+
+@pytest.mark.parametrize("view", ["review", "search"])
+def test_a_row_committed_before_its_event_stays_out_until_refresh(
+        qt_app, config, store, view):
+    """The database holds a stopped run's new row before any event for it:
+    an unrelated event's reconciliation must not insert it; an explicit
+    refresh shows it."""
+    from babelfishr.models import Transmission
+    from babelfishr.pipeline import mark_processing_stopped
+
+    app, window, session, done, held, asr = _shown_thread_after_stop(qt_app, config, store)
+    try:
+        asr.release.set()
+        assert _wait(lambda: app.outstanding_work() == 0)
+        app.wait_for_session_ends(10.0)
+        words = store.get_transmission(done).transcript
+        if view == "review":
+            window._show_review_queue()
+        else:
+            window._run_search(words.split()[0])
+        shown = set(window.timeline.order())
+        # Committed, no event published (the barrier): a stopped-run row
+        # that qualifies for this view.
+        late = Transmission(session_id=session.id, started_at=store.get_transmission(done).started_at,
+                            duration=1.0, transcript=words, state=ProcessingState.COMPLETE,
+                            audio_path=store.get_transmission(done).audio_path)
+        mark_processing_stopped(late, session.id)
+        store.save_transmission(late)
+        # Unrelated manual work: its update makes the view reconcile.
+        window._on_retry(done)
+        assert _wait(lambda: app.outstanding_work() == 0)
+        window._drain_events()
+        assert late.id not in window.timeline.order(), (
+            "reconciliation inserted a stopped run's row before any reveal")
+        window.refresh_action.trigger()
+        assert late.id in window.timeline.order(), "an explicit refresh must reveal it"
+    finally:
+        asr.release.set()
+        window.close()
+        app.close()
+
+
+def test_the_badge_is_idle_after_stop_while_an_abandoned_call_runs(qt_app, config, store):
+    app, window, session, done, held, asr = _shown_thread_after_stop(qt_app, config, store)
+    try:
+        assert asr.entered.is_set() and not asr.release.is_set()
+        for _ in range(3):
+            window._drain_events()
+            window._refresh_state_badge()
+            _pump(qt_app, 5)
+        assert "Idle" in window.state_badge.text(), window.state_badge.text()
+        # Ownership is kept: the call still holds the engines.
+        assert app.outstanding_work() >= 1
+        asr.release.set()
+        assert _wait(lambda: app.outstanding_work() == 0)
+        window._drain_events()
+        window._refresh_state_badge()
+        assert "Idle" in window.state_badge.text(), window.state_badge.text()
+    finally:
+        asr.release.set()
+        window.close()
         app.close()

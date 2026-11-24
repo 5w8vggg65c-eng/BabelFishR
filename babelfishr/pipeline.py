@@ -595,6 +595,17 @@ class ProcessingPipeline:
                 self._idle.set()
         return removed, running
 
+    @property
+    def visible_pending(self) -> int:
+        """Work the window may show as processing: manual jobs, and
+        automatic work of runs not stopped. An engine call abandoned at
+        Stop still counts in :attr:`pending` (it owns the engines until it
+        returns) but not here."""
+        with self._active_lock:
+            return sum(1 for tx_id in self._in_flight
+                       if self._origin.get(tx_id) not in self._stopped_runs
+                       or self._origin.get(tx_id) is None)
+
     def is_manual(self, tx_id: str) -> bool:
         """In flight as manual work (Retry, Transcribe anyway)."""
         with self._active_lock:
