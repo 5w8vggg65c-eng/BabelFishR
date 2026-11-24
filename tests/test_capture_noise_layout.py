@@ -156,7 +156,7 @@ LEGITIMATE = [
 #: every one a separate token, longest unbroken run 1, no letter or digit.
 FIELD_LOOP_SHAPE = " ".join(["("] + [")"] * 54 + ["\u266a"])
 
-#: Structural loops: nobody says these. Held on their own.
+#: Structural loops: very unlikely to be faithful transcripts. Held on their own.
 SEVERE_LOOPS = [
     FIELD_LOOP_SHAPE,
     "ლლლლლლლლლლლლლლლლლლლლლლლლლლლლლლ",

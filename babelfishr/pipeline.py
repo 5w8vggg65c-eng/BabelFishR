@@ -191,7 +191,9 @@ def degenerate_text(text: str) -> tuple:
     or a long line (12+ characters) of at most four distinct symbols with no
     letter or digit anywhere, spaced or not - the shape of a real field
     loop (56 characters, three distinct brackets/symbols, every one
-    separated by a space). Nobody says either.
+    separated by a space). Either is a heuristic: very unlikely to be a
+    faithful transcript of speech, not proof that none was spoken - which
+    is why the words and the audio are always kept for review.
     Punctuation, number formatting and repeated digits never count as
     severe ("NO!!!", "S.O.S.", "1, 2, 3", "00000000" are ordinary).
 
