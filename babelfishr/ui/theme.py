@@ -1,7 +1,7 @@
 """Semantic, appearance-adaptive styling: the BabelFishR field console (v5).
 
 The approved v5 concept (docs/ui-preview/README.md): a black/charcoal ground,
-a teal identity/status band, turquoise rectangular selections, thin grey
+a teal identity/status band, turquoise-outlined selections, thin grey
 rules, compact controls, and regular-weight monospaced technical type. Two
 panes: Sessions, input and local engines on the left; the recording
 waveform, the original/translation review list and the selected-audio
@@ -47,6 +47,7 @@ CONSOLE = {
     "disabled_bg": "#303E42",
     "disabled_text": "#7A898E",
     "statusbar": "#131B1E",
+    "selected_bg": "#11282C",      # a faint turquoise tint, not a fill
 }
 
 DAYLIGHT = {
@@ -64,6 +65,7 @@ DAYLIGHT = {
     "disabled_bg": "#DDE3E4",
     "disabled_text": "#6B7A80",
     "statusbar": "#E9EDEE",
+    "selected_bg": "#DCF1F2",
 }
 
 #: Status colours. Every use is paired with a text label or symbol.
@@ -238,25 +240,37 @@ QMenu::item:disabled {{ color: {t['disabled_text']}; }}
 /* --- message rows ---------------------------------------------------------- */
 #bubble {{
     background: {t['window']}; border: none;
+    border-top: 2px solid transparent; border-right: 2px solid transparent;
     border-bottom: 1px solid {t['border']};
     border-left: 4px solid transparent;
+}}
+#bubble:focus {{ border-bottom: 1px solid {t['accent']}; }}
+/* Selection: a turquoise outline and a faint tint - never a solid fill, so
+   the text keeps its normal colour. Declared before the review and failed
+   edges so that, on a selected row, the amber or red left edge still shows. */
+#bubble[selected="true"] {{
+    background: {t['selected_bg']};
+    border-top: 2px solid {t['accent']}; border-right: 2px solid {t['accent']};
+    border-bottom: 2px solid {t['accent']}; border-left: 4px solid {t['accent']};
 }}
 #bubble[review="true"] {{ border-left: 4px solid {t['warning']}; }}
 #bubble[state="failed"] {{ border-left: 4px solid {t['error']}; }}
 #bubble[skipped="true"] #originalText {{ color: {t['text_muted']}; }}
-#bubble:focus {{ border-bottom: 1px solid {t['accent']}; }}
-#bubble[selected="true"] {{ background: {t['accent']}; }}
-#bubble[selected="true"] QLabel {{ color: {t['on_accent']}; }}
-#bubble[selected="true"] #reviewMark[tone="check"] {{
-    background: {t['window']}; color: {t['warning']};
+
+/* The transcript and translation boxes: thin rules, a small caption. */
+#transcriptBox, #translationBox {{
+    background: {t['surface']}; border: 1px solid {t['border']};
 }}
-#bubble[selected="true"] QToolButton {{ color: {t['on_accent']};
-                                       border-color: {t['on_accent']}; }}
+#transcriptBox[held="held"] {{ border-left: 3px solid {t['warning']}; }}
+#boxCaption {{ color: {t['text_muted']}; font-size: 11px;
+              background: transparent; }}
+#transcriptBox[held="held"] #boxCaption,
+#transcriptBox[held="check"] #boxCaption {{ color: {t['warning']}; }}
 
 #timeCell {{ font-size: 14px; }}
 #bubbleHeader {{ color: {t['text_muted']}; font-size: 11px; }}
-#originalText {{ color: {t['text']}; font-size: 14px; }}
-#translatedText {{ color: {t['text']}; font-size: 14px; }}
+#originalText {{ color: {t['text']}; font-size: 14px; background: transparent; }}
+#translatedText {{ color: {t['text']}; font-size: 14px; background: transparent; }}
 #errorText {{ color: {t['error']}; font-size: 12px; }}
 #noteText {{ color: {t['warning']}; font-size: 12px; }}
 #provisional {{ color: {t['text_muted']}; font-style: italic; }}

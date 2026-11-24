@@ -45,6 +45,25 @@ SAMPLES = [
      "The team is in position. Radio check in five minutes.", 4.1),
 ]
 
+#: More typed sample text, for the transcript layout: an English message
+#: with no translation (en -> en), a long Japanese one, and one the speech
+#: check held for review. Synthetic, like the rest.
+EXTRA_SAMPLES = [
+    ("en", "Sample text, English to English, so there is no translation box: "
+     "net control to all stations, this is a routine check of the repeater, "
+     "please acknowledge in turn and keep transmissions short. Weather at "
+     "the ridge is clear, winds light from the west, next check on the hour.",
+     None, 9.4, None),
+    ("ja", "これはサンプルの文章です。全局へ、こちらは管制局です。中継器の定時点検を"
+     "行っています。順番に応答してください。尾根の天候は晴れ、西からの風は弱いです。",
+     "This is sample text. All stations, this is control. We are running the "
+     "scheduled repeater check. Please respond in turn. Weather at the ridge "
+     "is clear, light winds from the west.", 6.8, None),
+    ("en", "Sample text: thank you for watching.", None, 1.9,
+     {"verdict": "likely_noise", "speech_ratio": 0.04, "speech_seconds": 0.1,
+      "no_speech_probability": 0.91}),
+]
+
 
 def _seed(store, recordings: pathlib.Path):
     """A named thread with synthetic messages and synthetic recordings."""
@@ -66,6 +85,9 @@ def _seed(store, recordings: pathlib.Path):
     # that show original and translation together.
     minute = {len(SAMPLES): 0, len(SAMPLES) + 1: 1}
     minute.update({i: i + 2 for i in range(len(SAMPLES))})
+    first_extra = len(SAMPLES) + 2
+    minute.update({first_extra + i: len(SAMPLES) + 2 + i
+                   for i in range(len(EXTRA_SAMPLES))})
 
     def message(index, **fields):
         duration = fields.pop("duration")
@@ -99,6 +121,17 @@ def _seed(store, recordings: pathlib.Path):
             transcription_engine="sample data", state=ProcessingState.FAILED,
             error=ErrorInfo(stage="translation",
                             message="sample data: no it->en language pack installed"))
+    for offset, (language, original, translated, duration, check) in enumerate(
+            EXTRA_SAMPLES):
+        fields = dict(content_class=ContentClass.SPEECH, source_language=language,
+                      transcript=original, transcription_engine="sample data",
+                      state=ProcessingState.COMPLETE)
+        if translated:
+            fields.update(translation=translated, translation_engine="sample data")
+        if check:
+            fields.update(signal_metadata={"speech_check": check})
+        message(first_extra + offset, duration=duration,
+                audio=lambda d: speech_like(d, 48_000), **fields)
     return conversation
 
 
@@ -227,6 +260,7 @@ def main(argv=None) -> int:
             qt_app.processEvents()
             time.sleep(0.05)
         shots = [(f"main-{args.appearance}", (1240, 1180)),
+                 (f"wide-{args.appearance}", (2000, 1100)),
                  (f"narrow-{args.appearance}", (620, 900))]
         for name, size in shots:
             window.resize(*size)
@@ -242,6 +276,27 @@ def main(argv=None) -> int:
                 status = 1
             else:
                 print(f"{path}  ({window.width()}x{window.height()})")
+        # A selected message with a translation, in view: how the selection
+        # reads on a row with both boxes.
+        for tx_id in window.timeline.order():
+            if window.timeline.bubble(tx_id).tx.source_language == "ja":
+                window.timeline.select(tx_id, reveal=True)
+                break
+        window.waveform.wait_until_loaded(10.0)
+        window.resize(1600, 1000)
+        for _ in range(20):
+            qt_app.processEvents()
+        selected = window.timeline.bubble(window.timeline.selected_id or "")
+        if selected is not None:
+            window.timeline.ensureWidgetVisible(selected, 0, 8)
+            for _ in range(5):
+                qt_app.processEvents()
+        path = out / f"ui-preview-selected-{args.appearance}.png"
+        if not window.grab().save(str(path)):
+            print(f"could not write {path}", file=sys.stderr)
+            status = 1
+        else:
+            print(f"{path}  ({window.width()}x{window.height()})")
         path = out / f"ui-preview-controls-{args.appearance}.png"
         swatch = _control_states(window)
         if not swatch.grab().save(str(path)):

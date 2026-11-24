@@ -126,6 +126,23 @@ def _speech_check_note(tx: Transmission) -> str:
             f"you choose.")
 
 
+def _transcript_caption(tx: Transmission) -> tuple:
+    """The transcript box's caption and its tone, from the speech check.
+
+    A transcript the speech check held back (``likely_noise``) is not
+    presented as ordinary output: its caption says it is held for review.
+    ``uncertain`` - or a held one the operator has since marked as speech -
+    gets the milder "check" marker. The words themselves are always shown.
+    """
+    metadata = tx.signal_metadata or {}
+    verdict = (metadata.get("speech_check") or {}).get("verdict")
+    if verdict == "likely_noise" and not metadata.get("speech_confirmed"):
+        return "TRANSCRIPT \u00b7 HELD FOR REVIEW", "held"
+    if verdict in ("likely_noise", "uncertain"):
+        return "TRANSCRIPT \u00b7 CHECK", "check"
+    return "TRANSCRIPT", "none"
+
+
 def _local_stamp(when) -> str:
     """``2026-09-07 10:41:20``: the local date and time of one transmission.
 
@@ -202,15 +219,18 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.setAccessibleName("Message")
 
-        # Columns, as the v5 review list: TIME | ORIGINAL | TRANSLATION |
-        # REVIEW. The widgets are the same ones as before; only where they
-        # sit has changed. Row 1 spans the text columns for the playback bar.
+        # Columns, as the v5 review list: TIME | MESSAGE | REVIEW. The
+        # MESSAGE column holds the transcript in its own labelled box at the
+        # full width of the text area, the translation (when there is one)
+        # in a second box under it, and the compact metadata, chips, notes
+        # and controls below both. Row 1, the playback bar, spans the whole
+        # row: under the text column alone its buttons would set a minimum
+        # width wider than a narrow list, widening every row past the view.
         grid = QtWidgets.QGridLayout(self)
         grid.setContentsMargins(10, 8, 10, 8)
         grid.setHorizontalSpacing(16)
         grid.setVerticalSpacing(4)
         grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(2, 1)
 
         self.time_label = QtWidgets.QLabel()
         self.time_label.setObjectName("timeCell")
@@ -221,12 +241,9 @@ class TransmissionBubble(QtWidgets.QFrame):
         outer = QtWidgets.QVBoxLayout()
         outer.setSpacing(4)
         grid.addLayout(outer, 0, 1)
-        translation_column = QtWidgets.QVBoxLayout()
-        translation_column.setSpacing(4)
-        grid.addLayout(translation_column, 0, 2)
         review_column = QtWidgets.QVBoxLayout()
         review_column.setSpacing(4)
-        grid.addLayout(review_column, 0, 3)
+        grid.addLayout(review_column, 0, 2)
 
         self.review_label = QtWidgets.QLabel("\u2013")
         self.review_label.setObjectName("reviewMark")
@@ -245,23 +262,57 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.provisional.hide()
         outer.addWidget(self.provisional)
 
+        # The transcript: its own bounded, captioned box, as wide as the
+        # text area. The caption says when the speech check holds it back.
+        self.transcript_box = QtWidgets.QFrame()
+        self.transcript_box.setObjectName("transcriptBox")
+        self.transcript_box.setAccessibleName("Transcript")
+        transcript_layout = QtWidgets.QVBoxLayout(self.transcript_box)
+        transcript_layout.setContentsMargins(8, 4, 8, 6)
+        transcript_layout.setSpacing(2)
+        self.transcript_caption = QtWidgets.QLabel("TRANSCRIPT")
+        self.transcript_caption.setObjectName("boxCaption")
+        transcript_layout.addWidget(self.transcript_caption)
         self.original_label = QtWidgets.QLabel()
         self.original_label.setObjectName("originalText")
         self.original_label.setWordWrap(True)
         self.original_label.setTextInteractionFlags(
             QtCore.Qt.TextSelectableByMouse)
-        outer.addWidget(self.original_label)
-        # Date, duration, language and measured signal: one muted line under
-        # the original, where the concept has "Play original".
-        outer.addWidget(self.header)
+        self.original_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
+                                          QtWidgets.QSizePolicy.Preferred)
+        transcript_layout.addWidget(self.original_label)
+        outer.addWidget(self.transcript_box)
 
+        # The translation, when there is one: a second labelled box under
+        # the transcript, also full width. No box at all otherwise.
+        self.translation_box = QtWidgets.QFrame()
+        self.translation_box.setObjectName("translationBox")
+        self.translation_box.setAccessibleName("Translation")
+        translation_layout = QtWidgets.QVBoxLayout(self.translation_box)
+        translation_layout.setContentsMargins(8, 4, 8, 6)
+        translation_layout.setSpacing(2)
+        self.translation_caption = QtWidgets.QLabel("TRANSLATION")
+        self.translation_caption.setObjectName("boxCaption")
+        translation_layout.addWidget(self.translation_caption)
         self.translated_label = QtWidgets.QLabel()
         self.translated_label.setObjectName("translatedText")
         self.translated_label.setWordWrap(True)
         self.translated_label.setTextInteractionFlags(
             QtCore.Qt.TextSelectableByMouse)
-        translation_column.addWidget(self.translated_label)
-        translation_column.addStretch(1)
+        self.translated_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
+                                            QtWidgets.QSizePolicy.Preferred)
+        translation_layout.addWidget(self.translated_label)
+        outer.addWidget(self.translation_box)
+
+        # Date, duration, language and measured signal: one muted line
+        # under the text, outside the boxes.
+        outer.addWidget(self.header)
+
+        # Metadata chips: compact, scannable, and readable without colour.
+        self.chip_row = QtWidgets.QHBoxLayout()
+        self.chip_row.setSpacing(5)
+        self.chip_row.addStretch(1)
+        outer.addLayout(self.chip_row)
 
         self.error_label = QtWidgets.QLabel()
         self.error_label.setObjectName("errorText")
@@ -278,12 +329,6 @@ class TransmissionBubble(QtWidgets.QFrame):
         # No waveform here. This is a message thread: the transcript is what
         # the operator reads. An analyser belongs to a tool that analyses, not
         # to every line of a conversation.
-
-        # Metadata chips: compact, scannable, and readable without colour.
-        self.chip_row = QtWidgets.QHBoxLayout()
-        self.chip_row.setSpacing(5)
-        self.chip_row.addStretch(1)
-        outer.addLayout(self.chip_row)
 
         controls = QtWidgets.QHBoxLayout()
         controls.setSpacing(8)
@@ -370,7 +415,7 @@ class TransmissionBubble(QtWidgets.QFrame):
         bar.addWidget(self.position_label)
         bar.addStretch(1)
         self.playback_bar.hide()
-        grid.addWidget(self.playback_bar, 1, 1, 1, 3)
+        grid.addWidget(self.playback_bar, 1, 0, 1, 3)
         self._watch_children_for_selection()
 
         self.update_from(tx)
@@ -469,14 +514,24 @@ class TransmissionBubble(QtWidgets.QFrame):
             corrected = (" <i>(edited)</i>" if tx.transcript_correction else "")
             self.original_label.setText(f"{_escape(original)}{corrected}")
             self.original_label.show()
+            self.transcript_box.show()
         elif tx.state in _IN_FLIGHT:
             # Same bubble, not a separate placeholder row: the operator sees
             # one line per transmission that fills itself in.
             self.original_label.setText(
                 f"<i>{_IN_FLIGHT[tx.state]}</i>")
             self.original_label.show()
+            self.transcript_box.show()
         else:
             self.original_label.hide()
+            self.transcript_box.hide()
+        caption, caption_tone = _transcript_caption(tx)
+        self.transcript_caption.setText(caption)
+        if self.transcript_box.property("held") != caption_tone:
+            self.transcript_box.setProperty("held", caption_tone)
+            for widget in (self.transcript_box, self.transcript_caption):
+                widget.style().unpolish(widget)
+                widget.style().polish(widget)
 
         # A translation row only when there is genuinely another language to
         # read. "already in English" under an English transcript is a line of
@@ -488,8 +543,13 @@ class TransmissionBubble(QtWidgets.QFrame):
                 f"<b>{_escape(tx.target_language)}:</b> "
                 f"{_escape(translated)}{corrected}")
             self.translated_label.show()
+            target = (tx.target_language or "").strip().upper()
+            self.translation_caption.setText(
+                f"TRANSLATION \u00b7 {target}" if target else "TRANSLATION")
+            self.translation_box.show()
         else:
             self.translated_label.hide()
+            self.translation_box.hide()
 
         if tx.state is ProcessingState.FAILED and tx.error:
             self.error_label.setText(
