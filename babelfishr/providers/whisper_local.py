@@ -25,6 +25,7 @@ vocabulary in as an initial prompt.
 from __future__ import annotations
 
 import logging
+import time
 import enum
 import pathlib
 from typing import Any, List, Optional, Sequence, Tuple
@@ -277,6 +278,21 @@ class FasterWhisperEngine(TranscriptionEngine):
             return TranscriptionResult(engine=self.id, engine_version=self.version,
                                        no_speech=True)
 
+        # The local voice detector, once, before decoding. Its result is
+        # reused below as speech evidence, and decides one thing here: with
+        # the language left to automatic detection and *no* voiced sample
+        # found at all, Whisper decodes once at temperature 0 instead of
+        # climbing its temperature-fallback ladder (up to six decodes per
+        # window, which made 20 s of noise take ~113 s on a Mac). The audio
+        # is still transcribed in full and still goes through the speech
+        # check; nothing is trimmed, capped or dropped. Unknown or non-zero
+        # detector results, and a specified language (Retry as speech in...),
+        # keep Whisper's normal decoding.
+        voiced = _voiced_samples(samples)
+        single_pass = language is None and voiced == 0
+        decode = {"temperature": 0.0} if single_pass else {}
+        started = time.monotonic()
+
         initial_prompt = None
         if vocabulary:
             # Whisper accepts a text prompt that biases decoding toward these
@@ -294,6 +310,7 @@ class FasterWhisperEngine(TranscriptionEngine):
                 vad_filter=False,
                 condition_on_previous_text=self.condition_on_previous_text,
                 word_timestamps=False,
+                **decode,
             )
             collected = list(segments)
         except Exception as exc:  # noqa: BLE001
@@ -332,8 +349,20 @@ class FasterWhisperEngine(TranscriptionEngine):
         # ...and an independent opinion: the voice-activity model bundled
         # with faster-whisper (Silero, local, no download).
         speech_ratio = speech_seconds = None
-        if full_text:
-            speech_ratio, speech_seconds = local_speech_activity(samples)
+        if full_text and voiced is not None:
+            speech_ratio = round(voiced / float(samples.size), 3)
+            speech_seconds = round(voiced / float(TARGET_RATE), 2)
+        temperatures = [float(t) for t in (getattr(seg, "temperature", None)
+                                           for seg in collected) if t is not None]
+        # Aggregate figures only - no words, no audio.
+        log.info("whisper: %.1f s audio, language %s, VAD voiced %s, decode %s, "
+                 "highest temperature used %s, %.2f s",
+                 samples.size / float(TARGET_RATE),
+                 "specified" if language else "automatic",
+                 "unknown" if voiced is None else f"{voiced / float(TARGET_RATE):.2f} s",
+                 "single pass at temperature 0" if single_pass else "default fallback",
+                 f"{max(temperatures):.1f}" if temperatures else "n/a",
+                 time.monotonic() - started)
 
         return TranscriptionResult(
             text=full_text,
@@ -381,32 +410,41 @@ def _disable_onnx_telemetry() -> None:
         log.debug("could not switch off onnxruntime telemetry: %s", exc)
 
 
-def local_speech_activity(samples: np.ndarray, sample_rate: int = TARGET_RATE
-                          ) -> Tuple[Optional[float], Optional[float]]:
-    """How much of *samples* (16 kHz float) the bundled Silero VAD calls speech.
+def _voiced_samples(samples: np.ndarray, sample_rate: int = TARGET_RATE) -> Optional[int]:
+    """How many samples of *samples* (16 kHz float) the bundled Silero VAD
+    calls speech, exactly, or None when it cannot run - never a guess, and
+    never raises: no opinion is a valid answer.
 
-    Returns ``(share of the clip, seconds)``, or ``(None, None)`` when the
-    detector cannot run - never a guess. Uses faster-whisper's own
-    voice-activity detector and its packaged model
+    Uses faster-whisper's own voice-activity detector and its packaged model
     (faster_whisper/assets/silero_vad_v6.onnx): local, nothing to download.
     The speech chunks are measured unpadded, so the figure is what the model
     heard, not what faster-whisper would keep around it for transcription.
     """
     data = np.asarray(samples, dtype=np.float32).ravel()
     if data.size == 0:
-        return None, None
+        return None
     try:
         _disable_onnx_telemetry()
         from faster_whisper.vad import VadOptions, get_speech_timestamps
 
         chunks = get_speech_timestamps(data, VadOptions(speech_pad_ms=0),
                                        sampling_rate=sample_rate)
+        voiced = sum(max(0, int(c["end"]) - int(c["start"])) for c in chunks)
     except Exception as exc:  # noqa: BLE001 - optional evidence, never fatal
         log.debug("local VAD unavailable: %s", exc)
+        return None
+    return min(voiced, data.size)
+
+
+def local_speech_activity(samples: np.ndarray, sample_rate: int = TARGET_RATE
+                          ) -> Tuple[Optional[float], Optional[float]]:
+    """``(share of the clip, seconds)`` of speech by the local VAD, or
+    ``(None, None)`` when it cannot run (see _voiced_samples)."""
+    voiced = _voiced_samples(samples, sample_rate)
+    if voiced is None:
         return None, None
-    voiced = sum(max(0, int(c["end"]) - int(c["start"])) for c in chunks)
-    voiced = min(voiced, data.size)
-    return round(voiced / float(data.size), 3), round(voiced / float(sample_rate), 2)
+    size = np.asarray(samples).size
+    return round(voiced / float(size), 3), round(voiced / float(sample_rate), 2)
 
 
 def _logprob_to_confidence(avg_logprob: Optional[float]) -> Optional[float]:
