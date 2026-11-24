@@ -83,6 +83,9 @@ def test_full_pipeline_runs_with_networking_broken(no_network, offline_app,
 
     store = Store(offline_app.database,
                   recordings_dir=offline_app.recording.directory)
+    # The standard fixture's bursts are 1.5-2.2 s apart (radio-style): the
+    # 0.8 s quiet it was written for, as the shared test config uses.
+    offline_app.detector.hang_time = 0.8
     app = BabelFishRApp(config=offline_app, store=store)
     # Stand in for prepared local assets: this environment cannot download
     # real weights, so local engines are simulated. What is being proved is

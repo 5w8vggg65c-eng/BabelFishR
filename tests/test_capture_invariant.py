@@ -46,7 +46,9 @@ def mixed_wav(tmp_path):
 
 def test_detector_retains_every_content_type():
     fixture = build_fixture(MIXED_SPEC, sample_rate=SR)
-    detected = detect_in_array(fixture.audio, SR)
+    # MIXED_SPEC's events are 1.5 s apart (radio-style): the 0.8 s quiet it
+    # was written for. The 3 s default would join them into one message.
+    detected = detect_in_array(fixture.audio, SR, DetectorSettings(hang_time=0.8))
     assert len(detected) == 5, "one or more events were discarded by classification"
     classes = {d.content_class for d in detected}
     assert DetectorClass.SPEECH in classes

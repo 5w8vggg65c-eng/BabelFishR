@@ -462,8 +462,9 @@ def test_the_decoder_exiting_is_reported_and_no_other_input_takes_over(receiver_
     receiver_config.record_receiver_input(save=False)
     app = mock_app(receiver_config, store)
     events = []
-    app.events.publish = (lambda publish: (lambda kind, payload: (events.append((kind, payload)),
-                                                                  publish(kind, payload))[1]))(app.events.publish)
+    # Events now also carry the run that produced them (run=...).
+    app.events.publish = (lambda publish: (lambda kind, payload, **kw: (events.append((kind, payload)),
+                                                                        publish(kind, payload, **kw))[1]))(app.events.publish)
     app.start_session(name="run")
     try:
         source = app._signal_source

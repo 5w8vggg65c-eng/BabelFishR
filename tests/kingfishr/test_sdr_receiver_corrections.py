@@ -282,8 +282,9 @@ def test_a_receiver_that_will_not_shut_down_is_reported_once_never_counted_done(
     app = mock_app(receiver_config, store)
     published = []
     real_publish = app.events.publish
-    app.events.publish = lambda kind, payload: (published.append((kind, payload)),
-                                                real_publish(kind, payload))[1]
+    # Events now also carry the run that produced them (run=...).
+    app.events.publish = lambda kind, payload, **kw: (published.append((kind, payload)),
+                                                      real_publish(kind, payload, **kw))[1]
     app.start_session(name="stuck")
     app.begin_capture()
     assert wait_for(lambda: app._signal_source.process is not None, timeout=10)

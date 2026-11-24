@@ -225,8 +225,9 @@ def _digital_run(receiver_config, store, tmp_path, monkeypatch):
     app = mock_app(receiver_config, store)
     published = []
     real_publish = app.events.publish
-    app.events.publish = lambda kind, payload: (published.append((kind, payload)),
-                                                real_publish(kind, payload))[1]
+    # Events now also carry the run that produced them (run=...).
+    app.events.publish = lambda kind, payload, **kw: (published.append((kind, payload)),
+                                                      real_publish(kind, payload, **kw))[1]
     app.start_session(name="cleanup")
     app.begin_capture()
     source = app._signal_source
