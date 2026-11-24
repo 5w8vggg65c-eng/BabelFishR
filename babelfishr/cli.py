@@ -963,7 +963,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_gui)
 
     p = sub.add_parser("config", help="show or write the configuration")
-    p.add_argument("--write", nargs="?", const="babelfishr.toml", metavar="PATH")
+    # The running product's own file name (kingfishr.toml for KingFishR).
+    p.add_argument("--write", nargs="?", const=product().config_names[0],
+                   metavar="PATH")
     p.set_defaults(func=cmd_config)
 
     # Commands a separate product's own entry point registered

@@ -141,3 +141,37 @@ def test_kingfishr_adds_the_analyze_command():
     parser = build_parser()
     commands = parser._subparsers._group_actions[0].choices
     assert "analyze" in commands and parser.prog == "kingfishr"
+
+
+def test_a_message_menu_offers_digital_analysis_in_kingfishr():
+    pytest.importorskip("PySide6")
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtWidgets
+
+    from babelfishr.models import Transmission
+    from babelfishr.ui.timeline import TimelineView
+
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    view = TimelineView()          # kept: the bubble belongs to it
+    bubble = view.add(Transmission(transcript="hi", audio_path="/x.wav"))
+    labels = {a.text() for a in bubble.menu_button.menu().actions() if a.text()}
+    assert any(label.startswith("Analyze as digital") for label in labels)
+    assert any("specific mode" in label for label in labels)
+    assert bubble.analyze_action.isEnabled()
+
+
+def test_config_write_uses_kingfishrs_file_and_leaves_babelfishrs_alone(homes, tmp_path):
+    """`kingfishr config --write` with no path writes kingfishr.toml in the
+    working directory; an existing babelfishr.toml there is not changed."""
+    from babelfishr.cli import main
+
+    home, bfr = homes
+    existing = tmp_path / "babelfishr.toml"
+    before = existing.read_bytes()
+    data_before = _snapshot(bfr)
+    assert main(["config", "--write"]) == 0
+    assert (tmp_path / "kingfishr.toml").is_file()
+    assert existing.read_bytes() == before
+    assert _snapshot(bfr) == data_before   # BabelFishR's data folder untouched
