@@ -183,7 +183,15 @@ class DetectorSettings:
     """
 
     tone_flatness: float = 0.008
-    """Below this, with no modulation, the event is a steady signalling tone."""
+    """Below this, with no modulation, the event may be a steady signalling
+    tone - if its dominant frequency also holds (tone_steady_share)."""
+
+    tone_steady_share: float = 0.8
+    """Share of the loud frames whose dominant frequency must sit at the
+    event's median one for it to count as a steady tone. Evenly loud, voiced
+    speech (TTS, a close microphone) is also harmonic and level-stationary,
+    and was called a tone and never transcribed; its pitch and formants move
+    from frame to frame, a signalling tone's frequency does not."""
 
     digital_kurtosis_max: float = 2.5
     """Below this kurtosis a stationary event looks like discrete symbols.
@@ -379,6 +387,25 @@ class NoiseFloorTracker:
 #: Communications audio occupies roughly this band; everything outside it is
 #: filter skirt, and including it makes every band-limited signal look tonal.
 SPEECH_BAND = (200.0, 3800.0)
+
+
+def dominant_frequency(frame: np.ndarray, sample_rate: int) -> float:
+    """Frequency (Hz) of the strongest component of *frame*, DC excluded,
+    refined between FFT bins by parabolic interpolation on the log
+    magnitude: a 20 ms frame has 50 Hz bins, too coarse to tell a steady
+    tone from a voice whose pitch moves between 100 and 150 Hz."""
+    if frame.size < 32:
+        return 0.0
+    spectrum = np.abs(np.fft.rfft(frame * np.hanning(frame.size)))
+    spectrum[0] = 0.0
+    k = int(np.argmax(spectrum))
+    offset = 0.0
+    if 0 < k < spectrum.size - 1:
+        a, b, c = np.log(spectrum[k - 1:k + 2] + 1e-12)
+        denominator = a - 2.0 * b + c
+        if denominator < 0:
+            offset = float(np.clip(0.5 * (a - c) / denominator, -0.5, 0.5))
+    return (k + offset) * sample_rate / frame.size
 
 
 def spectral_flatness(frame: np.ndarray, sample_rate: int,
@@ -587,6 +614,7 @@ class RadioActivityDetector(TransmissionDetector):
             "hf_ratio": high_frequency_ratio(frame, self.sample_rate),
             "kurtosis": amplitude_kurtosis(frame),
             "crest": crest_factor(frame),
+            "peak_hz": dominant_frequency(frame, self.sample_rate),
             "samples": int(sum(b.size for b in self._buffer)),
             "loud": bool(loud),
         })
@@ -827,7 +855,18 @@ class RadioActivityDetector(TransmissionDetector):
         median_crest = float(np.median(crest[selected]))
         stationary = modulation < self.settings.min_modulation_db
 
-        likely_tone = stationary and median_flatness < self.settings.tone_flatness
+        # A signalling tone holds one frequency; level-stationary voiced
+        # speech is harmonic too, but its pitch and formants move.
+        steady = True
+        peaks = [s.get("peak_hz") for s, keep in zip(stats, selected) if keep]
+        if peaks and all(p is not None for p in peaks):
+            peaks = np.asarray(peaks, dtype=float)
+            centre = float(np.median(peaks))
+            tolerance = max(10.0, 0.02 * centre)
+            steady = float(np.mean(np.abs(peaks - centre) <= tolerance)) \
+                >= self.settings.tone_steady_share
+        likely_tone = (stationary and median_flatness < self.settings.tone_flatness
+                       and steady)
         # A digital burst and static are both broadband and both stationary in
         # level; what separates them is the shape of the sample distribution.
         # Static is Gaussian; discrete symbols are flat-topped and sub-Gaussian.
