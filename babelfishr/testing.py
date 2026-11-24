@@ -211,7 +211,13 @@ def standard_fixture(sample_rate: int = 48_000) -> Fixture:
     """The canonical multi-transmission fixture used across the test suite.
 
     Five real transmissions with squelch tails, separated by idle noise, plus a
-    static burst and a brief crackle that must *not* be counted.
+    0.9 s static burst and a brief (0.06 s) crackle. The crackle is shorter
+    than min_duration and must not be counted. The static burst is recorded
+    and classified as noise: it crosses the gate for longer than
+    min_duration, and static can carry a weak voice, so it is kept for the
+    speech check and the operator rather than dropped. (Up to the 0.5 s
+    post-roll it was dropped only as a side effect of squelch-tail trimming
+    and a miscounted signal length.)
     """
     return build_fixture([
         {"gap": 1.5},

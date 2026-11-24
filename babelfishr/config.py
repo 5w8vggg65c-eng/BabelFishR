@@ -104,8 +104,8 @@ class DetectorConfig:
     open_margin_db: float = 8.0
     close_margin_db: float = 4.0
     hang_time: float = 0.8
-    pre_roll: float = 0.30
-    post_roll: float = 0.20
+    pre_roll: float = 0.50
+    post_roll: float = 0.50
     min_duration: float = 0.30
     max_duration: float = 300.0
     segment_seconds: float = 15.0

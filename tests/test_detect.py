@@ -16,11 +16,22 @@ SR = 48_000
 
 
 def test_counts_separated_transmissions():
+    from conftest import recorded_events
+
     fixture = standard_fixture(SR)
-    expected = [t for t in fixture.transmissions
-                if t.kind == "voice" and t.duration > 0.1]
+    expected = recorded_events(fixture)
     detected = detect_in_array(fixture.audio, SR)
     assert len(detected) == len(expected)
+    # The crackle is dropped; the static burst is kept, as noise, in its place.
+    kinds = [t.kind for t in expected]
+    for event, kind in zip(detected, kinds):
+        if kind == "static":
+            assert event.content_class.value == "noise"
+        else:
+            assert event.content_class.value == "speech"
+    crackle = next(t for t in fixture.transmissions if t.duration < 0.1)
+    assert not any(d.start_offset <= crackle.start <= d.start_offset + d.duration
+                   for d in detected)
 
 
 def test_transmissions_are_in_chronological_order():

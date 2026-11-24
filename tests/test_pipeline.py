@@ -144,7 +144,8 @@ def test_engine_metadata_is_recorded(app, fixture_wav):
             assert tx.transcription_engine_version
 
 
-def test_capture_does_not_block_on_slow_transcription(config, store, fixture_wav):
+def test_capture_does_not_block_on_slow_transcription(config, store, fixture_wav,
+                                                      expected_transmissions):
     """A slow engine must delay transcripts, never the capture thread."""
 
     class SlowEngine(MockTranscriptionEngine):
@@ -161,8 +162,8 @@ def test_capture_does_not_block_on_slow_transcription(config, store, fixture_wav
     captured = app.capture.run_to_completion()
     capture_elapsed = time.monotonic() - started
 
-    assert captured == 5
-    # Five clips at 0.25 s each is 1.25 s of engine time; capture must not have
+    assert captured == expected_transmissions
+    # Six clips at 0.25 s each is 1.5 s of engine time; capture must not have
     # waited for it.
     assert capture_elapsed < 1.0
     app.wait_for_processing(timeout=60)

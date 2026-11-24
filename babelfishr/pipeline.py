@@ -174,27 +174,74 @@ NO_SPEECH_CONFIDENCE = 0.5
 LANGUAGE_CERTAIN = 0.8
 
 
+def degenerate_text(text: str) -> tuple:
+    """Does a transcript look like recognition output with no speech behind
+    it? Returns ``(kind, reason)``: kind is ``"severe"``, ``"repeated"`` or
+    ``""``, and reason says why in words.
+
+    Speech recognisers fed noise often return a loop, sometimes with high
+    confidence (a field recording gave 0.93 for a repeated-symbol line).
+    These checks use only the shape of the text - runs, Unicode categories,
+    word repetition and compression - so they apply to every script alike:
+    no alphabet or language is treated as suspect, and short replies
+    ("Copy.", "10-4") are too short to be judged.
+
+    ``"severe"`` is structural: one character unbroken eight or more times,
+    or text that is mostly symbols. Nobody says that. ``"repeated"`` is the
+    same words over and over - which noise produces, but so does a real call
+    ("mayday mayday mayday", a callsign or number repeated). On its own it
+    is only a reason to look; see assess_speech.
+    """
+    import itertools
+    import unicodedata
+    import zlib
+
+    text = (text or "").strip()
+    chars = [c for c in text if not c.isspace()]
+    longest = max((sum(1 for _ in run) for char, run in itertools.groupby(text)
+                   if not char.isspace()), default=0)
+    if longest >= 8:
+        return ("severe", "one character repeats unbroken")
+    if len(chars) >= 5:
+        symbols = sum(unicodedata.category(c)[0] in "PS" for c in chars) / len(chars)
+        if symbols >= 0.5:
+            return ("severe", "it is mostly punctuation or symbols")
+    words = [w.strip(".,!?;:\u3001\u3002\u060c\u061f\"'()-").lower() for w in text.split()]
+    words = [w for w in words if w]
+    if len(words) >= 6 and len(set(words)) / len(words) <= 0.4:
+        return ("repeated", "the same words repeat")
+    raw = text.encode("utf-8")
+    if len(raw) >= 30 and len(raw) / len(zlib.compress(raw, 9)) >= 2.4:
+        return ("repeated", "it repeats itself")
+    return ("", "")
+
+
 def assess_speech(result) -> Optional[dict]:
     """Was this recording speech at all? Evidence, not a filter.
 
     Returns None when there is nothing to say (no text, or no evidence).
     Otherwise a small record for ``signal_metadata["speech_check"]``:
     ``verdict`` is ``"likely_noise"`` (strong evidence of no speech - two
-    independent signals agree: the transcript is kept, translation is not
-    attempted, the message is marked for review), ``"uncertain"`` (one
-    signal doubts it: kept, translated, marked for review) or
-    ``"speech"``. The recording itself is never touched.
+    independent signals agree, or the text itself is a loop: the transcript
+    is kept, translation is not attempted, the message is marked for review),
+    ``"uncertain"`` (one signal doubts it: kept, translated, marked for
+    review) or ``"speech"``. ``reasons`` says why in words. The recording
+    itself is never touched. Engine confidence alone never clears a
+    transcript: a looping one can score high.
     """
-    if not (getattr(result, "text", "") or "").strip():
+    text = (getattr(result, "text", "") or "").strip()
+    if not text:
         return None
     ratio = getattr(result, "speech_ratio", None)
     seconds = getattr(result, "speech_seconds", None)
     nsp = getattr(result, "no_speech_probability", None)
     confidence = getattr(result, "confidence", None)
-    if ratio is None and nsp is None:
+    loop_kind, loop_reason = degenerate_text(text)
+    if ratio is None and nsp is None and not loop_kind:
         return None
     engine_doubts = nsp is not None and nsp >= NO_SPEECH_PROBABILITY
     engine_unsure = confidence is not None and confidence < NO_SPEECH_CONFIDENCE
+    vad_heard_none = False
     if ratio is not None:
         vad_heard_none = (seconds < NO_SPEECH_VAD_SECONDS if seconds is not None
                           else ratio < NO_SPEECH_VAD_RATIO)
@@ -203,15 +250,34 @@ def assess_speech(result) -> Optional[dict]:
         likely_noise = vad_heard_none and (engine_doubts or engine_unsure)
         uncertain = vad_heard_none or engine_doubts
     else:
-        likely_noise = (nsp >= NO_SPEECH_PROBABILITY and confidence is not None
-                        and confidence < NO_SPEECH_CONFIDENCE)
-        uncertain = nsp >= NO_SPEECH_PROBABILITY
+        likely_noise = engine_doubts and engine_unsure
+        uncertain = engine_doubts
+    reasons = []
+    if loop_kind == "severe":
+        # Structural: held whatever else is known.
+        likely_noise = True
+        reasons.append(f"the transcript looks like a recognition loop: {loop_reason}")
+    elif loop_kind == "repeated":
+        # Plausible repeated words - a real call can repeat. Held only when
+        # no-speech evidence agrees; otherwise translated and marked.
+        uncertain = True
+        if vad_heard_none or engine_doubts:
+            likely_noise = True
+        reasons.append(f"the transcript repeats itself: {loop_reason}")
+    if vad_heard_none:
+        reasons.append("the local voice detector heard almost no speech")
+    if engine_doubts:
+        reasons.append("the speech engine itself estimates there was no speech")
+    if engine_unsure and (vad_heard_none or engine_doubts):
+        reasons.append("the speech engine's confidence is low")
     verdict = "likely_noise" if likely_noise else ("uncertain" if uncertain else "speech")
-    return {"verdict": verdict, "speech_ratio": ratio, "speech_seconds": seconds,
+    return {"verdict": verdict, "reasons": reasons, "repetition": loop_kind,
+            "speech_ratio": ratio, "speech_seconds": seconds,
             "no_speech_probability": nsp,
             "transcript_confidence": confidence,
-            "method": "local VAD + engine estimate" if ratio is not None
-                      else "engine estimate only"}
+            "method": ("local VAD + engine estimate" if ratio is not None
+                       else "engine estimate only" if nsp is not None
+                       else "transcript text only")}
 
 
 def _skip_reason(detected: DetectedTransmission) -> str:

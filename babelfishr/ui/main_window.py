@@ -30,14 +30,31 @@ log = logging.getLogger(__name__)
 
 #: State labels paired with a semantic colour NAME (resolved per appearance),
 #: plus a symbol, so state never depends on colour alone.
+#: LISTENING and RECEIVING come from the audio-level gate (detect.py), not
+#: from the receiver: no input BabelFishR supports reports squelch, carrier
+#: or RX state, so they are worded as what they are - armed and waiting,
+#: and audio activity estimated from the level.
 STATE_TEXT = {
     PipelineState.IDLE: ("Idle", "idle", "\u25cb"),
-    PipelineState.LISTENING: ("Listening", "listening", "\u25c9"),
-    PipelineState.RECEIVING: ("Receiving", "receiving", "\u25cf"),
+    PipelineState.LISTENING: ("Armed \u00b7 Listening", "listening", "\u25c9"),
+    PipelineState.RECEIVING: ("Audio active (est.)", "receiving", "\u25cf"),
     PipelineState.TRANSCRIBING: ("Transcribing", "working", "\u25d4"),
     PipelineState.TRANSLATING: ("Translating", "working", "\u25d1"),
     PipelineState.COMPLETE: ("Complete", "ok", "\u2713"),
     PipelineState.ERROR: ("Error", "error", "\u26a0"),
+}
+
+STATE_TIPS = {
+    PipelineState.LISTENING: (
+        "Monitoring is armed. A recording starts by itself when the audio level "
+        "rises above the activity threshold and ends after it stays below it "
+        "for the hang time. This is the audio feed, not the radio's squelch."),
+    PipelineState.RECEIVING: (
+        "Audio activity, estimated from the input level. BabelFishR receives no "
+        "squelch, carrier or RX signal from this input, so this is not the "
+        "receiver's own status: noise loud enough can look the same. Long "
+        "activity is handed to speech recognition in parts of about "
+        "15 seconds while it continues."),
 }
 
 COMMON_LANGUAGES = [
@@ -1728,6 +1745,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.state_badge.setStyleSheet("")
         self.state_badge.setProperty("tone", tone)
         self.state_badge.setAccessibleDescription(text)
+        self.state_badge.setToolTip(STATE_TIPS.get(state, ""))
 
     def _refresh_mode_badge(self) -> None:
         """Label the operating-mode control and mark the current choice.

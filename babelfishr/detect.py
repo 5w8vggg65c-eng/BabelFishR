@@ -95,11 +95,18 @@ class DetectorSettings:
     hang_time: float = 0.8
     """Seconds of quiet tolerated inside one transmission before it ends."""
 
-    pre_roll: float = 0.30
-    """Audio kept from *before* detection, so the first word is never clipped."""
+    pre_roll: float = 0.50
+    """Audio kept from *before* detection, so the first word is never clipped.
 
-    post_roll: float = 0.20
-    """Audio kept after the signal drops."""
+    0.5 s (was 0.3): measured on synthetic speech through a -20 dBFS gate, a
+    soft opening syllable 0.25 s long kept 60% at 0.3 s and all of it at 0.5."""
+
+    post_roll: float = 0.50
+    """Audio kept after the signal drops.
+
+    0.5 s (was 0.2): a closing syllable 12 dB below the speech, 0.4 s long,
+    kept 35% at 0.2 s and all of it at 0.5. Only the rest of the hang-time
+    quiet is cut."""
 
     min_duration: float = 0.30
     """Shorter events are discarded as crackle."""
@@ -721,9 +728,15 @@ class RadioActivityDetector(TransmissionDetector):
             audio, trimmed = self._trim_tail(audio, stats)
 
         duration = audio.size / float(self.sample_rate)
+        # The signal runs from the end of the pre-roll to the last frame that
+        # held the gate open - measured directly, not as "duration minus the
+        # rolls", which miscounts once the squelch-tail trim has removed
+        # part of the post-roll (a real 0.7 s burst then looked like crackle).
+        # The frames that opened the gate are the last of the pre-roll; they
+        # are signal too.
+        signal_start = max(0, pre_samples - self.settings.open_frames * self.frame_size)
         signal_duration = max(
-            0.0, duration - pre_samples / float(self.sample_rate)
-            - self.settings.post_roll)
+            0.0, (min(last_active, audio.size) - signal_start) / float(self.sample_rate))
         if signal_duration < self.settings.min_duration and not continues_previous:
             # Crackle. A short last part of a segmented recording is not
             # crackle - it is the end of audio already partly handed on, and

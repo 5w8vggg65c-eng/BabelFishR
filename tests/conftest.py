@@ -54,8 +54,14 @@ def fixture_wav(tmp_path: pathlib.Path) -> str:
 @pytest.fixture
 def expected_transmissions() -> int:
     fixture = standard_fixture(SAMPLE_RATE)
-    return len([t for t in fixture.transmissions
-                if t.kind == "voice" and t.duration > 0.1])
+    return len(recorded_events(fixture))
+
+
+def recorded_events(fixture):
+    """The fixture's events a capture keeps: every voice longer than the
+    crackle, and the static burst (recorded and classified as noise)."""
+    return [t for t in fixture.transmissions
+            if (t.kind == "voice" and t.duration > 0.1) or t.kind == "static"]
 
 
 @pytest.fixture

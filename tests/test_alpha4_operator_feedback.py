@@ -727,10 +727,10 @@ def test_live_capture_states_still_display_while_monitoring(qt_app, config,
     # The detector opening: the service sets its state and publishes it.
     app.capture._set_state(PipelineState.RECEIVING)
     window._drain_events()
-    assert "Receiving" in window.state_badge.text()
+    assert "Audio active (est.)" in window.state_badge.text()
     # Processing finished mid-run: back to what the capture is doing.
     window._set_state(PipelineState.COMPLETE)
-    assert "Receiving" in window.state_badge.text()
+    assert "Audio active (est.)" in window.state_badge.text()
     app.capture._set_state(PipelineState.LISTENING)
     window._drain_events()
     window._set_state(PipelineState.COMPLETE)
@@ -1063,7 +1063,7 @@ def test_an_obsolete_receiving_does_not_overwrite_a_listening_run(
     # The run's own transitions still show.
     app.capture._set_state(PipelineState.RECEIVING)
     window._drain_events()
-    assert "Receiving" in window.state_badge.text()
+    assert "Audio active (est.)" in window.state_badge.text()
     app.stop_session()
     window.close()
 

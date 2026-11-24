@@ -111,14 +111,17 @@ def _speech_check_note(tx: Transmission) -> str:
         evidence.append(f"the local voice detector found {found}")
     if nsp is not None:
         evidence.append(f"the speech engine's no-speech estimate is {nsp:.2f}")
-    said = "; ".join(evidence)
+    # Why the text itself looks wrong (pipeline.degenerate_text), if it does.
+    evidence += [r for r in (check.get("reasons") or [])
+                 if r.startswith("the transcript ")]
+    said = f" ({'; '.join(evidence)})" if evidence else ""
     if verdict == "likely_noise":
-        return (f"Probably not speech ({said}). The transcript may be words "
+        return (f"Probably not speech{said}. The transcript may be words "
                 f"invented from noise, so it was not translated automatically. "
                 f"Check it against the original audio. If it is speech, choose "
                 f"Retry as speech in... from the message menu: it is transcribed "
                 f"again in the language you pick, then translated.")
-    return (f"Speech uncertain ({said}). Check the transcript against the "
+    return (f"Speech uncertain{said}. Check the transcript against the "
             f"original audio; Retry as speech in... re-runs it in a language "
             f"you choose.")
 

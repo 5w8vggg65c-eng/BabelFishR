@@ -24,8 +24,9 @@ Three things you will see a lot:
 - **The badge row** is the row of small coloured labels under the menu row
   and the toolbar: the **Operating mode** button, the readiness
   chip (**Ready**, **Partly ready**, **Not ready** or **Checking**) and the
-  activity indicator (**Idle**, **Listening**, **Receiving**, **Transcribing**,
-  **Translating**).
+  activity indicator (**Idle**, **Armed · Listening**, **Audio active (est.)**,
+  **Transcribing**, **Translating**). "Audio active" is estimated from the
+  input level, not reported by the receiver (see docs/LIVE_CAPTURE.md).
 - **The ⋯ button** is the small three-dots button at the right-hand end of each
   message bubble. Every action on a message — play, edit, retry, transcribe
   anyway, export — is in the menu that opens from it. There is no right-click

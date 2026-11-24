@@ -46,7 +46,7 @@ is sample data.
 | `BabelFishR` / `CONCEPT / SAMPLE DATA` | Identity row. The right side is empty in the app; only the preview script fills it ("UI PREVIEW / SAMPLE DATA"). |
 | `FIELD OFFLINE` | The real operating-mode control (a menu of the three modes), showing whatever mode the app is in. |
 | `SOURCE: RECORDED FILE` | What is really being read. During a replay it shows `SOURCE: RECORDED FILE · <file name>`, and `· ended` once the file is read through; a long or non-ASCII name is elided in the middle, with the full text in the tooltip. Otherwise it shows the selected input's live status. It never implies a microphone or radio is being received during a replay, and no "recording the room" warning appears then. |
-| `IDLE` | The real monitoring state (Idle / Listening / Receiving / …), shown in capitals. |
+| `IDLE` | The real monitoring state (Idle / Armed · Listening / Audio active (est.) / …), shown in capitals. "Audio active" is estimated from the audio level; no supported input reports receiver squelch or RX state. |
 | Monitor · Sessions · Models · Settings · Help | The app's real menus: **File · View · Receiver · Tools · Help** (see deviations). |
 | SESSIONS list | The named Sessions (the former tab row), drawn as a list. Rename, colours, context menu and hide/remove work as before. |
 | Saved sessions · Search | **Hidden sessions** (View ▸ Show hidden Sessions) and **Search** (focuses the search field). |
