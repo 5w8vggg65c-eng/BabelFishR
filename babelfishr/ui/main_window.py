@@ -1845,9 +1845,12 @@ class MainWindow(QtWidgets.QMainWindow):
             # this state "Partly ready - recording works", so the chip now
             # agrees with it.
             text, tone = "\u25d1 Partly ready", "working"
-            detail = ("Partly ready: recording works, but transcription or "
-                      "translation is not available yet. This describes what "
-                      "is installed, not the operating mode.")
+            words = {"yes": "works", "NO": "not available yet",
+                     "not checked yet": "installed, not checked yet"}
+            detail = ("Partly ready: recording works; transcription "
+                      f"{words[report.stage_word('transcribe')]}, translation "
+                      f"{words[report.stage_word('translate')]}. This describes "
+                      "what is installed, not the operating mode.")
         else:
             text, tone = "\u26a0 Not ready", "error"
             detail = "Not ready: audio capture is not working."

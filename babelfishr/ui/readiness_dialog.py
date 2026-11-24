@@ -105,11 +105,20 @@ class ReadinessDialog(QtWidgets.QDialog):
             self.subtitle.setText(
                 "Recording, local transcription and local translation all work "
                 "with the network disconnected.")
+        elif report.field_ready_unknown:
+            # The dialog opens with smoke tests off: a prepared computer is
+            # not checked yet, which is not the same as unavailable.
+            self.headline.setText("Prepared - not checked yet")
+            self.subtitle.setText(
+                "Recording works, and the transcription model and language "
+                "packs are installed. They have not been tested in this "
+                "check: use Re-check to run the real smoke tests.")
         elif report.can_record:
             self.headline.setText("Partly ready - recording works")
             self.subtitle.setText(
-                "Everything received will be recorded and kept. Transcription "
-                "and translation are not available yet, and can be run over "
+                "Everything received will be recorded and kept. "
+                f"Transcription: {_stage(report, 'transcribe')}; translation: "
+                f"{_stage(report, 'translate')}. Processing can be run over "
                 "these recordings later once prepared. Record Only mode is "
                 "recommended.")
         else:
@@ -124,6 +133,11 @@ class ReadinessDialog(QtWidgets.QDialog):
         self.remedies.setPlainText(
             "Next steps:\n" + "\n".join(remedies) if remedies
             else "No outstanding actions.")
+
+
+def _stage(report, stage: str) -> str:
+    return {"yes": "works", "NO": "not available yet",
+            "not checked yet": "installed, not checked yet"}[report.stage_word(stage)]
 
 
 def _symbol(status: CheckStatus) -> str:

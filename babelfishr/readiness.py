@@ -138,6 +138,20 @@ class ReadinessReport:
         return (transcription and translation
                 and (self.transcription_unverified or self.translation_unverified))
 
+    def stage_word(self, stage: str) -> str:
+        """"yes", "not checked yet" or "NO" for "transcribe"/"translate".
+
+        Wording only: "not checked yet" is a present asset whose smoke test
+        did not run, which is neither working nor unavailable.
+        """
+        works, unverified = {
+            "transcribe": (self.can_transcribe, self.transcription_unverified),
+            "translate": (self.can_translate, self.translation_unverified),
+        }[stage]
+        if works:
+            return "yes"
+        return "not checked yet" if unverified else "NO"
+
     def recommended_mode(self) -> OperatingMode:
         if self.field_ready:
             return OperatingMode.FIELD_OFFLINE
@@ -150,11 +164,16 @@ class ReadinessReport:
         lines += [c.line() for c in self.checks]
         lines.append("")
         lines.append(f"  record     : {'yes' if self.can_record else 'NO'}")
-        lines.append(f"  transcribe : {'yes' if self.can_transcribe else 'NO'}")
-        lines.append(f"  translate  : {'yes' if self.can_translate else 'NO'}")
+        lines.append(f"  transcribe : {self.stage_word('transcribe')}")
+        lines.append(f"  translate  : {self.stage_word('translate')}")
         lines.append("")
         if self.field_ready:
             lines.append("READY for offline field operation.")
+        elif self.field_ready_unknown:
+            lines.append(
+                "PREPARED, NOT CHECKED YET. The model and language packs are "
+                "installed but their smoke tests did not run; run the check "
+                "without --no-smoke-tests to confirm they work.")
         elif self.can_record:
             lines.append(
                 "NOT fully ready. Recording works, so Record Only mode will "
