@@ -113,8 +113,10 @@ class MainWindow(QtWidgets.QMainWindow):
         #: automatic reconciliation adds none of their rows (see _may_place)
         #: except those an explicit open or View > Refresh has shown.
         self._stopped_here: set = set()
-        #: Rows of those runs that an explicit open / refresh showed.
-        self._revealed_ids: set = set()
+        #: Rows an explicit open / refresh showed, with their run: id ->
+        #: session id. Only reveals made after a run was stopped count for
+        #: that run (Stop withdraws earlier ones, see _stop_monitoring).
+        self._revealed_ids: Dict[str, str] = {}
         #: Rows the operator processed by hand (Retry, Transcribe anyway):
         #: their results are theirs to see.
         self._manual_ids: set = set()
@@ -1209,6 +1211,11 @@ class MainWindow(QtWidgets.QMainWindow):
         session = self.app.stop_session()
         if session is not None:
             self._stopped_here.add(session.id)
+            # A reveal from before Stop does not authorise this run's rows
+            # afterwards: only an explicit open or refresh after Stop does.
+            # Rows on screen stay as they are.
+            self._revealed_ids = {tx_id: run for tx_id, run in self._revealed_ids.items()
+                                  if run != session.id}
             self._mark_shown_rows_stopped(session.id)
         self.start_button.setText("Start monitoring")
         self._set_controls_enabled(True)
@@ -1219,10 +1226,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_state(PipelineState.IDLE)
         if session is not None:
             self.status.showMessage(
-                "Monitoring stopped. Every recording is saved; any not yet "
-                "processed are marked \"saved, not processed\" - View > "
-                "Refresh shows them, and Transcribe anyway or Retry processes "
-                "them.", 12000)
+                "Monitoring stopped. View > Refresh shows saved recordings; "
+                "use Transcribe anyway or Retry for unfinished ones.", 12000)
         self.meter.reset()
 
     def _mark_shown_rows_stopped(self, run: str) -> None:
@@ -2592,7 +2597,10 @@ class MainWindow(QtWidgets.QMainWindow):
         Reached only at the end of an explicit open (thread, Search, Review,
         Bookmarked, View > Refresh), never from automatic reconciliation:
         the rows shown now count as revealed (see _may_place)."""
-        self._revealed_ids |= set(self.timeline.order())
+        for tx_id in self.timeline.order():
+            bubble = self.timeline.bubble(tx_id)
+            if bubble is not None:
+                self._revealed_ids[tx_id] = bubble.tx.session_id
         buttons = {"thread": self.filter_all, "review": self.filter_review,
                    "bookmarked": self.filter_bookmarked}
         target = buttons.get(self._view_kind)

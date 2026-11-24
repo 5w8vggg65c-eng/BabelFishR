@@ -952,3 +952,50 @@ def test_the_badge_is_idle_after_stop_while_an_abandoned_call_runs(qt_app, confi
         asr.release.set()
         window.close()
         app.close()
+
+
+def test_a_reveal_from_before_stop_does_not_authorise_rows_after_stop(
+        qt_app, config, store):
+    """Root's sequence: the operator opens All while a current-run row is on
+    screen, switches to a filter that hides it, presses Stop; later
+    unrelated work makes the filter reconcile. The earlier reveal must not
+    let that row in - only an explicit open or refresh after Stop does."""
+    asr = SlowASR()
+    asr.release.set()
+    app, window, source, session = _window_monitoring(qt_app, config, store, asr)
+    try:
+        _push(source, [{"gap": 0.5}, VOICE, QUIET])
+        assert _wait(lambda: _rows(store, session.id)
+                     and _rows(store, session.id)[0].state is ProcessingState.COMPLETE)
+        window._drain_events()
+        (done,) = _rows(store, session.id)
+        asr.release.clear()
+        asr.entered.clear()
+        _push(source, [VOICE, QUIET])
+        assert asr.entered.wait(15.0)                 # message X is running
+        window._drain_events()
+        (x,) = [t for t in _rows(store, session.id) if t.id != done.id]
+        window._reload_timeline()                     # explicit open of All
+        assert x.id in window.timeline.order() and x.id in window._revealed_ids
+        window._show_review_queue()                   # a filter that hides X
+        assert x.id not in window.timeline.order()
+        window._stop_monitoring()
+        assert x.id not in window._revealed_ids, "the pre-Stop reveal survived Stop"
+        asr.release.set()                             # X ends saved-not-processed
+        assert _wait(lambda: app.outstanding_work() == 0)
+        app.wait_for_session_ends(10.0)
+        assert is_processing_stopped(store.get_transmission(x.id))
+        assert x.id in {t.id for t in store.review_queue()}   # it qualifies
+        window._drain_events()
+
+        window._on_retry(done.id)                     # unrelated manual work
+        assert _wait(lambda: app.outstanding_work() == 0)
+        window._drain_events()
+        assert x.id not in window.timeline.order(), (
+            "a reveal from before Stop let the stopped run's row in")
+        window.refresh_action.trigger()               # explicit, after Stop
+        assert x.id in window.timeline.order()
+    finally:
+        asr.release.set()
+        window.close()
+        app.close()

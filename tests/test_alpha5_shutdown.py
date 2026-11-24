@@ -175,7 +175,7 @@ def test_stop_and_quit_keep_the_gui_alive_with_a_held_source(qt_app, config, sto
         assert len(ticks) >= before + 5, "the event loop did not turn during Stop"
         assert app.capture_finishing(), "the capture was treated as finished"
         assert app.outstanding_work() >= 1, "a capture that can still produce counted as nothing"
-        assert "saved, not processed" in window.status.currentMessage().lower()
+        assert "refresh shows saved recordings" in window.status.currentMessage().lower()
         assert app.standalone_pipeline is not None and app.standalone_pipeline.accepting
 
         started = time.monotonic()

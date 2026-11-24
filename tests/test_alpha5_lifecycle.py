@@ -507,7 +507,7 @@ def _stop_monitoring_body(qt_app, app, window, engine, timer, ticks, wav):
     # engine call still owns the engines (pending), but the window is Idle
     # and says the recordings are saved, not that it is finishing them.
     assert "Idle" in window.state_badge.text(), window.state_badge.text()
-    assert "saved, not processed" in window.status.currentMessage().lower()
+    assert "refresh shows saved recordings" in window.status.currentMessage().lower()
     assert window.start_button.text() == "Start monitoring"
 
     window._stop_monitoring()             # a second Stop changes nothing
