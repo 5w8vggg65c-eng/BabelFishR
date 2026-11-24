@@ -987,14 +987,21 @@ class Store:
         params += [threshold, threshold, limit]
         rows = self._conn.execute(
             f"""SELECT t.* FROM transmissions t
-               WHERE t.reviewed = 0 AND t.hidden = 0 {scope}AND (
+               WHERE t.hidden = 0 {scope}AND (
+                  (t.reviewed = 0 AND (
                      t.state = 'failed'
                   OR (t.transcript_confidence IS NOT NULL
                       AND t.transcript_confidence < ?)
                   OR (t.language_confidence IS NOT NULL
-                      AND t.language_confidence < ?)
-                  OR json_extract(t.signal_metadata, '$.speech_check.verdict')
-                     IN ('likely_noise', 'uncertain'))
+                      AND t.language_confidence < ?)))
+                  -- A speech-check flag clears only once the operator has
+                  -- saved the words (Transmission.needs_review), not on a
+                  -- note or a Retry as speech.
+                  OR (json_extract(t.signal_metadata, '$.speech_check.verdict')
+                      IN ('likely_noise', 'uncertain')
+                      AND NOT (t.reviewed = 1
+                               AND (COALESCE(t.transcript_correction, '') != ''
+                                    OR COALESCE(t.translation_correction, '') != ''))))
                ORDER BY t.started_at DESC LIMIT ?""",
             tuple(params)).fetchall()
         return [_from_row(r) for r in rows]

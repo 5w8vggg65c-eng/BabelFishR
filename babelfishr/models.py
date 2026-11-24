@@ -778,15 +778,17 @@ class Transmission:
         """Low confidence, or a failure the operator should look at."""
         if self.state is ProcessingState.FAILED:
             return True
+        # A speech-check flag clears only when the operator has saved the
+        # transcript/translation (Edit transcript and translation). Not by
+        # Retry as speech, which only lifts the translation hold, and not by
+        # a note: an older version marked a message reviewed when only a
+        # note was saved, and a note does not check the recognised words.
+        check = (self.signal_metadata or {}).get("speech_check") or {}
+        if (check.get("verdict") in ("likely_noise", "uncertain")
+                and not (self.reviewed and self.has_correction)):
+            return True
         if self.reviewed:
             return False
-        # Confirming a message is speech (Retry as speech in...) lifts the
-        # translation hold only; it does not verify the new words, so the
-        # flag stays until the message is marked Reviewed or a fresh check
-        # clears it.
-        check = (self.signal_metadata or {}).get("speech_check") or {}
-        if check.get("verdict") in ("likely_noise", "uncertain"):
-            return True
         thresholds = [v for v in (self.transcript_confidence,
                                   self.language_confidence) if v is not None]
         return any(v < 0.6 for v in thresholds)

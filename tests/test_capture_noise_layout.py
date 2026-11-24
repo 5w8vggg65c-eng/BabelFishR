@@ -148,6 +148,7 @@ LEGITIMATE = [
     "Mayday, mayday, mayday, this is Kilo One.",
     "Echo echo echo, radio check, how copy?",
     "The quick brown fox jumps over the lazy dog near the river bank today.",
+    "(laughs)", "[inaudible]", "... uh ... ok ...", "-- -- -- copy -- --",
 ]
 
 #: A synthetic line with the aggregate shape of the 0.933-confidence field
@@ -164,6 +165,9 @@ SEVERE_LOOPS = [
     "ーーーーーーーーーーーー",
     "...............",
     "?!?!?!?!?!?!",
+    FIELD_LOOP_SHAPE + " a",                      # a stray letter...
+    FIELD_LOOP_SHAPE + " 7",                      # ...or digit does not let it out
+    " ".join(list("()[]{}\u266a\u266b") * 7),     # nor do more distinct symbols
 ]
 
 #: Loop-like but short or with words in it: review only.

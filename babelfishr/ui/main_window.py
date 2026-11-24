@@ -52,9 +52,7 @@ STATE_TIPS = {
     PipelineState.RECEIVING: (
         "Audio activity, estimated from the input level. BabelFishR receives no "
         "squelch, carrier or RX signal from this input, so this is not the "
-        "receiver's own status: noise loud enough can look the same. Long "
-        "activity is handed to speech recognition in parts of about "
-        "15 seconds while it continues."),
+        "receiver's own status: noise loud enough can look the same."),
 }
 
 COMMON_LANGUAGES = [
@@ -1751,7 +1749,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.state_badge.setStyleSheet("")
         self.state_badge.setProperty("tone", tone)
         self.state_badge.setAccessibleDescription(text)
-        self.state_badge.setToolTip(STATE_TIPS.get(state, ""))
+        tip = STATE_TIPS.get(state, "")
+        if state is PipelineState.RECEIVING:
+            seconds = self.app.config.detector.segment_seconds
+            tip += (f" Long activity is handed to speech recognition in parts of "
+                    f"about {seconds:g} seconds while it continues." if seconds else
+                    " Segmenting is off: long activity reaches speech recognition "
+                    "only when it ends.")
+        self.state_badge.setToolTip(tip)
 
     def _refresh_mode_badge(self) -> None:
         """Label the operating-mode control and mark the current choice.

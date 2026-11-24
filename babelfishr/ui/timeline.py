@@ -74,6 +74,10 @@ def _speech_check_note(tx: Transmission) -> str:
     verdict = check.get("verdict")
     if verdict not in ("likely_noise", "uncertain"):
         return ""
+    if operator_checked(tx):
+        return ("You checked and saved this transcript. The automatic speech "
+                "check had marked it "
+                + ("probably not speech." if verdict == "likely_noise" else "uncertain."))
     confirmed = metadata.get("speech_confirmed") or {}
     if confirmed:
         language = confirmed.get("source_language", "?")
@@ -126,6 +130,13 @@ def _speech_check_note(tx: Transmission) -> str:
             f"you choose.")
 
 
+def operator_checked(tx: Transmission) -> bool:
+    """The operator saved this message's transcript/translation (Edit
+    transcript and translation) and it has not been re-recognised since.
+    Not a note, and not Retry as speech: those leave the words unchecked."""
+    return bool(tx.reviewed and tx.has_correction)
+
+
 def _transcript_caption(tx: Transmission) -> tuple:
     """The transcript box's caption and its tone, from the speech check.
 
@@ -136,6 +147,8 @@ def _transcript_caption(tx: Transmission) -> tuple:
     """
     metadata = tx.signal_metadata or {}
     verdict = (metadata.get("speech_check") or {}).get("verdict")
+    if operator_checked(tx):
+        return "TRANSCRIPT \u00b7 CHECKED BY OPERATOR", "none"
     if verdict == "likely_noise" and not metadata.get("speech_confirmed"):
         return "TRANSCRIPT \u00b7 HELD FOR REVIEW", "held"
     if verdict in ("likely_noise", "uncertain"):
@@ -174,6 +187,146 @@ def _differs(source: str, target: str) -> bool:
         return bool(source and target)
     return (source.strip().lower().split("-")[0]
             != target.strip().lower().split("-")[0])
+
+
+class WrappingText(QtWidgets.QTextEdit):
+    """Read-only, selectable rich text that always fits its width.
+
+    A word-wrapped QLabel cannot break a run with no spaces in it, so a long
+    recognition loop or identifier was cut off at the box edge. This wraps
+    at word boundaries, and anywhere within a run longer than a line
+    (QTextOption.WrapAtWordBoundaryOrAnywhere), by layout alone: the text is
+    not altered, so selection and copy give back exactly the stored words.
+    Its height follows its document; it never scrolls by itself, and wheel
+    events go on to the thread. ``text()``/``setText()`` mirror QLabel's for
+    the callers and tests that read it.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._html = ""
+        self.setReadOnly(True)
+        self.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.setLineWrapMode(QtWidgets.QTextEdit.WidgetWidth)
+        self.setWordWrapMode(QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere)
+        self.document().setDocumentMargin(0)
+        self.viewport().setAutoFillBackground(False)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
+        self.setContextMenuPolicy(QtCore.Qt.DefaultContextMenu)
+
+    def setText(self, html: str) -> None:          # noqa: N802 - QLabel's name
+        self._html = html
+        self.setHtml(html)
+        self._fit()
+
+    def text(self) -> str:
+        return self._html
+
+    def setWordWrap(self, _on: bool) -> None:      # noqa: N802 - always wraps
+        pass
+
+    def hasHeightForWidth(self) -> bool:           # noqa: N802
+        return True
+
+    def heightForWidth(self, width: int) -> int:   # noqa: N802
+        document = self.document().clone()
+        document.setTextWidth(max(1, width - 2 * self.frameWidth()))
+        return int(document.size().height() + 0.999) + 2 * self.frameWidth()
+
+    def sizeHint(self):                            # noqa: N802
+        return QtCore.QSize(super().sizeHint().width(), self.heightForWidth(self.width()))
+
+    def minimumSizeHint(self):                     # noqa: N802
+        return QtCore.QSize(0, self.heightForWidth(self.width()))
+
+    def resizeEvent(self, event):                  # noqa: N802
+        super().resizeEvent(event)
+        self._fit()
+
+    def showEvent(self, event):                    # noqa: N802
+        super().showEvent(event)
+        self._fit()
+
+    def _fit(self) -> None:
+        height = self.heightForWidth(self.width())
+        if self.height() != height or self.minimumHeight() != height:
+            self.setFixedHeight(height)
+
+    def wheelEvent(self, event):                   # noqa: N802
+        event.ignore()                             # the thread scrolls, not the row
+
+
+class FlowLayout(QtWidgets.QLayout):
+    """Left-to-right items that wrap onto further lines (for chips).
+
+    Its minimum width is the widest single item, not the sum of all of them,
+    and it reports height-for-width, so a narrow row grows a line instead of
+    growing wider than its window.
+    """
+
+    def __init__(self, parent=None, spacing: int = 5):
+        super().__init__(parent)
+        self._items: List[QtWidgets.QLayoutItem] = []
+        self.setContentsMargins(0, 0, 0, 0)
+        self.setSpacing(spacing)
+
+    def addItem(self, item):                       # noqa: N802 - Qt API
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):                       # noqa: N802
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):                       # noqa: N802
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):                 # noqa: N802
+        return QtCore.Qt.Orientations()
+
+    def hasHeightForWidth(self):                   # noqa: N802
+        return True
+
+    def heightForWidth(self, width):               # noqa: N802
+        return self._arrange(QtCore.QRect(0, 0, width, 0), apply=False)
+
+    def setGeometry(self, rect):                   # noqa: N802
+        super().setGeometry(rect)
+        self._arrange(rect, apply=True)
+
+    def sizeHint(self):                            # noqa: N802
+        return self.minimumSize()
+
+    def minimumSize(self):                         # noqa: N802
+        size = QtCore.QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        return size + QtCore.QSize(margins.left() + margins.right(),
+                                   margins.top() + margins.bottom())
+
+    def _arrange(self, rect, apply: bool) -> int:
+        margins = self.contentsMargins()
+        area = rect.adjusted(margins.left(), margins.top(),
+                             -margins.right(), -margins.bottom())
+        x, y, line = area.x(), area.y(), 0
+        gap = self.spacing()
+        for item in self._items:
+            if item.widget() is not None and not item.widget().isVisibleTo(
+                    self.parentWidget()):
+                continue
+            hint = item.sizeHint()
+            if x > area.x() and x + hint.width() > area.right() + 1:
+                x, y, line = area.x(), y + line + gap, 0
+            if apply:
+                item.setGeometry(QtCore.QRect(QtCore.QPoint(x, y), hint))
+            x += hint.width() + gap
+            line = max(line, hint.height())
+        return y + line - rect.y() + margins.bottom()
 
 
 class TransmissionBubble(QtWidgets.QFrame):
@@ -273,13 +426,11 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.transcript_caption = QtWidgets.QLabel("TRANSCRIPT")
         self.transcript_caption.setObjectName("boxCaption")
         transcript_layout.addWidget(self.transcript_caption)
-        self.original_label = QtWidgets.QLabel()
+        # Wraps at word boundaries, and anywhere inside a run too long for
+        # a line (a loop, an identifier, a callsign run), without changing
+        # the text: what is selected and copied is exactly what was stored.
+        self.original_label = WrappingText()
         self.original_label.setObjectName("originalText")
-        self.original_label.setWordWrap(True)
-        self.original_label.setTextInteractionFlags(
-            QtCore.Qt.TextSelectableByMouse)
-        self.original_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
-                                          QtWidgets.QSizePolicy.Preferred)
         transcript_layout.addWidget(self.original_label)
         outer.addWidget(self.transcript_box)
 
@@ -294,13 +445,11 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.translation_caption = QtWidgets.QLabel("TRANSLATION")
         self.translation_caption.setObjectName("boxCaption")
         translation_layout.addWidget(self.translation_caption)
-        self.translated_label = QtWidgets.QLabel()
+        # Wraps at word boundaries, and anywhere inside a run too long for
+        # a line (a loop, an identifier, a callsign run), without changing
+        # the text: what is selected and copied is exactly what was stored.
+        self.translated_label = WrappingText()
         self.translated_label.setObjectName("translatedText")
-        self.translated_label.setWordWrap(True)
-        self.translated_label.setTextInteractionFlags(
-            QtCore.Qt.TextSelectableByMouse)
-        self.translated_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
-                                            QtWidgets.QSizePolicy.Preferred)
         translation_layout.addWidget(self.translated_label)
         outer.addWidget(self.translation_box)
 
@@ -309,10 +458,13 @@ class TransmissionBubble(QtWidgets.QFrame):
         outer.addWidget(self.header)
 
         # Metadata chips: compact, scannable, and readable without colour.
-        self.chip_row = QtWidgets.QHBoxLayout()
-        self.chip_row.setSpacing(5)
-        self.chip_row.addStretch(1)
-        outer.addLayout(self.chip_row)
+        # Chips wrap onto further lines rather than widening the row: a row
+        # with many chips (continuous audio, clipped, confidence, tags) once
+        # needed 880 px and ran past a 1146 px laptop window.
+        self.chip_box = QtWidgets.QWidget()
+        self.chip_box.setObjectName("chipBox")
+        self.chip_row = FlowLayout(self.chip_box, spacing=5)
+        outer.addWidget(self.chip_box)
 
         self.error_label = QtWidgets.QLabel()
         self.error_label.setObjectName("errorText")
@@ -644,7 +796,7 @@ class TransmissionBubble(QtWidgets.QFrame):
 
     def _rebuild_chips(self, tx: Transmission) -> None:
         """Compact metadata chips: class, confidence, tags, digital result."""
-        while self.chip_row.count() > 1:
+        while self.chip_row.count() > 0:
             item = self.chip_row.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
@@ -675,12 +827,13 @@ class TransmissionBubble(QtWidgets.QFrame):
             tone = "accent" if attempt.outcome.is_success else "warning"
             chips.append((f"DSD: {attempt.summary()}", tone))
 
-        for index, (text, tone) in enumerate(chips):
+        for text, tone in chips:
             chip = QtWidgets.QLabel(text)
             chip.setObjectName("chip")
             chip.setProperty("tone", tone)
             chip.setAccessibleName(text)
-            self.chip_row.insertWidget(index, chip)
+            self.chip_row.addWidget(chip)
+        self.chip_box.setVisible(bool(chips))
 
     def set_selected(self, selected: bool) -> None:
         """Mark this row as the one the waveform and Selected Audio follow."""
@@ -860,6 +1013,7 @@ class TransmissionBubble(QtWidgets.QFrame):
 
 def _escape(text: str) -> str:
     return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
 
 
 #: How many turns of the event loop an anchor is re-applied for. Enough to

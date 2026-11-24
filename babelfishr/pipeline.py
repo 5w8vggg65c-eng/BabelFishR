@@ -188,10 +188,10 @@ def degenerate_text(text: str) -> tuple:
     one character, not a digit, repeated unbroken at least 12 times and
     making up at least 80% of the text (``ლლლლ...``, ``!!!!...``) - an
     elongated shout inside other words ("Nooooooooooooo! Stop!") is not it;
-    or a long line (12+ characters) of at most four distinct symbols with no
-    letter or digit anywhere, spaced or not - the shape of a real field
-    loop (56 characters, three distinct brackets/symbols, every one
-    separated by a space). Either is a heuristic: very unlikely to be a
+    or a long line (12+ non-space characters) at least 90% symbols, spaced or
+    not - the shape of a real field loop (56 characters, three distinct
+    brackets/symbols, every one separated by a space), still matched with a
+    stray letter or a few more distinct symbols in it. Either is a heuristic: very unlikely to be a
     faithful transcript of speech, not proof that none was spoken - which
     is why the words and the audio are always kept for review.
     Punctuation, number formatting and repeated digits never count as
@@ -215,10 +215,12 @@ def degenerate_text(text: str) -> tuple:
     if longest >= 12 and longest / len(chars) >= 0.8:
         return ("severe", "one character repeats unbroken")
     letterless = not any(c.isalnum() for c in chars)
-    if letterless and len(chars) >= 12 and len(set(chars)) <= 4:
-        # Speech is transcribed as words; a long line of a few symbols or
-        # brackets with no letter or digit anywhere is a loop, spaced or not.
-        return ("severe", "it is a long run of a few symbols, with no letters or digits")
+    symbol_share = sum(not c.isalnum() for c in chars) / len(chars)
+    if len(chars) >= 12 and symbol_share >= 0.9:
+        # Speech is transcribed as words; a long line that is almost all
+        # symbols or brackets is a loop, spaced or not - including one with
+        # a stray letter or digit, or several different symbols in it.
+        return ("severe", "it is almost all symbols, with almost no letters or digits")
     words = [w.strip(".,!?;:\u3001\u3002\u060c\u061f\"'()-").lower() for w in text.split()]
     words = [w for w in words if w]
     if len(words) >= 6 and len(set(words)) / len(words) <= 0.4:
@@ -572,6 +574,15 @@ class ProcessingPipeline:
             tx.skip_reason = ""
             # New words, not yet checked: an earlier review was of the old ones.
             tx.reviewed = False
+            if tx.transcript_correction or tx.translation_correction:
+                # An earlier correction would otherwise keep overriding the
+                # new words on screen. It is kept, not discarded.
+                tx.signal_metadata = dict(tx.signal_metadata, superseded_correction={
+                    "transcript": tx.transcript_correction,
+                    "translation": tx.translation_correction,
+                    "corrected_at": tx.corrected_at.isoformat() if tx.corrected_at else None})
+                tx.transcript_correction = ""
+                tx.translation_correction = ""
         tx.clear_error()
         tx.state = ProcessingState.CAPTURED
         self.store.save_transmission(tx)

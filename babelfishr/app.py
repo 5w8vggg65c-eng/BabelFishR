@@ -1308,7 +1308,11 @@ class BabelFishRApp:
         if notes is not None:
             tx.notes = notes
         tx.corrected_at = utcnow()
-        tx.reviewed = True
+        if transcript is not None or translation is not None:
+            # Saving the transcript/translation is the operator's check of
+            # the recognised words. A note alone is not: it must not clear a
+            # message from review, or certify words nobody checked.
+            tx.reviewed = True
         self.store.save_transmission(tx)
         self.events.publish("updated", tx)
         return tx

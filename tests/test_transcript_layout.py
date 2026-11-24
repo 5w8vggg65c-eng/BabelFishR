@@ -276,8 +276,10 @@ def test_selected_review_and_failed_edges_stay_distinguishable():
     # edges are declared after the selection and still show on a selected row.
     assert selected < review < failed
     block = sheet[selected:sheet.index("}", selected)]
-    assert "selected_bg" not in block and "background:" in block
-    assert theme.tokens()["accent"] not in block.split("background:")[1].split(";")[0]
+    background = block.split("background:")[1].split(";")[0].strip()
+    tokens = theme.tokens()
+    assert background == tokens["selected_bg"], background   # the faint tint...
+    assert background != tokens["accent"]                     # ...not the solid accent
 
 
 # ---- held / uncertain ---------------------------------------------------------------
@@ -362,3 +364,231 @@ def test_play_menu_and_click_selection_still_work_for_a_row(qt_app, tmp_path):
     labels = [a.text() for a in first.menu_button.menu().actions()]
     assert "Retry as speech in..." in labels
     view.close()
+
+
+# ---- the operator's laptop width -------------------------------------------------
+
+#: The Mac's current window width in logical pixels, as root measured it.
+LAPTOP_WIDTH = 1146
+
+BUSY_ROW = dict(
+    transcript="Net control to all stations, this is a routine check of the repeater; "
+               "please acknowledge in turn and keep transmissions short.",
+    clipped=True, transcript_confidence=0.42, tags=["net-control", "repeater"],
+    signal_metadata={"segment": {"continued": True, "continues_previous": True},
+                     "speech_check": {"verdict": "uncertain", "reasons": [],
+                                      "speech_ratio": 0.1, "speech_seconds": 0.2,
+                                      "no_speech_probability": 0.3}})
+
+
+def test_the_window_fits_the_laptop_width_with_every_chip(qt_app, window_with):
+    """Resize to the real width, not just minimumSizeHint(): an enlarged
+    minimum would hold the window wider than the screen."""
+    window, made = window_with([BUSY_ROW, dict(BUSY_ROW, translation="Hola.",
+                                               source_language="es")])
+    assert _resize(qt_app, window, LAPTOP_WIDTH) == LAPTOP_WIDTH, (
+        f"the window will not shrink to {LAPTOP_WIDTH} px")
+    viewport = window.timeline.viewport() if hasattr(window.timeline, "viewport") \
+        else window.timeline
+    scroll = window.timeline.findChildren(QtWidgets.QScrollArea)
+    for area in scroll:
+        assert not area.horizontalScrollBar().isVisible(), "rows overflow sideways"
+    for tx in made:
+        bubble = window.timeline.bubble(tx.id)
+        assert bubble.isVisible()
+        right = bubble.mapTo(window, QtCore.QPoint(bubble.width(), 0)).x()
+        assert right <= window.width(), "a row runs past the window"
+        chips = _chips(bubble)
+        texts = " ".join(c.text() for c in chips)
+        assert "clipped" in texts and "continuous audio" in texts
+        for chip in chips:
+            assert _inside(chip, bubble), f"chip {chip.text()!r} runs out of its row"
+        assert bubble.review_label.text() != "–"          # the review mark shows
+    del viewport
+
+
+def test_minimum_width_is_reported_and_rows_still_fit_there(qt_app, window_with):
+    window, made = window_with([BUSY_ROW])
+    smallest = _resize(qt_app, window, 300)            # Qt clamps to the real minimum
+    print(f"\nreal minimum window width with every chip: {smallest} px "
+          f"(minimumSizeHint {window.minimumSizeHint().width()} px)")
+    assert smallest <= LAPTOP_WIDTH
+    bubble = window.timeline.bubble(made[0].id)
+    right = bubble.mapTo(window, QtCore.QPoint(bubble.width(), 0)).x()
+    assert right <= window.width(), f"at {smallest} px a row runs past the window"
+    for chip in _chips(bubble):
+        assert _inside(chip, bubble)
+
+
+# ---- what the caption says after the operator acts --------------------------------
+
+HELD = {"speech_check": {"verdict": "likely_noise", "reasons": [],
+                         "speech_ratio": 0.0, "speech_seconds": 0.0,
+                         "no_speech_probability": 0.9}}
+
+
+def _held(store, tmp_path, **fields):
+    session = Session(name="held", sample_rate=48_000, target_language="en")
+    store.save_session(session)
+    tx = _message(session.id, 0, utcnow(), tmp_path, transcript="thank you for watching",
+                  source_language="es", signal_metadata=dict(HELD), **fields)
+    store.save_transmission(tx)
+    return tx
+
+
+def test_an_explicit_correction_is_shown_as_checked(qt_app, config, store, tmp_path):
+    from babelfishr.app import BabelFishRApp
+    from babelfishr.ui.timeline import _speech_check_note, _transcript_caption
+
+    tx = _held(store, tmp_path)
+    app = BabelFishRApp(config=config, store=store)
+    app.correct(tx.id, transcript="gracias por ver", translation="thanks for watching")
+    tx = store.get_transmission(tx.id)
+    assert tx.reviewed and not tx.needs_review
+    assert tx.id not in {t.id for t in store.review_queue()}
+    assert _transcript_caption(tx)[0] == "TRANSCRIPT · CHECKED BY OPERATOR"
+    assert _speech_check_note(tx).startswith("You checked and saved this transcript")
+
+
+def test_a_note_alone_does_not_certify_the_words(qt_app, config, store, tmp_path):
+    from babelfishr.app import BabelFishRApp
+    from babelfishr.ui.timeline import _transcript_caption
+
+    tx = _held(store, tmp_path)
+    app = BabelFishRApp(config=config, store=store)
+    app.correct(tx.id, notes="heard a carrier, nothing else")
+    tx = store.get_transmission(tx.id)
+    assert tx.notes == "heard a carrier, nothing else"
+    assert not tx.reviewed and tx.needs_review
+    assert tx.id in {t.id for t in store.review_queue()}
+    assert _transcript_caption(tx)[0] == "TRANSCRIPT · HELD FOR REVIEW"
+
+
+def test_retry_as_speech_after_a_correction_is_unchecked_again(qt_app, config, store,
+                                                               tmp_path):
+    """Retry as speech produces new words: they are what is shown, they are
+    not checked, and the earlier correction is kept, not lost."""
+    from test_live_audio_fixes import PairTranslation, ScriptedTranscription, _retry
+    from test_live_audio_fixes import result as scripted
+
+    from babelfishr.app import BabelFishRApp
+    from babelfishr.ui.timeline import _transcript_caption
+
+    tx = _held(store, tmp_path)
+    app = BabelFishRApp(config=config, store=store)
+    app.correct(tx.id, transcript="gracias por ver", translation="thanks for watching")
+    _retry(config, store,
+           ScriptedTranscription(scripted("equipo uno en posicion", ratio=0.01, nsp=0.8,
+                                          language="es")),
+           PairTranslation(pairs=(("es", "en"),)), tx.id, source_language="es")
+    tx = store.get_transmission(tx.id)
+    assert not tx.reviewed and tx.needs_review
+    assert tx.display_transcript == "equipo uno en posicion"
+    assert tx.signal_metadata["superseded_correction"]["transcript"] == "gracias por ver"
+    assert _transcript_caption(tx)[0] == "TRANSCRIPT · CHECK"
+
+
+# ---- review findings ------------------------------------------------------------------
+
+def test_an_unbroken_transcript_wraps_instead_of_being_clipped(qt_app, window_with):
+    """A recognition loop, URL or callsign run has no spaces to wrap at. It
+    used to be cut at the box edge with no sign anything was missing."""
+    loop = "ლ" * 400
+    window, made = window_with([dict(transcript=loop)])
+    _resize(qt_app, window, 1146)
+    bubble = window.timeline.bubble(made[0].id)
+    label = bubble.original_label
+    line = label.fontMetrics().height()
+    assert label.height() > 5 * line, "the run did not wrap onto further lines"
+    assert label.heightForWidth(label.width()) <= label.height() + 2, "clipped"
+    assert label.toPlainText() == loop          # displayed exactly, nothing inserted
+
+
+def test_a_note_reviewed_row_from_an_older_version_stays_consistent(qt_app, config,
+                                                                    store, tmp_path):
+    """Older versions set reviewed on a note-only edit. Caption, review mark
+    and Review queue agree: the words were never checked."""
+    from babelfishr.ui.timeline import _transcript_caption
+
+    tx = _held(store, tmp_path, reviewed=True, notes="carrier only")
+    tx = store.get_transmission(tx.id)
+    assert tx.needs_review and tx.id in {t.id for t in store.review_queue()}
+    assert _transcript_caption(tx)[0] == "TRANSCRIPT · HELD FOR REVIEW"
+
+
+def test_retry_as_speech_confirmation_alone_shows_check(qt_app, config, store, tmp_path):
+    from babelfishr.ui.timeline import _transcript_caption
+
+    tx = _held(store, tmp_path)
+    tx.signal_metadata = dict(tx.signal_metadata,
+                              speech_confirmed={"source_language": "es", "by": "operator"})
+    assert _transcript_caption(tx)[0] == "TRANSCRIPT · CHECK"
+    assert tx.needs_review
+
+
+@pytest.mark.parametrize("seconds,words", [(20.0, "about 20 seconds"),
+                                           (0, "Segmenting is off")])
+def test_the_activity_tooltip_follows_the_segment_setting(qt_app, config, store,
+                                                          seconds, words):
+    from babelfishr.app import BabelFishRApp
+    from babelfishr.pipeline import PipelineState
+    from babelfishr.ui.main_window import MainWindow
+
+    config.detector.segment_seconds = seconds
+    window = MainWindow(BabelFishRApp(config=config, store=store))
+    try:
+        window._state = PipelineState.RECEIVING
+        window._refresh_state_badge()
+        assert words in window.state_badge.toolTip()
+    finally:
+        window.close()
+
+
+# ---- copy gives back exactly what was said ---------------------------------------------
+
+EXACT = {
+    "identifier": "W1AW/K2ABC-UNIT-0042-ALPHA-BRAVO-CHARLIE-DELTA-ECHO-FOXTROT-GOLF-HOTEL"
+                  "-INDIA-JULIETT-KILO-LIMA-MIKE-NOVEMBER-OSCAR-PAPA-QUEBEC-ROMEO",
+    "arabic": "\u0645\u0631\u062d\u0628\u0627 \u0643\u064a\u0641 \u062d\u0627\u0644\u0643 "
+              "\u0627\u0644\u064a\u0648\u0645\u060c \u0646\u062d\u0646 \u0641\u064a "
+              "\u0627\u0644\u0645\u0648\u0642\u0639",
+    # Persian with its own zero-width non-joiner (U+200C), which must survive.
+    "persian_zwnj": "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645 "
+                    "\u0628\u0627 \u0634\u0645\u0627 \u0635\u062d\u0628\u062a "
+                    "\u06a9\u0646\u0645",
+    "loop": "\u10da" * 400,
+}
+
+
+@pytest.mark.parametrize("name", EXACT)
+def test_selecting_and_copying_a_transcript_gives_the_exact_text(qt_app, window_with, name):
+    from PySide6.QtTest import QTest
+
+    text = EXACT[name]
+    window, made = window_with([dict(transcript=text)])
+    _resize(qt_app, window, 1146)
+    label = window.timeline.bubble(made[0].id).original_label
+    assert label.toPlainText() == text
+    clipboard = QtWidgets.QApplication.clipboard()
+
+    # Select all and copy, as the keyboard does.
+    clipboard.clear()
+    label.selectAll()
+    label.copy()
+    pump(qt_app)
+    assert clipboard.text() == text
+
+    # A real mouse drag from before the first character to after the last.
+    clipboard.clear()
+    label.moveCursor(QtGui.QTextCursor.End)
+    end = label.cursorRect().center() + QtCore.QPoint(2, 0)
+    viewport = label.viewport()
+    rtl = text[0] in "\u0645\u0627"
+    begin = QtCore.QPoint(viewport.width() - 1 if rtl else 0, 2)
+    QTest.mousePress(viewport, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, begin)
+    QTest.mouseMove(viewport, end)
+    QTest.mouseRelease(viewport, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, end)
+    label.copy()
+    pump(qt_app)
+    assert clipboard.text() == text, "a mouse-selected copy differs from the transcript"
+    assert len(label.toPlainText()) == len(text)        # nothing added for wrapping
