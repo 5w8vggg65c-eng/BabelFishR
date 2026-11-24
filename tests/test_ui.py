@@ -51,8 +51,9 @@ def test_bubble_separates_original_from_translation(qt_app):
 
     The transcript no longer carries a language prefix: it is the message the
     operator reads, and the source language is already in the header line.
-    The translation keeps its label, because that line needs saying which
-    language it is in.
+    The translation keeps its language label, because that line needs saying
+    which language it is in - in its box caption, so the copyable text is
+    only the translated words.
     """
     from babelfishr.ui.timeline import TimelineView
 
@@ -62,8 +63,8 @@ def test_bubble_separates_original_from_translation(qt_app):
     assert bubble.original_label.text() != bubble.translated_label.text()
     assert bubble.original_label.text() == "hola"
     assert "es" in bubble.header.text()
-    assert "en" in bubble.translated_label.text()
-    assert "hello" in bubble.translated_label.text()
+    assert "EN" in bubble.translation_caption.text()
+    assert bubble.translated_label.text() == "hello"
 
 
 def test_failed_bubble_offers_retry_and_reassures(qt_app):

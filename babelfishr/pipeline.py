@@ -577,10 +577,12 @@ class ProcessingPipeline:
             if tx.transcript_correction or tx.translation_correction:
                 # An earlier correction would otherwise keep overriding the
                 # new words on screen. It is kept, not discarded.
-                tx.signal_metadata = dict(tx.signal_metadata, superseded_correction={
+                earlier = list(tx.signal_metadata.get("superseded_corrections") or [])
+                earlier.append({
                     "transcript": tx.transcript_correction,
                     "translation": tx.translation_correction,
                     "corrected_at": tx.corrected_at.isoformat() if tx.corrected_at else None})
+                tx.signal_metadata = dict(tx.signal_metadata, superseded_corrections=earlier)
                 tx.transcript_correction = ""
                 tx.translation_correction = ""
         tx.clear_error()

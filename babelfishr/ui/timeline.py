@@ -190,7 +190,7 @@ def _differs(source: str, target: str) -> bool:
 
 
 class WrappingText(QtWidgets.QTextEdit):
-    """Read-only, selectable rich text that always fits its width.
+    """Read-only, selectable plain text that always fits its width.
 
     A word-wrapped QLabel cannot break a run with no spaces in it, so a long
     recognition loop or identifier was cut off at the box edge. This wraps
@@ -205,7 +205,13 @@ class WrappingText(QtWidgets.QTextEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._html = ""
+        self._heights = {}                 # width -> height, for this text
         self.setReadOnly(True)
+        # Like the QLabel it replaces: focus on click only. The default
+        # (wheel focus) moved focus - and with it the row selection - to
+        # whatever transcript the pointer crossed while scrolling the thread,
+        # and made every transcript a Tab stop.
+        self.setFocusPolicy(QtCore.Qt.ClickFocus)
         self.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         self.setFrameShape(QtWidgets.QFrame.NoFrame)
         self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
@@ -217,9 +223,13 @@ class WrappingText(QtWidgets.QTextEdit):
         self.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
         self.setContextMenuPolicy(QtCore.Qt.DefaultContextMenu)
 
-    def setText(self, html: str) -> None:          # noqa: N802 - QLabel's name
-        self._html = html
-        self.setHtml(html)
+    def setText(self, text: str) -> None:          # noqa: N802 - QLabel's name
+        """Plain text, exactly as given: no markup, no escaping, whitespace
+        kept. Labels such as "edited" or the language belong in the box
+        caption, so what is selected and copied is only the words."""
+        self._html = text
+        self._heights.clear()
+        self.setPlainText(text)
         self._fit()
 
     def text(self) -> str:
@@ -232,9 +242,18 @@ class WrappingText(QtWidgets.QTextEdit):
         return True
 
     def heightForWidth(self, width: int) -> int:   # noqa: N802
-        document = self.document().clone()
-        document.setTextWidth(max(1, width - 2 * self.frameWidth()))
-        return int(document.size().height() + 0.999) + 2 * self.frameWidth()
+        height = self._heights.get(width)
+        if height is None:
+            document = self.document().clone()
+            document.setTextWidth(max(1, width - 2 * self.frameWidth()))
+            height = int(document.size().height() + 0.999) + 2 * self.frameWidth()
+            self._heights[width] = height
+        return height
+
+    def changeEvent(self, event):                  # noqa: N802
+        if event.type() in (QtCore.QEvent.FontChange, QtCore.QEvent.StyleChange):
+            self._heights.clear()                  # the same text, new metrics
+        super().changeEvent(event)
 
     def sizeHint(self):                            # noqa: N802
         return QtCore.QSize(super().sizeHint().width(), self.heightForWidth(self.width()))
@@ -663,21 +682,22 @@ class TransmissionBubble(QtWidgets.QFrame):
         # with it - the language already appears in the header line.
         original = tx.display_transcript
         if original:
-            corrected = (" <i>(edited)</i>" if tx.transcript_correction else "")
-            self.original_label.setText(f"{_escape(original)}{corrected}")
+            # Only the words: "edited" is said in the caption.
+            self.original_label.setText(original)
             self.original_label.show()
             self.transcript_box.show()
         elif tx.state in _IN_FLIGHT:
             # Same bubble, not a separate placeholder row: the operator sees
             # one line per transmission that fills itself in.
-            self.original_label.setText(
-                f"<i>{_IN_FLIGHT[tx.state]}</i>")
+            self.original_label.setText(_IN_FLIGHT[tx.state])
             self.original_label.show()
             self.transcript_box.show()
         else:
             self.original_label.hide()
             self.transcript_box.hide()
         caption, caption_tone = _transcript_caption(tx)
+        if original and tx.transcript_correction:
+            caption += " \u00b7 EDITED"
         self.transcript_caption.setText(caption)
         if self.transcript_box.property("held") != caption_tone:
             self.transcript_box.setProperty("held", caption_tone)
@@ -690,14 +710,14 @@ class TransmissionBubble(QtWidgets.QFrame):
         # noise in every bubble of an English-speaking operator's thread.
         translated = tx.display_translation
         if translated and _differs(tx.source_language, tx.target_language):
-            corrected = " <i>(edited)</i>" if tx.translation_correction else ""
-            self.translated_label.setText(
-                f"<b>{_escape(tx.target_language)}:</b> "
-                f"{_escape(translated)}{corrected}")
+            # Only the words: the language and "edited" are in the caption.
+            self.translated_label.setText(translated)
             self.translated_label.show()
             target = (tx.target_language or "").strip().upper()
-            self.translation_caption.setText(
-                f"TRANSLATION \u00b7 {target}" if target else "TRANSLATION")
+            caption = f"TRANSLATION \u00b7 {target}" if target else "TRANSLATION"
+            if tx.translation_correction:
+                caption += " \u00b7 EDITED"
+            self.translation_caption.setText(caption)
             self.translation_box.show()
         else:
             self.translated_label.hide()

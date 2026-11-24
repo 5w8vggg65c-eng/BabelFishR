@@ -484,7 +484,7 @@ def test_retry_as_speech_after_a_correction_is_unchecked_again(qt_app, config, s
     tx = store.get_transmission(tx.id)
     assert not tx.reviewed and tx.needs_review
     assert tx.display_transcript == "equipo uno en posicion"
-    assert tx.signal_metadata["superseded_correction"]["transcript"] == "gracias por ver"
+    assert tx.signal_metadata["superseded_corrections"][-1]["transcript"] == "gracias por ver"
     assert _transcript_caption(tx)[0] == "TRANSCRIPT · CHECK"
 
 
@@ -557,6 +557,8 @@ EXACT = {
                     "\u0628\u0627 \u0634\u0645\u0627 \u0635\u062d\u0628\u062a "
                     "\u06a9\u0646\u0645",
     "loop": "\u10da" * 400,
+    # Repeated spaces, a line break, a tab and characters HTML would eat.
+    "whitespace": "a  b\nc & <d>\tx  end",
 }
 
 
@@ -592,3 +594,87 @@ def test_selecting_and_copying_a_transcript_gives_the_exact_text(qt_app, window_
     pump(qt_app)
     assert clipboard.text() == text, "a mouse-selected copy differs from the transcript"
     assert len(label.toPlainText()) == len(text)        # nothing added for wrapping
+
+
+
+def test_scrolling_over_transcripts_neither_takes_focus_nor_moves_the_selection(
+        qt_app, window_with):
+    """The transcript widget takes focus on click only (as the QLabel did):
+    a wheel over another row scrolls the thread and leaves the selection."""
+    rows = [dict(transcript=f"Message {i}: " + "routine traffic " * 12) for i in range(12)]
+    window, made = window_with(rows)
+    _resize(qt_app, window, 1146)
+    timeline = window.timeline
+    first = timeline.bubble(made[0].id)
+    assert first.original_label.focusPolicy() == QtCore.Qt.ClickFocus
+    timeline.select(made[0].id)
+    pump(qt_app)
+    other = timeline.bubble(made[-1].id).original_label
+    bar = timeline.verticalScrollBar()              # TimelineView is the scroll area
+    assert bar.maximum() > 0, "not enough rows to scroll"
+    before = bar.value()
+    target = other.viewport()
+    point = QtCore.QPointF(5, 5)
+    event = QtGui.QWheelEvent(point, target.mapToGlobal(point.toPoint()).toPointF(),
+                              QtCore.QPoint(0, 0), QtCore.QPoint(0, -120),
+                              QtCore.Qt.NoButton, QtCore.Qt.NoModifier,
+                              QtCore.Qt.NoScrollPhase, False)
+    QtWidgets.QApplication.sendEvent(target, event)
+    pump(qt_app)
+    assert QtWidgets.QApplication.focusWidget() is not other
+    assert timeline.selected_transmission().id == made[0].id, "the selection moved"
+    # Qt hands an ignored wheel event on to the parent widgets - the thread's
+    # scroll area - only for real (spontaneous) input, which a test cannot
+    # synthesise; a plain row frame is the same. What can be checked is the
+    # precondition: the transcript leaves the event unaccepted, as the row
+    # frame does, and the thread itself scrolls when the event reaches it.
+    assert not event.isAccepted(), "the transcript kept the wheel event"
+    QtWidgets.QApplication.sendEvent(timeline.viewport(), QtGui.QWheelEvent(
+        point, timeline.viewport().mapToGlobal(point.toPoint()).toPointF(),
+        QtCore.QPoint(0, 0), QtCore.QPoint(0, -120), QtCore.Qt.NoButton,
+        QtCore.Qt.NoModifier, QtCore.Qt.NoScrollPhase, False))
+    pump(qt_app)
+    assert bar.value() != before
+    assert timeline.selected_transmission().id == made[0].id
+
+
+
+def test_edited_and_translated_text_copies_as_just_the_words(qt_app, window_with):
+    """"edited" and the language are said in the captions; copying the
+    transcript or the translation gives only the operator's words."""
+    window, made = window_with([dict(
+        transcript="unit one  in position", source_language="es", target_language="en",
+        translation="team one in position",
+        transcript_correction="unidad uno  en posici\u00f3n\tcambio",
+        translation_correction="unit one in position,\nover")])
+    _resize(qt_app, window, 1146)
+    bubble = window.timeline.bubble(made[0].id)
+    assert bubble.transcript_caption.text().endswith("\u00b7 EDITED")
+    assert bubble.translation_caption.text() == "TRANSLATION \u00b7 EN \u00b7 EDITED"
+    clipboard = QtWidgets.QApplication.clipboard()
+    for label, expected in ((bubble.original_label, "unidad uno  en posici\u00f3n\tcambio"),
+                            (bubble.translated_label, "unit one in position,\nover")):
+        clipboard.clear()
+        label.selectAll()
+        label.copy()
+        pump(qt_app)
+        assert clipboard.text() == expected
+
+
+
+def test_every_superseded_correction_is_kept(qt_app, config, store, tmp_path):
+    """Two corrections, each followed by Retry as speech: both are kept."""
+    from test_live_audio_fixes import PairTranslation, ScriptedTranscription, _retry
+    from test_live_audio_fixes import result as scripted
+
+    from babelfishr.app import BabelFishRApp
+
+    tx = _held(store, tmp_path)
+    app = BabelFishRApp(config=config, store=store)
+    engine = ScriptedTranscription(scripted("equipo uno", ratio=0.01, nsp=0.8, language="es"))
+    for words in ("first correction", "second correction"):
+        app.correct(tx.id, transcript=words, translation=words)
+        _retry(config, store, engine, PairTranslation(pairs=(("es", "en"),)), tx.id,
+               source_language="es")
+    kept = store.get_transmission(tx.id).signal_metadata["superseded_corrections"]
+    assert [c["transcript"] for c in kept] == ["first correction", "second correction"]
