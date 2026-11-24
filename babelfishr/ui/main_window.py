@@ -763,12 +763,14 @@ class MainWindow(QtWidgets.QMainWindow):
         quiet_label = QtWidgets.QLabel("End a message after")
         grid.addWidget(quiet_label, 2, 0)
         self.quiet_seconds_box = QtWidgets.QDoubleSpinBox()
-        self.quiet_seconds_box.setRange(0.5, 30.0)
+        # The same bounds DetectorSettings.validate() accepts, so a saved
+        # value is shown as what it is.
+        self.quiet_seconds_box.setRange(0.1, 30.0)
         self.quiet_seconds_box.setSingleStep(0.5)
         self.quiet_seconds_box.setDecimals(1)
         self.quiet_seconds_box.setSuffix(" s of quiet")
         self.quiet_seconds_box.setValue(
-            max(0.5, min(30.0, float(self.app.config.detector.hang_time))))
+            max(0.1, min(30.0, float(self.app.config.detector.hang_time))))
         self.quiet_seconds_box.setAccessibleName("Seconds of quiet that end a message")
         self.quiet_seconds_box.setToolTip(
             "A message ends when the input's audio level stays below the "

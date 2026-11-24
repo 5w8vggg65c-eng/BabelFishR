@@ -206,6 +206,23 @@ def test_the_window_sets_the_quiet_in_seconds(qt_app, default_config, tmp_path):
         assert not box.isEnabled()
         window._set_controls_enabled(True)
         assert box.isEnabled()
+        # The control's range is the validated range: a saved 0.2 shows 0.2.
+        assert box.minimum() == 0.1 and box.maximum() == 30.0
+    finally:
+        window.close()
+        app.close()
+
+
+def test_a_short_saved_quiet_is_displayed_as_saved(qt_app, default_config):
+    from babelfishr.ui.main_window import MainWindow
+
+    default_config.detector.hang_time = 0.2
+    default_config.detector.to_settings()          # valid
+    app = BabelFishRApp(config=default_config)
+    window = MainWindow(app)
+    try:
+        assert window.quiet_seconds_box.value() == pytest.approx(0.2)
+        assert app.config.detector.hang_time == pytest.approx(0.2)
     finally:
         window.close()
         app.close()
