@@ -63,15 +63,32 @@ def audio(seconds=2.0, seed=0):
 
 
 def vad_returns(monkeypatch, value):
-    calls = []
+    """Stub the supported faster-whisper VAD API (get_speech_timestamps),
+    which every version of the engine calls - not the engine's own helper -
+    so these tests judge behaviour, not the presence of a function.
 
-    def fake(samples, sample_rate=TARGET_RATE):
+    *value*: voiced samples to report (0 = none), None = the detector is not
+    available (import fails), or an exception for the detector to raise.
+    Returns the list of calls made to it."""
+    calls = []
+    if value is None:
+        monkeypatch.setitem(sys.modules, "faster_whisper.vad", None)   # ImportError
+        return calls
+    vad = types.ModuleType("faster_whisper.vad")
+
+    class VadOptions:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    def get_speech_timestamps(samples, vad_options=None, sampling_rate=16000, **kwargs):
         calls.append(np.asarray(samples).size)
         if isinstance(value, Exception):
             raise value
-        return value
+        return [{"start": 0, "end": int(value)}] if value else []
 
-    monkeypatch.setattr(whisper_local, "_voiced_samples", fake)
+    vad.VadOptions, vad.get_speech_timestamps = VadOptions, get_speech_timestamps
+    monkeypatch.setitem(sys.modules, "faster_whisper.vad", vad)
+    monkeypatch.setitem(sys.modules, "onnxruntime", types.ModuleType("onnxruntime"))
     return calls
 
 
@@ -80,7 +97,9 @@ def test_automatic_language_and_zero_voiced_samples_decode_once(engine, monkeypa
     clip = audio()
     result = engine.transcribe(clip, TARGET_RATE)
     samples, kwargs = engine.fake.calls[0]
-    assert kwargs["temperature"] == 0.0                     # one decode temperature
+    assert kwargs.get("temperature") == 0.0, (                # one decode temperature
+        f"Whisper was asked for {kwargs.get('temperature', 'the default fallback')}")
+    assert samples.dtype == np.float32 and samples.shape == clip.shape
     assert np.array_equal(samples, clip)                    # the full, unchanged audio
     assert len(calls) == 1, "the detector ran more than once"
     assert result.text == "noise words"                     # text kept, not dropped
@@ -115,18 +134,7 @@ def test_a_specified_language_keeps_full_decoding_even_with_zero_voice(engine,
 
 
 def test_a_failing_detector_falls_back_to_default_decoding(engine, monkeypatch):
-    broken = types.ModuleType("faster_whisper.vad")
-
-    class VadOptions:
-        def __init__(self, **kwargs):
-            pass
-
-    def get_speech_timestamps(*args, **kwargs):
-        raise RuntimeError("onnx session failed")
-
-    broken.VadOptions, broken.get_speech_timestamps = VadOptions, get_speech_timestamps
-    monkeypatch.setitem(sys.modules, "faster_whisper.vad", broken)
-    monkeypatch.setitem(sys.modules, "onnxruntime", types.ModuleType("onnxruntime"))
+    vad_returns(monkeypatch, RuntimeError("onnx session failed"))
     result = engine.transcribe(audio(), TARGET_RATE)
     assert "temperature" not in engine.fake.calls[0][1]
     assert result.text == "noise words" and result.speech_seconds is None
