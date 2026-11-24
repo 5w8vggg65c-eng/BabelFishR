@@ -25,6 +25,8 @@ CSV_COLUMNS = [
     "target_language", "translation", "translation_correction", "state",
     "tags", "bookmarked", "reviewed", "notes", "audio_path",
     "transcription_engine", "translation_engine",
+    # Appended, so existing columns keep their positions.
+    "needs_review", "translation_status",
 ]
 
 
@@ -46,6 +48,9 @@ def to_csv(transmissions: Sequence[Transmission]) -> str:
     writer.writeheader()
     for tx in transmissions:
         row = tx.to_dict()
+        unresolved = (tx.signal_metadata or {}).get("translation_unresolved")
+        row["translation_status"] = ("not attempted: language unresolved"
+                                     if unresolved else "")
         row["tags"] = ",".join(tx.tags)
         writer.writerow({k: row.get(k, "") for k in CSV_COLUMNS})
     return buffer.getvalue()

@@ -130,6 +130,26 @@ def _speech_check_note(tx: Transmission) -> str:
             f"you choose.")
 
 
+def _translation_unresolved_note(tx: Transmission) -> str:
+    """Why no translation was attempted (pipeline TRANSLATION_UNRESOLVED),
+    or "". Visible until the message is retried or its words are saved."""
+    unresolved = (tx.signal_metadata or {}).get("translation_unresolved") or {}
+    if not unresolved:
+        return ""
+    guessed = unresolved.get("guessed_language") or "?"
+    target = unresolved.get("target_language") or "?"
+    confidence = unresolved.get("language_confidence")
+    shown = f"{confidence:.0%}" if isinstance(confidence, (int, float)) else "unknown certainty"
+    words = (f"Translation not attempted: language unresolved. Automatic "
+             f"detection guessed '{guessed}' ({shown}), and no {guessed}->{target} "
+             f"language pack is installed. ")
+    if operator_checked(tx):
+        return words + "You have since checked and saved this message."
+    return words + ("If this is speech, choose its language with Message > "
+                    "Retry as speech in... (Ctrl+L). The recording and "
+                    "transcript are kept.")
+
+
 def operator_checked(tx: Transmission) -> bool:
     """The operator saved this message's transcript/translation (Edit
     transcript and translation) and it has not been re-recognised since.
@@ -739,6 +759,9 @@ class TransmissionBubble(QtWidgets.QFrame):
         speech_note = _speech_check_note(tx)
         if speech_note:
             details.append(_escape(speech_note))
+        unresolved_note = _translation_unresolved_note(tx)
+        if unresolved_note:
+            details.append(_escape(unresolved_note))
         attempt = tx.latest_analysis
         if attempt is not None:
             line = (f"Digital analysis ({attempt.engine} "
@@ -767,6 +790,8 @@ class TransmissionBubble(QtWidgets.QFrame):
         pending = STATE_LABELS.get(tx.state, "")
         if pending:
             status_bits.append(pending)
+        if (tx.signal_metadata or {}).get("translation_unresolved"):
+            status_bits.append("translation not attempted")
         if tx.needs_review and tx.state is not ProcessingState.FAILED:
             status_bits.append("needs review")
         self.status_label.setText("  ·  ".join(status_bits))

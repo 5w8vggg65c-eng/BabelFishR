@@ -997,8 +997,10 @@ class Store:
                   -- A speech-check flag clears only once the operator has
                   -- saved the words (Transmission.needs_review), not on a
                   -- note or a Retry as speech.
-                  OR (json_extract(t.signal_metadata, '$.speech_check.verdict')
-                      IN ('likely_noise', 'uncertain')
+                  OR ((json_extract(t.signal_metadata, '$.speech_check.verdict')
+                       IN ('likely_noise', 'uncertain')
+                       OR json_extract(t.signal_metadata,
+                                       '$.translation_unresolved') IS NOT NULL)
                       AND NOT (t.reviewed = 1
                                AND (COALESCE(t.transcript_correction, '') != ''
                                     OR COALESCE(t.translation_correction, '') != ''))))

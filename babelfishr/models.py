@@ -783,8 +783,14 @@ class Transmission:
         # Retry as speech, which only lifts the translation hold, and not by
         # a note: an older version marked a message reviewed when only a
         # note was saved, and a note does not check the recognised words.
-        check = (self.signal_metadata or {}).get("speech_check") or {}
+        metadata = self.signal_metadata or {}
+        check = metadata.get("speech_check") or {}
         if (check.get("verdict") in ("likely_noise", "uncertain")
+                and not (self.reviewed and self.has_correction)):
+            return True
+        # Translation not attempted, language unresolved (pipeline
+        # TRANSLATION_UNRESOLVED): same rule - saved words clear it.
+        if (metadata.get("translation_unresolved")
                 and not (self.reviewed and self.has_correction)):
             return True
         if self.reviewed:

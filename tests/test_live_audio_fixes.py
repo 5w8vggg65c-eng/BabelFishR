@@ -358,12 +358,15 @@ def test_uncertain_automatic_language_is_not_reported_as_a_missing_pack(
                       ScriptedTranscription(result("Thanks for watching.", ratio=0.5,
                                                    language="nn", language_confidence=0.696)),
                       translation, target_language="en")
-    assert tx.state is ProcessingState.FAILED and tx.error.stage == "translation"
-    assert "language uncertain" in tx.error.message
-    assert "'nn' (70%)" in tx.error.message
-    assert "Source language" in tx.error.message
+    # Not a failure: translation was not attempted and the message says why
+    # (tests/test_translation_unresolved.py covers the whole state).
+    assert tx.state is ProcessingState.COMPLETE and tx.error is None
+    unresolved = tx.signal_metadata["translation_unresolved"]
+    assert unresolved["reason"] == "language-uncertain"
+    assert "'nn' (70%)" in unresolved["message"]
+    assert "Source language" in unresolved["message"]
     assert tx.transcript == "Thanks for watching."
-    assert translation.calls == 0
+    assert translation.calls == 0 and tx.needs_review
 
 
 def test_confident_language_without_a_pack_says_the_pack_is_missing(
@@ -480,8 +483,8 @@ def test_retry_as_speech_fixes_a_wrong_automatic_language(config, store, tmp_pat
     translation = PairTranslation(pairs=())
     app, tx = run_one(config, store, tmp_path, transcription, translation,
                       target_language="en")
-    assert tx.state is ProcessingState.FAILED
-    assert "Retry as speech in" in tx.error.message
+    assert tx.state is ProcessingState.COMPLETE and tx.error is None
+    assert "Retry as speech in" in tx.signal_metadata["translation_unresolved"]["message"]
 
     _retry(config, store, transcription, translation, tx.id, source_language="en")
     tx = store.get_transmission(tx.id)

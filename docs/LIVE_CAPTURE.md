@@ -61,6 +61,19 @@ transcript: a looping line has scored 0.93. The transcript and the original
 audio are always kept. **Retry as speech in…** re-runs a message in a
 language the operator chooses.
 
+## Language unresolved
+
+When automatic detection is unsure of the language (below 80%) and no
+language pack is installed for the guessed pair, translation is **not
+attempted**. The message is complete, not failed: the transcript and audio
+are kept, it says "Translation not attempted: language unresolved" with
+the guess and its certainty, and it is marked for review (and listed in
+the review queue, exports included) until it is retried in a chosen
+language with **Message ▸ Retry as speech in…** (Ctrl+L) or its words are
+saved with Edit. A missing pack for a confident or operator-chosen
+language, a broken translation engine, and a provider error are still
+reported as failures.
+
 ## Still to verify on hardware
 
 Not verified here (no SDR, receiver or suitable cables in the development

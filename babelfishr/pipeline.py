@@ -173,6 +173,14 @@ NO_SPEECH_CONFIDENCE = 0.5
 #: uncertain rather than as a missing language pack.
 LANGUAGE_CERTAIN = 0.8
 
+# signal_metadata key: translation was not attempted because an uncertain
+# automatic language guess names a pair with no installed pack. Not a
+# failure (nothing broke) and not a success (nothing was translated): the
+# message needs review until it is retried in a chosen language or the
+# operator saves the words. Cleared whenever the message is recognised or
+# translated again.
+TRANSLATION_UNRESOLVED = "translation_unresolved"
+
 
 def degenerate_text(text: str) -> tuple:
     """Does a transcript look like recognition output with no speech behind
@@ -705,6 +713,7 @@ class ProcessingPipeline:
         check = assess_speech(result)
         metadata = dict(tx.signal_metadata or {})
         metadata.pop("speech_check", None)
+        metadata.pop(TRANSLATION_UNRESOLVED, None)
         if check is not None:
             metadata["speech_check"] = check
         tx.signal_metadata = metadata
@@ -720,11 +729,12 @@ class ProcessingPipeline:
             return False
         return True
 
-    def _missing_pair(self, tx: Transmission, target: str) -> str:
-        """Why this pair cannot be translated, in words, or "".
+    def _missing_pair(self, tx: Transmission, target: str) -> tuple:
+        """``(kind, words)``: why this pair cannot be translated, or ("", "").
 
-        Tells an uncertain automatic language guess apart from a language
-        pack that is really missing. Skipped when the engine installs packs
+        ``kind`` is "uncertain" for an uncertain automatic language guess
+        (the language is unresolved; nothing failed) or "missing" for a
+        language pack that is really missing. Skipped when the engine installs packs
         itself (Online / Setup), which must get its chance. A capability
         lookup that raises EngineError/EngineUnavailable propagates to the
         caller's handled translation-failure path.
@@ -734,7 +744,7 @@ class ProcessingPipeline:
         if (not source or source == target or not callable(supports)
                 or getattr(self.translation, "auto_install", False)
                 or supports(source, target)):
-            return ""
+            return "", ""
         # A pair can also look missing because the engine itself is broken
         # (Argos not importable, or no packs readable at all): report that,
         # with the engine's own reason, rather than blame one language pack.
@@ -747,17 +757,22 @@ class ProcessingPipeline:
         if (tx.source_language_mode is not SourceLanguageMode.SPECIFIED
                 and (confidence is None or confidence < LANGUAGE_CERTAIN)):
             shown = f"{confidence:.0%}" if confidence is not None else "unknown certainty"
-            return (f"language uncertain: automatic detection guessed '{source}' "
-                    f"({shown}), and no {source}->{target} pack is installed. "
-                    f"If the speech is another language, choose it with this "
-                    f"message's Retry as speech in... (Session options > "
-                    f"Source language sets it for new recordings).")
-        return (f"no {source}->{target} language pack is installed. Install "
-                f"it in Online / Setup (Tools > Setup assistant), then Retry.")
+            return "uncertain", (
+                f"Translation not attempted: language unresolved. Automatic "
+                f"detection guessed '{source}' ({shown}), and no "
+                f"{source}->{target} pack is installed. If this is speech, "
+                f"choose its language with Message > Retry as speech in... "
+                f"(Session options > Source language sets it for new "
+                f"recordings).")
+        return "missing", (f"no {source}->{target} language pack is installed. Install "
+                           f"it in Online / Setup (Tools > Setup assistant), then Retry.")
 
     def _translate(self, tx: Transmission) -> None:
         if self.translation is None:
             return
+        if TRANSLATION_UNRESOLVED in (tx.signal_metadata or {}):
+            tx.signal_metadata = {k: v for k, v in tx.signal_metadata.items()
+                                  if k != TRANSLATION_UNRESOLVED}
         target = tx.target_language or self.config.translate.target_language
         if (self.config.translate.skip_if_same_language
                 and tx.source_language and tx.source_language == target):
@@ -780,7 +795,23 @@ class ProcessingPipeline:
 
         try:
             self._engine_gate("translation")
-            missing = self._missing_pair(tx, target)
+            kind, missing = self._missing_pair(tx, target)
+            if kind == "uncertain":
+                # Not attempted, and said so: the transcript and audio stay,
+                # the message is marked for review (needs_review and the
+                # review queue read this marker), and no FAILED error claims
+                # a breakage that did not happen.
+                tx.translation = ""
+                tx.translation_engine = ""
+                tx.target_language = target
+                tx.signal_metadata = dict(tx.signal_metadata or {}, **{
+                    TRANSLATION_UNRESOLVED: {
+                        "reason": "language-uncertain",
+                        "guessed_language": tx.source_language,
+                        "language_confidence": tx.language_confidence,
+                        "target_language": target,
+                        "message": missing}})
+                return
             if missing:
                 tx.fail("translation", missing)
                 self.store.save_transmission(tx)
