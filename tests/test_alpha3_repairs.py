@@ -480,7 +480,8 @@ def test_the_default_bubble_has_no_waveform(qt_app):
     assert "Play original recording" in menu_labels
     assert "Play decoded audio" in menu_labels
     assert "Export audio..." in menu_labels
-    assert any("Analyze as digital" in text for text in menu_labels)
+    # Digital analysis is KingFishR's (tests/kingfishr/test_product_isolation.py).
+    assert not any("Analyze as digital" in text for text in menu_labels)
     assert any("Edit transcript" in text for text in menu_labels)
     assert any("tags" in text.lower() for text in menu_labels)
     assert any("note" in text.lower() for text in menu_labels)

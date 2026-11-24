@@ -249,9 +249,10 @@ def test_secondary_actions_live_in_an_overflow_menu(qt_app):
     for expected in ("Edit transcript and translation...", "Edit tags...",
                      "Bookmark", "Transcribe anyway", "Export audio..."):
         assert expected in labels, f"{expected} missing from the overflow menu"
-    # Automatic hunting and a specific-mode submenu are both offered.
-    assert any(label.startswith("Analyze as digital") for label in labels)
-    assert any("specific mode" in label for label in labels)
+    # Digital analysis (automatic hunting, specific mode) is KingFishR's:
+    # tests/kingfishr/test_product_isolation.py checks it is offered there.
+    assert not any(label.startswith("Analyze as digital") for label in labels)
+    assert not any("specific mode" in label for label in labels)
 
 
 def test_skipped_recording_offers_transcribe_anyway(qt_app):

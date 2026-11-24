@@ -111,7 +111,7 @@ Everything below is a different thing you might be selecting.
 | **A USB audio interface** | A separate box with a line input. | The normal way to bring analogue receiver audio in. |
 | **Analogue radio audio through a USB interface** | Radio accessory/speaker output → cable → interface line input → Mac. | The standard FalconClaw path. What the interface hears is what you get. |
 | **Native USB audio from a radio** | A radio that presents itself to the Mac as a USB sound device. | Simpler wiring, same result. It appears in the list like any other input. |
-| **SDR receiver** | Not part of BabelFishR. | See KingFishR (`kingfishr/README.md`). |
+| **SDR input** | A software-defined radio as the receiver. | Not part of BabelFishR: see KingFishR (`kingfishr/README.md`). |
 
 ### The rules BabelFishR follows about your input
 
@@ -212,6 +212,11 @@ This distinction matters more than any feature list.
   **no audio has actually been transcribed**.
 - **Real translation output.** No language pack could be downloaded, so **no
   text has actually been translated**.
+- **DSD-neo and any SDR.** Not part of BabelFishR. In KingFishR the DSD-neo
+  integration is tested against a stub binary and the SDR receiver against
+  stubs and synthetic audio; the real DSD-neo binary has never run, no real
+  digital traffic has been decoded, and no SDR device driver is bundled or
+  claimed.
 - **Apple notarization**, unless a specific release says otherwise.
 
 Everything above is written and reviewable, but "written" is not "working".

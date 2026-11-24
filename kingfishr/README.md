@@ -10,11 +10,25 @@ It is a separate distribution in this repository. It depends on
 
 ## Starting it
 
+From the repository root, install the shared core with the desktop app,
+live audio capture, local transcription and local translation first, then
+KingFishR itself (it depends on `babelfishr`, which must already be
+installed from this checkout):
+
 ```bash
-pip install ./            # BabelFishR, from the repository root
-pip install ./kingfishr   # KingFishR
-kingfishr-gui             # or: kingfishr <command>, python -m kingfishr
+pip install ".[gui,audio,asr,translate]"
 ```
+
+```bash
+pip install ./kingfishr
+```
+
+```bash
+kingfishr-gui
+```
+
+`kingfishr <command>` and `python -m kingfishr` start the command line.
+SDR++ and DSD-neo are separate programs, installed as described below.
 
 Only these entry points activate KingFishR (`kingfishr.activate()`): they
 set its product identity and register its hooks

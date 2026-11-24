@@ -230,7 +230,7 @@ def test_build_test_selection_collects_the_whole_deterministic_suite():
         "tests/test_model_selection.py",
         "tests/test_runtime_paths.py",
         "tests/test_glossary_path.py",
-        "tests/test_dsd_cli.py",
+        "tests/kingfishr/test_dsd_cli.py",   # moved with the DSD code
         "tests/test_offline_integration.py",
         "tests/test_gui_setup.py",
     ]
