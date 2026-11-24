@@ -3,8 +3,10 @@
 Order of resolution:
 
 1. the process environment (``ANTHROPIC_API_KEY`` and friends);
-2. a ``.env`` file next to the config, if present (developer convenience);
-3. the macOS Keychain, via ``security find-generic-password``.
+2. an explicitly supplied ``.env`` path, then the running product's own
+   implicit ``.env`` files (developer convenience; see _implicit_dotenv_files);
+3. the macOS Keychain, via ``security find-generic-password``, under the
+   running product's own service (keychain_service).
 
 Nothing here writes a credential to disk except :func:`store_in_keychain`,
 which the operator triggers explicitly.
@@ -18,7 +20,7 @@ import pathlib
 import platform
 import shutil
 import subprocess
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 log = logging.getLogger(__name__)
 
@@ -34,11 +36,22 @@ def keychain_service() -> str:
     return product().name
 
 
-def _product_dotenv() -> pathlib.Path:
-    """The running product's own ``~/.config/<product>/.env``."""
-    from ..extensions import product
+def _implicit_dotenv_files() -> List[pathlib.Path]:
+    """The .env files read without being named, for the running product.
 
-    return pathlib.Path.home() / ".config" / product().config_stem / ".env"
+    BabelFishR (unchanged): ``./.env``, then ``~/.config/babelfishr/.env``.
+    Another product (KingFishR) reads only its own
+    ``~/.config/<product>/.env``: a ``.env`` in the working directory may
+    hold BabelFishR's key, so it is not an implicit fallback there. An
+    explicit ``dotenv_path`` and the process environment stay overrides.
+    """
+    from ..extensions import BABELFISHR, product
+
+    running = product()
+    own = pathlib.Path.home() / ".config" / running.config_stem / ".env"
+    if running == BABELFISHR:
+        return [pathlib.Path.cwd() / ".env", own]
+    return [own]
 
 
 def _read_dotenv(path: pathlib.Path) -> Dict[str, str]:
@@ -61,7 +74,7 @@ def get_secret(name: str, dotenv_path: Optional[str] = None) -> Optional[str]:
         return value.strip()
 
     candidates = [pathlib.Path(dotenv_path)] if dotenv_path else []
-    candidates += [pathlib.Path.cwd() / ".env", _product_dotenv()]
+    candidates += _implicit_dotenv_files()
     for candidate in candidates:
         found = _read_dotenv(candidate).get(name)
         if found:
@@ -118,7 +131,7 @@ def describe_source(name: str) -> str:
     """Where a secret would come from, for the settings UI."""
     if os.environ.get(name):
         return "environment variable"
-    for candidate in (pathlib.Path.cwd() / ".env", _product_dotenv()):
+    for candidate in _implicit_dotenv_files():
         if _read_dotenv(candidate).get(name):
             return f".env file ({candidate})"
     if get_from_keychain(name):

@@ -85,3 +85,23 @@ def test_babelfishr_keeps_its_existing_service(keychain):
     assert credentials.keychain_service() == credentials.KEYCHAIN_SERVICE == "BabelFishR"
     assert credentials.get_secret(NAME) == "babelfishr-secret-do-not-share"
     assert set(_services(calls)) == {"BabelFishR"}
+
+
+def test_kingfishr_does_not_fall_back_to_a_shared_working_directory_env(keychain, tmp_path):
+    (tmp_path / ".env").write_text(f"{NAME}=shared-cwd-dotenv-secret\n")
+    assert credentials.get_secret(NAME) is None
+    assert credentials.describe_source(NAME) == "not configured"
+
+
+def test_explicit_overrides_still_apply_in_kingfishr(keychain, tmp_path, monkeypatch):
+    named = tmp_path / "chosen.env"
+    named.write_text(f"{NAME}=explicit-dotenv-secret\n")
+    assert credentials.get_secret(NAME, dotenv_path=str(named)) == "explicit-dotenv-secret"
+    monkeypatch.setenv(NAME, "process-environment-secret")
+    assert credentials.get_secret(NAME) == "process-environment-secret"
+
+
+def test_babelfishr_still_reads_the_working_directory_env(keychain, tmp_path):
+    extensions.reset()
+    (tmp_path / ".env").write_text(f"{NAME}=babelfishr-cwd-secret\n")
+    assert credentials.get_secret(NAME) == "babelfishr-cwd-secret"
