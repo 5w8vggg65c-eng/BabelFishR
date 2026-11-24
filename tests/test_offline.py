@@ -188,7 +188,8 @@ def test_record_only_needs_no_engines(config, store, fixture_wav):
     app.stop_session()
 
 
-def test_field_offline_records_even_with_no_processing(config, store, fixture_wav):
+def test_field_offline_records_even_with_no_processing(config, store, fixture_wav,
+                                                       expected_transmissions):
     """Transcription unavailable must never stop capture."""
     config.mode = OperatingMode.FIELD_OFFLINE.value
     app = BabelFishRApp(config=config, store=store)
@@ -198,7 +199,7 @@ def test_field_offline_records_even_with_no_processing(config, store, fixture_wa
 
     app.start_session(replay_path=fixture_wav, name="offline")
     app.run_replay()
-    assert len(app.transmissions()) == 5
+    assert len(app.transmissions()) == expected_transmissions
     for tx in app.transmissions():
         assert pathlib.Path(tx.audio_path).exists()
     app.stop_session()

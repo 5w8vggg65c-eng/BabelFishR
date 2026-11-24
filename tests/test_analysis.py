@@ -321,12 +321,13 @@ def test_untested_sdr_driver_is_refused_honestly(config):
     assert "not bundled" in status["reason"]
 
 
-def test_sdr_absence_does_not_affect_the_audio_pipeline(app, fixture_wav):
+def test_sdr_absence_does_not_affect_the_audio_pipeline(app, fixture_wav,
+                                                        expected_transmissions):
     app.config.sdr.driver = "rtlsdr"  # configured but unavailable
     app.select_engines()
     app.start_session(replay_path=fixture_wav, name="no-sdr")
     app.run_replay()
-    assert len(app.transmissions()) == 5
+    assert len(app.transmissions()) == expected_transmissions
 
 
 def test_recorded_iq_source_satisfies_the_signal_interface(tmp_path):

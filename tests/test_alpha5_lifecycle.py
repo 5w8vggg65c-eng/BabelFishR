@@ -60,7 +60,12 @@ class HoldingEngine(MockTranscriptionEngine):
     name = "Test holding transcription"
 
     def __init__(self):
-        super().__init__()
+        # One non-English phrase, so translation always runs. The mock picks
+        # a phrase by hashing the audio; which recording hashes to which
+        # language is incidental (it moved when the pre/post-roll widened),
+        # and an English one would correctly skip translation - not what
+        # these lifecycle tests are about.
+        super().__init__(phrases=[("es", "equipo uno en posicion esperando instrucciones")])
         self.entered = threading.Event()
         self.release = threading.Event()
         self.closed = False

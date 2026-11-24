@@ -94,7 +94,9 @@ def test_full_pipeline_runs_with_networking_broken(no_network, offline_app,
     app.run_replay()
 
     transmissions = app.transmissions()
-    assert len(transmissions) == 5
+    from conftest import recorded_events
+
+    assert len(transmissions) == len(recorded_events(fixture))
     for tx in transmissions:
         assert pathlib.Path(tx.audio_path).exists()
     assert any(tx.transcript for tx in transmissions)
