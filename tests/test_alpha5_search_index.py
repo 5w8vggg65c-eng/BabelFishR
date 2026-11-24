@@ -453,13 +453,20 @@ def test_a_replayed_recording_writes_each_index_entry_only_when_its_text_changes
     app.start_session(replay_path=fixture_wav, name="run")
     app.run_replay()
 
+    # While the Python trace callback is installed, this thread touches the
+    # connection only under the store's lock. macOS run 29 stalled silently
+    # here; the reproduced stack (Linux, this test with a tighter poll) was:
+    # this thread in an unlocked set_trace_callback(None) right after
+    # stop_session(), holding the GIL and waiting for SQLite's connection
+    # mutex, while stop_session's background "babelfishr-session-end" thread
+    # was in Store.close_session under the store lock, holding that mutex and
+    # waiting for the GIL to run the callback. pytest-timeout needs the GIL,
+    # so it could not report it. Waiting on the store lock releases the GIL.
+    # The polling reads take the lock for the same reason: an unlocked read
+    # beside a locked write is the same pattern. (Product code installs no
+    # Python callback on the connection; its unlocked cross-thread reads are
+    # a separate, still-open concurrency issue.)
     def settled():
-        # Read under the store's lock while the trace callback is installed.
-        # The pipeline worker writes under that lock; an unlocked read from
-        # this thread can deadlock with it in native code (the worker holds
-        # SQLite's connection mutex and waits for the GIL to run the Python
-        # callback; this thread holds the GIL and waits for the mutex), which
-        # stalled macOS run 29 silently. Waiting on the lock releases the GIL.
         with store._lock:
             return all(tx.state in (ProcessingState.COMPLETE, ProcessingState.FAILED,
                                     ProcessingState.SKIPPED)
