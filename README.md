@@ -188,11 +188,11 @@ packaged executable SHA-256
   fallback checks.
 - **Local probes of the packaged candidate on the owner's Mac** (after the
   operator approved its first launch; Field Offline with locally prepared
-  models; recorded fixtures replayed in real time, not a live microphone or
-  radio):
-  - A 44 s public English speech fixture with the 3 s quiet: exactly two
-    messages. Pauses of about 1 s stayed inside a message and 4 s gaps
-    split them. The first text arrived 21.22 s before the input ended, both
+  models; recorded fixture replays, not a live microphone or radio):
+  - A 44 s public English speech fixture with the 3 s quiet, replayed in
+    real time: exactly two messages. Pauses of about 1 s stayed inside a
+    message and 4 s gaps split them. The first text appeared 21.22 s after
+    the replay started, while the 44 s input was still running; both
     messages completed, and the audio kept in each message matched the
     source exactly. Low-level samples before and after the messages are
     not part of any message (by design), so this fixture does not show
@@ -202,7 +202,8 @@ packaged executable SHA-256
   - The public French clip: with French specified, 5.10 s; with automatic
     language, 6.34 s. Both were recognised as French and translated to
     English by the local faster-whisper and Argos engines, with no errors.
-  - A 55 s continuous replay: first text at 33.32 s, four messages, and all
+  - A 55 s continuous fixture, replayed in real time: first text at 33.32 s
+    after the start, while the input was still running; four messages, and all
     2,640,000 samples kept in order with no gaps or repeats; 59.07 s in all.
   - In the window: the candidate opens, there is no Receiver menu, no
     "possibly digital" label appeared (including on older stored rows), and
@@ -213,10 +214,13 @@ packaged executable SHA-256
   --strict` passed. The build is ad-hoc signed and **not notarized**: its
   first launch needed the operator's approval in macOS. The installed app
   opened normally in Field Offline, Idle, with its local engines ready, no
-  Receiver menu and no "possibly digital" label. The quiet control shows
-  3.0 s and the saved setting is 3.0 s (changed from 0.8 s by the operator;
-  no other setting changed). The existing recordings and database were
-  checked unchanged afterwards.
+  Receiver menu and no "possibly digital" label. The quiet was set to 3.0 s
+  through the window's control at the owner's request (from 0.8 s); the
+  control shows 3.0 s and the saved setting is 3.0 s. Other effective
+  preferences were preserved (the existing segmentation defaults were
+  written out explicitly). Afterwards the existing recordings were
+  hash-verified unchanged, and the database kept all its records and
+  passed its integrity check.
 - **Not yet verified for build 34:** live microphone capture, any physical
   radio or interface, and network egress by an independent capture.
 
