@@ -301,11 +301,40 @@ def test_the_readme_is_honest_about_notarization():
 
 
 def test_the_readme_states_the_hardware_that_was_never_tested():
+    """The remaining limits and the product boundary, as they stand - not
+    absolutes that later evidence contradicted."""
     text = _readme()
-    section = text[text.index("### NOT tested"):]
-    for item in ("FalconClaw", "USB audio interface", "DSD-neo", "SDR",
-                 "M5 MacBook Air"):
-        assert item in section, f"the untested list omits {item}"
+    section = text[text.index("### Not yet validated"):text.index("## Signal path")]
+    flat = " ".join(section.split())
+    # Physical hardware and field conditions stay unclaimed.
+    for item in ("physical radio", "FalconClaw", "USB audio interface",
+                 "real receiver audio"):
+        assert item in flat, f"the remaining-limits list omits {item!r}"
+    # The current build still needs its own Mac checks.
+    assert "lean post-split build on a Mac" in flat
+    # No blanket quality guarantee and no independent zero-egress claim.
+    assert "no quality guarantee" in flat
+    assert "no zero-egress certification is claimed" in flat
+    # SDR / DSD-neo: KingFishR's, with no over-the-air or hardware claim.
+    assert "Not part of BabelFishR" in flat and "KingFishR" in flat
+    assert "no RTL-SDR, over-the-air signal or Mac SDR setup has been validated" in flat
+    # Pre-split Mac evidence is dated to its build, and kept apart from it.
+    whole = " ".join(text.split())
+    assert "Verified on a real Mac before the split (2026-11-24, build 32, commit `2278dbb`)" in whole
+    assert "has not yet been built, installed or run on a Mac" in whole
+
+
+def test_the_readme_does_not_repeat_contradicted_absolutes():
+    """Real transcription, translation and audio input were verified on a
+    Mac (build 32), and KingFishR's real DSD-neo ran on Linux: these old
+    absolutes are false now and must not come back."""
+    flat = " ".join(_readme().split()).lower()
+    for stale in ("no audio has actually been transcribed",
+                  "no text has actually been translated",
+                  "no coreaudio device has ever been opened",
+                  "the real dsd-neo binary has never run",
+                  "the real binary has never run"):
+        assert stale not in flat, f"the README still says {stale!r}"
 
 
 def test_the_readme_does_not_promise_translation_of_any_language():

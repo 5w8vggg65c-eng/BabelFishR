@@ -150,9 +150,36 @@ radio traffic while it is actually recording the surrounding room.*
 
 ## What has actually been tested, and what has not
 
-This distinction matters more than any feature list.
+This distinction matters more than any feature list. Evidence is dated by
+the build it was gathered on: a check of an earlier build is not a check of
+the current one.
 
-### Verified on a real Apple Silicon Mac (GitHub `macos-26` arm64 runner)
+### The current build has not had its own Mac checks yet
+
+BabelFishR was split from KingFishR (the SDR features moved out) after the
+builds described below. The lean BabelFishR binary from the split has not
+yet been built, installed or run on a Mac. Until it has, the Mac evidence
+below is about the earlier, pre-split builds only.
+
+### Verified on a real Mac before the split (2026-11-24, build 32, commit `2278dbb`)
+
+On the project owner's Apple Silicon Mac, with the installed app:
+
+- **Real local transcription and translation.** A public French speech
+  clip (`tests/fixtures/public/uberi_speech_recognition/`, provenance
+  recorded there) was transcribed by the local Whisper *small* model and
+  translated French to English by a local Argos Translate pack.
+- **Continuous reception produced text while it was still running.** A
+  continuous replay was handed to recognition in parts, and the first text
+  appeared before the input had ended, not after Stop.
+- **Noise was held for review**, not translated as if it were speech.
+- **Real audio input.** Audio had already been captured with the app from
+  an input on that Mac.
+
+This is one Mac and one public clip: it shows the local engines run and the
+pipeline holds together, not a quality level on radio traffic.
+
+### Verified on GitHub's Apple Silicon runners (`macos-26` arm64), pre-split builds
 
 - The application bundle **builds, launches and imports its own code** as a
   frozen app.
@@ -164,8 +191,9 @@ This distinction matters more than any feature list.
 - The **main window constructs and opens** (offscreen).
 - The **disk image mounts** and contains a launchable app and an `/Applications`
   drop target.
-- The **whole deterministic test suite passes on macOS arm64**, not only on
-  the Linux development machine.
+- The **whole deterministic test suite passes on macOS arm64**, including
+  the Whisper model-layout tests that need faster-whisper installed (the
+  Linux development environment does not have it).
 
 ### Verified in automated tests (simulated audio, no hardware)
 
@@ -199,29 +227,32 @@ This distinction matters more than any feature list.
   processing, search and export all complete with `socket.connect`,
   `create_connection`, `getaddrinfo` and `http.client` raising.
 
-### NOT tested — no hardware was available
+### Not yet validated
 
-- **Any physical radio, FalconClaw PTT, cable or USB audio interface.**
-- **Any real audio input device.** No CoreAudio device has ever been opened by
-  this code, and the microphone-permission prompt has never been seen. Device
-  hot-plug, disconnection and reconnection are covered only by simulation.
-- **The M5 MacBook Air specifically.** The bundle was built and launched on a
-  GitHub-hosted Apple Silicon runner, which is not your machine.
-- **Real transcription output.** No model weights could be downloaded in the
-  development environment (Hugging Face is blocked by its network policy), so
-  **no audio has actually been transcribed**.
-- **Real translation output.** No language pack could be downloaded, so **no
-  text has actually been translated**.
-- **DSD-neo and any SDR.** Not part of BabelFishR. In KingFishR the DSD-neo
-  integration is tested against a stub binary and the SDR receiver against
-  stubs and synthetic audio; the real DSD-neo binary has never run, no real
-  digital traffic has been decoded, and no SDR device driver is bundled or
-  claimed.
+- **Any physical radio, FalconClaw PTT, downlead cable or USB audio
+  interface: not tested.** No radio has been connected; the gate, rolls,
+  segmenting and squelch-tail handling have not been checked on real
+  receiver audio.
+- **The lean post-split build on a Mac** (see above): build, install,
+  launch, offline engines and live capture all need re-checking on it.
+- **Recognition and translation quality on real radio traffic.** There is
+  no quality guarantee for any language, model size or audio condition; one
+  public clip on one Mac is not a field sample. Every transcript and its
+  original audio are kept for checking.
+- **Network egress, independently.** Field Offline is enforced in the code
+  and tested with outbound sockets refused; it has not been verified with an
+  independent network monitor, and no zero-egress certification is claimed.
+- **Device hot-plug, disconnection and reconnection** on real interfaces:
+  covered by simulation only.
+- **SDR, over-the-air reception and DSD-neo.** Not part of BabelFishR - they
+  are KingFishR's (`kingfishr/README.md`). KingFishR's earlier tests ran the
+  real SDR++ and DSD-neo on Linux from a recorded file, with no radio
+  hardware; no RTL-SDR, over-the-air signal or Mac SDR setup has been
+  validated, and no SDR device driver is bundled or claimed.
 - **Apple notarization**, unless a specific release says otherwise.
 
-Everything above is written and reviewable, but "written" is not "working".
-Treat the first run on your Mac as the real integration test, and use the
-[macOS validation procedure](docs/MACOS_VALIDATION.md).
+Treat the first run of each new build on your Mac as its integration test,
+and use the [macOS validation procedure](docs/MACOS_VALIDATION.md).
 
 ---
 
