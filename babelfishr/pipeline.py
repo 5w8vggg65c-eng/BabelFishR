@@ -606,6 +606,11 @@ class ProcessingPipeline:
                        if self._origin.get(tx_id) not in self._stopped_runs
                        or self._origin.get(tx_id) is None)
 
+    @property
+    def has_manual_work(self) -> bool:
+        with self._active_lock:
+            return any(self._origin.get(tx_id) is None for tx_id in self._in_flight)
+
     def is_manual(self, tx_id: str) -> bool:
         """In flight as manual work (Retry, Transcribe anyway)."""
         with self._active_lock:

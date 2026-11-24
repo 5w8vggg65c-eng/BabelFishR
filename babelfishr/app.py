@@ -928,9 +928,13 @@ class BabelFishRApp:
 
     def _can_reuse(self, pipeline: ProcessingPipeline, busy: bool = True) -> bool:
         """A leftover processor may serve the next run only when it is still
-        accepting and owns exactly this mode's current engines (with
-        ``busy``, only when it still has work - an idle one is retired)."""
+        accepting, holds no manual job, and owns exactly this mode's current
+        engines (with ``busy``, only when it still has work - an idle one is
+        retired)."""
+        # Only for engine calls abandoned at Stop: a processor running a
+        # manual saved-recording job still refuses the start, as before.
         return (pipeline.accepting and (pipeline.pending > 0 or not busy)
+                and not pipeline.has_manual_work
                 and self._standalone_mode is self.mode
                 and pipeline.transcription is self.transcription
                 and pipeline.translation is self.translation)
