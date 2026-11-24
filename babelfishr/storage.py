@@ -707,8 +707,19 @@ class Store:
         self._conn.execute("DELETE FROM transmissions_fts_map WHERE id = ?", (tx_id,))
 
     def get_transmission(self, tx_id: str) -> Optional[Transmission]:
-        row = self._conn.execute("SELECT * FROM transmissions WHERE id = ?",
-                                 (tx_id,)).fetchone()
+        # Under the store's lock, like every write. The connection is shared
+        # across threads; this read runs on the GUI thread (Transcribe
+        # anyway, Retry, Retry as speech) while the pipeline worker saves.
+        # Unlocked, the two raced: sqlite3.InterfaceError ("bad parameter or
+        # other API misuse") escaped the operator's action, and the worker
+        # read the row back as missing and skipped it (3 of 160 stress runs
+        # of test_capture_invariant, 2 of 40 at an earlier baseline).
+        # Waiting on this RLock releases the GIL, so a writer that needs the
+        # GIL is never blocked by a waiting reader. Only this read is locked:
+        # the other unlocked reads are a separate, still-open follow-up.
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM transmissions WHERE id = ?",
+                                     (tx_id,)).fetchone()
         return _from_row(row) if row else None
 
     # ---- conversations (the operator's named Session tabs) -------------
