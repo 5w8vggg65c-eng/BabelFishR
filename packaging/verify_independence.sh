@@ -40,7 +40,17 @@ run_isolated_limited() {
   output_file="$(mktemp)"
   ( run_isolated "$@" >"$output_file" 2>&1 ) &
   local pid=$!
-  ( sleep "$limit"; kill -9 "$pid" 2>/dev/null ) 2>/dev/null &
+  # The watcher must not hold the caller's output open. Called as
+  # OUTPUT=$(run_isolated_limited ...), anything it inherits keeps that
+  # command substitution waiting: with only stderr redirected, its sleep
+  # held stdout and every check that finished in a second still took the
+  # whole limit (measured on a Mac: 2.012 s instead of 0.117 s for a 0.1 s
+  # check under a 2 s watcher). Its sleep is also ended with it, so it can
+  # never send the kill after the check has finished.
+  ( sleep "$limit" & sleeper=$!
+    trap 'kill "$sleeper" 2>/dev/null; exit 0' TERM
+    wait "$sleeper"
+    kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   local watcher=$!
   wait "$pid"; status=$?
   kill "$watcher" 2>/dev/null || true
