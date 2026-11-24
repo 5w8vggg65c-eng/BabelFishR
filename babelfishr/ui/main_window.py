@@ -885,6 +885,8 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda _: self._refresh_session_tabs())
         view_menu.addAction(self.show_hidden_sessions_action)
 
+        self._build_message_menu(bar)
+
         receiver_menu = bar.addMenu("&Receiver")
         self.open_receiver_action = QtGui.QAction("Open receiver window (SDR++)", self)
         self.open_receiver_action.setStatusTip(
@@ -2290,6 +2292,109 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.waveform.show_recording(tx.id, tx.audio_path)
         self._refresh_selected_panel()
+        self._refresh_message_menu()
+
+    # -- the Message menu: the selected message's actions, from the menu bar --
+    def _build_message_menu(self, bar) -> None:
+        """Every action of a message's \u22ef menu, for the selected message,
+        from the menu bar and the keyboard.
+
+        The \u22ef button is the only other way in, and it is a pop-up a
+        click must open: on a Mac under assistive or automated control it
+        never opened, which left "Retry as speech in..." - the way to give a
+        message its real language - out of reach. These run the very same
+        handlers as the row's own menu.
+        """
+        self.message_menu = bar.addMenu("&Message")
+        self.message_menu.setObjectName("messageMenu")
+        self.message_menu.aboutToShow.connect(self._refresh_message_menu)
+
+        def add(text, slot, shortcut=None, tip=""):
+            action = QtGui.QAction(text, self)
+            if shortcut:
+                action.setShortcut(shortcut)
+            if tip:
+                action.setStatusTip(tip)
+            action.triggered.connect(slot)
+            self.message_menu.addAction(action)
+            return action
+
+        self.message_play_action = add(
+            "Play original recording", lambda: self._on_selected("play"))
+        self.message_menu.addSeparator()
+        self.message_edit_action = add(
+            "Edit transcript and translation...", lambda: self._on_selected("edit"),
+            "Ctrl+E")
+        self.message_note_action = add(
+            "Add or edit note...", lambda: self._on_selected("note"))
+        self.message_tags_action = add(
+            "Edit tags...", lambda: self._on_selected("tags"))
+        self.message_bookmark_action = add(
+            "Bookmark", lambda: self._on_selected("bookmark"), "Ctrl+B")
+        self.message_bookmark_action.setCheckable(True)
+        self.message_menu.addSeparator()
+        self.message_transcribe_action = add(
+            "Transcribe anyway", lambda: self._on_selected("transcribe"))
+        self.message_retry_action = add(
+            "Retry processing", lambda: self._on_selected("retry"))
+        self.message_retry_speech_action = add(
+            "Retry as speech in...", lambda: self._on_selected("retry-speech"),
+            "Ctrl+L",
+            "Transcribe the selected message again in a language you choose, "
+            "then translate it")
+        self.message_export_action = add(
+            "Export audio...", lambda: self._on_selected("export"))
+        self.message_menu.addSeparator()
+        self.message_remove_action = add(
+            "Remove message\u2026", lambda: self._on_selected("remove"))
+        self.message_restore_action = add(
+            "Restore to thread", lambda: self._on_selected("restore"))
+        self._refresh_message_menu()
+
+    def _selected_bubble(self):
+        tx = self.timeline.selected_transmission()
+        return self.timeline.bubble(tx.id) if tx is not None else None
+
+    def _refresh_message_menu(self) -> None:
+        """Enabled for a selected message; mirrors what its own \u22ef menu
+        offers (Transcribe anyway, Remove/Restore) and its bookmark."""
+        if not hasattr(self, "message_menu"):
+            return
+        bubble = self._selected_bubble()
+        for action in self.message_menu.actions():
+            if not action.isSeparator():
+                action.setEnabled(bubble is not None)
+        if bubble is None:
+            self.message_bookmark_action.setChecked(False)
+            return
+        self.message_bookmark_action.setChecked(bool(bubble.tx.bookmarked))
+        self.message_transcribe_action.setEnabled(bubble.transcribe_action.isVisible()
+                                                  and bubble.transcribe_action.isEnabled())
+        self.message_remove_action.setEnabled(bubble.remove_action.isVisible())
+        self.message_restore_action.setEnabled(bubble.restore_action.isVisible())
+        self.message_play_action.setEnabled(bubble.play_action.isEnabled())
+
+    def _on_selected(self, what: str) -> None:
+        bubble = self._selected_bubble()
+        if bubble is None:
+            self.status.showMessage("Select a message first.", 5000)
+            return
+        tx_id = bubble.tx.id
+        actions = {
+            "play": bubble.play_action.trigger,
+            "edit": bubble._edit,
+            "note": bubble._edit_note,
+            "tags": bubble._edit_tags,
+            "bookmark": bubble.bookmark_action.trigger,
+            "transcribe": bubble.transcribe_action.trigger,
+            "retry": lambda: self._on_retry(tx_id),
+            "retry-speech": lambda: self._on_retry_as_speech(tx_id),
+            "export": bubble._export,
+            "remove": bubble.remove_action.trigger,
+            "restore": bubble.restore_action.trigger,
+        }
+        actions[what]()
+        self._refresh_message_menu()
 
     def _refresh_selected_panel(self) -> None:
         tx = self.timeline.selected_transmission()

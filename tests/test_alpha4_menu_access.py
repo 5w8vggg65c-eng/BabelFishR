@@ -175,7 +175,7 @@ def test_the_menu_bar_is_drawn_inside_the_window(qt_app, config, store):
     panes = window.pane_splitter
     assert panes.mapTo(window, QtCore.QPoint(0, 0)).y() >= on_window.bottom(), (
         "the content is drawn over the menu bar")
-    assert menu_titles(window) == ["File", "View", "Receiver", "Tools", "Help"]
+    assert menu_titles(window) == ["File", "View", "Message", "Receiver", "Tools", "Help"]
     for title in menu_titles(window):
         assert top_level_action(window, title).menu().actions(), f"{title} is empty"
     window.close()
