@@ -22,7 +22,23 @@ from typing import Dict, Optional
 
 log = logging.getLogger(__name__)
 
+#: BabelFishR's Keychain service, unchanged. Another product (KingFishR)
+#: reads and writes under its own name (keychain_service) and never this one.
 KEYCHAIN_SERVICE = "BabelFishR"
+
+
+def keychain_service() -> str:
+    """The running product's Keychain service: "BabelFishR" for BabelFishR."""
+    from ..extensions import product
+
+    return product().name
+
+
+def _product_dotenv() -> pathlib.Path:
+    """The running product's own ``~/.config/<product>/.env``."""
+    from ..extensions import product
+
+    return pathlib.Path.home() / ".config" / product().config_stem / ".env"
 
 
 def _read_dotenv(path: pathlib.Path) -> Dict[str, str]:
@@ -45,8 +61,7 @@ def get_secret(name: str, dotenv_path: Optional[str] = None) -> Optional[str]:
         return value.strip()
 
     candidates = [pathlib.Path(dotenv_path)] if dotenv_path else []
-    candidates += [pathlib.Path.cwd() / ".env",
-                   pathlib.Path.home() / ".config" / "babelfishr" / ".env"]
+    candidates += [pathlib.Path.cwd() / ".env", _product_dotenv()]
     for candidate in candidates:
         found = _read_dotenv(candidate).get(name)
         if found:
@@ -60,10 +75,15 @@ def keychain_available() -> bool:
 
 
 def get_from_keychain(account: str,
-                      service: str = KEYCHAIN_SERVICE) -> Optional[str]:
-    """Read a password from the macOS Keychain. Silent no-op elsewhere."""
+                      service: Optional[str] = None) -> Optional[str]:
+    """Read a password from the macOS Keychain. Silent no-op elsewhere.
+
+    *service* defaults to the running product's own (keychain_service):
+    there is no fallback to another product's entry.
+    """
     if not keychain_available():
         return None
+    service = service or keychain_service()
     try:
         result = subprocess.run(
             ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
@@ -77,10 +97,12 @@ def get_from_keychain(account: str,
 
 
 def store_in_keychain(account: str, secret: str,
-                      service: str = KEYCHAIN_SERVICE) -> bool:
-    """Store a secret in the macOS Keychain. Returns True on success."""
+                      service: Optional[str] = None) -> bool:
+    """Store a secret in the running product's Keychain service (or
+    *service*). Returns True on success."""
     if not keychain_available():
         return False
+    service = service or keychain_service()
     try:
         result = subprocess.run(
             ["security", "add-generic-password", "-U", "-s", service,
@@ -96,8 +118,7 @@ def describe_source(name: str) -> str:
     """Where a secret would come from, for the settings UI."""
     if os.environ.get(name):
         return "environment variable"
-    for candidate in (pathlib.Path.cwd() / ".env",
-                      pathlib.Path.home() / ".config" / "babelfishr" / ".env"):
+    for candidate in (pathlib.Path.cwd() / ".env", _product_dotenv()):
         if _read_dotenv(candidate).get(name):
             return f".env file ({candidate})"
     if get_from_keychain(name):
