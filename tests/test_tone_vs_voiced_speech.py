@@ -13,6 +13,10 @@ and formants move. The rule now requires that too.
 
 from __future__ import annotations
 
+import hashlib
+import pathlib
+import struct
+
 import numpy as np
 import pytest
 
@@ -95,3 +99,52 @@ def test_dominant_frequency_resolves_between_bins():
     t = np.arange(960) / SR
     for f in (125.0, 1025.0, 1750.0):
         assert abs(dominant_frequency(np.sin(2 * np.pi * f * t), SR) - f) < 5.0
+
+
+# ---- the actual field fixture ---------------------------------------------------
+
+FRENCH = (pathlib.Path(__file__).parent / "fixtures" / "public"
+          / "uberi_speech_recognition" / "french.aiff")
+FRENCH_SHA256 = "2bdb86e8d511a6f8e784188edc1bea6a504c703ab8ac5826246fece8b7e44582"
+
+
+def read_aiff_pcm16(path):
+    """Mono 16-bit big-endian PCM AIFF -> (float samples, rate), without the
+    aifc module (removed in Python 3.13)."""
+    data = path.read_bytes()
+    assert data[:4] == b"FORM" and data[8:12] == b"AIFF"
+    pos, comm, ssnd = 12, None, None
+    while pos + 8 <= len(data):
+        chunk, size = data[pos:pos + 4], struct.unpack(">I", data[pos + 4:pos + 8])[0]
+        body = data[pos + 8:pos + 8 + size]
+        if chunk == b"COMM":
+            comm = body
+        elif chunk == b"SSND":
+            ssnd = body
+        pos += 8 + size + (size & 1)
+    channels, frames, bits = struct.unpack(">hIh", comm[:8])
+    assert (channels, bits) == (1, 16)
+    exponent = struct.unpack(">H", comm[8:10])[0] & 0x7FFF
+    mantissa = struct.unpack(">Q", comm[10:18])[0]
+    rate = mantissa * 2.0 ** (exponent - 16383 - 63)
+    offset = struct.unpack(">I", ssnd[:4])[0]
+    pcm = np.frombuffer(ssnd[8 + offset:8 + offset + frames * 2], dtype=">i2")
+    return pcm.astype(np.float64) / 32768.0, rate
+
+
+def test_the_public_french_fixture_reaches_speech_recognition():
+    """The clip the actual Mac skipped as a tone (runs 28 and 30: TONE,
+    confidence 0.209, 3.02 s), replayed as the field test did: 48 kHz, 1 s
+    of digital silence each side, fixed -20 dBFS gate, rolls 0.5 s."""
+    assert hashlib.sha256(FRENCH.read_bytes()).hexdigest() == FRENCH_SHA256
+    speech, rate = read_aiff_pcm16(FRENCH)
+    assert (rate, speech.size) == (44100.0, 111695)
+    resampled = np.interp(np.arange(int(round(speech.size * SR / rate))) * rate / SR,
+                          np.arange(speech.size), speech)
+    audio = np.concatenate([np.zeros(SR), resampled, np.zeros(SR)])
+    found = detect_in_array(audio, SR, GATE)
+    assert len(found) == 1
+    event = found[0]
+    assert event.duration == pytest.approx(3.02, abs=0.05)
+    assert event.content_class is not ContentClass.TONE
+    assert event.should_auto_transcribe(GATE), "it never reaches speech recognition"
