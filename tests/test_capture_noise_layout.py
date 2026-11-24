@@ -150,15 +150,37 @@ LEGITIMATE = [
     "The quick brown fox jumps over the lazy dog near the river bank today.",
 ]
 
+#: A synthetic line with the aggregate shape of the 0.933-confidence field
+#: loop (its text was not shared): 56 non-space characters - one opening
+#: bracket (Ps), 54 closing brackets (Pe), one symbol (So) - three distinct,
+#: every one a separate token, longest unbroken run 1, no letter or digit.
+FIELD_LOOP_SHAPE = " ".join(["("] + [")"] * 54 + ["\u266a"])
+
 #: Structural loops: nobody says these. Held on their own.
 SEVERE_LOOPS = [
+    FIELD_LOOP_SHAPE,
     "ლლლლლლლლლლლლლლლლლლლლლლლლლლლლლლ",
     "!!!!!!!!!!!!!!!!!!!!",
-    "♪ ♪ ♪ ♪ ♪",
     "ーーーーーーーーーーーー",
-    "の、の、の、の、の、の、の、の、",
     "...............",
+    "?!?!?!?!?!?!",
 ]
+
+#: Loop-like but short or with words in it: review only.
+MILD_LOOPS = ["♪ ♪ ♪ ♪ ♪", "...", "の、の、の、の、の、の、の、の、"]
+
+#: Root review of 44cb96b: each of these was held as a severe loop despite
+#: speech heard (VAD 0.8 / 2 s), no-speech 0.01 and confidence 0.99.
+#: Punctuation, number formatting and repeated digits are ordinary text.
+ROOT_COUNTEREXAMPLES = {
+    "NO!!!": "speech",
+    "S.O.S. S.O.S. S.O.S.": "speech",
+    "1, 2, 3, 4, 5.": "speech",
+    "7, 7, 7, 7, 7, 7.": "uncertain",       # repeated: a look, never a hold
+    "\u0661\u060c \u0662\u060c \u0663\u060c \u0664\u060c \u0665.": "speech",  # Arabic-Indic
+    "00000000": "speech",
+    "Nooooooooooooo! Stop!": "speech",
+}
 
 #: Repeated words: noise produces these, and so do real calls. A review
 #: flag at most, never a hold on repetition alone.
@@ -185,6 +207,28 @@ def test_legitimate_speech_in_any_script_is_not_called_a_loop(text):
 @pytest.mark.parametrize("text", SEVERE_LOOPS)
 def test_structural_loops_are_severe_in_any_script(text):
     assert degenerate_text(text)[0] == "severe"
+
+
+@pytest.mark.parametrize("text", MILD_LOOPS)
+def test_short_or_wordy_loops_are_only_a_reason_to_look(text):
+    assert degenerate_text(text)[0] == "repeated"
+
+
+@pytest.mark.parametrize("text,verdict", ROOT_COUNTEREXAMPLES.items())
+def test_punctuation_and_numbers_are_never_held_against_speech_evidence(text, verdict):
+    check = assess_speech(result(text, confidence=0.99, ratio=0.8, seconds=2.0,
+                                 nsp=0.01))
+    assert check["verdict"] == verdict, (text, check)
+    assert degenerate_text(text)[0] != "severe"
+
+
+def test_the_field_loop_shape_is_held_even_against_speech_evidence():
+    """The safeguard root asked to keep: confidence and a voice detector
+    hearing room speech do not make a bracket loop a transcript."""
+    for kwargs in (dict(confidence=0.933, language="nn", language_confidence=0.531),
+                   dict(confidence=0.99, ratio=0.8, seconds=2.0, nsp=0.01)):
+        check = assess_speech(result(FIELD_LOOP_SHAPE, **kwargs))
+        assert check["verdict"] == "likely_noise" and check["repetition"] == "severe"
 
 
 @pytest.mark.parametrize("text", REPEATED_CALLS)
@@ -222,7 +266,7 @@ def result(text, confidence=0.9, language="en", language_confidence=0.95,
 def test_engine_confidence_alone_never_clears_a_loop():
     """The root counterexample, in aggregate: a 5.9 s repeated-symbol line
     at transcript confidence 0.933, detected as 'nn' at 0.531."""
-    check = assess_speech(result("ლლლლლლლლლლლლლლლლლლლლლლლლლლლლლლ", confidence=0.933,
+    check = assess_speech(result(FIELD_LOOP_SHAPE, confidence=0.933,
                                  language="nn", language_confidence=0.531))
     assert check["verdict"] == "likely_noise" and check["repetition"] == "severe"
     assert any("loop" in r for r in check["reasons"])
@@ -261,7 +305,7 @@ def _run_scripted(config, store, tmp_path, scripted, pairs=(("es", "en"),)):
 
 def test_a_confident_loop_is_held_visibly_with_its_words_and_audio_kept(
         config, store, tmp_path):
-    loop = "ლლლლლლლლლლლლლლლლლლლლლლლლლლლლლლ"
+    loop = FIELD_LOOP_SHAPE
     tx, translation = _run_scripted(config, store, tmp_path,
                                     result(loop, confidence=0.933, language="nn",
                                            language_confidence=0.531))
@@ -298,7 +342,7 @@ def test_the_held_note_names_the_loop(qt_app):
     from babelfishr.pipeline import assess_speech
     from babelfishr.ui.timeline import _speech_check_note
 
-    loop = "ლლლლლლლლლლლლლლლლლლლლლლლლლლლლლლ"
+    loop = FIELD_LOOP_SHAPE
     tx = Transmission(session_id="s", started_at=utcnow(), transcript=loop,
                       state=ProcessingState.COMPLETE,
                       signal_metadata={"speech_check": assess_speech(

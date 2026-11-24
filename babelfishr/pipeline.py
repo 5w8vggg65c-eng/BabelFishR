@@ -181,31 +181,42 @@ def degenerate_text(text: str) -> tuple:
 
     Speech recognisers fed noise often return a loop, sometimes with high
     confidence (a field recording gave 0.93 for a repeated-symbol line).
-    These checks use only the shape of the text - runs, Unicode categories,
-    word repetition and compression - so they apply to every script alike:
-    no alphabet or language is treated as suspect, and short replies
-    ("Copy.", "10-4") are too short to be judged.
+    These checks use only the shape of the text, so they apply to every
+    script alike: no alphabet or language is treated as suspect.
 
-    ``"severe"`` is structural: one character unbroken eight or more times,
-    or text that is mostly symbols. Nobody says that. ``"repeated"`` is the
-    same words over and over - which noise produces, but so does a real call
-    ("mayday mayday mayday", a callsign or number repeated). On its own it
-    is only a reason to look; see assess_speech.
+    ``"severe"`` is deliberately narrow and structural, either:
+    one character, not a digit, repeated unbroken at least 12 times and
+    making up at least 80% of the text (``ლლლლ...``, ``!!!!...``) - an
+    elongated shout inside other words ("Nooooooooooooo! Stop!") is not it;
+    or a long line (12+ characters) of at most four distinct symbols with no
+    letter or digit anywhere, spaced or not - the shape of a real field
+    loop (56 characters, three distinct brackets/symbols, every one
+    separated by a space). Nobody says either.
+    Punctuation, number formatting and repeated digits never count as
+    severe ("NO!!!", "S.O.S.", "1, 2, 3", "00000000" are ordinary).
+
+    ``"repeated"`` is a reason to look, not to hold: the same words over and
+    over, loop-like compression, or text with no letters or digits at all.
+    Noise produces these, but so do real calls ("mayday mayday mayday", a
+    callsign or number repeated). See assess_speech.
     """
     import itertools
-    import unicodedata
     import zlib
 
     text = (text or "").strip()
     chars = [c for c in text if not c.isspace()]
-    longest = max((sum(1 for _ in run) for char, run in itertools.groupby(text)
-                   if not char.isspace()), default=0)
-    if longest >= 8:
+    if not chars:
+        return ("", "")
+    runs = [(char, sum(1 for _ in run)) for char, run in itertools.groupby(text)
+            if not char.isspace() and not char.isdigit()]
+    char, longest = max(runs, key=lambda r: r[1], default=("", 0))
+    if longest >= 12 and longest / len(chars) >= 0.8:
         return ("severe", "one character repeats unbroken")
-    if len(chars) >= 5:
-        symbols = sum(unicodedata.category(c)[0] in "PS" for c in chars) / len(chars)
-        if symbols >= 0.5:
-            return ("severe", "it is mostly punctuation or symbols")
+    letterless = not any(c.isalnum() for c in chars)
+    if letterless and len(chars) >= 12 and len(set(chars)) <= 4:
+        # Speech is transcribed as words; a long line of a few symbols or
+        # brackets with no letter or digit anywhere is a loop, spaced or not.
+        return ("severe", "it is a long run of a few symbols, with no letters or digits")
     words = [w.strip(".,!?;:\u3001\u3002\u060c\u061f\"'()-").lower() for w in text.split()]
     words = [w for w in words if w]
     if len(words) >= 6 and len(set(words)) / len(words) <= 0.4:
@@ -213,6 +224,8 @@ def degenerate_text(text: str) -> tuple:
     raw = text.encode("utf-8")
     if len(raw) >= 30 and len(raw) / len(zlib.compress(raw, 9)) >= 2.4:
         return ("repeated", "it repeats itself")
+    if len(chars) >= 3 and letterless:
+        return ("repeated", "it has no letters or digits")
     return ("", "")
 
 

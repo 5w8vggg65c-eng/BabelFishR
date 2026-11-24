@@ -43,14 +43,19 @@ Each transcript is checked locally, with no download and no language list:
 
 - the share and seconds of speech the bundled Silero voice detector hears;
 - Whisper's own no-speech estimate;
-- the shape of the text itself: a long unbroken run of one character, or
-  mostly symbols, is a recognition loop ("severe"); the same words over and
-  over is "repeated", which a real call ("mayday mayday mayday", a callsign
-  or number) can also be.
+- the shape of the text itself. Two narrow structural shapes are a
+  recognition loop ("severe"): one non-digit character repeated unbroken 12+
+  times and making up 80%+ of the text, or a line of 12+ characters made of
+  at most four distinct symbols with no letter or digit anywhere (the shape
+  of a real field loop: 56 brackets/symbols, three distinct, each spaced).
+  Punctuation, number formatting and repeated digits ("NO!!!", "S.O.S.",
+  "1, 2, 3", "00000000") are never severe. The same words over and over,
+  loop-like compression, or short text with no letters is "repeated" - a
+  real call ("mayday mayday mayday", a callsign or number) can be that too.
 
 A severe loop, or two no-speech signals agreeing (including repeated words
 with no-speech evidence), holds the translation and marks the message for
-review. One doubtful signal, or repeated words on their own, marks it for
+review. One doubtful signal, or "repeated" text on its own, marks it for
 review and it is still translated. Engine confidence alone never clears a
 transcript: a looping line has scored 0.93. The transcript and the original
 audio are always kept. **Retry as speech in…** re-runs a message in a
