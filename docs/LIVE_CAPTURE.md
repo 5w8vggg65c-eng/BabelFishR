@@ -50,9 +50,9 @@ chat by itself, one message per utterance, until Stop:
 ## No analogue/digital guess
 
 Earlier versions labelled some messages "possibly digital" from the shape of
-the audio. On microphone and USB audio that landed mostly on ordinary
-analogue FM voice, and ordinary audio cannot tell analogue from digital radio
-in any case. BabelFishR no longer makes that guess; the detector's level,
+the audio. That guess was unreliable and could label ordinary voice as
+digital (false positives), and ordinary audio cannot tell analogue from
+digital radio in any case. BabelFishR no longer makes that guess; the detector's level,
 flatness and distribution measurements are still recorded. Messages saved by
 an earlier version keep the stored value (and exports include it), but the
 window shows no badge for it. Demodulating or decoding RF belongs to KingFishR;

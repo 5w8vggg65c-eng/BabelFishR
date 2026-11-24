@@ -296,7 +296,8 @@ def test_the_readme_says_the_app_does_not_identify_a_radio_by_itself():
 def test_the_readme_is_honest_about_notarization():
     text = _readme()
     assert "not notarized" in text
-    assert "right-click" in text.lower() or "control-click" in text.lower()
+    # Current macOS: first open is refused; Privacy & Security > Open Anyway.
+    assert "Privacy & Security" in text and "Open Anyway" in text
     assert "If a release does not say" in text
 
 

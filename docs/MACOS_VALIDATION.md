@@ -36,7 +36,8 @@ outputs can be much hotter than a computer input expects.
 
 Normally: download `BabelFishR-macOS-arm64.dmg` from Releases, open it, drag
 BabelFishR to Applications, and launch it. While builds are unnotarized the
-first launch needs right-click ▸ Open ▸ Open.
+first launch is refused: open it once, then **System Settings ▸ Privacy &
+Security ▸ Open Anyway**, and confirm (password or Touch ID).
 
 The packaged binary is also the CLI, so everything below works against the
 installed app with no Python involved:

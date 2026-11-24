@@ -62,9 +62,10 @@ class ContentClass(str, enum.Enum):
     """Legacy only: never produced any more.
 
     Versions before 2026-11-24 guessed "possibly digital" from the sample
-    distribution of level-steady audio. On microphone and USB audio it
-    landed mostly on ordinary analogue FM voice, and a microphone cannot
-    tell analogue from digital radio anyway. Kept so older rows load
+    distribution of level-steady audio. The guess was unreliable and could
+    label ordinary voice as digital (false positives), and ordinary audio
+    from a microphone or interface cannot tell analogue from digital radio
+    anyway. Kept so older rows load
     unchanged; the window shows no badge for it (timeline.UNBADGED_CLASSES)."""
 
     UNKNOWN = "unknown"
@@ -837,7 +838,7 @@ class RadioActivityDetector(TransmissionDetector):
         Kurtosis and crest factor are measured and recorded, but no longer
         used to guess "digital": BabelFishR receives ordinary audio from a
         microphone or interface and cannot tell analogue from digital radio
-        (a false guess landed mostly on analogue FM voice).
+        (the old guess was unreliable and gave false positives).
         """
         if not stats:
             return Verdict(content_class=ContentClass.UNKNOWN, confidence=0.4)

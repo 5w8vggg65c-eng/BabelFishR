@@ -41,8 +41,16 @@ developer tools to install or use it.
 
 Alpha builds are **ad-hoc signed and not notarized by Apple**, because
 notarization requires a paid Apple Developer ID. macOS will refuse the first
-launch. To open it: **right-click (or Control-click) BabelFishR in Applications,
-choose Open, then click Open in the dialog.** You only have to do this once.
+launch. To open it:
+
+1. Open BabelFishR from Applications once. macOS says it cannot be opened;
+   close that message.
+2. Open **System Settings ▸ Privacy & Security**, scroll to the Security
+   section, and click **Open Anyway** next to the line about BabelFishR.
+3. Confirm with your password or Touch ID, then choose **Open**.
+
+You only have to do this once per installed build. (Older macOS versions
+also allowed right-click ▸ Open; current versions use Open Anyway.)
 
 Each release states plainly whether it was notarized. If a release does not say
 it was notarized by Apple, it was not.
@@ -352,9 +360,11 @@ zero-connectivity validation procedure.
 
 Every event crossing the activity threshold is written to disk and the database
 **before** anything classifies, transcribes or analyses it. Static, tones and
-suspected digital bursts are all kept; classification only decides whether an
-ASR call happens automatically, and every bubble offers *Transcribe anyway* and
-*Analyze as digital*.
+any other sound are all kept; only a steady tone is kept from automatic
+speech recognition. Any message can be processed by hand: *Transcribe anyway*
+and *Retry* (also *Retry as speech in…* to choose its language) are in each
+message's menu and in the **Message** menu. Digital-voice analysis is not part
+of BabelFishR (see KingFishR).
 
 A transmission cannot be received twice, so a misclassification must never be
 the reason one is gone.
