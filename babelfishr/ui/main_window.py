@@ -413,6 +413,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.search_field.setMinimumWidth(180)
         self.search_field.returnPressed.connect(
             lambda: self._run_search(self.search_field.text()))
+        # Emptying the field - its clear button, or deleting the text - ends
+        # the search. It used to leave the filtered results on screen under
+        # an empty field, with no filter selected.
+        self.search_field.textChanged.connect(self._on_search_text_changed)
         filter_row.addWidget(self.search_field, 1)
         right_layout.addLayout(filter_row)
 
@@ -2636,6 +2640,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timeline.set_transmissions(results)
         self._announce_view(len(results))
         self._sync_filters()
+
+    def _on_search_text_changed(self, text: str) -> None:
+        if not text.strip() and self._view_kind == "search":
+            self._reload_timeline()
 
     def _show_bookmarked(self) -> None:
         """Only this Session's bookmarked messages - a store query, like
