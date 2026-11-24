@@ -35,7 +35,6 @@ NONE = "none"
 DEVICE = "device"
 SYSTEM_DEFAULT = "system-default"
 RECEIVER = "receiver"
-RECEIVER_TEXT = "SDR receiver  —  SDR++ with the RTL-SDR (opens the receiver window)"
 
 CHOOSE_TEXT = "— Choose an audio input —"
 SYSTEM_DEFAULT_TEXT = ("Use the macOS system default input "
@@ -153,7 +152,7 @@ class InputPanel(QtWidgets.QWidget):
             self.device_box.addItem(SYSTEM_DEFAULT_TEXT,
                                     {"kind": SYSTEM_DEFAULT})
             if self._receiver_offered():
-                self.device_box.addItem(RECEIVER_TEXT, {"kind": RECEIVER})
+                self.device_box.addItem(self._receiver_text(), {"kind": RECEIVER})
             self.device_box.setEnabled(
                 (bool(self._devices) or self._receiver_offered()) and not self._monitoring)
             self._restore_selection()
@@ -162,16 +161,26 @@ class InputPanel(QtWidgets.QWidget):
         self.refresh_status()
 
     def _receiver_offered(self) -> bool:
-        """The SDR receiver is listed when SDR++ is installed or running, or
-        when it was chosen before - never invented on a machine without it."""
-        from ..receiver import receiver_status
+        """A receiver input is listed only when an extension supplies one
+        (KingFishR; babelfishr.extensions) and says it is offered here, or
+        it was chosen before. BabelFishR lists none - a saved receiver
+        selection then leaves the box on "Choose an audio input"."""
+        from ..extensions import first
 
+        receiver_status = first("receiver_status")
+        if receiver_status is None:
+            return False
         try:
             status = receiver_status(self.app.config)
         except Exception:  # noqa: BLE001 - listing inputs must never fail
             return self.app.config.input_is_receiver
-        return bool(status["sdrpp"] or status["sdrpp_running"]
-                    or self.app.config.input_is_receiver)
+        return bool(status.get("offered") or self.app.config.input_is_receiver)
+
+    def _receiver_text(self) -> str:
+        from ..extensions import first
+
+        text = first("receiver_input_text")
+        return text() if text is not None else "Receiver"
 
     def _label_for(self, device: AudioDevice, labels) -> str:
         kind = ("built-in microphone" if device.is_builtin
@@ -193,6 +202,8 @@ class InputPanel(QtWidgets.QWidget):
             self.device_box.setCurrentIndex(max(index, 0))
             return
         if selection.kind == RECEIVER:
+            # Not offered (BabelFishR): findData is -1, so the box stays on
+            # "Choose an audio input" and nothing can start by accident.
             index = self.device_box.findData({"kind": RECEIVER})
             self.device_box.setCurrentIndex(max(index, 0))
             return
@@ -324,6 +335,8 @@ class InputPanel(QtWidgets.QWidget):
         """``(ok, message)``. Never returns ok for an unconfirmed input."""
         status = self.app.input_status()
         state = status["state"]
+        if state == "receiver-unavailable":
+            return False, status["message"]
         if state == "receiver":
             # The receiver arrives over the network from SDR++; no audio
             # device backend is involved, so none is required.
@@ -377,12 +390,16 @@ class InputPanel(QtWidgets.QWidget):
             self._set_status("INPUT: none selected", "idle")
             self._show_alert("")
             self.meter.reset()
+        elif state == "receiver-unavailable":
+            self._set_status("INPUT: choose an audio input", "error")
+            self._show_alert("<b>CHOOSE AN AUDIO INPUT.</b> "
+                             + _escape_html(status["message"]))
+            self.meter.reset()
         elif state == "receiver":
             receiver = status["receiver"]
             if receiver["available"]:
-                running = "running" if receiver["sdrpp_running"] else "will be started"
-                self._set_status(f"INPUT: SDR receiver (SDR++ {running}) — SELECTED",
-                                 "working")
+                summary = receiver.get("summary") or "receiver"
+                self._set_status(f"INPUT: {summary} — SELECTED", "working")
                 self._show_alert("")
             else:
                 self._set_status("INPUT: SDR receiver — NOT AVAILABLE", "error")
@@ -501,3 +518,8 @@ class InputPanel(QtWidgets.QWidget):
 
 __all__ = ["InputPanel", "PERMISSION_TEXT", "CHOOSE_TEXT",
            "SYSTEM_DEFAULT_TEXT"]
+
+
+def _escape_html(text: str) -> str:
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# KingFishR is a separate distribution. It depends on BabelFishR (the shared
+# core) and adds the specialised SDR features. BabelFishR's own pyproject
+# packages only babelfishr*; it never includes or discovers this package.
+[project]
+name = "kingfishr"
+version = "0.1.0"
+description = "BabelFishR core plus SDR receiver, DSD-neo digital voice and experimental decoders"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "BabelFishR contributors" }]
+dependencies = ["babelfishr"]
+
+[project.optional-dependencies]
+gui = ["babelfishr[gui]"]
+
+[project.scripts]
+kingfishr = "kingfishr.cli:main"
+
+[project.gui-scripts]
+kingfishr-gui = "kingfishr.ui:run"
+
+[tool.setuptools.packages.find]
+include = ["kingfishr*"]

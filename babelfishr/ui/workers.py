@@ -195,10 +195,3 @@ def readiness_job(app, run_smoke_tests: bool = True,
     """Field Check off the GUI thread; smoke tests load models and take time."""
     report("Checking audio, storage and engines...")
     return app.readiness(run_smoke_tests=run_smoke_tests)
-
-
-def analysis_job(app, transmission_id: str, protocol: str = "",
-                 report: Callable[[str], None] = lambda text: None):
-    """Digital analysis off the GUI thread; dsd-neo can run for seconds."""
-    report("Running digital analysis...")
-    return app.analyze_digital(transmission_id, protocol=protocol)

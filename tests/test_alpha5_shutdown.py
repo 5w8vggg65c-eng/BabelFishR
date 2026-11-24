@@ -25,7 +25,7 @@ import pytest
 
 from babelfishr.app import BabelFishRApp, ProcessingBusy
 from babelfishr.audio.source import CallbackAudioSource
-from babelfishr.models import AnalysisAttempt, ProcessingState
+from babelfishr.models import ProcessingState
 from babelfishr.pipeline import CaptureService
 from babelfishr.providers.mock import (MockTranscriptionEngine,
                                        MockTranslationEngine)
@@ -307,42 +307,6 @@ def test_no_accepted_transmission_is_stranded_by_quit(qt_app, config, store):
 # ---- C: every store user --------------------------------------------------------
 
 
-class FakeAnalyser:
-    """Stands in for dsd-neo at the production seam (from_config), which is
-    consulted several times per run (availability, then the analysis
-    itself), so the gates are shared by every instance. Blocks inside
-    analyse() until released, then returns a real attempt."""
-
-    entered = threading.Event()
-    release = threading.Event()
-    configured = True
-    executable = "fake-dsd"
-
-    def available(self):
-        return True
-
-    def unavailable_reason(self):
-        return ""
-
-    def version(self):
-        return "0"
-
-    def analyse(self, request):
-        FakeAnalyser.entered.set()
-        assert FakeAnalyser.release.wait(60.0)
-        return AnalysisAttempt(transmission_id=request.transmission.id,
-                               engine="fake-analyser", engine_version="0")
-
-
-def install_fake_analyser(monkeypatch):
-    from babelfishr.analysis.dsd import DsdNeoAnalyser
-
-    FakeAnalyser.entered = threading.Event()
-    FakeAnalyser.release = threading.Event()
-    monkeypatch.setattr(DsdNeoAnalyser, "from_config",
-                        classmethod(lambda cls, config: FakeAnalyser()))
-
-
 def window_with_a_saved_message(qt_app, config, store, wav):
     from babelfishr.ui.main_window import MainWindow
 
@@ -359,46 +323,9 @@ def window_with_a_saved_message(qt_app, config, store, wav):
     return app, window, app.recent_transmissions()[0]
 
 
-def test_a_running_digital_analysis_saves_before_the_store_closes(qt_app, config, store,
-                                                                  wav, monkeypatch):
-    app, window, tx = window_with_a_saved_message(qt_app, config, store, wav)
-    install_fake_analyser(monkeypatch)
-    order = []
-    real_save, real_close = store.save_transmission, store.close
-    store.save_transmission = lambda t: (order.append("save"), real_save(t))[1]
-    store.close = lambda: (order.append("store-close"), real_close())[1]
-    timer, ticks = heartbeat(qt_app)
-    try:
-        window._on_analyze_digital(tx.id, "")              # the real window path
-        assert FakeAnalyser.entered.wait(10.0), "the analysis never started"
-        assert app.active_operations() == {"digital analysis": 1}
-
-        assert window.close() is False, "Quit was accepted with an analysis still running"
-        before = len(ticks)
-        pump(qt_app, 40)
-        assert len(ticks) >= before + 3
-        assert "digital analysis" in window.status.currentMessage()
-        assert "store-close" not in order and store.get_transmission(tx.id) is not None
-
-        FakeAnalyser.release.set()
-        assert pump_until(qt_app, lambda: not window.isVisible(), timeout=20.0)
-        assert order.index("save") < order.index("store-close"), order
-        from babelfishr.storage import Store
-        again = Store(config.database, recordings_dir=config.recording.directory)
-        saved = again.get_transmission(tx.id)
-        again.close()
-        assert len(saved.analysis_attempts) == 1
-        assert saved.analysis_attempts[0].engine == "fake-analyser"
-    finally:
-        timer.stop()
-        FakeAnalyser.release.set()
-        pump_until(qt_app, lambda: not window.isVisible(), timeout=20.0) or window.close()
-
-
 def test_new_work_is_refused_while_quit_is_pending(qt_app, config, store, wav,
                                                    monkeypatch):
     app, window, source = window_on_held_capture(qt_app, config, store, VOICE_OPEN)
-    install_fake_analyser(monkeypatch)
     timer, _ = heartbeat(qt_app)
     try:
         window._stop_monitoring()
@@ -416,12 +343,6 @@ def test_new_work_is_refused_while_quit_is_pending(qt_app, config, store, wav,
         assert app.transcribe_anyway("old-tx") is False
         assert app.retry("old-tx") is False
         assert "quitting" in app.processing_problem("old-tx")
-        assert app.analyze_digital("old-tx") is None
-        assert not FakeAnalyser.entered.is_set()
-        window._on_analyze_digital("old-tx", "")
-        assert "not started" in window.status.currentMessage()
-        pump(qt_app, 10)
-        assert not FakeAnalyser.entered.is_set()
         source.released.set()
         assert pump_until(qt_app, lambda: not window.isVisible(), timeout=20.0)
     finally:

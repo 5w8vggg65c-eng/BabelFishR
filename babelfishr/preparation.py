@@ -162,15 +162,11 @@ def prepare_field(config, *, asr_model: Optional[str] = None,
                     "(see the error above)")
             break
 
-    # -- optional DSD ----------------------------------------------------
-    from .analysis import DsdNeoAnalyser
+    # -- extension lines (KingFishR's optional decoder; none here) --------
+    from .extensions import hooks
 
-    analyser = DsdNeoAnalyser.from_config(config)
-    if analyser.available():
-        result.add("DSD-neo (optional)", True,
-                   f"{analyser.resolve_executable()} version {analyser.version()}")
-    else:
-        say("DSD-neo not found (optional; digital post-processing unavailable)")
+    for preparation_checks in hooks("preparation_checks"):
+        preparation_checks(config, result, say)
 
     return result
 

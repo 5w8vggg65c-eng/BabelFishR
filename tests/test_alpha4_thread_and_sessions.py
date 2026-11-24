@@ -21,8 +21,7 @@ import pytest
 
 from babelfishr.app import BabelFishRApp
 from babelfishr.config import Config
-from babelfishr.models import (AnalysisAttempt, AnalysisOutcome,
-                               DEFAULT_CONVERSATION_NAME, ProcessingState,
+from babelfishr.models import (DEFAULT_CONVERSATION_NAME, ProcessingState,
                                Provenance, Session, Transmission)
 from babelfishr.providers.mock import (MockTranscriptionEngine,
                                        MockTranslationEngine)
@@ -625,29 +624,6 @@ def test_an_unprovided_unit_id_is_never_an_identification():
         supplied = Transmission(session_id="s", unit_id="4021",
                                 unit_id_provenance=provenance)
         assert supplied.has_supplied_unit_id is True
-
-
-def test_decoded_identifiers_are_materialised_with_dsd_provenance():
-    from babelfishr.signal_metadata import apply_decoded_metadata
-
-    transmission = Transmission(session_id="s")
-    attempt = AnalysisAttempt(
-        engine="dsd-neo", engine_version="1.2.3", protocol="DMR",
-        outcome=AnalysisOutcome.PROTOCOL_IDENTIFIED,
-        metadata={"talkgroup": "1201", "source_id": "4021",
-                  "color_code": "1", "nac": "293"})
-    assert apply_decoded_metadata(transmission, attempt) is True
-
-    assert transmission.talkgroup == "1201"
-    assert transmission.talkgroup_provenance is Provenance.DSD
-    assert transmission.unit_id == "4021"
-    assert transmission.unit_id_provenance is Provenance.DSD
-    assert transmission.protocol == "DMR"
-    assert transmission.protocol_provenance is Provenance.DSD
-    assert transmission.has_supplied_unit_id is True
-    # The raw output is kept whole, including the keys not promoted.
-    assert transmission.signal_metadata["dsd-neo"]["nac"] == "293"
-    assert transmission.signal_metadata["dsd-neo"]["color_code"] == "1"
 
 
 def test_nothing_is_invented_from_ordinary_audio(config, store, wav):

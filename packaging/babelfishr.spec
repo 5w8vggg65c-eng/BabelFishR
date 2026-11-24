@@ -63,7 +63,9 @@ analysis = Analysis(
     hiddenimports=hidden,
     hookspath=[],
     runtime_hooks=[],
-    excludes=["tkinter", "matplotlib", "PySide6.QtWebEngineCore"],
+    # KingFishR is a separate product: never bundled into BabelFishR, even
+    # when it is installed in the build environment.
+    excludes=["tkinter", "matplotlib", "PySide6.QtWebEngineCore", "kingfishr"],
     noarchive=False,
 )
 

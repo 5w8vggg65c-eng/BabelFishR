@@ -30,6 +30,15 @@ from .storage import Store
 
 log = logging.getLogger(__name__)
 
+#: A saved selection names the SDR receiver, which BabelFishR does not
+#: include. Shown instead of starting; the receiver settings are kept.
+RECEIVER_NOT_INCLUDED = (
+    "Choose an audio input. The saved settings select the SDR receiver, "
+    "which BabelFishR does not include (it is part of KingFishR). The "
+    "receiver settings are kept unchanged. BabelFishR will not record from "
+    "the microphone, the system default or any other input in its place: "
+    "choose the input you want to monitor before starting.")
+
 
 #: Sentinel: "the caller said nothing", which is not "the caller said all".
 _UNSCOPED = object()
@@ -538,17 +547,21 @@ class BabelFishRApp:
         """
         return resolve_identity(self.selected_input_identity())
 
-    # -- the SDR receiver ----------------------------------------------------
+    # -- a named receiver input (an extension's; none in BabelFishR) ---------
     @property
     def receiver(self):
-        """The receiver controller (SDR++ / DSD-neo), created on first use."""
-        if getattr(self, "_receiver", None) is None:
-            from .receiver import ReceiverController
+        """The registered receiver controller, created on first use, or None.
 
-            self._receiver = ReceiverController(
-                self.config,
-                on_status=lambda kind, message: self.events.publish(
-                    "audio-status", {"kind": kind, "message": message}))
+        BabelFishR has no receiver. A separate product (KingFishR) supplies
+        one through babelfishr.extensions from its own entry point.
+        """
+        if getattr(self, "_receiver", None) is None:
+            from .extensions import first
+
+            factory = first("receiver_controller")
+            if factory is None:
+                return None
+            self._receiver = factory(self)
         return self._receiver
 
     def input_status(self) -> dict:
@@ -564,11 +577,21 @@ class BabelFishRApp:
         selection = self.config.audio.input
         identity = self.selected_input_identity()
         if selection.kind == "receiver" and selection.confirmed:
-            from .receiver import receiver_status
+            from .extensions import first
 
+            receiver_status = first("receiver_status")
+            if receiver_status is None:
+                # A settings file from a version (or product) that had the
+                # SDR receiver. Its receiver settings are kept as they are;
+                # nothing is recorded until an audio input is chosen - not
+                # the microphone, not the system default.
+                return {"state": "receiver-unavailable", "identity": identity,
+                        "device": None, "label": "", "expected": "",
+                        "candidates": [], "message": RECEIVER_NOT_INCLUDED}
             status = receiver_status(self.config)
+            label = status.get("label") or "receiver"
             return {"state": "receiver", "identity": identity, "device": None,
-                    "label": "SDR receiver (SDR++)", "expected": "SDR receiver (SDR++)",
+                    "label": label, "expected": label,
                     "candidates": [], "receiver": status}
         if selection.use_system_default and selection.confirmed:
             return {"state": "system-default", "identity": identity,
@@ -756,7 +779,10 @@ class BabelFishRApp:
             # The operator chose the receiver by name. Everything up to a
             # source comes from the receiver controller, and a receiver that
             # cannot be used is an error - never another input in its place.
-            source = self.receiver.open_source()
+            receiver = self.receiver
+            if receiver is None:
+                raise InputNotSelected(RECEIVER_NOT_INCLUDED)
+            source = receiver.open_source()
             self._signal_source = source
             return source
 
@@ -1241,46 +1267,6 @@ class BabelFishRApp:
         """
         pipeline = self._processing_pipeline()
         return pipeline.force_transcribe(tx_id) if pipeline is not None else False
-
-    # -- digital analysis ------------------------------------------------
-    def analyser(self):
-        """The configured DSD-neo analyser, or None when unavailable."""
-        from .analysis import DsdNeoAnalyser
-
-        engine = DsdNeoAnalyser.from_config(self.config)
-        return engine if engine.available() else None
-
-    def analyze_digital(self, tx_id: str, protocol: str = "",
-                        timeout: Optional[float] = None):
-        """Run digital analysis over a recording. Returns the attempt, or None.
-
-        Never raises on a missing tool or a failed decode: the outcome is
-        recorded on the transmission and the recording is untouched.
-        """
-        from .analysis.base import AnalysisRequest
-        from .analysis.dsd import DsdNeoAnalyser
-        from .signal_metadata import apply_decoded_metadata
-
-        try:
-            # Registered for the whole run, result save included: this is a
-            # store user shutdown has to wait for. Refused once Quit is
-            # pending - returns None rather than start work that could not
-            # be saved.
-            with self.activity("digital analysis"):
-                tx = self.store.get_transmission(tx_id)
-                if tx is None:
-                    return None
-                engine = DsdNeoAnalyser.from_config(self.config)
-                attempt = engine.analyse(AnalysisRequest(
-                    transmission=tx, protocol=protocol,
-                    timeout=timeout or self.config.analysis.timeout))
-                tx.analysis_attempts.append(attempt)
-                apply_decoded_metadata(tx, attempt)
-                self.store.save_transmission(tx)
-                self.events.publish("updated", tx)
-                return attempt
-        except ProcessingBusy:
-            return None
 
     def signal_metadata(self):
         """Measured RF metadata, when a signal source is supplying it."""

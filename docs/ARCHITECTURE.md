@@ -85,10 +85,9 @@ Consequences of writing before processing:
 | `modes` | operating modes, offline guards, Application Support paths |
 | `readiness` | Field Check: real smoke tests, no downloads |
 | `preparation` | the only code permitted to download anything |
-| `analysis/` | DSD-neo as an optional local post-processing provider |
-| `sources` | optional SDR `SignalSource` extension point |
+| `sources` | the `SignalSource` / `SignalMetadata` contract (no RF source ships) |
+| `extensions` | explicit hooks and product identity; filled only by KingFishR's own entry point |
 | `ui/theme` | appearance-adaptive semantic styling |
-| `experimental/` | quarantined signalling decoders (see EXPERIMENTAL.md) |
 
 ## Detection
 
@@ -114,3 +113,18 @@ courtesy beeps never cost a transcription.
   factory entry in `providers/__init__.py`.
 - **Sources**: subclass `AudioSource`; replay and live already share it.
 - **Detectors**: implement `TransmissionDetector`.
+
+## BabelFishR and KingFishR
+
+The SDR receiver (`kingfishr/receiver/`), DSD-neo analysis
+(`kingfishr/analysis/`), the recorded-IQ source and the experimental
+decoders moved, with their history, into the separate `kingfishr`
+distribution (`kingfishr/`). BabelFishR does not import, package or
+discover it: `babelfishr/extensions.py` holds hooks that only
+`kingfishr.activate()` - called by KingFishR's own entry points - fills,
+together with KingFishR's product identity (its own data folder, database,
+config files and `KINGFISHR_*` variables). Shared data stays in the core:
+analysis attempts, decoded identifiers and decoded audio are stored and
+shown read-only by BabelFishR, and the `[analysis]`, `[sdr]` and
+`[receiver]` settings round-trip unchanged.
+

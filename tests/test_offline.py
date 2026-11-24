@@ -297,9 +297,11 @@ def test_documented_cli_commands_all_exist():
     commands = set(subparsers[0].choices)
     for required in ("prepare-field", "field-check", "languages", "devices",
                      "doctor", "replay", "listen", "search", "export",
-                     "profiles", "selftest", "gui", "config", "analyze", "mode",
+                     "profiles", "selftest", "gui", "config", "mode",
                      "level", "calibrate", "test-record", "sessions", "engines"):
         assert required in commands, f"documented command {required!r} is missing"
+    # Digital analysis is KingFishR's (tests/kingfishr/test_product_isolation.py).
+    assert "analyze" not in commands
 
 
 def test_argos_error_messages_reference_a_real_command():

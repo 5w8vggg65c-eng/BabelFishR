@@ -8,8 +8,6 @@ from typing import Dict, List, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..analysis.dsd import AUTO_ROTATION_SECONDS
-from ..analysis.dsd import PRESETS as DSD_PRESETS
 from ..models import (ContentClass, ProcessingState, Provenance,
                       Transmission)
 from .playback import (LONG_RECORDING_SECONDS, PAUSED, PLAYING, SKIP_MS,
@@ -631,25 +629,12 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.transcribe_action = menu.addAction(
             "Transcribe anyway", lambda: self.transcribeAnywayRequested.emit(
                 self.tx.id))
-        self.analyze_action = menu.addAction(
-            "Analyze as digital (hunt all profiles)",
-            lambda: self.analyzeDigitalRequested.emit(self.tx.id, "auto"))
-        self.analyze_action.setToolTip(
-            f"Tries every profile in turn. A full rotation takes about "
-            f"{int(AUTO_ROTATION_SECONDS)} seconds at 48 kHz, so a shorter "
-            f"recording may finish before the right profile is reached - "
-            f"pick a specific preset below if you know the mode.")
+        # Digital analysis belongs to KingFishR, which adds its actions here
+        # through babelfishr.extensions; BabelFishR registers none.
+        from ..extensions import hooks
 
-        protocols = QtWidgets.QMenu("Analyze as a specific mode...", menu)
-        for preset in DSD_PRESETS:
-            if preset.id == "auto":
-                continue
-            action = protocols.addAction(
-                preset.label,
-                lambda checked=False, name=preset.id:
-                self.analyzeDigitalRequested.emit(self.tx.id, name))
-            action.setToolTip(preset.describe())
-        self.protocol_menu = menu.addMenu(protocols)
+        for bubble_menu in hooks("bubble_menu"):
+            bubble_menu(self, menu)
         menu.addSeparator()
         menu.addAction("Retry processing",
                        lambda: self.retryRequested.emit(self.tx.id))
@@ -824,8 +809,6 @@ class TransmissionBubble(QtWidgets.QFrame):
             ProcessingState.SKIPPED, ProcessingState.COMPLETE)
         self.action_button.setVisible(can_force)
         self.transcribe_action.setEnabled(bool(tx.audio_path))
-        self.analyze_action.setEnabled(bool(tx.audio_path))
-        self.protocol_menu.setEnabled(bool(tx.audio_path))
 
         self.decoded_action.setVisible(bool(tx.decoded_audio_path))
 

@@ -135,15 +135,6 @@ def test_an_invalid_provenance_stays_unknown(claimed, config, store, wav):
     app.close()
 
 
-def test_a_recorded_iq_source_does_not_claim_to_be_a_receiver():
-    """Replaying a recording is not taking a measurement."""
-    from babelfishr.sources import RecordedIQSource
-
-    samples = np.sin(2 * np.pi * 1000 * np.arange(8000) / 8000)
-    source = RecordedIQSource(samples, 8000)
-    assert source.metadata().provenance is Provenance.UNKNOWN
-
-
 # ---- 2. source scalars must not corrupt persisted measurements ----------
 
 

@@ -501,36 +501,6 @@ def cmd_languages(args) -> int:
     return 1
 
 
-def cmd_analyze(args) -> int:
-    """Run digital post-processing over a stored recording."""
-    from .app import BabelFishRApp
-    from .config import Config
-    from .storage import Store
-
-    config = Config.load(args.config)
-    app = BabelFishRApp(config=config, store=Store(config.database))
-    attempt = app.analyze_digital(args.transmission, protocol=args.protocol or "")
-    if attempt is None:
-        print(f"No such transmission: {args.transmission}", file=sys.stderr)
-        return 1
-    print(f"engine    : {attempt.engine} {attempt.engine_version}")
-    print(f"input     : {attempt.input_path}"
-          + (" (derived copy)" if attempt.input_is_derived else " (original)"))
-    print(f"command   : {' '.join(attempt.command) or '-'}")
-    print(f"runtime   : {attempt.runtime_seconds:.2f}s  exit={attempt.exit_status}")
-    print(f"outcome   : {attempt.outcome.label}")
-    if attempt.protocol:
-        print(f"protocol  : {attempt.protocol}")
-    if attempt.metadata:
-        print(f"metadata  : {attempt.metadata}")
-    if attempt.decoded_audio:
-        print(f"decoded   : {attempt.decoded_audio}")
-    if attempt.error:
-        print(f"error     : {attempt.error}")
-    print("\nThe original recording is unchanged.")
-    return 0 if attempt.outcome.is_success else 2
-
-
 def cmd_mode(args) -> int:
     from .config import Config
     from .modes import OperatingMode
@@ -839,10 +809,13 @@ def cmd_config(args) -> int:
 
 # ---- parser -----------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
+    from .extensions import product
+
+    name = product().config_stem
     parser = argparse.ArgumentParser(
-        prog="babelfishr",
+        prog=name,
         description="Receive, record, transcribe and translate radio traffic.")
-    parser.add_argument("--version", action="version", version=f"babelfishr {__version__}")
+    parser.add_argument("--version", action="version", version=f"{name} {__version__}")
     parser.add_argument("--config", help="path to a config file")
     parser.add_argument("--log-level", default="WARNING",
                         help="DEBUG, INFO, WARNING, ERROR")
@@ -909,11 +882,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--available", action="store_true",
                    help="also list packs available to download")
     p.set_defaults(func=cmd_languages)
-
-    p = sub.add_parser("analyze", help="run digital post-processing on a recording")
-    p.add_argument("transmission", help="transmission id")
-    p.add_argument("--protocol", help="force a protocol, e.g. DMR")
-    p.set_defaults(func=cmd_analyze)
 
     p = sub.add_parser("mode", help="show or set the operating mode")
     p.add_argument("--set", choices=[m.value for m in __import__(
@@ -997,6 +965,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("config", help="show or write the configuration")
     p.add_argument("--write", nargs="?", const="babelfishr.toml", metavar="PATH")
     p.set_defaults(func=cmd_config)
+
+    # Commands a separate product's own entry point registered
+    # (babelfishr.extensions). None for BabelFishR.
+    from .extensions import hooks
+
+    for cli_commands in hooks("cli_commands"):
+        cli_commands(sub)
     return parser
 
 
