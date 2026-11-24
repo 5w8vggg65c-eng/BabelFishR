@@ -21,11 +21,17 @@ REVIEW_COLUMN_WIDTH = 120
 
 CONTENT_LABELS = {
     "speech": "speech",
-    "noise": "noise / static",
-    "tone": "tone only",
-    "digital-suspected": "possibly digital",
+    # What the audio itself shows, not a claim about the radio signal.
+    "noise": "noise-like audio",
+    "tone": "steady tone",
     "unknown": "unclassified",
 }
+
+#: Stored classes the window never badges. "digital-suspected" was a guess
+#: from earlier versions (never produced now, see
+#: detect.ContentClass.DIGITAL_SUSPECTED); a row saved with it keeps the
+#: value in the database and in exports, but shows no badge.
+UNBADGED_CLASSES = {"digital-suspected"}
 
 STATE_LABELS = {
     ProcessingState.CAPTURED: "queued",
@@ -775,6 +781,9 @@ class TransmissionBubble(QtWidgets.QFrame):
 
         status_bits: List[str] = []
         pending = STATE_LABELS.get(tx.state, "")
+        if (tx.signal_metadata or {}).get("processing_stopped"):
+            # Not "not speech": monitoring was stopped before processing.
+            pending = "saved, not processed (monitoring stopped)"
         if pending:
             status_bits.append(pending)
         if (tx.signal_metadata or {}).get("translation_unresolved"):
@@ -833,7 +842,8 @@ class TransmissionBubble(QtWidgets.QFrame):
 
         chips: List[tuple] = []
         label = CONTENT_LABELS.get(tx.content_class.value, tx.content_class.value)
-        if tx.content_class is not ContentClass.SPEECH:
+        if (tx.content_class is not ContentClass.SPEECH
+                and tx.content_class.value not in UNBADGED_CLASSES):
             chips.append((label, "warning"))
         if tx.transcript_confidence is not None and tx.transcript:
             tone = "warning" if tx.transcript_confidence < 0.6 else "plain"

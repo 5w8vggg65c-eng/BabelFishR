@@ -2,20 +2,25 @@
 
 ## Arm once
 
-Start monitoring once. Each recording then starts and ends by itself:
+Start monitoring once. BabelFishR then listens, transcribes and fills the
+chat by itself, one message per utterance, until Stop:
 
 - **Starts** when the input's audio level rises above the activity threshold
   for two 20 ms frames (`detector.threshold_dbfs` in fixed mode, or the
   tracked noise floor + `open_margin_db` in auto mode).
-- **Ends** when the level stays below the close threshold for
-  `detector.hang_time` (0.8 s by default).
+- **Ends** after about **3 seconds of quiet**: the level stays below the
+  close threshold for `detector.hang_time` (3 s by default; set it in the
+  window as **End a message after ... s of quiet**). Shorter pauses - a
+  breath, a gap between words - stay in the same message, and the next audio
+  starts the next one. "Quiet" is the input's audio level: a microphone or
+  interface cannot report a radio's squelch. The default was 0.8 s, a
+  radio-burst value; a settings file that already holds a value keeps it.
 - **Keeps** `pre_roll` before the start and `post_roll` after the last active
   frame, so soft opening and closing syllables stay in the recording. New
   installs use 0.5 s for both (previously 0.3 / 0.2). On synthetic speech
   through a −20 dBFS gate, 0.3 s kept 60% of a soft 0.25 s opening syllable
   and 0.2 s kept 35% of a soft 0.4 s closing syllable; 0.5 s kept all of both.
-  A settings file that already holds values (Eric's has 0.3 / 0.2) is read as
-  written; change them there to adopt 0.5 / 0.5.
+  A settings file that already holds values is read as written.
 - **Long reception** is handed to speech recognition in parts of about
   `segment_seconds` (15 s) while it continues, cut at the quietest frame of
   the last 3 s, so text arrives before Stop. The parts join sample for
@@ -24,6 +29,34 @@ Start monitoring once. Each recording then starts and ends by itself:
 - **Squelch-tail trimming** still applies at the end of an ordinary burst
   (up to `max_tail_trim`). It is not applied at Stop to a recording already
   handed on in parts.
+
+## Stop
+
+**Stop Monitoring** ends capture and automatic chat updates at once:
+
+- Every captured sample is saved, including the message still open at Stop
+  and audio the input had already delivered.
+- Anything not yet processed is kept as **saved, not processed**. Rows on
+  screen that were waiting change to that indicator; recordings saved by the
+  Stop itself are not added to the chat. **View > Refresh** (or opening the
+  thread, Search or Needs Review) shows them; **Transcribe anyway** or
+  **Retry** processes them. They never resume by themselves, also not after
+  a relaunch.
+- A speech-recognition or translation call already running finishes in the
+  background (it cannot be interrupted), but its result is discarded.
+  Starting again straight away queues new messages behind it.
+- Manual jobs (Retry, Transcribe anyway) are not cancelled by Stop.
+
+## No analogue/digital guess
+
+Earlier versions labelled some messages "possibly digital" from the shape of
+the audio. On microphone and USB audio that landed mostly on ordinary
+analogue FM voice, and ordinary audio cannot tell analogue from digital radio
+in any case. BabelFishR no longer makes that guess; the detector's level,
+flatness and distribution measurements are still recorded. Messages saved by
+an earlier version keep the stored value (and exports include it), but the
+window shows no badge for it. Demodulating or decoding RF belongs to KingFishR;
+BabelFishR takes already-decoded ordinary audio.
 
 ## Receiver status versus audio activity
 

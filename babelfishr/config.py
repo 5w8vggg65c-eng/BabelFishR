@@ -105,7 +105,9 @@ class DetectorConfig:
     threshold_dbfs: float = -45.0
     open_margin_db: float = 8.0
     close_margin_db: float = 4.0
-    hang_time: float = 0.8
+    hang_time: float = 3.0
+    """Seconds of quiet that end a message (see DetectorSettings.hang_time).
+    Shown in the window as "End a message after ... s of quiet"."""
     pre_roll: float = 0.50
     post_roll: float = 0.50
     min_duration: float = 0.30

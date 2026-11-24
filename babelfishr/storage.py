@@ -997,6 +997,8 @@ class Store:
                   -- A speech-check flag clears only once the operator has
                   -- saved the words (Transmission.needs_review), not on a
                   -- note or a Retry as speech.
+                  -- Saved, not processed: monitoring was stopped first.
+                  OR json_extract(t.signal_metadata, '$.processing_stopped') IS NOT NULL
                   OR ((json_extract(t.signal_metadata, '$.speech_check.verdict')
                        IN ('likely_noise', 'uncertain')
                        OR json_extract(t.signal_metadata,

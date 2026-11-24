@@ -132,20 +132,32 @@ def test_steady_tone_is_classified_but_retained():
     ({"kind": "voice", "duration": 3.0, "level_dbfs": -14}, ContentClass.SPEECH),
     ({"kind": "static", "duration": 3.0, "level_dbfs": -20}, ContentClass.NOISE),
     ({"kind": "tone", "duration": 2.0, "level_dbfs": -14}, ContentClass.TONE),
-    ({"kind": "digital", "duration": 3.0, "level_dbfs": -14},
-     ContentClass.DIGITAL_SUSPECTED),
-    ({"kind": "digital", "duration": 3.0, "levels": 2, "level_dbfs": -14},
-     ContentClass.DIGITAL_SUSPECTED),
-    ({"kind": "digital", "duration": 3.0, "symbol_rate": 2400.0,
-      "level_dbfs": -14}, ContentClass.DIGITAL_SUSPECTED),
 ])
 def test_every_content_type_is_detected_and_classified(spec, expected):
-    """Speech, static, tones and digital bursts must ALL survive detection."""
+    """Speech, static and tones must ALL survive detection."""
     fixture = build_fixture([{"gap": 1.0}, spec, {"gap": 1.0}], sample_rate=SR)
     detected = detect_in_array(fixture.audio, SR)
     assert len(detected) == 1, f"{spec['kind']} was discarded by the detector"
     assert detected[0].content_class is expected
     assert detected[0].audio.size > 0
+
+
+@pytest.mark.parametrize("spec", [
+    {"kind": "digital", "duration": 3.0, "level_dbfs": -14},
+    {"kind": "digital", "duration": 3.0, "levels": 2, "level_dbfs": -14},
+    {"kind": "digital", "duration": 3.0, "symbol_rate": 2400.0, "level_dbfs": -14},
+])
+def test_digital_shaped_bursts_survive_and_are_not_guessed_digital(spec):
+    """They are recorded like everything else. The "possibly digital" guess
+    is gone: on microphone/USB audio it landed mostly on analogue FM voice,
+    and ordinary audio cannot tell analogue from digital radio."""
+    fixture = build_fixture([{"gap": 1.0}, spec, {"gap": 1.0}], sample_rate=SR)
+    (found,) = detect_in_array(fixture.audio, SR)
+    assert found.audio.size > 0
+    assert found.content_class is not ContentClass.DIGITAL_SUSPECTED
+    assert found.likely_digital is False
+    assert found.kurtosis is not None and found.crest is not None   # still measured
+    assert found.should_auto_transcribe(DetectorSettings())
 
 
 def test_digital_burst_is_separated_from_static_by_a_wide_margin():

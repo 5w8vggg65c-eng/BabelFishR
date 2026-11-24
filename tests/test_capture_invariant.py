@@ -52,7 +52,8 @@ def test_detector_retains_every_content_type():
     assert DetectorClass.SPEECH in classes
     assert DetectorClass.NOISE in classes
     assert DetectorClass.TONE in classes
-    assert DetectorClass.DIGITAL_SUSPECTED in classes
+    # The digital-shaped burst is retained too - just never guessed "digital".
+    assert DetectorClass.DIGITAL_SUSPECTED not in classes
 
 
 def test_every_event_is_recorded_and_logged(app, mixed_wav):
@@ -69,8 +70,7 @@ def test_every_event_is_recorded_and_logged(app, mixed_wav):
         assert samples.size > 0
 
 
-@pytest.mark.parametrize("content", [
-    ContentClass.NOISE, ContentClass.TONE, ContentClass.DIGITAL_SUSPECTED])
+@pytest.mark.parametrize("content", [ContentClass.NOISE, ContentClass.TONE])
 def test_non_speech_classes_are_persisted(app, mixed_wav, content):
     app.select_engines()
     app.start_session(replay_path=mixed_wav, name="classes")
@@ -209,12 +209,19 @@ def test_settings_separate_recording_from_processing():
     assert not hasattr(settings, "auto_process_noise")
 
 
-def test_digital_shaped_audio_reaches_the_digital_queue(app, mixed_wav):
-    app.select_engines()
-    app.start_session(replay_path=mixed_wav, name="digital-queue")
+def test_digital_shaped_audio_is_recorded_and_transcribed_not_labelled(
+        config, store, tmp_path):
+    """The digital-shaped burst is saved and reaches recognition like any
+    other audio; nothing labels it "possibly digital" any more."""
+    wav = build_fixture([{"gap": 1.5}, {"kind": "digital", "duration": 2.0,
+                                         "level_dbfs": -14}, {"gap": 1.5}],
+                        sample_rate=SR).write(str(tmp_path / "digital.wav"))
+    app = BabelFishRApp(config=config, store=store)
+    app.transcription, app.translation = MockTranscriptionEngine(), MockTranslationEngine()
+    app.start_session(replay_path=wav, name="digital-shaped")
     app.run_replay()
-    digital = [t for t in app.transmissions()
-               if t.content_class is ContentClass.DIGITAL_SUSPECTED]
-    assert digital
-    assert all(t.worth_digital_analysis for t in digital)
-    assert all(pathlib.Path(t.audio_path).exists() for t in digital)
+    (tx,) = app.transmissions()
+    assert pathlib.Path(tx.audio_path).exists()
+    assert tx.content_class is not ContentClass.DIGITAL_SUSPECTED
+    assert tx.transcript and tx.state is not ProcessingState.SKIPPED
+    app.stop_session()

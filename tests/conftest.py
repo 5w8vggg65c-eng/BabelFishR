@@ -75,6 +75,11 @@ def config(tmp_path: pathlib.Path) -> Config:
     cfg.recording.directory = str(tmp_path / "recordings")
     cfg.asr.engine = "mock"
     cfg.translate.engine = "mock"
+    # The shared synthetic fixtures are radio-style bursts 1.5-2.2 s apart,
+    # written for the old 0.8 s quiet that ended a message. They keep it, so
+    # the many tests built on "several messages" still get several. The new
+    # 3 s default is tested on its own in tests/test_utterance_quiet.py.
+    cfg.detector.hang_time = 0.8
     cfg.translate.target_language = "en"
     return cfg
 

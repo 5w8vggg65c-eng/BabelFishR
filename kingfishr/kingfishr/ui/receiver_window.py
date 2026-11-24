@@ -305,7 +305,7 @@ def install(window) -> None:
     window.sdr_label.setObjectName("sectionLabel")
     grid = window.channel_label.parentWidget().layout()
     if isinstance(grid, QtWidgets.QGridLayout):
-        grid.addWidget(window.sdr_label, 2, 0, 1, 6)
+        grid.addWidget(window.sdr_label, grid.rowCount(), 0, 1, 6)
 
     bar = window.menuBar()
     tools = window.findChild(QtWidgets.QMenu, "toolsMenu")

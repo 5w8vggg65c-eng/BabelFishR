@@ -154,12 +154,28 @@ This distinction matters more than any feature list. Evidence is dated by
 the build it was gathered on: a check of an earlier build is not a check of
 the current one.
 
-### The current build has not had its own Mac checks yet
+### Builds and what each has been checked on
 
-BabelFishR was split from KingFishR (the SDR features moved out) after the
-builds described below. The lean BabelFishR binary from the split has not
-yet been built, installed or run on a Mac. Until it has, the Mac evidence
-below is about the earlier, pre-split builds only.
+| Build | Commit | Checked | Installed? |
+|---|---|---|---|
+| 32 | `2278dbb` (before the BabelFishR/KingFishR split) | real Mac and GitHub runner, below | yes, on the project owner's Mac |
+| 33 | `4b17f63` (the lean split) | GitHub runner, and candidate tests on the owner's Mac, below | no - not installed yet |
+| next | this branch: 3 s message quiet, immediate Stop, no "possibly digital" | Linux automated tests only | not built yet |
+
+### Build 33 (`4b17f63`, 2026-11-24): runner and candidate checks, not installed
+
+- **GitHub `macos-26` arm64 runner, run 33:** build, standalone and bundle
+  checks passed; the deterministic suite gave 1372 passed, 11 skipped, 0
+  failed, including the seven Whisper model-layout tests that need
+  faster-whisper. Skipped there: the real-engine tests (no Whisper model or
+  Argos pack is prepared on the runner), two KingFishR tests that need a real
+  dsd-neo, and two CoreAudio fallback checks.
+- **Candidate tests of build 33 on the owner's Mac (the candidate was not
+  installed; build 32 remains the installed app):** the public French clip, French source
+  set, transcribed and translated to English in 4.56 s; noise with automatic
+  language took 16.38 s and its questionable text was held for review; a
+  55 s continuous replay gave its first text at 32.83 s, before the input
+  ended, with all 2,640,000 samples preserved.
 
 ### Verified on a real Mac before the split (2026-11-24, build 32, commit `2278dbb`)
 
@@ -233,8 +249,9 @@ pipeline holds together, not a quality level on radio traffic.
   interface: not tested.** No radio has been connected; the gate, rolls,
   segmenting and squelch-tail handling have not been checked on real
   receiver audio.
-- **The lean post-split build on a Mac** (see above): build, install,
-  launch, offline engines and live capture all need re-checking on it.
+- **Installation and live capture of a post-split build on a Mac** (see
+  the table above): build 33 has had runner and candidate checks but is not
+  installed; this branch's changes are not built yet.
 - **Recognition and translation quality on real radio traffic.** There is
   no quality guarantee for any language, model size or audio condition; one
   public clip on one Mac is not a field sample. Every transcript and its

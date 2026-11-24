@@ -59,13 +59,13 @@ class ContentClass(str, enum.Enum):
     """A steady tone: courtesy beep, roger beep, carrier with no modulation."""
 
     DIGITAL_SUSPECTED = "digital-suspected"
-    """Broadband but strongly structured - possibly a digital burst.
+    """Legacy only: never produced any more.
 
-    Deliberately conservative and deliberately *not* authoritative: it routes a
-    recording toward optional digital analysis. Ordinary accessory audio is
-    often too filtered for this to be reliable, so a negative here means
-    nothing, and a positive is a hint, not an identification.
-    """
+    Versions before 2026-11-24 guessed "possibly digital" from the sample
+    distribution of level-steady audio. On microphone and USB audio it
+    landed mostly on ordinary analogue FM voice, and a microphone cannot
+    tell analogue from digital radio anyway. Kept so older rows load
+    unchanged; the window shows no badge for it (timeline.UNBADGED_CLASSES)."""
 
     UNKNOWN = "unknown"
 
@@ -92,8 +92,18 @@ class DetectorSettings:
     close_margin_db: float = 4.0
     """Hysteresis, so a fading signal does not chatter the gate."""
 
-    hang_time: float = 0.8
-    """Seconds of quiet tolerated inside one transmission before it ends."""
+    hang_time: float = 3.0
+    """End a message after this many seconds of quiet.
+
+    "Quiet" is the input's audio level staying below the close threshold -
+    the level the microphone or interface delivers, not a radio's squelch,
+    carrier or RX state, which nothing here can see. Pauses shorter than
+    this stay inside one message, so a speaker drawing breath is not split.
+    3 s (was 0.8 s, a radio-burst value): monitoring a microphone or a
+    receiver's audio, a message is then one utterance, and the next audio
+    starts the next message - until Stop. Continuous audio that is never
+    quiet this long is still handed on in parts (segment_seconds).
+    Settings files that already hold a value keep it."""
 
     pre_roll: float = 0.50
     """Audio kept from *before* detection, so the first word is never clipped.
@@ -193,18 +203,6 @@ class DetectorSettings:
     and was called a tone and never transcribed; its pitch and formants move
     from frame to frame, a signalling tone's frequency does not."""
 
-    digital_kurtosis_max: float = 2.5
-    """Below this kurtosis a stationary event looks like discrete symbols.
-
-    Gaussian static sits at ~3.0 and synthetic 2/4-FSK at 1.4-2.0, so 2.5 is
-    roughly midway. Conservative on purpose: a false "digital" only routes a
-    recording toward optional analysis, and a false "noise" only sends it to a
-    different queue. Neither ever affects whether it is recorded.
-    """
-
-    digital_crest_max: float = 2.8
-    """Corroborating peak-to-RMS ceiling; static measures ~3.8."""
-
     def validate(self) -> "DetectorSettings":
         if self.open_margin_db <= self.close_margin_db:
             raise ValueError("open_margin_db must exceed close_margin_db")
@@ -212,6 +210,9 @@ class DetectorSettings:
             raise ValueError("pre_roll and post_roll must be >= 0")
         if self.min_duration <= 0:
             raise ValueError("min_duration must be > 0")
+        if not 0.1 <= self.hang_time <= 30.0:
+            raise ValueError("hang_time (quiet that ends a message) must be "
+                             "between 0.1 and 30 seconds")
         if self.segment_seconds and self.segment_seconds < 2.0:
             raise ValueError("segment_seconds must be 0 (off) or at least 2 seconds")
         if self.segment_search_seconds < 0:
@@ -833,9 +834,10 @@ class RadioActivityDetector(TransmissionDetector):
         * *spectral flatness* separates tonal from broadband;
         * *envelope modulation* separates speech (which swings in level from
           syllable to syllable) from stationary noise in the same band;
-        * *symbol structure* separates a digital burst - which is broadband and
-          stationary in level but highly regular in its zero crossings - from
-          formless static.
+        Kurtosis and crest factor are measured and recorded, but no longer
+        used to guess "digital": BabelFishR receives ordinary audio from a
+        microphone or interface and cannot tell analogue from digital radio
+        (a false guess landed mostly on analogue FM voice).
         """
         if not stats:
             return Verdict(content_class=ContentClass.UNKNOWN, confidence=0.4)
@@ -867,18 +869,13 @@ class RadioActivityDetector(TransmissionDetector):
                 >= self.settings.tone_steady_share
         likely_tone = (stationary and median_flatness < self.settings.tone_flatness
                        and steady)
-        # A digital burst and static are both broadband and both stationary in
-        # level; what separates them is the shape of the sample distribution.
-        # Static is Gaussian; discrete symbols are flat-topped and sub-Gaussian.
-        likely_digital = (stationary and not likely_tone
-                          and median_kurtosis < self.settings.digital_kurtosis_max
-                          and median_crest < self.settings.digital_crest_max)
-        likely_noise = (stationary and not likely_tone and not likely_digital
+        # No "digital" guess (see above): likely_digital stays False so the
+        # recorded field keeps its shape for older readers.
+        likely_digital = False
+        likely_noise = (stationary and not likely_tone
                         and median_flatness > self.settings.noise_flatness)
 
-        if likely_digital:
-            content_class = ContentClass.DIGITAL_SUSPECTED
-        elif likely_noise:
+        if likely_noise:
             content_class = ContentClass.NOISE
         elif likely_tone:
             content_class = ContentClass.TONE

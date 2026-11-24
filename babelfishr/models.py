@@ -788,6 +788,10 @@ class Transmission:
         if (check.get("verdict") in ("likely_noise", "uncertain")
                 and not (self.reviewed and self.has_correction)):
             return True
+        # Saved, not processed: monitoring was stopped first (pipeline
+        # PROCESSING_STOPPED). It waits for Transcribe anyway / Retry.
+        if metadata.get("processing_stopped"):
+            return True
         # Translation not attempted, language unresolved (pipeline
         # TRANSLATION_UNRESOLVED): same rule - saved words clear it.
         if (metadata.get("translation_unresolved")

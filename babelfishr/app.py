@@ -22,7 +22,8 @@ from .config import Config
 from .models import (ProcessingState, RadioProfile, Session, SourceLanguageMode,
                      Transmission, utcnow)
 from .pipeline import (CaptureService, EventBus, PipelineState,
-                       ProcessingPipeline, ProcessingStopped)
+                       ProcessingPipeline, ProcessingStopped,
+                       mark_processing_stopped)
 from .providers import (EngineUnavailable, Glossary, TranscriptionEngine,
                         TranslationEngine, build_transcription_engine,
                         build_translation_engine, is_placeholder)
@@ -134,10 +135,27 @@ class _SessionEnd:
     call while an attempt is running does nothing.
     """
 
-    def __init__(self, store: Store, session_id: str, ended_at):
+    def __init__(self, store: Store, session_id: str, ended_at,
+                 stopped_ids=(), events: Optional[EventBus] = None,
+                 in_flight=lambda tx_id: False,
+                 claims: Optional[threading.Lock] = None):
         self.store = store
         self.session_id = session_id
         self.ended_at = ended_at
+        #: The run's recordings taken out of the processing queue at Stop:
+        #: marked saved-not-processed here, off the window's thread.
+        self.stopped_ids = list(stopped_ids)
+        self.events = events
+        #: True while any processor holds the id - a manual Transcribe
+        #: anyway / Retry the operator started after Stop. Such a row is the
+        #: job's to write, never this marker's.
+        self.in_flight = in_flight
+        #: Held for each row's check-read-write here, and by manual
+        #: admission (BabelFishRApp.retry / transcribe_anyway) while it saves
+        #: and registers its job: a manual job is either in flight when this
+        #: checks (skipped), already finished (terminal: skipped), or admitted
+        #: only after this row's write (and then clears the marker itself).
+        self.claims = claims or threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self.done = False
@@ -158,6 +176,19 @@ class _SessionEnd:
 
     def _attempt(self) -> None:
         try:
+            for tx_id in self.stopped_ids:
+                with self.claims:
+                    if self.in_flight(tx_id):
+                        continue       # a manual job holds it: its row to write
+                    tx = self.store.get_transmission(tx_id)
+                    if tx is None or tx.state.is_terminal:
+                        continue       # gone, or already processed (manually)
+                    mark_processing_stopped(tx, self.session_id)
+                    self.store.save_transmission(tx)
+                    if self.events is not None:
+                        # Tagged with the stopped run: the window shows it
+                        # only as a stopped indicator on a row already shown.
+                        self.events.publish("updated", tx, run=self.session_id)
             self.store.close_session(self.session_id, ended_at=self.ended_at)
             self.done = True
         except Exception as exc:  # noqa: BLE001 - recorded, reported, retried
@@ -229,6 +260,11 @@ class BabelFishRApp:
         self._ready_for_cleanup = False
         #: The end-of-run writes still in flight, oldest first.
         self._session_ends: List[_SessionEnd] = []
+        #: Monitoring runs (session ids) the operator has stopped.
+        self._stopped_runs: set = set()
+        #: Serialises manual admission with a Stop's marker writes (see
+        #: _SessionEnd.claims). Held only for one row's save and admission.
+        self._row_claims = threading.Lock()
         # The named thread the operator is working in. One capture service and
         # one pipeline exist globally; this only decides which thread a run is
         # filed under and which rows the window shows.
@@ -754,11 +790,19 @@ class BabelFishRApp:
         self.store.save_session(session)
         self.session = session
 
-        self.pipeline = ProcessingPipeline(
-            store=self.store, transcription=self.transcription,
-            translation=self.translation, config=self.config, events=self.events,
-            glossary=self.glossary, workers=workers)
-        self.pipeline.start(session)
+        reuse = self.standalone_pipeline
+        if reuse is not None and self._can_reuse(reuse, busy=False):
+            # Same worker, engines and mode as before (see
+            # _discard_standalone_pipeline); only the run is new.
+            self.standalone_pipeline, self._standalone_mode = None, None
+            reuse._session = session
+            self.pipeline = reuse
+        else:
+            self.pipeline = ProcessingPipeline(
+                store=self.store, transcription=self.transcription,
+                translation=self.translation, config=self.config,
+                events=self.events, glossary=self.glossary, workers=workers)
+            self.pipeline.start(session)
         self._session_mode = self.mode
 
         self.capture = CaptureService(
@@ -863,6 +907,12 @@ class BabelFishRApp:
         if self.standalone_pipeline is None:
             return
         pipeline = self.standalone_pipeline
+        if self._can_reuse(pipeline):
+            # Still finishing an engine call abandoned at Stop, or manual
+            # work: the new run queues behind it on the same worker rather
+            # than being refused or running a second set of engines beside
+            # it. Kept as is for _open_session to adopt.
+            return
         if not pipeline.stop_if_idle(timeout=5.0):
             pending = pipeline.pending
             if pending:
@@ -876,6 +926,15 @@ class BabelFishRApp:
         self.standalone_pipeline = None
         self._standalone_mode = None
 
+    def _can_reuse(self, pipeline: ProcessingPipeline, busy: bool = True) -> bool:
+        """A leftover processor may serve the next run only when it is still
+        accepting and owns exactly this mode's current engines (with
+        ``busy``, only when it still has work - an idle one is retired)."""
+        return (pipeline.accepting and (pipeline.pending > 0 or not busy)
+                and self._standalone_mode is self.mode
+                and pipeline.transcription is self.transcription
+                and pipeline.translation is self.translation)
+
     def stop_session(self) -> Optional[Session]:
         """Stop capture and forget where it was going.
 
@@ -885,6 +944,19 @@ class BabelFishRApp:
         "Recording into ..." after monitoring had stopped.
         """
         session = self.session
+        stopped_ids: List[str] = []
+        if session is not None:
+            # The user's choice: Stop ends automatic processing and chat
+            # updates for this run at once. Its queued recordings stay saved
+            # (marked saved-not-processed below); a running engine call
+            # finishes but its result is neither saved nor shown; the final
+            # flush is saved and marked, not processed. Manual work and other
+            # runs carry on. Nothing here waits.
+            self._stopped_runs.add(session.id)
+            for pipeline in (self.pipeline, self.standalone_pipeline):
+                if pipeline is not None:
+                    removed, _running = pipeline.cancel_run(session.id)
+                    stopped_ids.extend(removed)
         if self.capture is not None:
             capture, self.capture = self.capture, None
             # Nothing here waits on audio. The join, the source close and the
@@ -935,7 +1007,10 @@ class BabelFishRApp:
             # Identity and time are fixed now; the write is tracked until
             # it lands, and close() waits for it before the store closes.
             session.ended_at = utcnow()
-            end = _SessionEnd(self.store, session.id, session.ended_at)
+            end = _SessionEnd(self.store, session.id, session.ended_at,
+                              stopped_ids=stopped_ids, events=self.events,
+                              in_flight=self._held_by_a_processor,
+                              claims=self._row_claims)
             self._session_ends.append(end)
             end.start()
             self.events.publish("session", session)
@@ -943,6 +1018,20 @@ class BabelFishRApp:
         return session
 
     # -- the end-of-run write --------------------------------------------
+    def _held_by_a_processor(self, tx_id: str) -> bool:
+        return any(p is not None and p.is_in_flight(tx_id)
+                   for p in (self.pipeline, self.standalone_pipeline, *self._retired))
+
+    def is_manually_processing(self, tx_id: str) -> bool:
+        """A manual job (Retry, Transcribe anyway) holds this recording."""
+        return any(p is not None and p.is_manual(tx_id)
+                   for p in (self.pipeline, self.standalone_pipeline))
+
+    def run_stopped(self, run: Optional[str]) -> bool:
+        """This monitoring run was stopped: its automatic results are not
+        shown (the window drops its events)."""
+        return run is not None and run in self._stopped_runs
+
     def _reap_session_ends(self) -> None:
         self._session_ends = [e for e in self._session_ends if not e.done]
 
@@ -1252,9 +1341,10 @@ class BabelFishRApp:
         pipeline = self._processing_pipeline()
         if pipeline is None:
             return False
-        if source_language:
-            return pipeline.retry(tx_id, source_language=source_language)
-        return pipeline.retry(tx_id)
+        with self._row_claims:
+            if source_language:
+                return pipeline.retry(tx_id, source_language=source_language)
+            return pipeline.retry(tx_id)
 
     def transcribe_anyway(self, tx_id: str) -> bool:
         """Force transcription of a recording the classifier routed away.
@@ -1266,7 +1356,10 @@ class BabelFishRApp:
         it would have been at capture time.
         """
         pipeline = self._processing_pipeline()
-        return pipeline.force_transcribe(tx_id) if pipeline is not None else False
+        if pipeline is None:
+            return False
+        with self._row_claims:
+            return pipeline.force_transcribe(tx_id)
 
     def signal_metadata(self):
         """Measured RF metadata, when a signal source is supplying it."""

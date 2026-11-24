@@ -310,8 +310,8 @@ def test_the_readme_states_the_hardware_that_was_never_tested():
     for item in ("physical radio", "FalconClaw", "USB audio interface",
                  "real receiver audio"):
         assert item in flat, f"the remaining-limits list omits {item!r}"
-    # The current build still needs its own Mac checks.
-    assert "lean post-split build on a Mac" in flat
+    # Post-split builds: not installed / not built, said so.
+    assert "Installation and live capture of a post-split build on a Mac" in flat
     # No blanket quality guarantee and no independent zero-egress claim.
     assert "no quality guarantee" in flat
     assert "no zero-egress certification is claimed" in flat
@@ -321,7 +321,8 @@ def test_the_readme_states_the_hardware_that_was_never_tested():
     # Pre-split Mac evidence is dated to its build, and kept apart from it.
     whole = " ".join(text.split())
     assert "Verified on a real Mac before the split (2026-11-24, build 32, commit `2278dbb`)" in whole
-    assert "has not yet been built, installed or run on a Mac" in whole
+    assert "| 33 | `4b17f63` (the lean split)" in text
+    assert "not installed yet" in whole and "not built yet" in whole
 
 
 def test_the_readme_does_not_repeat_contradicted_absolutes():

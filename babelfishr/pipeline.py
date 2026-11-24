@@ -72,6 +72,10 @@ class Event:
 
     payload: Any = None
     at: _dt.datetime = dataclasses.field(default_factory=utcnow)
+    run: Optional[str] = None
+    """The monitoring run (session id) whose automatic work produced this,
+    or None for manual work and everything else. The window drops a run's
+    events once that run has been stopped."""
 
 
 class EventBus:
@@ -90,8 +94,9 @@ class EventBus:
         with self._lock:
             self._subscribers.append(callback)
 
-    def publish(self, kind: str, payload: Any = None) -> None:
-        event = Event(kind=kind, payload=payload)
+    def publish(self, kind: str, payload: Any = None,
+                run: Optional[str] = None) -> None:
+        event = Event(kind=kind, payload=payload, run=run)
         with self._lock:
             subscribers = list(self._subscribers)
         for callback in subscribers:
@@ -322,6 +327,12 @@ def _skip_reason(detected: DetectedTransmission) -> str:
           "Automatic speech processing was skipped. The recording is kept.")
 
 
+def _clear_processing_stopped(tx: Transmission) -> None:
+    if is_processing_stopped(tx):
+        tx.signal_metadata = {k: v for k, v in tx.signal_metadata.items()
+                              if k != PROCESSING_STOPPED}
+
+
 def _slug(text: str) -> str:
     safe = "".join(c if c.isalnum() or c in "-_." else "-" for c in text.strip())
     return safe.strip("-") or "unnamed"
@@ -329,6 +340,42 @@ def _slug(text: str) -> str:
 
 class ProcessingStopped(RuntimeError):
     """Work was offered to a processor that has already begun shutting down."""
+
+
+class RunStopped(ProcessingStopped):
+    """Automatic work was offered for a monitoring run that has been stopped.
+
+    The recording is already saved; it is marked saved-not-processed
+    (PROCESSING_STOPPED) instead, for the operator to process by hand."""
+
+
+#: signal_metadata key: monitoring was stopped before this was processed.
+#: Saved with state SKIPPED (terminal, so nothing resumes it automatically);
+#: Retry / Transcribe anyway clear it.
+PROCESSING_STOPPED = "processing_stopped"
+
+
+def mark_processing_stopped(tx: Transmission, run: Optional[str]) -> Transmission:
+    """Saved audio, not processed because its monitoring run was stopped.
+
+    Anything the row already holds (a transcript saved before Stop) stays.
+    """
+    tx.state = ProcessingState.SKIPPED
+    tx.auto_processed = False
+    tx.skip_reason = ("Monitoring was stopped before this recording was "
+                      "processed. The recording is saved: use Transcribe "
+                      "anyway (or Retry) to process it.")
+    tx.signal_metadata = dict(tx.signal_metadata or {}, **{
+        PROCESSING_STOPPED: {"run": run, "at": utcnow().isoformat()}})
+    return tx
+
+
+def is_processing_stopped(tx: Transmission) -> bool:
+    return bool((tx.signal_metadata or {}).get(PROCESSING_STOPPED))
+
+
+class _Abandon(Exception):
+    """Internal: the item's monitoring run was stopped; stop at this stage."""
 
 
 class ProcessingPipeline:
@@ -371,6 +418,13 @@ class ProcessingPipeline:
         #: running, or running. Also what lets the application refuse to
         #: delete a message a worker is still writing, and say so.
         self._in_flight: set = set()
+        #: For each id in flight, the monitoring run it was accepted for
+        #: automatically, or None for manual work (Retry, Transcribe anyway).
+        self._origin: Dict[str, Optional[str]] = {}
+        #: Monitoring runs that have been stopped: their automatic work is
+        #: not started, not saved and not published (see cancel_run).
+        self._stopped_runs: set = set()
+        self._local = threading.local()
 
     # -- lifecycle -------------------------------------------------------
     def start(self, session: Optional[Session] = None) -> None:
@@ -480,7 +534,7 @@ class ProcessingPipeline:
             self._idle.wait(timeout=0.05)
         return self.pending == 0
 
-    def submit(self, tx_id: str) -> bool:
+    def submit(self, tx_id: str, run: Optional[str] = None) -> bool:
         """Accept one id. Returns False if it is already in flight.
 
         An id already accepted is not queued twice: one run is what was asked
@@ -491,15 +545,89 @@ class ProcessingPipeline:
         retiring and can say so.
         """
         with self._active_lock:
+            if run is not None and run in self._stopped_runs:
+                raise RunStopped(f"monitoring run {run} has been stopped")
             if not self._accepting:
                 raise ProcessingStopped(
                     "this processor is shutting down and takes no new work")
             if tx_id in self._in_flight:
                 return False
             self._in_flight.add(tx_id)
+            self._origin[tx_id] = run
             self._idle.clear()
         self._queue.put(tx_id)
         return True
+
+    # -- per-run cancellation (Stop) ---------------------------------------
+    def cancel_run(self, run: str):
+        """Stop a monitoring run's automatic work, without waiting.
+
+        From now on: nothing more is accepted for *run*; its queued items
+        leave the queue (their recordings are already saved); an item of
+        its already running finishes its current engine call - a native
+        call cannot be interrupted - but nothing it produces is saved or
+        published. Manual work, and other runs, are untouched.
+
+        Returns ``(removed, running)``: ids taken out of the queue, which
+        the caller marks saved-not-processed, and ids of the run still
+        held by a worker, which the worker marks itself.
+        """
+        with self._active_lock:
+            self._stopped_runs.add(run)
+            ours = {tx_id for tx_id, origin in self._origin.items() if origin == run}
+            kept, removed = [], []
+            while True:
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is not None and item in ours and item not in removed:
+                    removed.append(item)
+                else:
+                    kept.append(item)
+            for item in kept:
+                self._queue.put_nowait(item)
+            for tx_id in removed:
+                self._in_flight.discard(tx_id)
+                self._origin.pop(tx_id, None)
+            running = sorted(ours - set(removed))
+            if not self._in_flight:
+                self._idle.set()
+        return removed, running
+
+    def is_manual(self, tx_id: str) -> bool:
+        """In flight as manual work (Retry, Transcribe anyway)."""
+        with self._active_lock:
+            return tx_id in self._in_flight and self._origin.get(tx_id) is None
+
+    def run_stopped(self, run: Optional[str]) -> bool:
+        with self._active_lock:
+            return run is not None and run in self._stopped_runs
+
+    def _current_run(self) -> Optional[str]:
+        return getattr(self._local, "run", None)
+
+    def _publish(self, kind: str, payload: Any = None) -> None:
+        """Publish, tagged with the run of the item this worker is running."""
+        self.events.publish(kind, payload, run=self._current_run())
+
+    def _settle_if_stopped(self, tx: Transmission) -> bool:
+        """After an automatic item's last save: if its run was stopped in the
+        gap between the last check and that save, the row is put back to
+        saved-not-processed (and only that is published). The window has
+        dropped the run's other events already. True when it did so."""
+        run = self._current_run()
+        if not self.run_stopped(run) or is_processing_stopped(tx):
+            return False
+        mark_processing_stopped(tx, run)
+        self.store.save_transmission(tx)
+        self._publish("updated", tx)
+        return True
+
+    def _check_run(self, tx: Transmission) -> None:
+        """At a stage boundary: abandon the item if its run was stopped."""
+        if self.run_stopped(self._current_run()):
+            raise _Abandon()
 
     def is_in_flight(self, tx_id: str) -> bool:
         with self._active_lock:
@@ -526,6 +654,7 @@ class ProcessingPipeline:
         tx.state = ProcessingState.CAPTURED
         tx.auto_processed = False
         tx.skip_reason = ""
+        _clear_processing_stopped(tx)
         self.store.save_transmission(tx)
         self.events.publish("updated", tx)
         try:
@@ -553,6 +682,7 @@ class ProcessingPipeline:
             if not self._accepting or tx_id in self._in_flight:
                 return False
             self._in_flight.add(tx_id)
+            self._origin[tx_id] = None          # manual
             self._idle.clear()
         queued = False
         try:
@@ -567,6 +697,7 @@ class ProcessingPipeline:
     def _release(self, tx_id: str) -> None:
         with self._active_lock:
             self._in_flight.discard(tx_id)
+            self._origin.pop(tx_id, None)
             if not self._in_flight:
                 self._idle.set()
 
@@ -595,8 +726,12 @@ class ProcessingPipeline:
                 tx.translation_correction = ""
         tx.clear_error()
         tx.state = ProcessingState.CAPTURED
+        if is_processing_stopped(tx):
+            # Saved-not-processed after a Stop: Retry is the manual route.
+            _clear_processing_stopped(tx)
+            tx.skip_reason = ""
         self.store.save_transmission(tx)
-        self.events.publish("updated", tx)
+        self._publish("updated", tx)
         return True
 
     # -- worker ----------------------------------------------------------
@@ -613,11 +748,14 @@ class ProcessingPipeline:
             # pending never read zero during this hand-off - the gap an
             # earlier version opened by counting the queue plus a separate
             # "active" figure that was incremented only here.
+            with self._active_lock:
+                self._local.run = self._origin.get(tx_id)
             try:
                 self._process(tx_id)
             except Exception:  # noqa: BLE001 - a worker must never die
                 log.exception("unhandled error processing %s", tx_id)
             finally:
+                self._local.run = None
                 self._release(tx_id)
 
     def _engine_gate(self, stage: str) -> None:
@@ -641,15 +779,35 @@ class ProcessingPipeline:
             log.warning("transmission %s vanished before processing", tx_id)
             return
 
+        if self._current_run() is None:
+            # Manual work (Retry, Transcribe anyway): whatever was marked
+            # saved-not-processed is being processed now. Clear it on this
+            # copy too, in case a Stop's marker write landed after the
+            # operator's request was saved.
+            _clear_processing_stopped(tx)
         try:
-            if not self._transcribe(tx):
+            try:
+                self._check_run(tx)
+                if not self._transcribe(tx):
+                    self._settle_if_stopped(tx)
+                    return
+                self._check_run(tx)
+                self._translate(tx)
+                self._check_run(tx)
+            except _Abandon:
+                # The run was stopped: nothing more is saved or shown as a
+                # result. The row is saved-not-processed, keeping whatever it
+                # held before Stop; the event says only that.
+                mark_processing_stopped(tx, self._current_run())
+                self.store.save_transmission(tx)
+                self._publish("updated", tx)
                 return
-            self._translate(tx)
 
             if tx.state is not ProcessingState.FAILED:
                 tx.state = ProcessingState.COMPLETE
             self.store.save_transmission(tx)
-            self.events.publish("updated", tx)
+            if not self._settle_if_stopped(tx):
+                self._publish("updated", tx)
         finally:
             # Finished - on every path out, and that is all this pipeline can
             # honestly say. It used to publish LISTENING here, a claim about
@@ -661,7 +819,7 @@ class ProcessingPipeline:
             # own outcome - COMPLETE with no words, FAILED with its error - is
             # already saved and published above; this is only the activity
             # signal. The window resolves it against the actual capture.
-            self.events.publish("state", PipelineState.COMPLETE)
+            self._publish("state", PipelineState.COMPLETE)
 
     def _load_audio(self, tx: Transmission):
         from .audio.wavefile import read_wav
@@ -674,15 +832,15 @@ class ProcessingPipeline:
         if self.transcription is None:
             tx.state = ProcessingState.SKIPPED
             self.store.save_transmission(tx)
-            self.events.publish("updated", tx)
+            self._publish("updated", tx)
             return False
         if tx.transcript and tx.state is not ProcessingState.CAPTURED:
             return True  # already done on an earlier attempt
 
         tx.state = ProcessingState.TRANSCRIBING
         self.store.save_transmission(tx)
-        self.events.publish("updated", tx)
-        self.events.publish("state", PipelineState.TRANSCRIBING)
+        self._publish("updated", tx)
+        self._publish("state", PipelineState.TRANSCRIBING)
 
         language = None
         if tx.source_language_mode is SourceLanguageMode.SPECIFIED:
@@ -695,12 +853,14 @@ class ProcessingPipeline:
                 audio, rate, language=language,
                 vocabulary=self.glossary.vocabulary(language) or None)
         except (EngineError, EngineUnavailable, OSError, ValueError) as exc:
+            self._check_run(tx)       # stopped meanwhile: not a failure to show
             tx.fail("transcription", str(exc))
             self.store.save_transmission(tx)
-            self.events.publish("updated", tx)
-            self.events.publish("error", {"transmission": tx.id, "stage": "transcription",
+            self._publish("updated", tx)
+            self._publish("error", {"transmission": tx.id, "stage": "transcription",
                                           "message": str(exc)})
             return False
+        self._check_run(tx)           # stopped during the call: discard it
 
         tx.transcript = result.text
         tx.transcript_confidence = result.confidence
@@ -720,12 +880,13 @@ class ProcessingPipeline:
         tx.state = ProcessingState.TRANSCRIBED
         tx.clear_error()
         self.store.save_transmission(tx)
-        self.events.publish("updated", tx)
+        self._publish("updated", tx)
 
         if not result.text.strip():
+            self._check_run(tx)
             tx.state = ProcessingState.COMPLETE
             self.store.save_transmission(tx)
-            self.events.publish("updated", tx)
+            self._publish("updated", tx)
             return False
         return True
 
@@ -790,8 +951,8 @@ class ProcessingPipeline:
             return
         tx.state = ProcessingState.TRANSLATING
         self.store.save_transmission(tx)
-        self.events.publish("updated", tx)
-        self.events.publish("state", PipelineState.TRANSLATING)
+        self._publish("updated", tx)
+        self._publish("state", PipelineState.TRANSLATING)
 
         try:
             self._engine_gate("translation")
@@ -815,8 +976,8 @@ class ProcessingPipeline:
             if missing:
                 tx.fail("translation", missing)
                 self.store.save_transmission(tx)
-                self.events.publish("updated", tx)
-                self.events.publish("error", {"transmission": tx.id,
+                self._publish("updated", tx)
+                self._publish("error", {"transmission": tx.id,
                                               "stage": "translation",
                                               "message": missing})
                 return
@@ -825,14 +986,16 @@ class ProcessingPipeline:
                 glossary=self.glossary.mapping(tx.source_language) or None,
                 do_not_translate=self.glossary.protected(tx.source_language) or None)
         except (EngineError, EngineUnavailable) as exc:
+            self._check_run(tx)
             # The transcript survives: only the translation stage failed.
             tx.fail("translation", str(exc))
             self.store.save_transmission(tx)
-            self.events.publish("updated", tx)
-            self.events.publish("error", {"transmission": tx.id, "stage": "translation",
+            self._publish("updated", tx)
+            self._publish("error", {"transmission": tx.id, "stage": "translation",
                                           "message": str(exc)})
             return
 
+        self._check_run(tx)           # stopped during the call: discard it
         tx.translation = "" if result.untranslated else result.text
         tx.target_language = target
         tx.translation_engine = result.engine
@@ -919,6 +1082,7 @@ class CaptureService:
         completes the finish itself when it does return.
         """
         timeout = self.stop_timeout if timeout is None else timeout
+        self._close_intake()
         self._running = False
         return self._stop_blocking(timeout)
 
@@ -933,6 +1097,7 @@ class CaptureService:
         thread has already returned (a replay that reached its end) there is
         nothing to wait for and the finish happens here, at once.
         """
+        self._close_intake()
         self._running = False
         thread = self._thread
         ended = thread is None or not thread.is_alive()
@@ -950,6 +1115,21 @@ class CaptureService:
             target=self._stop_blocking, args=(self.stop_timeout,),
             name="babelfishr-capture-stop", daemon=True)
         self._stopper.start()
+
+    def _close_intake(self) -> None:
+        """The audio cutoff: from the Stop request on, the source adds
+        nothing new; what it already holds is still drained into the final
+        flush (_drain_source). Without this, a live input kept filling its
+        queue until the stopper closed the device - after the audio thread
+        had already drained it - so post-Stop audio could reach the last
+        recording."""
+        close = getattr(self.source, "close_intake", None)
+        if close is None:
+            return
+        try:
+            close()
+        except Exception as exc:  # noqa: BLE001 - the stop itself must go on
+            log.warning("closing the input's intake failed: %s", exc)
 
     def _stop_blocking(self, timeout: float) -> bool:
         thread = self._thread
@@ -1128,7 +1308,7 @@ class CaptureService:
         reading = self.meter.update(block)
         self._block_count += 1
         if self._block_count % self._level_divisor == 0:
-            self.events.publish("level", reading)
+            self.events.publish("level", reading, run=self.session.id)
         self.safety.feed(block)
 
         was_open = self.detector.open
@@ -1207,15 +1387,28 @@ class CaptureService:
         # --- persistence, before any classification-driven decision ---------
         tx.audio_path = self.recorder.write(tx, self.session, detected.audio,
                                             detected.sample_rate)
+        run = self.session.id
+        stopped = self.pipeline is not None and self.pipeline.run_stopped(run)
+        if stopped:
+            # Saved after Stop (the final flush): kept, not processed, and
+            # not offered to the chat as new automatic traffic.
+            mark_processing_stopped(tx, run)
         self.store.save_transmission(tx)
         self.transmissions_captured += 1
-        self.events.publish("transmission", tx)
+        self.events.publish("transmission", tx, run=run)
+        if stopped:
+            return tx
 
         # --- now, and only now, decide about automatic processing -----------
         auto = detected.should_auto_transcribe(self.detector.settings)
         if auto and self.pipeline is not None:
             try:
-                self.pipeline.submit(tx.id)
+                self.pipeline.submit(tx.id, run=run)
+            except RunStopped:
+                # Stopped between the check above and here.
+                mark_processing_stopped(tx, run)
+                self.store.save_transmission(tx)
+                self.events.publish("updated", tx, run=run)
             except ProcessingStopped:
                 # The recording and the row are already safe. The message
                 # stays Captured - honestly pending - and is recorded here so
@@ -1229,7 +1422,7 @@ class CaptureService:
         tx.state = ProcessingState.SKIPPED
         tx.skip_reason = _skip_reason(detected)
         self.store.save_transmission(tx)
-        self.events.publish("updated", tx)
+        self.events.publish("updated", tx, run=run)
         return tx
 
     def _metadata_under(self, tuning):
@@ -1273,4 +1466,6 @@ class CaptureService:
     def _set_state(self, state: str) -> None:
         if state != self.state:
             self.state = state
-            self.events.publish("state", state)
+            # Tagged: after Stop the window drops the run's activity (the
+            # drain and final flush run after it has shown Idle).
+            self.events.publish("state", state, run=self.session.id)

@@ -96,6 +96,15 @@ class AudioSource(abc.ABC):
         """True when no further audio will ever arrive (files end; live does not)."""
         return False
 
+    def close_intake(self) -> None:
+        """Stop accepting new audio, at once and without blocking.
+
+        Called at the Stop request, before anything is drained: what is
+        already buffered stays readable, nothing arriving afterwards is
+        added. Closing the device itself (which may block) is stop()'s job,
+        done later off the caller's thread. A source that buffers nothing
+        has nothing to do here."""
+
     def blocks(self, timeout: float = 1.0) -> Iterator[AudioBlock]:
         while self.running or not self.finished:
             block = self.read(timeout=timeout)
@@ -219,12 +228,24 @@ class LiveAudioSource(AudioSource):
         self.name = f"live:{device or 'default'}"
 
         self._queue: "queue.Queue[AudioBlock]" = queue.Queue(maxsize=max_queue_blocks)
+        #: How many blocks may still be buffered when a run ends. The capture
+        #: drains up to this many at Stop (CaptureService._drain_source), so
+        #: audio the device delivered just before Stop reaches the final
+        #: flush rather than being left in the queue.
+        self.capacity = int(max_queue_blocks)
         self._stream = None
         self._running = False
         self._samples_seen = 0
         self._start_time: Optional[_dt.datetime] = None
         self._watchdog: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        #: Whether the device callback may still enqueue audio. Closed at the
+        #: Stop request (close_intake), under the same lock the callback holds
+        #: for its check-and-enqueue: once close_intake returns, no block can
+        #: enter the queue, and the capture drains only audio delivered
+        #: before Stop.
+        self._intake_lock = threading.Lock()
+        self._intake_open = False
         self.dropped_blocks = 0
         self.overflow_count = 0
 
@@ -247,6 +268,8 @@ class LiveAudioSource(AudioSource):
         self._stop_event.clear()
         self._start_time = utcnow()
         self._samples_seen = 0
+        with self._intake_lock:
+            self._intake_open = True
         self._open_stream()
         self._running = True
         if self.reconnect:
@@ -316,16 +339,23 @@ class LiveAudioSource(AudioSource):
             timestamp=(self._start_time or utcnow()) + _dt.timedelta(seconds=offset),
             offset=offset,
         )
-        try:
-            self._queue.put_nowait(block)
-        except queue.Full:
-            # Better to lose the oldest block than to stall the audio callback.
-            self.dropped_blocks += 1
+        with self._intake_lock:
+            if not self._intake_open:
+                return                 # after Stop: not part of this run
             try:
-                self._queue.get_nowait()
                 self._queue.put_nowait(block)
-            except queue.Empty:  # pragma: no cover - race, harmless
-                pass
+            except queue.Full:
+                # Better to lose the oldest block than to stall the audio callback.
+                self.dropped_blocks += 1
+                try:
+                    self._queue.get_nowait()
+                    self._queue.put_nowait(block)
+                except queue.Empty:  # pragma: no cover - race, harmless
+                    pass
+
+    def close_intake(self) -> None:
+        with self._intake_lock:
+            self._intake_open = False
 
     def _watch(self) -> None:  # pragma: no cover - needs real hardware
         """Reopen the stream if the device goes away mid-session."""
@@ -363,6 +393,7 @@ class LiveAudioSource(AudioSource):
             log.debug("error closing stream: %s", exc)
 
     def stop(self) -> None:
+        self.close_intake()            # idempotent; already closed at Stop
         self._running = False
         self._stop_event.set()
         self._close_stream()

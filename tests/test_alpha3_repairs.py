@@ -30,9 +30,10 @@ from babelfishr.testing import build_fixture
 SR = 48_000
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-#: A fixture whose bursts the classifier calls DIGITAL_SUSPECTED. On the
-#: operator's Mac, ordinary speech through the built-in microphone landed in
-#: exactly this class - which is the whole reason it must still be transcribed.
+#: A digital-shaped burst. The classifier used to call it DIGITAL_SUSPECTED;
+#: on the operator's Mac ordinary speech through the built-in microphone
+#: landed in that class. Nothing is labelled digital now, and it must still
+#: be transcribed.
 DIGITAL_SPEC = [
     {"gap": 1.5},
     {"kind": "digital", "duration": 2.5, "level_dbfs": -14},
@@ -67,15 +68,16 @@ def _mock_app(config, store) -> BabelFishRApp:
 
 def test_a_digital_suspected_transmission_is_saved_and_reaches_asr(
         config, store, digital_wav):
-    """1. Captured, saved, and automatically transcribed - not skipped."""
+    """1. Captured, saved, and automatically transcribed - not skipped -
+    and no longer labelled "possibly digital"."""
     app = _mock_app(config, store)
     engine = app.transcription
     app.start_session(replay_path=digital_wav, name="digital-asr")
     app.run_replay()
 
-    digital = [t for t in app.transmissions()
-               if t.content_class is ContentClass.DIGITAL_SUSPECTED]
-    assert digital, "the fixture did not produce a digital-suspected event"
+    digital = app.transmissions()
+    assert digital, "the digital-shaped burst was not captured"
+    assert not [t for t in digital if t.content_class is ContentClass.DIGITAL_SUSPECTED]
     for tx in digital:
         assert pathlib.Path(tx.audio_path).exists(), "capture-first broken"
         assert tx.state is not ProcessingState.SKIPPED
@@ -108,13 +110,14 @@ def test_reverting_the_routing_restores_the_alpha_3_failure(
     app = _mock_app(config, store)
     app.start_session(replay_path=digital_wav, name="regression")
     app.run_replay()
-    digital = [t for t in app.transmissions()
-               if t.content_class is ContentClass.DIGITAL_SUSPECTED]
-    assert digital
-    assert all(t.state is ProcessingState.SKIPPED for t in digital), (
-        "the old routing no longer reproduces the failure, so the test that "
-        "checks the fix proves nothing")
-    assert all(not t.transcript for t in digital)
+    # The old veto keyed on DIGITAL_SUSPECTED, which nothing produces now:
+    # even under alpha 3's routing the burst is transcribed. (Before
+    # 2026-11-24 this same routing skipped it - the defect this guards.)
+    captured = app.transmissions()
+    assert captured
+    assert not [t for t in captured if t.content_class is ContentClass.DIGITAL_SUSPECTED]
+    assert all(t.state is not ProcessingState.SKIPPED and t.transcript
+               for t in captured)
     app.stop_session()
     monkeypatch.setattr(detect_module.DetectedTransmission,
                         "should_auto_transcribe", original)
@@ -521,7 +524,9 @@ def test_a_bubble_being_processed_says_so_in_place(qt_app):
 
 
 def test_a_digital_chip_neither_suppresses_nor_replaces_the_transcript(qt_app):
-    """12. Advisory metadata stays a chip beside the words."""
+    """12. The words are shown. A row an earlier version saved with the old
+    "possibly digital" guess keeps that value, but the window shows no
+    badge for it: the guess was speculative (mostly analogue FM voice)."""
     from PySide6 import QtWidgets
 
     bubble = _bubble(transcript="units responding",
@@ -531,7 +536,8 @@ def test_a_digital_chip_neither_suppresses_nor_replaces_the_transcript(qt_app):
     assert not bubble.original_label.isHidden()
     chips = [c.text() for c in bubble.findChildren(QtWidgets.QLabel)
              if c.objectName() == "chip"]
-    assert "possibly digital" in chips
+    assert not any("digital" in chip for chip in chips), chips
+    assert bubble.tx.content_class is ContentClass.DIGITAL_SUSPECTED   # kept
     assert not any("possibly digital" in c.text()
                    for c in [bubble.original_label])
 
@@ -855,13 +861,11 @@ def test_an_alpha_3_settings_file_cannot_suppress_noise_or_digital(config,
     app.start_session(replay_path=mixed, name="upgraded")
     app.run_replay()
 
-    routed = [t for t in app.transmissions()
-              if t.content_class in (ContentClass.NOISE,
-                                     ContentClass.DIGITAL_SUSPECTED)]
-    assert routed, "the fixture produced neither static nor a digital burst"
+    routed = app.transmissions()
+    assert len(routed) == 2, "the static and the digital-shaped burst were not both captured"
     classes = {t.content_class for t in routed}
     assert ContentClass.NOISE in classes
-    assert ContentClass.DIGITAL_SUSPECTED in classes
+    assert ContentClass.DIGITAL_SUSPECTED not in classes
     for tx in routed:
         assert tx.state is not ProcessingState.SKIPPED, (
             f"{tx.content_class.value} was skipped under alpha 3 settings")

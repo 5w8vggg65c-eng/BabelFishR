@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import copy
 import pathlib
 from typing import Dict, List, Optional
 
@@ -46,9 +47,10 @@ STATE_TEXT = {
 
 STATE_TIPS = {
     PipelineState.LISTENING: (
-        "Monitoring is armed. A recording starts by itself when the audio level "
+        "Monitoring is armed. A message starts by itself when the audio level "
         "rises above the activity threshold and ends after it stays below it "
-        "for the hang time. This is the audio feed, not the radio's squelch."),
+        "for the set seconds of quiet (End a message after). This is the audio "
+        "feed, not the radio's squelch."),
     PipelineState.RECEIVING: (
         "Audio activity, estimated from the input level. BabelFishR receives no "
         "squelch, carrier or RX signal from this input, so this is not the "
@@ -107,6 +109,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # store query that opened the view, so what arrives cannot widen it.
         self._view_kind = "thread"
         self._view_query = ""
+        #: Rows of a stopped monitoring run that the window did not show
+        #: (their events arrived after Stop). A filtered view's automatic
+        #: reconciliation leaves them out; an explicit open or View >
+        #: Refresh shows the store as it is, and clears this.
+        self._withheld: set = set()
         self._readiness = None
         self._theming = False
         self._readiness_worker = None
@@ -748,6 +755,27 @@ class MainWindow(QtWidgets.QMainWindow):
             self.target_language_box.setCurrentIndex(index)
         grid.addWidget(self.target_language_box, 1, 5)
 
+        # The quiet that ends a message (detector.hang_time), in seconds.
+        quiet_label = QtWidgets.QLabel("End a message after")
+        grid.addWidget(quiet_label, 2, 0)
+        self.quiet_seconds_box = QtWidgets.QDoubleSpinBox()
+        self.quiet_seconds_box.setRange(0.5, 30.0)
+        self.quiet_seconds_box.setSingleStep(0.5)
+        self.quiet_seconds_box.setDecimals(1)
+        self.quiet_seconds_box.setSuffix(" s of quiet")
+        self.quiet_seconds_box.setValue(
+            max(0.5, min(30.0, float(self.app.config.detector.hang_time))))
+        self.quiet_seconds_box.setAccessibleName("Seconds of quiet that end a message")
+        self.quiet_seconds_box.setToolTip(
+            "A message ends when the input's audio level stays below the "
+            "activity threshold this long; shorter pauses stay in the same "
+            "message, and the next audio starts a new one. This is the audio "
+            "level, not the radio's squelch. Long audio that never goes quiet "
+            "is still transcribed in parts while it continues.")
+        quiet_label.setBuddy(self.quiet_seconds_box)
+        self.quiet_seconds_box.valueChanged.connect(self._on_quiet_seconds)
+        grid.addWidget(self.quiet_seconds_box, 2, 1)
+
         # The operating mode lives in the header, next to readiness, and only
         # there. Two controls for one setting is two things to disagree.
         self.channel_label = QtWidgets.QLabel("No profile selected")
@@ -873,6 +901,14 @@ class MainWindow(QtWidgets.QMainWindow):
             "restored. Their data was kept.")
         self.show_removed_action.toggled.connect(lambda _: self._reload_timeline())
         view_menu.addAction(self.show_removed_action)
+
+        self.refresh_action = QtGui.QAction("Refresh", self)
+        self.refresh_action.setShortcut(QtGui.QKeySequence.Refresh)
+        self.refresh_action.setStatusTip(
+            "Show this view as saved, including recordings kept but not "
+            "processed after Stop")
+        self.refresh_action.triggered.connect(self._refresh_current_view)
+        view_menu.addAction(self.refresh_action)
 
         self.show_hidden_sessions_action = QtGui.QAction("Show hidden Sessions", self)
         self.show_hidden_sessions_action.setCheckable(True)
@@ -1158,34 +1194,71 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Not monitoring. Nothing is being recorded.", 8000)
 
     def _stop_monitoring(self) -> None:
-        # Returns as soon as the capture has stopped. Processing still under
-        # way is not waited for here - this is the GUI thread - and not
-        # abandoned: it carries on, accounted for, and each transcript lands
-        # in its bubble as it finishes. Pressing Stop again is a no-op.
-        self.app.stop_session()
+        # Returns at once. The operator's choice: Stop ends this run's
+        # automatic processing and chat updates immediately. Its recordings
+        # are all saved; any not yet processed are marked "saved, not
+        # processed" for Transcribe anyway / Retry. Rows already shown that
+        # were still waiting change to that indicator now; nothing new is
+        # added. Manual jobs carry on. Pressing Stop again is a no-op.
+        session = self.app.stop_session()
+        if session is not None:
+            self._mark_shown_rows_stopped(session.id)
         self.start_button.setText("Start monitoring")
         self._set_controls_enabled(True)
         self._refresh_capture_tab_label()
         # Inputs can be changed again, but only once the watch has stopped.
         self.input_panel.set_monitoring(False)
         self._refresh_context_lines()
-        outstanding = self.app.outstanding_work()
-        if outstanding:
-            # Counts work still being processed and, as one, a capture that
-            # is still finishing its last recording off this thread.
-            self._set_state(PipelineState.TRANSCRIBING if self._processing_active()
-                            else PipelineState.IDLE)
+        self._set_state(PipelineState.IDLE)
+        if session is not None:
             self.status.showMessage(
-                f"Monitoring stopped. Still finishing {outstanding} "
-                f"transmission(s) - each appears in its bubble as it "
-                f"completes.", 10000)
-        else:
-            self._set_state(PipelineState.IDLE)
+                "Monitoring stopped. Every recording is saved; any not yet "
+                "processed are marked \"saved, not processed\" - View > "
+                "Refresh shows them, and Transcribe anyway or Retry processes "
+                "them.", 12000)
         self.meter.reset()
+
+    def _mark_shown_rows_stopped(self, run: str) -> None:
+        """Part of the Stop action: rows of *run* on screen that were still
+        waiting or being processed show the stopped indicator. In memory
+        only - the store gets the same marker off this thread."""
+        from ..pipeline import mark_processing_stopped
+
+        for tx_id in self.timeline.order():
+            bubble = self.timeline.bubble(tx_id)
+            tx = bubble.tx if bubble is not None else None
+            if tx is None or tx.session_id != run or tx.state.is_terminal:
+                continue
+            if self.app.is_manually_processing(tx_id):
+                continue                       # a manual job: still its own
+            self.timeline.update(mark_processing_stopped(copy.copy(tx), run))
+
+    def _refresh_current_view(self) -> None:
+        """View > Refresh: show the current view exactly as the store has it,
+        including recordings a stopped run saved after Stop."""
+        kind = self._view_kind
+        if kind == "search" and self._view_query:
+            self._run_search(self._view_query)
+        elif kind == "review":
+            self._show_review_queue()
+        elif kind == "bookmarked":
+            self._show_bookmarked()
+        else:
+            self._reload_timeline()
+
+    def _on_quiet_seconds(self, value: float) -> None:
+        """Takes effect from the next Start (the running gate keeps its own
+        copy); refused while monitoring by the disabled control."""
+        self.app.config.detector.hang_time = float(value)
+        try:
+            self.app.config.save()
+        except OSError:  # noqa: BLE001 - a preference is never worth a crash
+            pass
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         for widget in (self.profile_box, self.profile_button,
                        self.source_mode_box, self.target_language_box,
+                       self.quiet_seconds_box,
                        self.calibrate_button,
                        # The processing mode decides which engines are loaded.
                        # Changing it under a live capture is refused by the
@@ -1260,6 +1333,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     reading.clipped, reading.clip_count)
                 self.clip_label.setText(
                     f"⚠ clipping ({reading.clip_count})" if reading.clip_count else "")
+            elif self._from_stopped_run(event):
+                continue
             elif event.kind == "state":
                 self._set_state(event.payload)
             elif event.kind in ("transmission", "updated"):
@@ -1305,6 +1380,29 @@ class MainWindow(QtWidgets.QMainWindow):
             # One query for the whole drained batch, not one per event.
             self._refresh_view(touched)
         self._refresh_context_lines()
+
+    def _from_stopped_run(self, event) -> bool:
+        """True when *event* belongs to a monitoring run already stopped.
+
+        The operator's choice: Stop ends automatic chat updates at once.
+        Such an event - a late transcript, a translation, a new recording
+        from the final flush, a state change, even one queued before Stop -
+        adds nothing. The one thing it may do is flip a row already on
+        screen to its saved-not-processed indicator; any other row is
+        withheld until the operator opens or refreshes a view.
+        """
+        run = getattr(event, "run", None)
+        if run is None or not self.app.run_stopped(run):
+            return False
+        tx = event.payload if event.kind in ("transmission", "updated") else None
+        if tx is not None:
+            from ..pipeline import is_processing_stopped
+
+            if is_processing_stopped(tx) and tx.id in self.timeline.order():
+                self.timeline.update(tx)
+            elif tx.id not in self.timeline.order():
+                self._withheld.add(tx.id)
+        return True
 
     def _admit(self, tx, arrival: bool) -> bool:
         """Show a live transmission or update as the current view allows.
@@ -1359,6 +1457,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for tx_id in shown - set(wanted):
             self.timeline.remove(tx_id)            # stopped qualifying
         for row in results:
+            if row.id in self._withheld:
+                continue                           # a stopped run's, not shown: stays out
             if row.id not in shown:
                 self.timeline.place(row)           # newly qualifying, or a replacement
             elif row.id in touched:
@@ -1970,6 +2070,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._store_gone():
             return
         self._view_kind, self._view_query = "thread", ""
+        self._withheld.clear()          # explicitly opened
         self.timeline.set_transmissions(self.app.recent_transmissions(
             include_hidden=self._showing_removed()))
         self._sync_filters()
@@ -2441,6 +2542,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         results = self.app.search(text)
         self._view_kind, self._view_query = "search", text
+        self._withheld.clear()          # explicitly opened
         self.timeline.set_transmissions(results)
         self._announce_view(len(results))
         self._sync_filters()
@@ -2456,6 +2558,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         results = self._bookmarked_results()
         self._view_kind, self._view_query = "bookmarked", ""
+        self._withheld.clear()          # explicitly opened
         self.timeline.set_transmissions(results)
         self._announce_view(len(results))
         self._sync_filters()
@@ -2492,6 +2595,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         results = self.app.review_queue()
         self._view_kind, self._view_query = "review", ""
+        self._withheld.clear()          # explicitly opened
         self.timeline.set_transmissions(results)
         self._announce_view(len(results))
         self._sync_filters()
