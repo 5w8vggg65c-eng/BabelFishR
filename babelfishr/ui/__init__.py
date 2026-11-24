@@ -28,8 +28,10 @@ def run(config_path: Optional[str] = None, argv: Optional[list] = None) -> int:
     from .theme import apply as apply_theme
 
     qt_app = QtWidgets.QApplication(argv if argv is not None else sys.argv)
-    qt_app.setApplicationName("BabelFishR")
-    qt_app.setOrganizationName("BabelFishR")
+    from ..extensions import product
+
+    qt_app.setApplicationName(product().name)
+    qt_app.setOrganizationName(product().name)
     apply_theme(qt_app)
 
     app = BabelFishRApp(config=config)

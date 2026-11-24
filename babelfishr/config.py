@@ -19,6 +19,8 @@ except ModuleNotFoundError:  # pragma: no cover - older interpreters
     except ModuleNotFoundError:
         _toml = None  # type: ignore
 
+# BabelFishR's names. The running product's (babelfishr.extensions) are
+# what is actually searched; these stay for anything that imported them.
 DEFAULT_CONFIG_NAMES = ("babelfishr.toml", "babelfishr.json")
 APP_DIR = pathlib.Path.home() / ".config" / "babelfishr"
 
@@ -381,23 +383,29 @@ class Config:
         return cfg
 
     def apply_env(self, env: Dict[str, str]) -> None:
+        # The running product's prefix only (BABELFISHR_ for BabelFishR): a
+        # second product must not pick up BabelFishR's database or home.
+        from .extensions import product
+
+        prefix = product().env_prefix
         mapping = {
-            "BABELFISHR_DEVICE": (self.audio, "device", str),
-            "BABELFISHR_TARGET_LANG": (self.translate, "target_language", str),
-            "BABELFISHR_SOURCE_LANG": (self.session, "source_language", str),
-            "BABELFISHR_ASR_ENGINE": (self.asr, "engine", str),
-            "BABELFISHR_ASR_MODEL": (self.asr, "model", str),
-            "BABELFISHR_TRANSLATE_ENGINE": (self.translate, "engine", str),
-            "BABELFISHR_RECORDINGS": (self.recording, "directory", str),
-            "BABELFISHR_DB": (self, "database", str),
-            "BABELFISHR_LOG_LEVEL": (self, "log_level", str),
-            "BABELFISHR_MODE": (self, "mode", str),
-            "BABELFISHR_HOME": (self, "app_home", str),
+            "DEVICE": (self.audio, "device", str),
+            "TARGET_LANG": (self.translate, "target_language", str),
+            "SOURCE_LANG": (self.session, "source_language", str),
+            "ASR_ENGINE": (self.asr, "engine", str),
+            "ASR_MODEL": (self.asr, "model", str),
+            "TRANSLATE_ENGINE": (self.translate, "engine", str),
+            "RECORDINGS": (self.recording, "directory", str),
+            "DB": (self, "database", str),
+            "LOG_LEVEL": (self, "log_level", str),
+            "MODE": (self, "mode", str),
+            "HOME": (self, "app_home", str),
         }
-        for key, (obj, attr, cast) in mapping.items():
+        for suffix, (obj, attr, cast) in mapping.items():
+            key = f"{prefix}_{suffix}"
             if env.get(key):
                 setattr(obj, attr, cast(env[key]))
-        if env.get("BABELFISHR_EXPERIMENTAL", "").lower() in ("1", "true", "yes", "on"):
+        if env.get(f"{prefix}_EXPERIMENTAL", "").lower() in ("1", "true", "yes", "on"):
             self.experimental = True
 
     def to_dict(self) -> Dict[str, Any]:
@@ -584,9 +592,13 @@ def _resolve_path(path: Optional[str]) -> Optional[pathlib.Path]:
         return p
     from .modes import AppPaths
 
-    candidates = [pathlib.Path.cwd() / name for name in DEFAULT_CONFIG_NAMES]
+    from .extensions import product
+
+    running = product()
+    config_dir = pathlib.Path.home() / ".config" / running.config_stem
+    candidates = [pathlib.Path.cwd() / name for name in running.config_names]
     candidates.append(AppPaths.resolve().settings)
-    candidates += [APP_DIR / name for name in DEFAULT_CONFIG_NAMES]
+    candidates += [config_dir / name for name in running.config_names]
     for candidate in candidates:
         if candidate.exists():
             return candidate

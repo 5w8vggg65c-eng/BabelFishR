@@ -149,7 +149,9 @@ def diagnostic_report(config, *, extra: str = "",
 
 def _log_tail(config, limit: int = MAX_LOG_LINES) -> List[str]:
     try:
-        path = config.paths().logs / "babelfishr.log"
+        from .extensions import product
+
+        path = config.paths().logs / product().log_name
         if not path.exists():
             return ["(no log file yet)"]
         text = path.read_text(encoding="utf-8", errors="replace")

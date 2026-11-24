@@ -104,22 +104,29 @@ class AppPaths:
 
     @classmethod
     def resolve(cls, override: Optional[str] = None) -> "AppPaths":
+        # The running product decides the folder and the variable read
+        # (babelfishr.extensions): a second product has its own data root and
+        # never opens BabelFishR's by default.
+        from .extensions import product
+
+        running = product()
+        home = os.environ.get(running.env("HOME"))
         if override:
             root = pathlib.Path(override).expanduser()
-        elif os.environ.get("BABELFISHR_HOME"):
-            root = pathlib.Path(os.environ["BABELFISHR_HOME"]).expanduser()
+        elif home:
+            root = pathlib.Path(home).expanduser()
         elif platform.system() == "Darwin":
-            root = pathlib.Path.home() / "Library" / "Application Support" / APP_NAME
+            root = pathlib.Path.home() / "Library" / "Application Support" / running.name
         else:
             base = os.environ.get("XDG_DATA_HOME")
             root = (pathlib.Path(base).expanduser() if base
-                    else pathlib.Path.home() / ".local" / "share") / APP_NAME
+                    else pathlib.Path.home() / ".local" / "share") / running.name
         return cls(
             root=root,
             models=root / "models",
             language_packs=root / "language-packs",
             recordings=root / "Recordings",
-            database=root / "babelfishr.sqlite3",
+            database=root / running.database_name,
             logs=root / "Logs",
             settings=root / "settings.toml",
         )
