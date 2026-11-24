@@ -190,7 +190,10 @@ def test_stop_does_not_wait_on_a_slow_source_close_after_the_thread_ended(
             f"stopper={capture._stopper} thread={capture._thread}")
         assert pump_until(qt_app, lambda: app.outstanding_work() == 0, timeout=20.0)
         txs = store.recent_transmissions()
-        assert len(txs) == 1 and txs[0].state is ProcessingState.COMPLETE
+        # Stop ends automatic processing at once (2026-11-24 decision): the
+        # final transmission is saved and marked saved-not-processed.
+        assert len(txs) == 1 and txs[0].state is ProcessingState.SKIPPED
+        assert txs[0].signal_metadata.get("processing_stopped")
         assert pathlib.Path(txs[0].audio_path).is_file()
         assert source.stop_held.calls == 1
     finally:

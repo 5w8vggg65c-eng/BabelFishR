@@ -175,7 +175,7 @@ def test_stop_and_quit_keep_the_gui_alive_with_a_held_source(qt_app, config, sto
         assert len(ticks) >= before + 5, "the event loop did not turn during Stop"
         assert app.capture_finishing(), "the capture was treated as finished"
         assert app.outstanding_work() >= 1, "a capture that can still produce counted as nothing"
-        assert "finishing" in window.status.currentMessage().lower()
+        assert "saved, not processed" in window.status.currentMessage().lower()
         assert app.standalone_pipeline is not None and app.standalone_pipeline.accepting
 
         started = time.monotonic()
@@ -204,7 +204,9 @@ def test_stop_and_quit_keep_the_gui_alive_with_a_held_source(qt_app, config, sto
         again.close()
         assert len(rows) == 1, "the transmission open at Stop was not handed over"
         assert pathlib.Path(rows[0].audio_path).is_file()
-        assert rows[0].state is ProcessingState.COMPLETE and rows[0].transcript
+        # Saved and marked, not transcribed: Stop ended automatic processing.
+        assert rows[0].state is ProcessingState.SKIPPED and not rows[0].transcript
+        assert rows[0].signal_metadata.get("processing_stopped")
         assert app.transcription is None                  # engine closed and dropped
     finally:
         cleanup(qt_app, window, source, timer)
@@ -230,9 +232,12 @@ def test_the_final_transmission_reaches_the_asr_before_the_store_closes(
 
         source.released.set()
         assert pump_until(qt_app, lambda: not window.isVisible(), timeout=20.0)
-        assert engine.calls == 1, "the final transmission never reached the ASR"
-        assert ("save", "complete") in order
-        assert order.index(("save", "complete")) < order.index("store-close")
+        # Stop/Quit end automatic processing (2026-11-24 decision): the
+        # final transmission is saved and marked before the store closes,
+        # and never reaches the engine.
+        assert engine.calls == 0
+        assert ("save", "skipped") in order and ("save", "complete") not in order
+        assert order.index(("save", "skipped")) < order.index("store-close")
         assert app.outstanding_work() == 0 and app._unprocessed == []
     finally:
         cleanup(qt_app, window, source, timer)
@@ -254,14 +259,19 @@ def test_stop_only_still_processes_the_final_transmission_and_saved_recordings(
         assert pump_until(qt_app, lambda: app.outstanding_work() == 0, timeout=20.0)
         pump(qt_app, 20)
         txs = store.recent_transmissions()
-        assert len(txs) == 1 and txs[0].state is ProcessingState.COMPLETE
-        assert engine.calls == 1
+        # Saved and marked, not processed automatically ...
+        assert len(txs) == 1 and txs[0].state is ProcessingState.SKIPPED
+        assert txs[0].signal_metadata.get("processing_stopped")
+        assert engine.calls == 0
         assert "Idle" in window.state_badge.text(), window.state_badge.text()
-        # Stop is not Quit: saved recordings can still be processed.
+        # ... and Stop is not Quit: the saved recording is processed by hand.
         assert app.shutdown_problem() == ""
         assert app.retry(txs[0].id) is True
         assert pump_until(qt_app, lambda: app.outstanding_work() == 0, timeout=20.0)
-        assert engine.calls == 2
+        assert engine.calls == 1
+        done = store.get_transmission(txs[0].id)
+        assert done.state is ProcessingState.COMPLETE and done.transcript
+        assert not done.signal_metadata.get("processing_stopped")
         timer.stop()
         window.close()
         assert pump_until(qt_app, lambda: not window.isVisible(), timeout=20.0)
@@ -285,9 +295,10 @@ def test_no_accepted_transmission_is_stranded_by_quit(qt_app, config, store):
         assert window.close() is False
         assert holding.closed == 0
 
-        holding.release.set()                              # first completes
+        holding.release.set()                              # first call returns
         assert pump_until(qt_app, lambda: any(
-            t.state is ProcessingState.COMPLETE for t in store.recent_transmissions()))
+            r.signal_metadata.get("processing_stopped")
+            for r in store.recent_transmissions()))
         assert window.isVisible(), "Quit went ahead with the capture still held"
         source.released.set()                              # second is flushed
         assert pump_until(qt_app, lambda: not window.isVisible(), timeout=20.0)
@@ -296,10 +307,14 @@ def test_no_accepted_transmission_is_stranded_by_quit(qt_app, config, store):
         again = Store(config.database, recordings_dir=config.recording.directory)
         rows = again.recent_transmissions()
         again.close()
+        # Neither is stranded: both are saved, before the store closed, and
+        # marked saved-not-processed (Stop/Quit end automatic processing; the
+        # running call finished but its result was discarded).
         assert len(rows) == 2, [r.state for r in rows]
-        assert all(r.state is ProcessingState.COMPLETE and r.transcript for r in rows)
+        assert all(r.state is ProcessingState.SKIPPED and not r.transcript for r in rows)
+        assert all(r.signal_metadata.get("processing_stopped") for r in rows)
         assert all(pathlib.Path(r.audio_path).is_file() for r in rows)
-        assert holding.calls == 2 and holding.closed == 1
+        assert holding.calls == 1 and holding.closed == 1
     finally:
         cleanup(qt_app, window, source, timer, holding)
 

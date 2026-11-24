@@ -674,7 +674,13 @@ def test_events_finishing_after_stop_do_not_revive_listening(qt_app, config,
     pump(qt_app, 60)
     assert "Idle" in window.state_badge.text(), window.state_badge.text()
     assert window.start_button.text() == "Start monitoring"
-    assert window.timeline.count() >= 1, "the run's bubbles were discarded"
+    # Stop ends automatic chat updates at once, including events queued
+    # before it (2026-11-24 decision): nothing is added by the drain. The
+    # rows are saved, and an explicit refresh shows them.
+    assert window.timeline.count() == 0
+    window.refresh_action.trigger()
+    assert window.timeline.count() >= 1, "the run's rows were not saved"
+    assert "Idle" in window.state_badge.text(), window.state_badge.text()
     window.close()
 
 

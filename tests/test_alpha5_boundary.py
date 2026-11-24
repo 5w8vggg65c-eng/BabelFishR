@@ -356,7 +356,10 @@ def test_stop_returns_while_the_store_lock_is_held_and_records_the_end_later(
         assert abs((stored.ended_at - ended_at).total_seconds()) < 1e-3
         assert pump_until(qt_app, lambda: app.outstanding_work() == 0, timeout=20.0)
         txs = store.recent_transmissions()
-        assert len(txs) == 1 and txs[0].state is ProcessingState.COMPLETE
+        # Stop ends automatic processing at once (2026-11-24 decision): the
+        # final transmission is saved and marked saved-not-processed.
+        assert len(txs) == 1 and txs[0].state is ProcessingState.SKIPPED
+        assert txs[0].signal_metadata.get("processing_stopped")
         # Stop is not Quit: the window still works afterwards.
         assert not app.closing and window.menuBar().isEnabled()
         window.close()
@@ -395,9 +398,11 @@ def test_quit_with_the_lock_held_returns_and_records_the_end_before_closing(
         assert app._closed
         ends = [o for o in order if o[0] == "end"]
         assert ends == [("end", session.id)], ends          # once, this run
-        assert ("save", "complete") in order
+        # Stop ends automatic processing at once (2026-11-24 decision): the
+        # final transmission is saved and marked saved-not-processed.
+        assert ("save", "skipped") in order and ("save", "complete") not in order
         assert order.index(("end", session.id)) < order.index("store-close")
-        assert order.index(("save", "complete")) < order.index("store-close")
+        assert order.index(("save", "skipped")) < order.index("store-close")
         from babelfishr.storage import Store
         again = Store(config.database, recordings_dir=config.recording.directory)
         stored = again.get_session(session.id)
@@ -405,7 +410,8 @@ def test_quit_with_the_lock_held_returns_and_records_the_end_before_closing(
         again.close()
         assert stored.ended_at is not None
         assert abs((stored.ended_at - session.ended_at).total_seconds()) < 1e-3
-        assert len(rows) == 1 and rows[0].state is ProcessingState.COMPLETE
+        assert len(rows) == 1 and rows[0].state is ProcessingState.SKIPPED
+        assert rows[0].signal_metadata.get("processing_stopped")
     finally:
         holder.release.set()
         timer.stop()

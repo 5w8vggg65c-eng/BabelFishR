@@ -110,14 +110,16 @@ def test_reverting_the_routing_restores_the_alpha_3_failure(
     app = _mock_app(config, store)
     app.start_session(replay_path=digital_wav, name="regression")
     app.run_replay()
-    # The old veto keyed on DIGITAL_SUSPECTED, which nothing produces now:
-    # even under alpha 3's routing the burst is transcribed. (Before
-    # 2026-11-24 this same routing skipped it - the defect this guards.)
+    # The burst is no longer labelled digital (it is classified as noise
+    # now), but alpha 3's routing also vetoed noise: with that lookup back,
+    # it is skipped and never transcribed - the defect the fix guards.
     captured = app.transmissions()
     assert captured
     assert not [t for t in captured if t.content_class is ContentClass.DIGITAL_SUSPECTED]
-    assert all(t.state is not ProcessingState.SKIPPED and t.transcript
-               for t in captured)
+    assert all(t.state is ProcessingState.SKIPPED for t in captured), (
+        "the old routing no longer reproduces the failure, so the test that "
+        "checks the fix proves nothing")
+    assert all(not t.transcript for t in captured)
     app.stop_session()
     monkeypatch.setattr(detect_module.DetectedTransmission,
                         "should_auto_transcribe", original)
@@ -526,7 +528,7 @@ def test_a_bubble_being_processed_says_so_in_place(qt_app):
 def test_a_digital_chip_neither_suppresses_nor_replaces_the_transcript(qt_app):
     """12. The words are shown. A row an earlier version saved with the old
     "possibly digital" guess keeps that value, but the window shows no
-    badge for it: the guess was speculative (mostly analogue FM voice)."""
+    badge for it: the guess was unreliable (false positives)."""
     from PySide6 import QtWidgets
 
     bubble = _bubble(transcript="units responding",
@@ -848,12 +850,14 @@ def test_an_alpha_3_settings_file_cannot_suppress_noise_or_digital(config,
 
     # And through the whole capture path, with those settings in force.
     config.detector = upgraded.detector
+    # Gaps longer than the 3 s of quiet that now ends a message (the loaded
+    # detector section carries the current default), so the two stay two.
     mixed = build_fixture([
         {"gap": 1.5},
         {"kind": "static", "duration": 2.0, "level_dbfs": -20},
-        {"gap": 1.5},
+        {"gap": 4.0},
         {"kind": "digital", "duration": 2.0, "level_dbfs": -14},
-        {"gap": 1.5},
+        {"gap": 4.0},
     ], sample_rate=SR).write(str(tmp_path / "alpha3.wav"))
 
     app = _mock_app(config, store)

@@ -20,7 +20,10 @@ def test_counts_separated_transmissions():
 
     fixture = standard_fixture(SR)
     expected = recorded_events(fixture)
-    detected = detect_in_array(fixture.audio, SR)
+    # The standard fixture's bursts are 1.5-2.2 s apart (radio-style): with
+    # the 0.8 s quiet they were written for. The 3 s default would join them
+    # (tests/test_utterance_quiet.py covers that default).
+    detected = detect_in_array(fixture.audio, SR, DetectorSettings(hang_time=0.8))
     assert len(detected) == len(expected)
     # The crackle is dropped; the static burst is kept, as noise, in its place.
     kinds = [t.kind for t in expected]
@@ -62,7 +65,8 @@ def test_hang_time_keeps_one_transmission_whole():
 
 def test_short_hang_time_would_split_it():
     """Confirms the previous test passes because of hang time, not by luck."""
-    settings = DetectorSettings(hang_time=0.05, post_roll=0.02, min_duration=0.2)
+    # 0.1 s is the shortest quiet DetectorSettings accepts.
+    settings = DetectorSettings(hang_time=0.1, post_roll=0.02, min_duration=0.2)
     detected = detect_in_array(gapped_transmission_fixture(SR).audio, SR, settings)
     assert len(detected) > 1
 
@@ -149,8 +153,8 @@ def test_every_content_type_is_detected_and_classified(spec, expected):
 ])
 def test_digital_shaped_bursts_survive_and_are_not_guessed_digital(spec):
     """They are recorded like everything else. The "possibly digital" guess
-    is gone: on microphone/USB audio it landed mostly on analogue FM voice,
-    and ordinary audio cannot tell analogue from digital radio."""
+    is gone: it was unreliable (false positives on ordinary voice), and
+    ordinary audio cannot tell analogue from digital radio."""
     fixture = build_fixture([{"gap": 1.0}, spec, {"gap": 1.0}], sample_rate=SR)
     (found,) = detect_in_array(fixture.audio, SR)
     assert found.audio.size > 0
@@ -201,8 +205,8 @@ def test_speech_modulation_separates_it_from_static():
     """The two discriminators must stay far apart, not merely on the right side."""
     fixture = build_fixture(
         [{"gap": 1.0}, {"kind": "voice", "duration": 3.0, "level_dbfs": -14},
-         {"gap": 1.5}, {"kind": "static", "duration": 3.0, "level_dbfs": -20},
-         {"gap": 1.0}], sample_rate=SR)
+         {"gap": 4.0}, {"kind": "static", "duration": 3.0, "level_dbfs": -20},
+         {"gap": 1.0}], sample_rate=SR)       # apart by more than the 3 s quiet
     detected = detect_in_array(fixture.audio, SR)
     voice = [d for d in detected if d.content_class is ContentClass.SPEECH]
     noise = [d for d in detected if d.content_class is ContentClass.NOISE]

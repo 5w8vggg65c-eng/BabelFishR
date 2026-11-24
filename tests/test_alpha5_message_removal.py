@@ -94,6 +94,13 @@ def captured_window(qt_app, config, store, wav):
     pump(qt_app)
     app.start_session(replay_path=wav, name="run")
     app.run_replay()
+    # Let both messages be transcribed and shown before Stop: since Stop ends
+    # automatic chat updates at once, anything still pending would stay
+    # saved-not-processed instead (tests/test_stop_immediately.py).
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline and app.outstanding_work():
+        pump(qt_app, 2)
+    pump(qt_app, 20)
     window._stop_monitoring()
     pump(qt_app, 40)
     txs = app.recent_transmissions()
