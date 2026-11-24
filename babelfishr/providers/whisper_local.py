@@ -283,7 +283,8 @@ class FasterWhisperEngine(TranscriptionEngine):
         # the language left to automatic detection and *no* voiced sample
         # found at all, Whisper decodes once at temperature 0 instead of
         # climbing its temperature-fallback ladder (up to six decodes per
-        # window, which made 20 s of noise take ~113 s on a Mac). The audio
+        # window; the suspected - not yet timed - cause of 20 s of noise
+        # taking ~113 s on a Mac, pending Mac timing). The audio
         # is still transcribed in full and still goes through the speech
         # check; nothing is trimmed, capped or dropped. Unknown or non-zero
         # detector results, and a specified language (Retry as speech in...),
