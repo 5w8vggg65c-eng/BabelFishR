@@ -166,9 +166,59 @@ the current one.
 
 | Build | Commit | Checked | Installed? |
 |---|---|---|---|
-| 32 | `2278dbb` (before the BabelFishR/KingFishR split) | real Mac and GitHub runner, below | yes, on the project owner's Mac |
+| 32 | `2278dbb` (before the BabelFishR/KingFishR split) | real Mac and GitHub runner, below | was installed; replaced by build 34 |
 | 33 | `4b17f63` (the lean split) | GitHub runner, and candidate tests on the owner's Mac, below | no - not installed yet |
-| next | this branch: 3 s message quiet, immediate Stop, no "possibly digital" | Linux automated tests only | not built yet |
+| 34 | `9b3125b` (3 s message quiet, immediate Stop, no "possibly digital") | GitHub runner, local probes of the packaged candidate, and installation on the owner's Mac, below | yes, installed Nov 24, 2026 on the project owner's Mac |
+
+Changes committed after `9b3125b` are not built yet; build 34 is the tested
+and installed binary.
+
+### Build 34 (`9b3125b`, Nov 24, 2026): runner checks, local candidate probes, installation
+
+Disk image SHA-256 `65082295d233842d9a7e55dc98230a43c10f922d133bb30ffb3ba49726979285`;
+packaged executable SHA-256
+`7227d19ef920fc3a587e75ae6313acc82fd1c21fbc8b1a82062ceb31b27f8185`.
+
+- **GitHub `macos-26` arm64 runner, run 34 (CI):** build, standalone,
+  bundle, signing and uninstaller checks passed. The deterministic suite gave
+  1407 passed, 11 skipped, 0 failures or errors, including every Whisper
+  model-layout and offline test. The skips are the same as run 33's: the
+  real-engine tests (no Whisper model or Argos pack is prepared on the
+  runner), two KingFishR tests that need a real dsd-neo, and two CoreAudio
+  fallback checks.
+- **Local probes of the packaged candidate on the owner's Mac** (after the
+  operator approved its first launch; Field Offline with locally prepared
+  models; recorded fixtures replayed in real time, not a live microphone or
+  radio):
+  - A 44 s public English speech fixture with the 3 s quiet: exactly two
+    messages. Pauses of about 1 s stayed inside a message and 4 s gaps
+    split them. The first text arrived 21.22 s before the input ended, both
+    messages completed, and the audio kept in each message matched the
+    source exactly. Low-level samples before and after the messages are
+    not part of any message (by design), so this fixture does not show
+    that every original sample was kept.
+  - Noise with automatic language: 18.61 s; no noise text was shown without
+    its review flag.
+  - The public French clip: with French specified, 5.10 s; with automatic
+    language, 6.34 s. Both were recognised as French and translated to
+    English by the local faster-whisper and Argos engines, with no errors.
+  - A 55 s continuous replay: first text at 33.32 s, four messages, and all
+    2,640,000 samples kept in order with no gaps or repeats; 59.07 s in all.
+  - In the window: the candidate opens, there is no Receiver menu, no
+    "possibly digital" label appeared (including on older stored rows), and
+    the waveform is still shown.
+- **Installed on the owner's Mac (Nov 24, 2026):** the app in Applications
+  was replaced from the build 34 disk image; the installed executable's
+  SHA-256 matches the tested one above, and `codesign --verify --deep
+  --strict` passed. The build is ad-hoc signed and **not notarized**: its
+  first launch needed the operator's approval in macOS. The installed app
+  opened normally in Field Offline, Idle, with its local engines ready, no
+  Receiver menu and no "possibly digital" label. The quiet control shows
+  3.0 s and the saved setting is 3.0 s (changed from 0.8 s by the operator;
+  no other setting changed). The existing recordings and database were
+  checked unchanged afterwards.
+- **Not yet verified for build 34:** live microphone capture, any physical
+  radio or interface, and network egress by an independent capture.
 
 ### Build 33 (`4b17f63`, 2026-11-24): runner and candidate checks, not installed
 
@@ -258,8 +308,8 @@ pipeline holds together, not a quality level on radio traffic.
   segmenting and squelch-tail handling have not been checked on real
   receiver audio.
 - **Installation and live capture of a post-split build on a Mac** (see
-  the table above): build 33 has had runner and candidate checks but is not
-  installed; this branch's changes are not built yet.
+  the table above): build 34 is installed and its checks passed, but no
+  post-split build has yet captured from a live microphone or a radio.
 - **Recognition and translation quality on real radio traffic.** There is
   no quality guarantee for any language, model size or audio condition; one
   public clip on one Mac is not a field sample. Every transcript and its
