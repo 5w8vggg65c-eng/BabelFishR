@@ -80,6 +80,10 @@ def _color_swatch(color: str, size: int = 12) -> QtGui.QIcon:
     return QtGui.QIcon(pixmap)
 
 
+def _ordinal(n: int) -> str:
+    return "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+
+
 class MainWindow(QtWidgets.QMainWindow):
     """Session header, input controls, live meter and the timeline."""
 
@@ -1793,6 +1797,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.status.showMessage(
                     f"{payload.get('stage', 'processing')} error: "
                     f"{payload.get('message', '')}", 12000)
+        # Once a second while anything is held: which recording is being
+        # processed, for how long, and each waiting card's place in line.
+        import time as _t
+
+        now = _t.monotonic()
+        if now - getattr(self, "_queue_tick", 0.0) >= 1.0:
+            self._queue_tick = now
+            if any(p is not None and p.visible_pending
+                   for p in (self.app.pipeline, self.app.standalone_pipeline)) \
+                    or getattr(self, "_queue_notes", None):
+                self._refresh_queue_positions()
+                badge_changed = True
         sequence = getattr(self, "sequence", None)
         if sequence is not None and sequence.waiting and not self._sequence_live():
             sequence.notify_live_ended()      # monitoring of that Session ended
@@ -1999,6 +2015,48 @@ class MainWindow(QtWidgets.QMainWindow):
                 return True
         return False
 
+    @staticmethod
+    def _clock(when) -> str:
+        from ..timefmt import bare_clock
+
+        return bare_clock(when)
+
+    def _queue_view(self):
+        """([(running job, its row)], [waiting ids in order]) across the
+        processors, from their own snapshots."""
+        running, waiting = [], []
+        for pipeline in (self.app.pipeline, self.app.standalone_pipeline):
+            snap = getattr(pipeline, "queue_snapshot", None) if pipeline else None
+            if snap is None:
+                continue
+            try:
+                snapshot = snap()
+            except Exception:  # noqa: BLE001 - feedback only
+                continue
+            for job in snapshot.running:
+                tx = (self.app.store.get_transmission(job.tx_id)
+                      if not self._store_gone() else None)
+                running.append((job, tx))
+            waiting += list(snapshot.waiting)
+        return running, waiting
+
+    def _refresh_queue_positions(self) -> None:
+        """Each held card says where it is: being processed (and how long)
+        or its place in line. Refreshed about once a second while work is
+        held; nothing is touched when there is none."""
+        running, waiting = self._queue_view()
+        notes = {job.tx_id: f"{job.stage} \u00b7 {int(job.seconds)} s"
+                 for job, _ in running}
+        for place, tx_id in enumerate(waiting, start=1):
+            notes[tx_id] = ("next in line" if place == 1
+                            else f"{place}{_ordinal(place)} in line")
+        previous = getattr(self, "_queue_notes", {})
+        for tx_id in set(previous) | set(notes):
+            bubble = self.timeline.bubble(tx_id)
+            if bubble is not None:
+                bubble.set_queue_note(notes.get(tx_id, ""))
+        self._queue_notes = notes
+
     def _refresh_state_badge(self) -> None:
         from . import theme
 
@@ -2037,12 +2095,30 @@ class MainWindow(QtWidgets.QMainWindow):
                 # A stopped run's messages; a manual job alone stays
                 # "Transcribing".
                 text = "Finishing"
-            if pending > 1:
+            running, waiting = self._queue_view()
+            if running:
+                # Which recording, read from the processor itself.
+                job, tx = running[0]
+                when = self._clock(tx.started_at) if tx is not None else ""
+                text += f" {when} ({int(job.seconds)} s)" if when else ""
+                if waiting:
+                    text += f" \u00b7 {len(waiting)} waiting"
+            elif pending > 1:
                 text += f" \u00b7 {pending - 1} queued"
-        elif state is PipelineState.RECEIVING:
-            capture = self.app.capture
-            if capture is not None and getattr(capture.detector, "continuing", False):
-                text += " \u00b7 continuous"
+        else:
+            if state is PipelineState.RECEIVING:
+                capture = self.app.capture
+                if capture is not None and getattr(capture.detector, "continuing", False):
+                    text += " \u00b7 continuous"
+            # While monitoring the badge shows the input's state; processing
+            # runs alongside it and is said too, from the processor's queue.
+            running, waiting = self._queue_view()
+            if running:
+                job, tx = running[0]
+                when = self._clock(tx.started_at) if tx is not None else ""
+                text += f" \u00b7 processing {when} ({int(job.seconds)} s)"
+                if waiting:
+                    text += f" \u00b7 {len(waiting)} waiting"
         return text
 
     def _refresh_mode_badge(self) -> None:

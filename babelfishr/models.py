@@ -783,6 +783,26 @@ class Transmission:
             return " ".join(s.text.strip() for s in split[0])
         return self.display_transcript
 
+    #: What every routine display says instead of a withheld guess.
+    UNINTELLIGIBLE = "Audio unintelligible"
+
+    @property
+    def presented_transcript(self) -> str:
+        """The original-language line for routine displays (the window, the
+        command line, readable exports): the published words, "Audio
+        unintelligible" for a withheld guess, never the raw guess. The raw
+        engine text stays in ``transcript`` for Edit, tooltips and the
+        forensic (JSON) export."""
+        return self.UNINTELLIGIBLE if self.guess_withheld else self.shown_transcript
+
+    def published_text(self) -> str:
+        """Every word a search may match: the published transcript and
+        translation, corrections, notes and tags - never a withheld guess."""
+        return " ".join(filter(None, (
+            self.shown_transcript, self.shown_translation,
+            self.transcript_correction, self.translation_correction,
+            self.notes, " ".join(self.tags or ()))))
+
     @property
     def shown_translation(self) -> str:
         if self.translation_correction:

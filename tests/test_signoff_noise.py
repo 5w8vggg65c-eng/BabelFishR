@@ -167,7 +167,8 @@ def test_exports_label_a_withheld_guess_and_never_present_it_as_traffic():
                 signal_metadata={})
     md = to_markdown([held, real])
     assert "**Original (no):** Takk for at du så på." not in md
-    assert "Audio unintelligible" in md and "Engine guess withheld" in md
+    assert "**Original:** *Audio unintelligible*" in md
+    assert "Takk for at du så på" not in md, "the guess is quoted in a readable export"
     assert "**Translated (en):** Thanks for watching." not in md
     assert "**Original (no):** Bil to, kom inn." in md
     rows = {r["id"]: r for r in csv.DictReader(io.StringIO(to_csv([held, real])))}
@@ -305,7 +306,8 @@ def test_a_legacy_record_is_trimmed_by_its_stored_duration_and_segments():
     assert legacy.shown_translation == "It is raining less now."
     assert legacy.transcript.endswith("Takk for at du så på."), "nothing rewritten"
     md = to_markdown([legacy])
-    assert "Det regner mindre nå." in md and "Withheld from the end" in md
+    assert "Det regner mindre nå." in md and "withheld from the end" in md
+    assert "Takk for at du så på" not in md
     assert "**Original (no):** Det regner mindre nå. Takk" not in md
 
 
@@ -326,3 +328,47 @@ def test_search_and_the_card_show_the_words_not_the_outro(app, store, qt_app, tm
     assert bubble.original_label.text() == "The rain is easing."
     assert "Thanks for watching!" in bubble.transcript_box.toolTip()
     assert bubble.pairing_label.text() == "Audio + transcript ✓"
+
+
+# --- search before the limit, both index kinds, and the command line ----------------
+
+@pytest.mark.parametrize("fts", [True, False], ids=["fts-index", "like-fallback"])
+def test_raw_guesses_never_starve_an_older_real_match(app, store, fts):
+    store.fts_enabled = fts
+    store.save_session(Session(id="run", conversation_id=app.conversation_id))
+    real = Transmission(id="real", session_id="run", started_at=T0, duration=4.0,
+                        state=ProcessingState.COMPLETE,
+                        transcript="Gate two is watching the road, over.")
+    store.save_transmission(real)
+    for i in range(5):                                     # newer raw guesses
+        store.save_transmission(Transmission(
+            id=f"guess{i}", session_id="run", duration=2.0,
+            started_at=T0 + dt.timedelta(minutes=i + 1), state=ProcessingState.COMPLETE,
+            transcript="Thanks for watching!",
+            signal_metadata={"speech_check": {"verdict": "likely_noise"}}))
+    found = store.search("watching", conversation_id=app.conversation_id, limit=2)
+    assert [t.id for t in found] == ["real"]
+    corrected = store.get_transmission("guess0")
+    corrected.transcript_correction = "Watching the east road."
+    store.save_transmission(corrected)
+    found = store.search("watching", conversation_id=app.conversation_id, limit=5)
+    assert {t.id for t in found} == {"real", "guess0"}, "the operator's correction counts"
+    assert store.get_transmission("guess1").transcript == "Thanks for watching!"
+
+
+def test_the_command_line_shows_audio_unintelligible_not_the_guess(config, store,
+                                                                   tmp_path, capsys):
+    from babelfishr.cli import main
+
+    store.save_session(Session(id="run"))
+    store.save_transmission(Transmission(
+        id="held", session_id="run", started_at=T0, duration=2.0,
+        state=ProcessingState.COMPLETE, transcript="Takk for at du så på.",
+        notes="hiss on channel 4",
+        signal_metadata={"speech_check": {"verdict": "likely_noise"}}))
+    settings = tmp_path / "cli.toml"
+    config.save(str(settings))
+    assert main(["--config", str(settings), "search", "hiss"]) == 0
+    out = capsys.readouterr().out
+    assert "1 match" in out and "Audio unintelligible" in out
+    assert "Takk for at du så på" not in out

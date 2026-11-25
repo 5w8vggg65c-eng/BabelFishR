@@ -301,17 +301,25 @@ def test_the_cache_is_per_thread():
 
 # --- the switch: baseline by default, comparable, per recording --------------
 
-def test_baseline_is_the_default_and_the_switch_reaches_the_engine():
+def test_one_encode_is_the_default_for_new_and_existing_profiles_with_opt_out(tmp_path):
+    """This preview turns the single encoder pass on for every profile - a
+    settings file written before the switch existed reads as on - and an
+    explicit ``shared_language_encode = false`` still selects the stock path."""
     from babelfishr.config import Config
     from babelfishr.providers import _transcription_factories
 
-    assert Config().asr.shared_language_encode is False
+    assert Config().asr.shared_language_encode is True
+    assert Config.from_dict({"asr": {"model": "large-v3"}}).asr.shared_language_encode is True
+    assert _transcription_factories(Config())["faster-whisper"]().shared_language_encode is True
+    old = tmp_path / "settings.toml"
+    old.write_text('[asr]\nmodel = "large-v3"\n', encoding="utf-8")       # an existing profile
+    assert Config.load(str(old)).asr.shared_language_encode is True
+    off = Config.from_dict({"asr": {"shared_language_encode": False}})
+    assert off.asr.shared_language_encode is False
+    assert Config.from_dict(off.to_dict()).asr.shared_language_encode is False
+    assert _transcription_factories(off)["faster-whisper"]().shared_language_encode is False
+    # The engine itself only does it when told to (the factory tells it).
     assert FasterWhisperEngine().shared_language_encode is False
-    assert _transcription_factories(Config())["faster-whisper"]().shared_language_encode is False
-    cfg = Config.from_dict({"asr": {"shared_language_encode": True}})
-    assert cfg.asr.shared_language_encode is True
-    assert Config.from_dict(cfg.to_dict()).asr.shared_language_encode is True
-    assert _transcription_factories(cfg)["faster-whisper"]().shared_language_encode is True
 
 
 def test_each_recording_is_detected_on_its_own(monkeypatch):

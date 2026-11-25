@@ -847,7 +847,9 @@ class TransmissionBubble(QtWidgets.QFrame):
         elif tx.state in _IN_FLIGHT:
             # Same bubble, not a separate placeholder row: the operator sees
             # one line per transmission that fills itself in.
-            self.original_label.setText(_IN_FLIGHT[tx.state])
+            note = getattr(self, "_queue_note", "")
+            self.original_label.setText(f"{_IN_FLIGHT[tx.state]} \u00b7 {note}"
+                                        if note else _IN_FLIGHT[tx.state])
             self.original_label.show()
             self.transcript_box.show()
         else:
@@ -1062,6 +1064,16 @@ class TransmissionBubble(QtWidgets.QFrame):
     @property
     def is_long_recording(self) -> bool:
         return float(self.tx.duration or 0.0) > LONG_RECORDING_SECONDS
+
+    def set_queue_note(self, note: str) -> None:
+        """Where this held recording is: "transcription · 8 s" or "3rd in
+        line" (from the processor's own queue); "" clears it."""
+        if getattr(self, "_queue_note", "") == note:
+            return
+        self._queue_note = note
+        if self.tx.state in _IN_FLIGHT and not self.tx.display_transcript:
+            text = _IN_FLIGHT[self.tx.state]
+            self.original_label.setText(f"{text} \u00b7 {note}" if note else text)
 
     #: Set by the list: starts the original *and what follows it* (the
     #: window's continuous playback). None: play just this one.

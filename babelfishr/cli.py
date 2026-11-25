@@ -560,10 +560,10 @@ def cmd_replay(args) -> int:
         if tx.source_language:
             meta += f"  {tx.source_language}"
         print(meta)
-        if tx.display_transcript:
-            print(f"    original  : {tx.display_transcript}")
-        if tx.display_translation:
-            print(f"    translated: {tx.display_translation}")
+        if tx.presented_transcript:
+            print(f"    original  : {tx.presented_transcript}")
+        if tx.shown_translation:
+            print(f"    translated: {tx.shown_translation}")
         if tx.error:
             print(f"    ERROR ({tx.error.stage}): {tx.error.message}")
         if tx.audio_path:
@@ -601,10 +601,10 @@ def cmd_listen(args) -> int:
                 stamp = tx.started_at.astimezone().strftime("%H:%M:%S")
                 print(f"\n[{stamp}] {tx.duration:.1f}s "
                       f"{tx.source_language or '??'}")
-                if tx.display_transcript:
-                    print(f"  {tx.display_transcript}")
-                if tx.display_translation:
-                    print(f"  -> {tx.display_translation}")
+                if tx.presented_transcript:
+                    print(f"  {tx.presented_transcript}")
+                if tx.shown_translation:
+                    print(f"  -> {tx.shown_translation}")
                 if tx.error:
                     print(f"  ERROR ({tx.error.stage}): {tx.error.message}")
         elif event.kind == "audio-status":
@@ -647,10 +647,10 @@ def cmd_search(args) -> int:
         stamp = tx.started_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
         print(f"{stamp}  {tx.duration:5.1f}s  {tx.source_language or '??'}  "
               f"{tx.channel_name}")
-        if tx.display_transcript:
-            print(f"    {tx.display_transcript}")
-        if tx.display_translation:
-            print(f"    -> {tx.display_translation}")
+        if tx.presented_transcript:
+            print(f"    {tx.presented_transcript}")
+        if tx.shown_translation:
+            print(f"    -> {tx.shown_translation}")
     if args.json:
         print(json.dumps([t.to_dict() for t in results], indent=2,
                          ensure_ascii=False))

@@ -150,15 +150,16 @@ class AsrConfig:
     min_confidence: float = 0.0
     """Transcripts below this are still stored, but flagged for review."""
 
-    shared_language_encode: bool = False
-    """Bench switch, off (faster-whisper's own detection) by default. On:
-    each recording's language is identified from the encoder output of the
-    unchanged generation window, which is then decoded, so Whisper's encoder
-    runs once per short clip instead of twice. Detection then sees the
-    generation features, which lack the one final 10 ms mel frame
-    faster-whisper's own detection adds; compare with
-    tools/bench_language_encode.py before turning it on. Each recording is
-    detected on its own; nothing is carried between recordings."""
+    shared_language_encode: bool = True
+    """On by default (this preview): each recording's language is identified
+    from the encoder output of its own unchanged generation window, which is
+    then decoded, so Whisper's encoder runs once per short clip instead of
+    twice - the live-monitoring backlog's main avoidable cost. Detection then
+    sees the generation features, which lack the one final 10 ms mel frame
+    faster-whisper's own detection adds. Each recording is detected on its
+    own; nothing is carried between recordings, and any error falls back to
+    faster-whisper's own detection. Set false to opt out (stock path); compare
+    the two with tools/bench_language_encode.py."""
 
 
 @dataclasses.dataclass

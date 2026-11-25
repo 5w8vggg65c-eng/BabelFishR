@@ -1648,10 +1648,32 @@ class Store:
 
         where.append("t.hidden = 0")
         clause = f"WHERE {' AND '.join(where)}" if where else ""
-        rows = self._conn.execute(
-            f"SELECT t.* FROM transmissions t {clause} "
-            f"ORDER BY t.started_at DESC LIMIT ?", (*params, limit)).fetchall()
-        return [_from_row(r) for r in rows]
+        if not query.strip():
+            rows = self._conn.execute(
+                f"SELECT t.* FROM transmissions t {clause} "
+                f"ORDER BY t.started_at DESC LIMIT ?", (*params, limit)).fetchall()
+            return [_from_row(r) for r in rows]
+        # Matches are by PUBLISHED words, decided before the limit: the index
+        # (any version, or the LIKE fallback) also holds raw engine text, so
+        # a withheld guess or a withheld sign-off may be a candidate; it only
+        # counts if the operator's words or the published text match. Rows
+        # are read newest first until the limit is filled, so an older valid
+        # match is never starved by newer raw guesses. Nothing is rewritten.
+        terms = [t.lower() for t in query.replace('"', " ").split() if t.strip()]
+        cursor = self._conn.execute(
+            f"SELECT t.* FROM transmissions t {clause} ORDER BY t.started_at DESC",
+            tuple(params))
+        found: List[Transmission] = []
+        for row in cursor:
+            tx = _from_row(row)
+            if tx.guess_withheld or tx.withheld_ending:
+                published = tx.published_text().lower()
+                if not all(term.strip("*") in published for term in terms):
+                    continue
+            found.append(tx)
+            if len(found) >= limit:
+                break
+        return found
 
     def _matching_ids(self, query: str) -> List[str]:
         if self.fts_enabled:

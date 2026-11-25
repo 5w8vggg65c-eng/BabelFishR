@@ -117,16 +117,15 @@ def to_markdown(transmissions: Sequence[Transmission],
             lines.append("*" + " | ".join(meta) + "*")
         lines.append("")
         if tx.guess_withheld:
-            # Not traffic: said plainly, with the engine's guess labelled.
-            lines.append("**Original:** *Audio unintelligible - no speech "
-                         "recognised. Engine guess withheld as not speech:* "
-                         f"\u201c{tx.transcript.strip()}\u201d")
+            # Not traffic, and the guess is not repeated here: the raw engine
+            # text is in Edit and in the JSON (forensic) export.
+            lines.append(f"**Original:** *{tx.presented_transcript}*")
         elif tx.shown_transcript:
             lines.append(f"**Original ({tx.source_language or 'unknown'}):** "
                          f"{tx.shown_transcript}")
         if tx.withheld_ending:
-            lines.append("*Withheld from the end (not supported by the recording):* "
-                         f"\u201c{tx.withheld_ending}\u201d")
+            lines.append("*A stock sign-off the recording does not support was "
+                         "withheld from the end.*")
         if tx.shown_translation:
             lines.append(f"**Translated ({tx.target_language}):** "
                          f"{tx.shown_translation}")

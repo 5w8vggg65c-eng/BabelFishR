@@ -299,8 +299,10 @@ def test_capture_publishes_spectrum_frames_off_the_callback_thread(app):
     # About ten or more readings per second of audio (at the UI's own
     # refresh rate), never one per callback: responsive, and bounded.
     seconds = signal.size / rate
-    blocks = signal.size / block
-    assert 5 * seconds <= len(frames) <= blocks / 2
+    # The callbacks actually made, the final partial block included (220500
+    # samples in 1024s is 216 of them): at most one frame per two.
+    blocks = -(-signal.size // block)
+    assert 5 * seconds <= len(frames) <= blocks // 2
     # Fixed memory on the capture side: one FFT-sized ring, nothing growing.
     assert capture.spectrum._ring.size == FFT_SIZE
     assert not [name for name in vars(capture.spectrum)
