@@ -778,8 +778,13 @@ class ProcessingPipeline:
             return False
         return True
 
-    def retry(self, tx_id: str, source_language: Optional[str] = None) -> bool:
+    def retry(self, tx_id: str, source_language: Optional[str] = None,
+              confirm_speech: bool = False) -> bool:
         """Retry a failed transmission. The audio was never lost.
+
+        With ``confirm_speech`` (and no *source_language*) the operator is
+        saying "this is speech, find its language yourself": the same as
+        below, with this recording's language left to automatic detection.
 
         With *source_language* the operator is saying "this is speech, in
         this language": the message is transcribed again in that language
@@ -799,7 +804,7 @@ class ProcessingPipeline:
             self._idle.clear()
         queued = False
         try:
-            queued = self._prepare_retry(tx_id, source_language)
+            queued = self._prepare_retry(tx_id, source_language, confirm_speech)
         finally:
             if queued:
                 self._queue.put(tx_id)
@@ -815,7 +820,8 @@ class ProcessingPipeline:
             if not self._in_flight:
                 self._idle.set()
 
-    def _prepare_retry(self, tx_id: str, source_language: Optional[str]) -> bool:
+    def _prepare_retry(self, tx_id: str, source_language: Optional[str],
+                       confirm_speech: bool = False) -> bool:
         tx = self.store.get_transmission(tx_id)
         if tx is None:
             return False
@@ -824,12 +830,19 @@ class ProcessingPipeline:
             # Clear Session History removed the recording: queuing would
             # only fail.
             return False
-        if source_language:
-            tx.source_language = source_language
-            tx.source_language_mode = SourceLanguageMode.SPECIFIED
+        if source_language or confirm_speech:
+            if source_language:
+                tx.source_language = source_language
+                tx.source_language_mode = SourceLanguageMode.SPECIFIED
+            else:
+                # Speech, language unknown: this recording alone is detected
+                # automatically; the Session's setting is untouched.
+                tx.source_language_mode = SourceLanguageMode.AUTOMATIC
             tx.signal_metadata = dict(tx.signal_metadata or {}, speech_confirmed={
-                "source_language": source_language, "by": "operator"})
+                "source_language": source_language or None,
+                "automatic": not source_language, "by": "operator"})
             tx.skip_reason = ""
+            tx.auto_processed = False
             # New words, not yet checked: an earlier review was of the old ones.
             tx.reviewed = False
             if tx.transcript_correction or tx.translation_correction:
@@ -1049,6 +1062,21 @@ class ProcessingPipeline:
         metadata.pop(TRANSLATION_UNRESOLVED, None)
         if check is not None:
             metadata["speech_check"] = check
+        # Positive acoustic evidence of static, from the recording itself
+        # (babelfishr.static); the card says "Static" only when no credible
+        # speech was found as well (Transmission.is_static).
+        try:
+            from .static import static_evidence
+
+            static = static_evidence(audio, rate)
+        except Exception:  # noqa: BLE001 - a label is never worth a failure
+            log.debug("static measurement failed for %s", tx.id, exc_info=True)
+            static = None
+        metadata.pop("static_check", None)
+        if static is not None and static.get("verdict") == "static":
+            # Recorded only when it is positive evidence; any other
+            # recording's metadata is left exactly as before.
+            metadata["static_check"] = static
         tx.signal_metadata = metadata
         tx.state = ProcessingState.TRANSCRIBED
         tx.clear_error()
@@ -1095,7 +1123,7 @@ class ProcessingPipeline:
                 f"Translation not attempted: language unresolved. Automatic "
                 f"detection guessed '{source}' ({shown}), and no "
                 f"{source}->{target} pack is installed. If this is speech, "
-                f"choose its language with Message > Retry as speech in... "
+                f"choose its language with Transcribe as speech\u2026 in the message's menu "
                 f"(Session options > Source language sets it for new "
                 f"recordings).")
         return "missing", (f"no {source}->{target} language pack is installed. Install "
@@ -1186,7 +1214,8 @@ class CaptureService:
     def __init__(self, source: AudioSource, store: Store, session: Session,
                  config: Config, events: EventBus,
                  pipeline: Optional[ProcessingPipeline] = None,
-                 profile: Optional[RadioProfile] = None):
+                 profile: Optional[RadioProfile] = None,
+                 detector_settings=None):
         self.source = source
         self.store = store
         self.session = session
@@ -1196,8 +1225,12 @@ class CaptureService:
         self.profile = profile
 
         self.meter = LevelMeter()
-        self.detector = RadioActivityDetector(source.sample_rate,
-                                              config.detector.to_settings())
+        self.detector = RadioActivityDetector(
+            source.sample_rate, detector_settings or config.detector.to_settings())
+        #: The microphone's start-capture level governs this capture's gate
+        #: (BabelFishRApp.capture_detector_settings), so changing it while
+        #: listening applies here at once.
+        self.mic_gate = False
         self.recorder = Recorder(
             directory=config.recording.directory, layout=config.recording.layout,
             bit_depth=config.audio.bit_depth, enabled=config.recording.enabled)

@@ -123,6 +123,68 @@ def test_unknown_detector_result_keeps_default_decoding(engine, monkeypatch):
     assert result.speech_ratio is None and result.speech_seconds is None
 
 
+def _quiet_then_louder(seconds=12):
+    clip = audio(seconds)
+    clip[:-3 * TARGET_RATE] *= 0.04
+    return clip
+
+
+def test_late_voice_evidence_preserves_the_full_words_with_one_decode(engine, monkeypatch):
+    clip = _quiet_then_louder()
+    calls = []
+
+    def voice(samples):
+        calls.append(samples.size)
+        return TARGET_RATE if len(calls) == 2 else 0
+
+    monkeypatch.setattr(whisper_local, "_voiced_samples", voice)
+    result = engine.transcribe(clip, TARGET_RATE)
+    assert calls == [clip.size, 4 * TARGET_RATE]
+    assert len(engine.fake.calls) == 1
+    assert np.array_equal(engine.fake.calls[0][0], clip)
+    assert result.speech_seconds == 1.0
+    assert result.speech_ratio == round(1 / 12, 3)
+
+
+@pytest.mark.parametrize("clip", [audio(12), np.zeros(12 * TARGET_RATE, dtype=np.float32)])
+def test_steady_input_has_no_extra_voice_scan_or_decode(engine, monkeypatch, clip):
+    calls = vad_returns(monkeypatch, 0)
+    result = engine.transcribe(clip, TARGET_RATE)
+    assert calls == [clip.size]
+    assert len(engine.fake.calls) == 1 and result.speech_seconds == 0.0
+
+
+@pytest.mark.parametrize("original", ["", "Thanks for watching."])
+def test_blank_or_stock_output_can_recover_late_words_in_original_time(engine, monkeypatch, original):
+    clip = _quiet_then_louder()
+    monkeypatch.setattr(whisper_local, "_voiced_samples",
+                        lambda x: TARGET_RATE if x.size == 4 * TARGET_RATE else 0)
+    languages = []
+
+    def transcribe(samples, **kwargs):
+        languages.append(kwargs["language"])
+        words = original if samples.size == clip.size else "Radio check"
+        info = types.SimpleNamespace(language="es", language_probability=0.85)
+        return iter([Segment(words, 0.5, 2.5)]), info
+
+    monkeypatch.setattr(engine.fake, "transcribe", transcribe)
+    result = engine.transcribe(clip, TARGET_RATE, language="es")
+    assert languages == ["es", "es"]
+    assert result.language == "es" and result.text == "Radio check"
+    assert [(s.start, s.end) for s in result.segments] == [(8.5, 10.5)]
+    assert result.speech_ratio == round(1 / 12, 3)
+
+
+def test_late_voice_does_not_endorse_words_only_in_the_prefix(engine, monkeypatch):
+    clip = _quiet_then_louder()
+    monkeypatch.setattr(whisper_local, "_voiced_samples",
+                        lambda x: TARGET_RATE if x.size == 4 * TARGET_RATE else 0)
+    info = types.SimpleNamespace(language="en", language_probability=0.8)
+    monkeypatch.setattr(engine.fake, "transcribe", lambda *a, **kw:
+                        (iter([Segment("Guessed words", 0.0, 2.0)]), info))
+    assert engine.transcribe(clip, TARGET_RATE).speech_seconds == 0.0
+
+
 def test_a_specified_language_keeps_full_decoding_even_with_zero_voice(engine,
                                                                        monkeypatch):
     """Retry as speech in a language stays the full-quality path for weak

@@ -40,7 +40,8 @@ def to_json(transmissions: Sequence[Transmission],
         # Machine-readable: every stored value as it is, plus whether the
         # transcript is a withheld guess, so no reader takes it for traffic.
         "transmissions": [dict(t.to_dict(), guess_withheld=t.guess_withheld,
-                               withheld_ending=t.withheld_ending)
+                               withheld_ending=t.withheld_ending,
+                               static=t.is_static)
                           for t in transmissions],
     }
     if session is not None:
@@ -63,10 +64,13 @@ def to_csv(transmissions: Sequence[Transmission]) -> str:
             row["translation"] = tx.shown_translation
             row["withheld_guess"] = tx.withheld_ending
             row["transcript_status"] = "unsupported sign-off withheld from the end"
+        if tx.is_static:
+            row["transcript_status"] = "static"
         if tx.guess_withheld:
             row["withheld_guess"] = tx.transcript
             row["transcript"] = ""
-            row["transcript_status"] = "audio unintelligible: engine guess withheld"
+            row["transcript_status"] = ("static: engine guess withheld" if tx.is_static
+                                        else "audio unintelligible: engine guess withheld")
             if not tx.translation_correction:
                 row["translation"] = ""
         writer.writerow({k: row.get(k, "") for k in CSV_COLUMNS})
@@ -116,7 +120,7 @@ def to_markdown(transmissions: Sequence[Transmission],
         if meta:
             lines.append("*" + " | ".join(meta) + "*")
         lines.append("")
-        if tx.guess_withheld:
+        if tx.guess_withheld or tx.is_static:
             # Not traffic, and the guess is not repeated here: the raw engine
             # text is in Edit and in the JSON (forensic) export.
             lines.append(f"**Original:** *{tx.presented_transcript}*")

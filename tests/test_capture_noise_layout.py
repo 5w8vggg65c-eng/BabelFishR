@@ -354,7 +354,7 @@ def test_the_held_note_names_the_loop(qt_app):
                                  language_confidence=0.531))})
     note = _speech_check_note(tx)
     assert note.startswith("Probably not speech (the transcript looks like a recognition loop")
-    assert "()" not in note and "Retry as speech in" in note
+    assert "()" not in note and "Transcribe as speech" in note
     call = "mayday mayday mayday mayday mayday mayday"
     tx.transcript = call
     tx.signal_metadata = {"speech_check": assess_speech(result(call, confidence=0.93))}

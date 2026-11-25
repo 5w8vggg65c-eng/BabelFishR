@@ -372,7 +372,7 @@ def test_play_menu_and_click_selection_still_work_for_a_row(qt_app, tmp_path):
     assert backend.loaded == wav and controller.owner == "one"
 
     labels = [a.text() for a in first.menu_button.menu().actions()]
-    assert "Retry as speech in..." in labels
+    assert "Transcribe as speech\u2026" in labels
     view.close()
 
 

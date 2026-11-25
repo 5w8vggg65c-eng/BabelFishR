@@ -129,8 +129,9 @@ def test_general_cannot_be_removed_and_says_why(qt_app, config, store, wav,
                                                 monkeypatch):
     app, window, general, ops, snapshot = two_sessions_window(qt_app, config,
                                                               store, wav)
-    action = menu_action(window, tab_index_for(window, general), "Remove Session")
+    action = menu_action(window, tab_index_for(window, general), "Delete Session")
     assert not action.isEnabled()
+    assert not menu_action(window, tab_index_for(window, general), "Hide Session").isEnabled()
     # The tab is permanent; emptying it is Clear Session History's job.
     assert "Clear Session History" in action.toolTip()
     assert "always kept" in app.conversation_removal_problem(general)
@@ -151,12 +152,12 @@ def test_cancel_changes_nothing(qt_app, config, store, wav, monkeypatch):
     app, window, general, ops, snapshot = two_sessions_window(qt_app, config,
                                                               store, wav)
     before = snapshot(ops)
-    answers(monkeypatch, window, "")
-    menu_action(window, tab_index_for(window, ops), "Remove Session").trigger()
+    asked = answers(monkeypatch, window, "")            # Cancel, the default
+    menu_action(window, tab_index_for(window, ops), "Delete Session").trigger()
     pump(qt_app)
-    answers(monkeypatch, window, window.DELETE_SESSION, "")
-    menu_action(window, tab_index_for(window, ops), "Remove Session").trigger()
-    pump(qt_app)
+    # ONE named confirmation, offering Hide Session, Delete and Cancel.
+    assert len(asked) == 1 and "Ops" in asked[0][0]
+    assert asked[0][1] == [window.HIDE_SESSION_ACTION, window.DELETE_CHOICE]
     assert snapshot(ops) == before
     assert store.get_conversation(ops).hidden is False
     assert tab_index_for(window, ops) is not None
@@ -174,11 +175,13 @@ def test_a_session_being_recorded_into_is_refused(qt_app, config, store, wav,
     app.begin_capture()
     assert app.capture_conversation_id == ops
     shown = silence_boxes(monkeypatch)
-    asked = answers(monkeypatch, window, window.HIDE_SESSION)
-    menu_action(window, tab_index_for(window, ops), "Remove Session").trigger()
+    asked = answers(monkeypatch, window, window.DELETE_CHOICE)
+    menu_action(window, tab_index_for(window, ops), "Hide Session").trigger()
+    menu_action(window, tab_index_for(window, ops), "Delete Session").trigger()
     pump(qt_app)
     assert not asked
-    assert shown["information"] and "Stop monitoring" in shown["information"][0][2]
+    assert len(shown["information"]) == 2
+    assert all("Stop monitoring" in box[2] for box in shown["information"])
     assert store.get_conversation(ops).hidden is False
     assert app.capture is not None and app.capture_conversation_id == ops
     app.stop_session()
@@ -199,10 +202,10 @@ def test_hiding_keeps_every_run_message_and_file_and_is_restorable(
     pump(qt_app)
     assert window.timeline.count() == len(before[1])
 
-    asked = answers(monkeypatch, window, window.HIDE_SESSION)
-    menu_action(window, tab_index_for(window, ops), "Remove Session").trigger()
+    asked = answers(monkeypatch, window)
+    menu_action(window, tab_index_for(window, ops), "Hide Session").trigger()
     pump(qt_app)
-    assert asked and "2 monitoring run(s)" in asked[0][2]
+    assert not asked, "Hide Session is direct: nothing is deleted, it is undoable"
     assert tab_index_for(window, ops) is None, "the tab is still shown"
     assert store.get_conversation(ops).hidden is True
     assert snapshot(ops) == before, "hiding changed the data"
@@ -232,8 +235,7 @@ def test_a_hidden_session_stays_hidden_after_relaunch(qt_app, config, store, wav
     app, window, general, ops, snapshot = two_sessions_window(qt_app, config,
                                                               store, wav)
     before = snapshot(ops)
-    answers(monkeypatch, window, window.HIDE_SESSION)
-    menu_action(window, tab_index_for(window, ops), "Remove Session").trigger()
+    menu_action(window, tab_index_for(window, ops), "Hide Session").trigger()
     pump(qt_app)
     window.close()
 
@@ -261,12 +263,11 @@ def test_permanent_deletion_removes_runs_messages_and_files_of_that_session_only
     assert set(inventory.transmission_ids) == set(ops_txs)
     assert set(inventory.owned) == set(ops_files)
 
-    asked = answers(monkeypatch, window, window.DELETE_SESSION,
-                    window.CONFIRM_DELETE_SESSION)
-    menu_action(window, tab_index_for(window, ops), "Remove Session").trigger()
+    asked = answers(monkeypatch, window, window.DELETE_CHOICE)
+    menu_action(window, tab_index_for(window, ops), "Delete Session").trigger()
     pump(qt_app)
 
-    scope = asked[1][2]
+    scope = asked[0][2]
     assert "2 monitoring run(s)" in scope and f"{len(ops_txs)} message(s)" in scope
     assert f"{len(ops_files)} recording file(s)" in scope
     assert store.get_conversation(ops) is None
@@ -310,8 +311,8 @@ def test_deleting_the_viewed_session_moves_to_general_and_stops_its_playback(
     controller.play(ops_txs[0], ops_files[0])
     assert controller.owner == ops_txs[0]
 
-    answers(monkeypatch, window, window.DELETE_SESSION, window.CONFIRM_DELETE_SESSION)
-    menu_action(window, tab_index_for(window, ops), "Remove Session").trigger()
+    answers(monkeypatch, window, window.DELETE_CHOICE)
+    menu_action(window, tab_index_for(window, ops), "Delete Session").trigger()
     pump(qt_app)
     assert controller.owner is None and ("stop",) in backend.calls
     assert app.conversation_id == general
@@ -333,11 +334,10 @@ def test_a_file_shared_with_another_session_survives_deletion(qt_app, config,
 
     inventory = app.conversation_removal_inventory(ops)
     assert ops_files[0] in inventory.shared and ops_files[0] not in inventory.owned
-    asked = answers(monkeypatch, window, window.DELETE_SESSION,
-                    window.CONFIRM_DELETE_SESSION)
-    menu_action(window, tab_index_for(window, ops), "Remove Session").trigger()
+    asked = answers(monkeypatch, window, window.DELETE_CHOICE)
+    menu_action(window, tab_index_for(window, ops), "Delete Session").trigger()
     pump(qt_app)
-    assert "NOT deleted: 1 file(s) another Session" in asked[1][2]
+    assert "NOT deleted: 1 file(s) another Session" in asked[0][2]
     assert pathlib.Path(ops_files[0]).is_file(), "a shared file was deleted"
     assert not any(pathlib.Path(f).exists() for f in ops_files[1:])
     assert store.get_transmission(gen_txs[0]).processed_audio_path == ops_files[0]
@@ -359,8 +359,8 @@ def test_an_unremovable_file_is_reported_and_left_for_retry(qt_app, config, stor
 
     monkeypatch.setattr(pathlib.Path, "unlink", refusing)
     shown = silence_boxes(monkeypatch)
-    answers(monkeypatch, window, window.DELETE_SESSION, window.CONFIRM_DELETE_SESSION)
-    menu_action(window, tab_index_for(window, ops), "Remove Session").trigger()
+    answers(monkeypatch, window, window.DELETE_CHOICE)
+    menu_action(window, tab_index_for(window, ops), "Delete Session").trigger()
     pump(qt_app)
     assert store.get_conversation(ops) is None
     assert stuck.is_file()

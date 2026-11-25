@@ -128,7 +128,7 @@ def test_the_window_says_kingfishr_and_adds_the_receiver_menu(homes):
     try:
         assert window.windowTitle() == "KingFishR"
         menus = [a.text().replace("&", "") for a in window.menuBar().actions()]
-        assert menus == ["File", "View", "Message", "Receiver", "Tools", "Help"]
+        assert menus == ["File", "View", "Receiver", "Tools", "Help"]
         assert window.receiver_line.text().startswith("Receiver:")
     finally:
         window.close()

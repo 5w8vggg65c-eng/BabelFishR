@@ -445,7 +445,11 @@ def test_the_menu_offers_a_route_back_to_the_whole_thread(qt_app, config,
     qt_app.processEvents()
     labels = [action.text() for menu in window.menuBar().actions()
               if menu.menu() for action in menu.menu().actions()]
-    assert "Show all transmissions" in labels
+    # The route back is the visible All messages filter (and Ctrl+Shift+A on
+    # the window); the View menu no longer repeats it.
+    assert window.filter_all.isVisibleTo(window)
+    assert window.show_all_action in window.actions()
+    assert window.show_all_action.shortcut().toString() == "Ctrl+Shift+A"
     assert "Show current session" not in labels
     window.hide()
 

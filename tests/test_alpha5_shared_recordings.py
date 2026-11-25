@@ -425,8 +425,8 @@ def test_the_window_keeps_a_shared_awkward_artifact_through_message_and_session_
     assert weird.is_file(), "the artifact two other messages use went with the message"
 
     # The other Session, for good, through its tab menu.
-    answers(monkeypatch, window, window.DELETE_SESSION, window.CONFIRM_DELETE_SESSION)
-    menu_action(window, tab_index_for(window, ops), "Remove Session").trigger()
+    answers(monkeypatch, window, window.DELETE_CHOICE)
+    menu_action(window, tab_index_for(window, ops), "Delete Session").trigger()
     pump(qt_app)
     assert store.get_conversation(ops) is None
     assert not any(pathlib.Path(f).exists() for f in ops_files), "Ops' own recordings stayed"
@@ -453,8 +453,11 @@ def test_finish_unfinished_deletions_reports_what_it_kept(qt_app, config, store,
     store.save_transmission(keeper)
     undo()
     shown = silence_boxes(monkeypatch)
+    window._refresh_cleanup_offer()                 # a deletion left a file
+    assert window.cleanup_button.isVisibleTo(window)
+    answers(monkeypatch, window, window.RETRY_CLEANUP)
 
-    window.finish_deletions_action.trigger()
+    window.cleanup_button.click()
     pump(qt_app)
     assert shown["information"], shown
     text = shown["information"][-1][2]

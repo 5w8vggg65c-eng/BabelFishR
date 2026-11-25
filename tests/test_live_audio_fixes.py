@@ -486,7 +486,7 @@ def test_retry_as_speech_fixes_a_wrong_automatic_language(config, store, tmp_pat
     app, tx = run_one(config, store, tmp_path, transcription, translation,
                       target_language="en")
     assert tx.state is ProcessingState.COMPLETE and tx.error is None
-    assert "Retry as speech in" in tx.signal_metadata["translation_unresolved"]["message"]
+    assert "Transcribe as speech\u2026" in tx.signal_metadata["translation_unresolved"]["message"]
 
     _retry(config, store, transcription, translation, tx.id, source_language="en")
     tx = store.get_transmission(tx.id)
@@ -628,18 +628,20 @@ def test_held_message_explains_itself_and_offers_retry_as_speech(config, store, 
         assert "Audio unintelligible" in bubble.pairing_label.text()
         tip = bubble.pairing_label.toolTip()
         assert "Probably not speech" in tip and "0.0 s of speech" in tip
-        assert "Retry as speech in..." in tip
+        assert "Transcribe as speech\u2026" in tip
         menu_texts = [a.text() for a in bubble.menu_button.menu().actions()]
-        assert "Retry as speech in..." in menu_texts
+        assert "Transcribe as speech\u2026" in menu_texts
+        assert "Retry as speech in..." not in menu_texts
+        assert "Transcribe anyway" not in menu_texts
 
         seen = []
-        monkeypatch.setattr(app, "retry",
+        monkeypatch.setattr(app, "transcribe_as_speech",
                             lambda tx_id, source_language=None:
                             seen.append((tx_id, source_language)) or True)
         monkeypatch.setattr(QtWidgets.QInputDialog, "getItem",
                             staticmethod(lambda *a, **k: ("English (en)", True)))
         action = next(a for a in bubble.menu_button.menu().actions()
-                      if a.text() == "Retry as speech in...")
+                      if a.text() == "Transcribe as speech\u2026")
         action.trigger()
         qt.processEvents()
         assert seen == [(tx.id, "en")]

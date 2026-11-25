@@ -127,6 +127,45 @@ class InputPanel(QtWidgets.QWidget):
         status.addWidget(self.meter, 1)
         layout.addLayout(status)
 
+        # Under the spectrum, for the Mac's own microphone only: the level at
+        # which a message starts being recorded, beside the live level. A
+        # USB interface, a receiver and a replayed file keep their settings.
+        self.gate_row = QtWidgets.QWidget()
+        gate = QtWidgets.QHBoxLayout(self.gate_row)
+        gate.setContentsMargins(0, 0, 0, 0)
+        gate_label = QtWidgets.QLabel("Start recording at")
+        self.gate_box = QtWidgets.QDoubleSpinBox()
+        low, high = getattr(self.app, "MIC_THRESHOLD_RANGE", (-80.0, -10.0))
+        self.gate_box.setRange(low, high)
+        self.gate_box.setDecimals(0)
+        self.gate_box.setSingleStep(1.0)
+        self.gate_box.setSuffix(" dBFS")
+        self.gate_box.setKeyboardTracking(False)
+        self.gate_box.setAccessibleName("Microphone start-recording level")
+        self.gate_box.setToolTip(
+            "Sound louder than this starts a message; anything quieter is not "
+            "recorded at all - no message, no card, no WAV. Half a second before "
+            "the start and after the end is kept. Changes apply at once, also "
+            "while listening, and are remembered. A message ends after the set "
+            "seconds of quiet; continuous sound is handed on in parts of about "
+            "15 s, each cut at the quietest point in its last 3 s so a word is "
+            "not split.")
+        gate_label.setBuddy(self.gate_box)
+        self.gate_box.valueChanged.connect(self._on_gate_changed)
+        self.gate_state = QtWidgets.QLabel("")
+        self.gate_state.setObjectName("sectionLabel")
+        self.level_now = QtWidgets.QLabel("Level now: \u2013")
+        self.level_now.setAccessibleName("Live input level")
+        self.level_now.setObjectName("sectionLabel")
+        gate.addWidget(gate_label)
+        gate.addWidget(self.gate_box)
+        gate.addWidget(self.level_now)
+        gate.addStretch(1)
+        layout.addWidget(self.gate_row)
+        layout.addWidget(self.gate_state)
+        self.gate_state.setWordWrap(True)
+        self._refresh_gate()
+
         self.alert_label = QtWidgets.QLabel()
         self.alert_label.setObjectName("inputAlert")
         self.alert_label.setWordWrap(True)
@@ -246,7 +285,40 @@ class InputPanel(QtWidgets.QWidget):
                 device, profile_id=(self._profile_id
                                     if self.profile_check.isChecked() else None))
         self.refresh_status()
+        self._refresh_gate()
         self.selectionChanged.emit()
+
+    # -- the microphone's start-recording level ---------------------------
+    def _refresh_gate(self) -> None:
+        """Shown for the built-in microphone (or a system default that is
+        it, or cannot be told apart); the value is the gate in force."""
+        route = getattr(self.app, "microphone_route", lambda: "")()
+        self.gate_row.setVisible(bool(route))
+        self.gate_state.setVisible(bool(route))
+        if not route:
+            return
+        value = self.app.mic_gate_dbfs()
+        self._loading_gate = True
+        try:
+            self.gate_box.setValue(value if value is not None
+                                   else self.app.config.detector.threshold_dbfs)
+        finally:
+            self._loading_gate = False
+        words = []
+        if value is None:
+            words.append("Now following the room's own level (automatic); set a "
+                         "level to fix it for the microphone.")
+        if route == "system-default-unconfirmed":
+            words.append("System default input: the hardware list cannot be read "
+                         "to confirm it is the built-in microphone; the level "
+                         "applies to it as chosen.")
+        self.gate_state.setText(" ".join(words))
+
+    def _on_gate_changed(self, value: float) -> None:
+        if getattr(self, "_loading_gate", False):
+            return
+        self.app.set_mic_threshold(value)
+        self.gate_state.setText("")
 
     def _on_profile_link(self, checked: bool) -> None:
         if self._loading or not self._profile_id:
@@ -388,6 +460,8 @@ class InputPanel(QtWidgets.QWidget):
         """Repaint the always-visible INPUT line."""
         from . import theme
 
+        if hasattr(self, "gate_row"):
+            self._refresh_gate()
         status = self.app.input_status()
         state = status["state"]
 
@@ -491,10 +565,15 @@ class InputPanel(QtWidgets.QWidget):
         self.refresh_status()
 
     def set_reading(self, rms: float, peak: float, clipped: bool,
-                    clip_count: int, spectrum=None) -> None:
+                    clip_count: int, spectrum=None, rms_dbfs=None) -> None:
         """A live reading; *spectrum* is its audio.spectrum.SpectrumFrame,
         when the producer computed one."""
         self.meter.set_reading(rms, peak, clipped, clip_count, spectrum=spectrum)
+        if self.gate_row.isVisibleTo(self):
+            # The reading's own RMS in dBFS; without it, back from the
+            # meter's -60..0 dB position.
+            level = rms_dbfs if rms_dbfs is not None else rms * 60.0 - 60.0
+            self.level_now.setText(f"Level now: {max(level, -99.0):.0f} dBFS (RMS)")
 
     def report_audio_status(self, kind: str, message: str) -> None:
         """React to the capture thread losing or regaining the device."""

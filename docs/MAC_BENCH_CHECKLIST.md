@@ -636,6 +636,53 @@ step 62 needs a known digital channel or a digital radio you do not yet have.
     could not finish quitting because SDR++ did not end, quit SDR++
     yourself and BabelFishR finishes.
 
+## T. Status band, microphone start level, Static, playback scrubbing, menus (new)
+
+65. Look at the teal band at the top in both the dark and the light
+    appearance. *Good:* the row stays teal from edge to edge; the
+    **Online / Setup** button and its arrow, the **Source** label and the
+    state text on the right are all orange, with a thin dark outline
+    around the letters, and stay readable while idle, monitoring and stopped.
+66. With the Mac's built-in microphone (or System default, when it is the
+    built-in microphone) as the source, look under the input spectrum.
+    *Good:* **Start recording at** with a value in dBFS, and **Level now**
+    moving with the room. Choose a USB interface or a replay file instead.
+    *Good:* the row disappears and their own settings are unchanged.
+67. Back on the microphone, start monitoring. Set **Start recording at**
+    just above the quiet room's **Level now**, wait 30 s in silence, then
+    press **Stop**. *Good:* no new card, no queued row and no new recording.
+    Speak a short sentence at a normal level. *Good:* one card with the
+    whole sentence, including its first and last syllables.
+68. Change **Start recording at** while monitoring, quit and reopen.
+    *Good:* the change applied at once and the value is still there.
+69. Hold the microphone near a hissing source (an untuned radio's static,
+    or a fan close to the microphone) until a card is made. *Good:* that
+    card says **Static**. A cough, a door or a clap says **Audio
+    unintelligible**; a spoken word is transcribed.
+70. Play a card longer than 10 s, and drag the line across the waveform.
+    *Good:* it keeps playing from where you let go. Pause and drag again.
+    *Good:* it stays paused at the new place. Click the waveform and press
+    the right and left arrow keys. *Good:* 5 s forward and back. **+5 s**
+    and continuous playback to the next card work as before.
+71. On a card whose words came out wrong or missing, open **⋯ ▸ Transcribe
+    as speech…** and choose **Automatic** or a language. *Good:* one new
+    attempt on that card only; other cards keep automatic language
+    detection. **Retry processing** appears only on a card that failed or
+    was stopped.
+72. Look at the menu row: **File, View, Tools, Help** (no Message menu).
+    **View** has no Review queue / All / Removed items; the **Review**,
+    **All** and **Removed** buttons above the messages do that. Click
+    **Removed** in a Session with nothing removed. *Good:* a short
+    sentence saying there is nothing removed. Remove a throwaway message
+    (⋯ ▸ Remove from view), click **Removed**, then **Restore** on it.
+    *Good:* it goes back to **All**.
+73. On a throwaway Session, use **Session actions ▾** (or right-click its
+    tab): **Hide Session** hides it at once, and **View ▸ Show hidden
+    Sessions** brings it back. **Delete Session…** asks one question named
+    after the Session, with **Hide Session**, **Delete** and **Cancel**;
+    pressing Return or Esc cancels. **Retry file cleanup…** appears under
+    the Session buttons only if a past deletion could not remove a file.
+
 ---
 
 ## If something goes wrong
@@ -648,7 +695,7 @@ step 62 needs a known digital channel or a digital radio you do not yet have.
 ## What this checklist cannot test
 
 No radio, USB radio interface, SDR dongle or FalconClaw PTT has been connected
-to BabelFishR yet. Sections A-R use the Mac's own microphone or recordings
+to BabelFishR yet. Sections A-R and T use the Mac's own microphone or recordings
 already saved. Section S is the first to use the RTL-SDR, and it is the only
 section that does; its steps have been exercised with the real SDR++ and
 DSD-neo playing a recorded signal from a file, on Linux, never with the

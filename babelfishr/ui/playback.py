@@ -374,6 +374,24 @@ class PlaybackController(QtCore.QObject):
             self.positionChanged.emit(self.owner, self.backend.position(),
                                       self._duration_ms)
 
+    def seek_to(self, tx_id: str, path: Optional[str], position_ms: int) -> bool:
+        """Move *tx_id*'s playback to *position_ms*, clamped to the clip -
+        only while that recording (that very file) is the one playing or
+        paused here. Playing stays playing and paused stays paused."""
+        if (self.owner != tx_id or not self.controllable
+                or self._state not in (PLAYING, PAUSED)):
+            return False
+        from .waveform import same_audio
+
+        if path and not same_audio(self.path or "", path):
+            return False
+        duration = self._duration_ms or self.backend.duration()
+        position = max(0, int(position_ms))
+        if duration:
+            position = min(position, int(duration))
+        self.backend.seek(position)
+        return True
+
     def end_early(self, tx_id: str) -> bool:
         """Stop *tx_id*'s clip before its end on the caller's behalf (the
         sequence skipping to the next recording): no finished, failed or

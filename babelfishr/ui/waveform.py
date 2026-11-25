@@ -16,9 +16,10 @@ Design notes
 * Loading runs on a worker thread. Each request carries a monotonically
   increasing token and a completion with an older token is discarded, so a
   slow clip can never overwrite the clip selected after it.
-* The widget is deliberately **read-only**: there is no click-to-seek. It is a
-  truthful picture of the recording and of where playback is, not a second
-  transport control competing with the thread's player.
+* The playhead can be clicked or dragged (Left/Right from the keyboard) to
+  seek - only within the recording being played or paused and drawn here,
+  through the same controller as the thread's player, so the two never
+  compete. Nothing else in the widget changes playback.
 """
 
 from __future__ import annotations
@@ -397,8 +398,9 @@ class _Loader:
 class RecordingWaveform(QtWidgets.QWidget):
     """Waveform of the selected transmission's own clip (read-only).
 
-    Deliberately no click-to-seek: this panel shows the recording and where
-    playback is, truthfully; transport stays with the thread's controls.
+    The playhead can be clicked or dragged to seek, but only within the
+    recording that is playing (or paused) and drawn here; Left/Right move it
+    by 5 s from the keyboard. Playing stays playing, paused stays paused.
     """
 
     loaded = QtCore.Signal(str)  # tx id, emitted on any terminal state
@@ -415,6 +417,11 @@ class RecordingWaveform(QtWidgets.QWidget):
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
                            QtWidgets.QSizePolicy.Fixed)
         self.setMinimumWidth(160)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.setAccessibleDescription(
+            "While this recording plays or is paused: click or drag to move the "
+            "playhead; Left and Right arrows move it 5 seconds.")
+        self._drag = None
 
         self.state = STATE_EMPTY
         self.message = NO_SELECTION_TEXT
@@ -493,6 +500,73 @@ class RecordingWaveform(QtWidgets.QWidget):
             controller.positionChanged.connect(self._on_position)
         self._sync_marker()
         self.update()
+
+    # -- seeking --------------------------------------------------------------
+    SEEK_KEY_MS = 5000
+
+    def _seek_fraction(self, x: float) -> Optional[float]:
+        area = self._wave_rect()
+        if area.width() <= 1:
+            return None
+        return max(0.0, min(1.0, (x - area.left()) / float(area.width() - 1)))
+
+    def _duration_ms(self) -> int:
+        dur = 0
+        if self._controller is not None and self.current_tx_id:
+            try:
+                dur = int(self._controller.position_for(self.current_tx_id)[1])
+            except Exception:  # noqa: BLE001
+                dur = 0
+        if dur <= 0 and self.envelope is not None:
+            dur = int(self.envelope.duration_s * 1000)
+        return dur
+
+    def _seek_to_fraction(self, fraction: float) -> bool:
+        dur = self._duration_ms()
+        if dur <= 0 or not self._owns_playback():
+            return False
+        return bool(self._controller.seek_to(
+            self.current_tx_id, self.current_path, int(round(fraction * dur))))
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == QtCore.Qt.LeftButton and self._owns_playback():
+            fraction = self._seek_fraction(event.position().x())
+            if fraction is not None:
+                # Bound to this recording: if playback moves on (the
+                # sequence starts the next clip) the drag lets go.
+                self._drag = (self.current_tx_id, self.current_path)
+                self._seek_to_fraction(fraction)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        drag = getattr(self, "_drag", None)
+        if drag is not None and event.buttons() & QtCore.Qt.LeftButton:
+            if drag != (self.current_tx_id, self.current_path) or not self._owns_playback():
+                self._drag = None                  # stale: another clip owns playback
+                return
+            fraction = self._seek_fraction(event.position().x())
+            if fraction is not None:
+                self._seek_to_fraction(fraction)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._drag = None
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        step = {QtCore.Qt.Key_Left: -self.SEEK_KEY_MS,
+                QtCore.Qt.Key_Right: self.SEEK_KEY_MS}.get(event.key())
+        if step is not None and self._owns_playback():
+            position = self._controller.position_for(self.current_tx_id)[0]
+            self._controller.seek_to(self.current_tx_id, self.current_path,
+                                     int(position) + step)
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def wait_until_loaded(self, timeout: float = 5.0) -> bool:
         """Process events until no load is pending. True if it settled."""

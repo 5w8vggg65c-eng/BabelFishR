@@ -222,7 +222,7 @@ def test_the_card_says_audio_unintelligible_and_keeps_review_routes(qt_app, tmp_
     assert bubble.translation_box.isHidden(), "a translation of the guess was shown"
     assert bubble.play_button.isEnabled(), "the WAV stays playable"
     labels = {a.text(): a for a in bubble.menu_button.menu().actions() if a.text()}
-    assert labels["Retry as speech in..."].isEnabled()
+    assert labels["Transcribe as speech\u2026"].isEnabled()
     assert labels["Edit transcript and translation..."].isEnabled()
 
 

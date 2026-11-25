@@ -183,7 +183,7 @@ def test_remove_from_thread_keeps_everything_and_is_restorable(
     assert other.id in {t["id"] for t in manifest["transmissions"]}
     assert "kept" in window.status.currentMessage()
 
-    # The way back: View > Show removed messages, then Restore.
+    # The way back: the Removed filter, then Restore.
     window.show_removed_action.setChecked(True)
     pump(qt_app)
     assert target.id in window.timeline._bubbles
@@ -433,7 +433,7 @@ def test_a_file_that_will_not_delete_is_recorded_and_retried(qt_app, config,
                                                              store, wav,
                                                              monkeypatch):
     """Partial filesystem failure: the row goes, the leftover is named, the
-    deletion is not called complete, and Tools > Finish unfinished deletions
+    deletion is not called complete, and Retry file cleanup...
     removes it once the obstacle is gone."""
     app, window, txs = captured_window(qt_app, config, store, wav)
     target = txs[0]
@@ -458,12 +458,22 @@ def test_a_file_that_will_not_delete_is_recorded_and_retried(qt_app, config,
     assert store.leftover_deletions() == {target.id: [str(stuck)]}
     assert "still on disk" in window.status.currentMessage()
 
+    # Offered only now, where it applies - not as a routine Tools item.
+    assert window.cleanup_button.isVisibleTo(window)
+    tools = [a.text() for a in window.menuBar().actions()
+             if a.text().replace("&", "") == "Tools"]
+    assert tools and not any("Finish unfinished" in a.text() or "cleanup" in a.text()
+                             for m in window.menuBar().actions()
+                             if m.text().replace("&", "") == "Tools"
+                             for a in m.menu().actions())
     monkeypatch.setattr(pathlib.Path, "unlink", real_unlink)
-    window.finish_deletions_action.trigger()
+    answers(monkeypatch, window, window.RETRY_CLEANUP)
+    window.cleanup_button.click()
     pump(qt_app)
     assert not stuck.exists()
     assert store.leftover_deletions() == {}
     assert shown["information"] and "All done" in shown["information"][-1][2]
+    assert not window.cleanup_button.isVisibleTo(window), "still offered with nothing left"
     window.close()
 
 

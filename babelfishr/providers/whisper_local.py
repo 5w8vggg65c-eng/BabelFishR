@@ -34,7 +34,7 @@ from typing import Any, List, Optional, Sequence, Tuple
 import numpy as np
 
 from ..dsp.resample import resample
-from ..models import TranscriptSegment
+from ..models import TranscriptSegment, signoff_is_noise, stock_signoff
 from .base import (EngineError, EngineUnavailable, PrivacyProfile,
                    TranscriptionEngine, TranscriptionResult)
 
@@ -373,8 +373,53 @@ class FasterWhisperEngine(TranscriptionEngine):
             return TranscriptionResult(engine=self.id, engine_version=self.version,
                                        no_speech=True)
 
-        # The local voice detector, once, before decoding. Its result is
-        # reused below as speech evidence, and decides one thing here: with
+        voiced = _voiced_samples(samples)
+        result = self._decode(model, samples, voiced, language, vocabulary)
+        if voiced != 0:
+            return result
+        # A long stretch of room noise can mask a short final utterance in
+        # the stateful voice detector. Give a distinct rise at the end a
+        # fresh detector context. Keep the full decode whenever it actually
+        # placed substantive words there.
+        tail_voice = _late_voice(samples)
+        if not tail_voice:
+            return result
+        start, count = tail_voice
+        offset = start / TARGET_RATE
+        if result.text and not stock_signoff(result.text):
+            words_at_end = any(s.text and s.end > offset and s.start < samples.size / TARGET_RATE
+                               for s in result.segments)
+            if (not words_at_end or result.no_speech_probability is None
+                    or result.no_speech_probability >= 0.5):
+                return result
+        else:
+            # Only a blank or stock output needs another audio decode.
+            try:
+                focused = self._decode(model, samples[start:], count, language, vocabulary)
+            except EngineError:
+                log.info("late-speech decode unavailable; retaining full recording result")
+                return result
+            tail_duration = (samples.size - start) / TARGET_RATE
+            if (not focused.text or not focused.segments
+                    or any(s.start >= tail_duration or s.end <= 0 for s in focused.segments)
+                    or focused.no_speech_probability is None
+                    or focused.no_speech_probability >= 0.5
+                    or signoff_is_noise(stock_signoff(focused.text), focused.speech_seconds,
+                                        focused.speech_ratio, focused.no_speech_probability,
+                                        focused.confidence)):
+                return result
+            for segment in focused.segments:
+                segment.start = offset + max(0.0, segment.start)
+                segment.end = offset + min(tail_duration, segment.end)
+            result = focused
+        result.speech_seconds = round(count / TARGET_RATE, 2)
+        result.speech_ratio = round(count / samples.size, 3)
+        log.info("speech confirmed in final %.1f s: %.2f s voiced",
+                 (samples.size - start) / TARGET_RATE, result.speech_seconds)
+        return result
+
+    def _decode(self, model, samples, voiced, language, vocabulary) -> TranscriptionResult:
+        # The full-recording voice detector decides one thing here: with
         # the language left to automatic detection and *no* voiced sample
         # found at all, Whisper decodes once at temperature 0 instead of
         # climbing its temperature-fallback ladder (up to six decodes per
@@ -384,7 +429,6 @@ class FasterWhisperEngine(TranscriptionEngine):
         # check; nothing is trimmed, capped or dropped. Unknown or non-zero
         # detector results, and a specified language (Retry as speech in...),
         # keep Whisper's normal decoding.
-        voiced = _voiced_samples(samples)
         single_pass = language is None and voiced == 0
         decode = {"temperature": 0.0} if single_pass else {}
         started = time.monotonic()
@@ -598,6 +642,26 @@ def _voiced_samples(samples: np.ndarray, sample_rate: int = TARGET_RATE) -> Opti
         log.debug("local VAD unavailable: %s", exc)
         return None
     return min(voiced, data.size)
+
+
+def _late_voice(samples: np.ndarray) -> Optional[Tuple[int, int]]:
+    """A fresh VAD reading for a short burst above a longer stretch of ambient audio."""
+    tail_size = 4 * TARGET_RATE
+    if samples.size < 2 * tail_size:
+        return None
+    frame_size = TARGET_RATE // 50
+    # Compare adjacent four-second intervals using 20 ms frame power.
+    # One loud click cannot lift the recent 90th percentile.
+    frames = samples[-2 * tail_size:].reshape(-1, frame_size)
+    power = np.mean(frames * frames, axis=1)
+    tail_frames = tail_size // frame_size
+    ambient = np.percentile(power[:-tail_frames], 80)
+    recent = np.percentile(power[-tail_frames:], 90)
+    if recent <= max(1e-12, 2.512 * ambient):  # 4 dB in mean-square level
+        return None
+    start = samples.size - tail_size
+    count = _voiced_samples(samples[start:])
+    return (start, count) if count and count >= TARGET_RATE // 2 else None
 
 
 def local_speech_activity(samples: np.ndarray, sample_rate: int = TARGET_RATE

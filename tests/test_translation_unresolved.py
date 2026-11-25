@@ -281,7 +281,7 @@ def test_the_bubble_says_translation_was_not_attempted(qt_app, config, store, tm
     assert bubble.notes_label.isHidden()
     tip = bubble.pairing_label.toolTip()
     assert "Translation not attempted: language unresolved" in tip
-    assert "'nn' (52%)" in tip and "Retry as speech in" in tip
+    assert "'nn' (52%)" in tip and "Transcribe as speech\u2026" in tip
     assert "Translation error" not in bubble.pairing_label.text()
     assert "Transcription error" not in bubble.pairing_label.text()
     assert bubble.review_label.text() == "CHECK"
@@ -342,5 +342,5 @@ def test_the_note_names_no_platform_shortcut(qt_app, config, store, tmp_path):
     app, tx = run_one(config, store, tmp_path, ScriptedTranscription(field_case()),
                       PairTranslation(pairs=()), target_language="en")
     note = _translation_unresolved_note(tx)
-    assert "Message > Retry as speech in..." in note
+    assert "Transcribe as speech\u2026" in note
     assert "Ctrl" not in note and "⌘" not in note

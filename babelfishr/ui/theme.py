@@ -38,6 +38,10 @@ CONSOLE = {
     "surface_raised": "#1D282B",   # section and column header strips
     "band": "#287882",
     "on_band": "#F2F7F8",
+    # Type on the teal band: a visibly orange foreground with a tight dark
+    # glyph halo (BAND_HALO) - 2.9:1 against this teal alone, 10.8:1
+    # against the halo at every glyph edge.
+    "band_text": "#FFB45C",
     "border": "#2E3B40",           # thin rules
     "rule_strong": "#5E7076",      # pane divider, outlined buttons
     "text": "#E6ECEE",
@@ -59,6 +63,7 @@ DAYLIGHT = {
     "surface_raised": "#E1E7E8",
     "band": "#1F6F78",
     "on_band": "#FFFFFF",
+    "band_text": "#FFB45C",          # 3.3:1 on this teal; 10.8:1 on the halo
     "border": "#C5CFD2",
     "rule_strong": "#7E8E93",
     "text": "#0A0E11",
@@ -89,6 +94,20 @@ RADIUS = 0
 #: Monospaced faces, in order of preference. Platform fonts only.
 MONOSPACE = ("Menlo", "SF Mono", "Monaco", "DejaVu Sans Mono",
              "Liberation Mono", "Consolas")
+
+
+#: The tight dark halo around each glyph on the teal band (one-pixel blur,
+#: no offset), so the orange reads clearly on either teal.
+BAND_HALO = "#101010"
+
+
+def add_band_halo(widget: QtWidgets.QWidget) -> None:
+    """Give a status-band label or button its glyph halo."""
+    effect = QtWidgets.QGraphicsDropShadowEffect(widget)
+    effect.setOffset(0, 0)
+    effect.setBlurRadius(4)
+    effect.setColor(QtGui.QColor(BAND_HALO))
+    widget.setGraphicsEffect(effect)
 
 
 def is_dark(widget: QtWidgets.QWidget = None) -> bool:
@@ -184,12 +203,19 @@ QMainWindow, #centralRoot {{ background: {t['window']}; }}
 #titleBar {{ background: {t['window']}; }}
 #appTitle, #titleNote {{ font-size: 15px; }}
 #statusBand {{ background: {t['band']}; }}
-#statusBand QLabel, #statusBand QToolButton {{
-    color: {t['on_band']}; font-size: 15px; background: transparent;
+/* All type on the band is light orange - the mode button and its arrow, the
+   source line and the state - in every state; states differ by words and
+   glyphs, never colour. The id selectors outrank any per-state style, and
+   only widgets inside #statusBand are touched. */
+#statusBand QLabel, #statusBand QToolButton, #statusBand #stateBadge,
+#statusBand #sourceLabel, #statusBand #modeButton {{
+    color: {t['band_text']}; font-size: 15px; font-weight: 600;
+    background: transparent;
 }}
+#statusBand #stateBadge[tone] {{ color: {t['band_text']}; }}
 #modeButton {{ border: 1px solid transparent; padding: 2px 6px; }}
-#modeButton:hover, #modeButton:focus {{ border: 1px solid {t['on_band']}; }}
-#modeButton:disabled {{ color: {t['on_band']}; }}
+#modeButton:hover, #modeButton:focus {{ border: 1px solid {t['band_text']}; }}
+#modeButton:disabled {{ color: {t['band_text']}; }}
 #modeButton::menu-indicator {{ image: none; width: 0; }}
 
 /* --- navigation: the in-window menu bar -------------------------------- */

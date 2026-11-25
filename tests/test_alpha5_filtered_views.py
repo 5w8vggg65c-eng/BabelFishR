@@ -172,7 +172,7 @@ def test_search_view_admits_only_what_the_search_admits(qt_app, config, store,
     assert window.timeline.order() == ["tx5", "tx0"]
 
     # Show all restores the thread, and live traffic lands on top again.
-    click_menu_item(qt_app, window, "&View", window.show_all_action)
+    click_filter(qt_app, window.filter_all)              # was View > Show all
     assert window.timeline.order() == ids(app.recent_transmissions(newest_first=True))
     assert "tx1" in window.timeline.order() and "tx6" not in window.timeline.order()
     deliver(qt_app, app, store, "transmission", record(7, "sg", "plain thread traffic"))
@@ -217,7 +217,7 @@ def test_switching_session_leaves_the_search_for_that_sessions_thread(
 
 def test_review_view_admits_only_what_the_review_queue_admits(qt_app, config, store):
     app, window, general, ops = two_sessions_window(qt_app, config, store)
-    click_menu_item(qt_app, window, "&View", window.review_action)
+    click_filter(qt_app, window.filter_review)           # was View > Review queue
     assert window.timeline.order() == ["tx2"] == ids(app.review_queue())
     assert "1 transmission(s) need review" in window.status.currentMessage()
 
@@ -287,3 +287,15 @@ def test_filtered_arrivals_above_the_viewport_keep_the_reading_position(
         f"the anchored bubble moved from y={before} to y={viewport_y(anchor_bubble)}")
     window.close()
     pump(qt_app, 40)
+
+
+def click_filter(qt_app, button):
+    """A real click on one of the filter buttons over the thread (they
+    replaced the View menu's Show all / Review queue items)."""
+    from PySide6 import QtCore
+    from PySide6.QtTest import QTest
+
+    assert button.isVisible() and button.isEnabled()
+    QTest.mouseClick(button, QtCore.Qt.LeftButton)
+    for _ in range(10):
+        qt_app.processEvents()

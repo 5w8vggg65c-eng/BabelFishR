@@ -175,7 +175,7 @@ def test_the_menu_bar_is_drawn_inside_the_window(qt_app, config, store):
     panes = window.pane_splitter
     assert panes.mapTo(window, QtCore.QPoint(0, 0)).y() >= on_window.bottom(), (
         "the content is drawn over the menu bar")
-    assert menu_titles(window) == ["File", "View", "Message", "Tools", "Help"]
+    assert menu_titles(window) == ["File", "View", "Tools", "Help"]
     for title in menu_titles(window):
         assert top_level_action(window, title).menu().actions(), f"{title} is empty"
     window.close()
@@ -234,9 +234,9 @@ def test_search_from_the_view_menu_finds_the_phrase_in_alpha_only(
     assert set(window.timeline._bubbles) == {alpha_txs[0].id}, (
         "search from the menu did not narrow the thread to the one match")
     assert "1 match" in window.status.currentMessage()
-    assert "Show all transmissions" in window.status.currentMessage()
+    assert "All, above the messages" in window.status.currentMessage()
 
-    click_menu_item(qt_app, window, "View", "Show all transmissions")
+    click_filter(qt_app, window.filter_all)          # was View > Show all
     assert set(window.timeline._bubbles) == {t.id for t in alpha_txs}, (
         "Show all did not restore Alpha's thread")
 
@@ -250,7 +250,7 @@ def test_search_from_the_view_menu_finds_the_phrase_in_alpha_only(
     click_menu_item(qt_app, window, "View", "Search transmissions...")
     assert window.timeline.count() == 0, "Alpha's phrase was found in Bravo"
     assert "0 match" in window.status.currentMessage()
-    click_menu_item(qt_app, window, "View", "Show all transmissions")
+    click_filter(qt_app, window.filter_all)          # was View > Show all
     assert set(window.timeline._bubbles) == {t.id for t in bravo_txs}
     window.close()
 
@@ -264,22 +264,22 @@ def test_review_queue_from_the_view_menu_shows_the_known_reviewable(
     window._refresh_session_tabs()
     window._reload_timeline()
 
-    click_menu_item(qt_app, window, "View", "Review queue")
+    click_filter(qt_app, window.filter_review)       # was View > Review queue
     assert set(window.timeline._bubbles) == {alpha_txs[1].id}, (
         "the review queue did not show exactly the low-confidence transmission")
     assert window.timeline.count() == 1, "an empty queue must not pass here"
     assert "1 transmission" in window.status.currentMessage()
 
-    click_menu_item(qt_app, window, "View", "Show all transmissions")
+    click_filter(qt_app, window.filter_all)          # was View > Show all
     assert set(window.timeline._bubbles) == {t.id for t in alpha_txs}
 
     # Bravo has nothing to review; that is the honest answer there.
     app.select_conversation(bravo.id)
     window._refresh_session_tabs()
     window._reload_timeline()
-    click_menu_item(qt_app, window, "View", "Review queue")
+    click_filter(qt_app, window.filter_review)       # was View > Review queue
     assert window.timeline.count() == 0
-    click_menu_item(qt_app, window, "View", "Show all transmissions")
+    click_filter(qt_app, window.filter_all)          # was View > Show all
     assert set(window.timeline._bubbles) == {t.id for t in bravo_txs}
     window.close()
 
@@ -356,3 +356,14 @@ def test_the_help_menu_is_wired(qt_app, config, store, monkeypatch):
     click_menu_item(qt_app, window, "Help", "Where are my recordings?")
     assert shown and shown[-1] == "Storage"
     window.close()
+
+
+def click_filter(qt_app, button):
+    """A real click on a filter button over the thread (they replaced the
+    View menu's Show all / Review queue items)."""
+    from PySide6 import QtCore
+    from PySide6.QtTest import QTest
+
+    assert button.isVisible() and button.isEnabled()
+    QTest.mouseClick(button, QtCore.Qt.LeftButton)
+    pump(qt_app)

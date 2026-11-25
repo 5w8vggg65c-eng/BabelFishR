@@ -166,7 +166,10 @@ def test_all_four_pairs(qt_app, wav, tmp_path, audio, text, expected):
     assert status == expected
     assert bubble.play_button.isEnabled() is audio
     assert bubble.play_action.isEnabled() is audio
-    assert bubble.retry_action.isEnabled() is audio
+    assert bubble.transcribe_action.isEnabled() is audio
+    # Retry processing (same settings) is offered only where processing
+    # failed - and, like the rest, only with the recording there.
+    assert bubble.retry_action.isEnabled() is (audio and not text)
 
 
 def test_whitespace_is_no_transcript_and_a_correction_counts(qt_app, wav):

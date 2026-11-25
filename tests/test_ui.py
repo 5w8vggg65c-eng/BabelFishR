@@ -253,7 +253,7 @@ def test_secondary_actions_live_in_an_overflow_menu(qt_app):
     bubble = view.add(Transmission(transcript="hi", audio_path="/x.wav"))
     labels = {a.text() for a in bubble.menu_button.menu().actions() if a.text()}
     for expected in ("Edit transcript and translation...", "Edit tags...",
-                     "Bookmark", "Transcribe anyway", "Export audio..."):
+                     "Bookmark", "Transcribe as speech\u2026", "Export audio..."):
         assert expected in labels, f"{expected} missing from the overflow menu"
     # Digital analysis (automatic hunting, specific mode) is KingFishR's:
     # tests/kingfishr/test_product_isolation.py checks it is offered there.

@@ -304,8 +304,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rename_session_button.clicked.connect(
             lambda: self._rename_session_tab(self.session_tabs.currentIndex()))
         session_buttons.addWidget(self.rename_session_button)
+        # Every action on the selected Session in one visible place - the
+        # same menu as right-clicking its tab.
+        self.session_actions_button = QtWidgets.QToolButton()
+        self.session_actions_button.setText("Session actions \u25be")
+        self.session_actions_button.setToolTip(
+            "Rename, colour, clear history, hide or delete the selected Session")
+        self.session_actions_button.setAccessibleName("Session actions")
+        self.session_actions_button.clicked.connect(self._show_session_actions)
+        session_buttons.addWidget(self.session_actions_button)
         session_buttons.addStretch(1)
         left_layout.addLayout(session_buttons)
+        # Only while a confirmed deletion still has files left on disk.
+        self.cleanup_button = QtWidgets.QPushButton("Retry file cleanup\u2026")
+        self.cleanup_button.setObjectName("paneLink")
+        self.cleanup_button.setFlat(True)
+        self.cleanup_button.setAccessibleName("Retry file cleanup")
+        self.cleanup_button.clicked.connect(lambda: self._finish_unfinished_deletions())
+        self.cleanup_button.hide()
+        left_layout.addWidget(self.cleanup_button)
         # The concept's "Saved sessions" and "Search": the real View actions.
         self.hidden_sessions_link = self._pane_link("Hidden sessions",
                                                     checkable=True)
@@ -414,7 +431,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.filter_all = self._filter_button("All messages")
         self.filter_review = self._filter_button("Needs review")
         self.filter_bookmarked = self._filter_button("Bookmarked")
-        for button in (self.filter_all, self.filter_review, self.filter_bookmarked):
+        self.filter_removed = self._filter_button("Removed")
+        self.filter_removed.setToolTip(
+            "Messages removed from this Session's thread - their recordings and "
+            "text are kept - with Restore to put them back")
+        for button in (self.filter_all, self.filter_review, self.filter_bookmarked,
+                       self.filter_removed):
             self.filter_group.addButton(button)
             filter_row.addWidget(button)
         self.filter_all.setChecked(True)
@@ -522,6 +544,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._wire_pane_links()
         # Nothing is selected yet: the panel and waveform say so.
         self._refresh_selected_panel()
+        self._refresh_cleanup_offer()
 
     def menuBar(self) -> QtWidgets.QMenuBar:  # noqa: N802
         """The in-window navigation bar (see _build_ui), not a bar QMainWindow
@@ -883,6 +906,8 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda: self._filter_clicked("review", self.review_action.trigger))
         self.filter_bookmarked.clicked.connect(
             lambda: self._filter_clicked("bookmarked", self._show_bookmarked))
+        self.filter_removed.clicked.connect(
+            lambda: self._filter_clicked("removed", self._show_removed))
 
     def _filter_clicked(self, kind: str, show) -> None:
         """Pressing the filter already on screen changes nothing - rebuilding
@@ -934,6 +959,10 @@ class MainWindow(QtWidgets.QMainWindow):
         font.setCapitalization(QtGui.QFont.AllUppercase)
         self.state_badge.setFont(font)
         row.addWidget(self.state_badge)
+        from . import theme as _theme
+
+        for widget in (self.mode_button, self.source_label, self.state_badge):
+            _theme.add_band_halo(widget)
 
     def _compact_combo(self, box: QtWidgets.QComboBox) -> QtWidgets.QComboBox:
         """A combo box whose longest item never sets the form's minimum
@@ -1067,8 +1096,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "A message ends when the input's audio level stays below the "
             "activity threshold this long; shorter pauses stay in the same "
             "message, and the next audio starts a new one. This is the audio "
-            "level, not the radio's squelch. Long audio that never goes quiet "
-            "is still transcribed in parts while it continues.")
+            "level, not the radio's squelch. Sound that never goes quiet is "
+            "still transcribed while it continues: it is handed on in parts of "
+            "about 15 s, each cut at the quietest point in its last 3 s so a "
+            "word is not split, and the next part carries straight on. A short "
+            "transmission that ends in quiet is always kept whole.")
         quiet_label.setBuddy(self.quiet_seconds_box)
         self.quiet_seconds_box.valueChanged.connect(self._on_quiet_seconds)
         form.addRow(quiet_label, self.quiet_seconds_box)
@@ -1218,26 +1250,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.search_action.triggered.connect(self._search)
         view_menu.addAction(self.search_action)
 
+        # Review queue, All messages and Removed are the filter buttons over
+        # the thread; the menu no longer repeats them. These actions stay on
+        # the window for their shortcuts and for older callers.
         self.review_action = QtGui.QAction("Review queue", self)
         self.review_action.triggered.connect(self._show_review_queue)
-        view_menu.addAction(self.review_action)
+        self.addAction(self.review_action)
 
         self.show_all_action = QtGui.QAction("Show all transmissions", self)
         self.show_all_action.setShortcut("Ctrl+Shift+A")
+        self.show_all_action.setShortcutContext(QtCore.Qt.WindowShortcut)
         self.show_all_action.setToolTip("Return to the full message thread")
         self.show_all_action.triggered.connect(self._reload_timeline)
-        view_menu.addAction(self.show_all_action)
+        self.addAction(self.show_all_action)
 
-        view_menu.addSeparator()
-        # Where a removed-but-kept message can be found again. Without this
-        # a message removed from view would be stranded in storage.
+        # Removed messages mixed into the thread (a compatibility switch;
+        # the Removed filter is the visible place to find them).
         self.show_removed_action = QtGui.QAction("Show removed messages", self)
         self.show_removed_action.setCheckable(True)
-        self.show_removed_action.setToolTip(
-            "Also show messages removed from this thread, so they can be "
-            "restored. Their data was kept.")
         self.show_removed_action.toggled.connect(lambda _: self._reload_timeline())
-        view_menu.addAction(self.show_removed_action)
+        self.addAction(self.show_removed_action)
+        view_menu.addSeparator()
 
         self.refresh_action = QtGui.QAction("Refresh", self)
         self.refresh_action.setShortcut(QtGui.QKeySequence.Refresh)
@@ -1310,13 +1343,15 @@ class MainWindow(QtWidgets.QMainWindow):
         tools_menu.addAction(self.copy_diagnostics_action)
 
         self.finish_deletions_action = QtGui.QAction(
-            "Finish unfinished deletions\u2026", self)
+            "Retry file cleanup\u2026", self)
         self.finish_deletions_action.setToolTip(
             "Try again to remove recording files a permanent deletion could "
             "not delete the first time.")
         self.finish_deletions_action.triggered.connect(
             self._finish_unfinished_deletions)
-        tools_menu.addAction(self.finish_deletions_action)
+        # Not a routine Tools item: offered only when a past confirmed
+        # deletion still has files to remove (see _refresh_cleanup_offer).
+        self.addAction(self.finish_deletions_action)
 
         self.reveal_logs_action = QtGui.QAction("Reveal Logs in Finder", self)
         self.reveal_logs_action.setToolTip("Open the folder containing the "
@@ -1594,6 +1629,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_review_queue()
         elif kind == "bookmarked":
             self._show_bookmarked()
+        elif kind == "removed":
+            self._show_removed()
         else:
             self._reload_timeline()
 
@@ -1749,7 +1786,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.input_panel.set_reading(
                     reading.rms_fraction, reading.peak_fraction,
                     reading.clipped, reading.clip_count,
-                    spectrum=getattr(reading, "spectrum", None))
+                    spectrum=getattr(reading, "spectrum", None),
+                    rms_dbfs=getattr(reading, "rms_dbfs", None))
                 self.clip_label.setText(
                     f"⚠ clipping ({reading.clip_count})" if reading.clip_count else "")
             elif event.kind == "state":
@@ -1912,6 +1950,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return self.app.review_queue()
         if self._view_kind == "bookmarked":
             return self._bookmarked_results()
+        if self._view_kind == "removed":
+            return self._removed_results()
         return []
 
     def _view_summary(self, count: int) -> str:
@@ -1921,13 +1961,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return f"{count} transmission(s) need review"
         if self._view_kind == "bookmarked":
             return f"{count} bookmarked transmission(s)"
+        if self._view_kind == "removed":
+            return f"{count} removed message(s) - Restore puts one back"
         return ""
 
     def _announce_view(self, count: int) -> None:
         if self._view_kind != "thread":
             self.status.showMessage(
-                f"{self._view_summary(count)} - View > Show all transmissions "
-                f"to go back", 10000)
+                f"{self._view_summary(count)} - All, above the messages, "
+                f"goes back", 10000)
 
     def _belongs_here(self, tx) -> bool:
         """Is this transmission part of the Session currently on screen?
@@ -2260,33 +2302,38 @@ class MainWindow(QtWidgets.QMainWindow):
             + ("\n\nThe recording itself is safe."
                if tx is not None and tx.audio_path else ""))
 
-    def _on_retry_as_speech(self, tx_id: str) -> None:
-        """Re-run one message as speech in a language the operator chooses.
+    AUTOMATIC_LANGUAGE = "Automatic (detect the language)"
 
-        For a message held back as probably-not-speech, or one whose language
-        was guessed wrongly: the session's own source-language setting only
-        applies to new recordings.
-        """
+    def _on_retry_as_speech(self, tx_id: str) -> None:
+        """Transcribe as speech...: one choice - Automatic or a language -
+        and one job for this recording. For a recording skipped or held as
+        probably not speech, or recognised in the wrong language; the
+        Session's own source-language setting applies to new recordings."""
         tx = self.app.store.get_transmission(tx_id)
         if tx is None:
             return
-        labels = [f"{name} ({code})" for code, name in COMMON_LANGUAGES]
-        codes = [code for code, _ in COMMON_LANGUAGES]
-        current = codes.index(tx.source_language) if tx.source_language in codes else 0
+        labels = [self.AUTOMATIC_LANGUAGE] + [f"{name} ({code})"
+                                              for code, name in COMMON_LANGUAGES]
+        codes = [None] + [code for code, _ in COMMON_LANGUAGES]
+        current = 0
+        if (tx.source_language_mode is SourceLanguageMode.SPECIFIED
+                and tx.source_language in codes):
+            current = codes.index(tx.source_language)
         label, ok = QtWidgets.QInputDialog.getItem(
-            self, "Retry as speech",
-            "Transcribe this recording again as speech in:", labels, current, False)
+            self, "Transcribe as speech",
+            "This recording is speech. Transcribe it (and translate it) in:",
+            labels, current, False)
         if not ok:
             return
         code = codes[labels.index(label)]
-        if self.app.retry(tx_id, source_language=code):
+        if self.app.transcribe_as_speech(tx_id, code):
             self.status.showMessage(
-                f"Transcribing the saved recording again as {label}...", 8000)
+                f"Transcribing the saved recording as speech ({label})...", 8000)
             return
         QtWidgets.QMessageBox.information(
-            self, "Retry as speech",
+            self, "Transcribe as speech",
             (self.app.processing_problem(tx_id)
-             or "The recording could not be queued again.")
+             or "The recording could not be queued.")
             + "\n\nThe recording itself is safe.")
 
     def _on_export_clip(self, tx_id: str) -> None:
@@ -2415,14 +2462,118 @@ class MainWindow(QtWidgets.QMainWindow):
             restore = menu.addAction("Restore Session")
             restore.triggered.connect(lambda: self._restore_session_tab(index))
         else:
-            remove = menu.addAction("Remove Session\u2026")
+            hide = menu.addAction(self.HIDE_SESSION_ACTION)
+            hide.setToolTip("Hide this Session's tab. Everything in it is kept; "
+                            "View \u203a Show hidden Sessions brings it back.")
+            hide.triggered.connect(lambda: self._hide_session_tab(index))
+            delete = menu.addAction(self.DELETE_SESSION_ACTION)
+            delete.triggered.connect(lambda: self._delete_session_tab(index))
             if conversation is not None and conversation.is_default:
-                # Not a decision made here: the default thread stays until
-                # the operator decides what removing it should mean.
-                remove.setEnabled(False)
-                remove.setToolTip(self.app.GENERAL_REMOVAL_PENDING)
-            remove.triggered.connect(lambda: self._remove_session_tab(index))
+                # The permanent General tab: emptied with Clear Session
+                # History, never hidden or deleted.
+                for action in (hide, delete):
+                    action.setEnabled(False)
+                    action.setToolTip(self.app.GENERAL_REMOVAL_PENDING)
         return menu
+
+    HIDE_SESSION_ACTION = "Hide Session"
+    DELETE_SESSION_ACTION = "Delete Session\u2026"
+
+    def _show_session_actions(self) -> None:
+        index = self.session_tabs.currentIndex()
+        if index < 0:
+            return
+        menu = self._build_session_tab_menu(index)
+        menu.exec(self.session_actions_button.mapToGlobal(
+            QtCore.QPoint(0, self.session_actions_button.height())))
+
+    def _hide_session_tab(self, index: int) -> None:
+        """Hide Session: at once, nothing deleted, undoable."""
+        conversation_id = self.session_tabs.tabData(index)
+        if not conversation_id or self._store_gone():
+            return
+        problem = self.app.conversation_removal_problem(conversation_id)
+        if problem:
+            QtWidgets.QMessageBox.information(
+                self, "This Session cannot be hidden yet", problem)
+            return
+        hidden = self.app.hide_conversation(conversation_id)
+        if hidden is None:
+            return
+        self._refresh_session_tabs()
+        self._reload_timeline()
+        self.status.showMessage(
+            f"\u201c{hidden.name}\u201d hidden. Everything in it is kept - View "
+            f"\u203a Show hidden Sessions to restore it.", 10000)
+
+    def _delete_session_tab(self, index: int) -> None:
+        """Delete Session...: ONE named confirmation offering Hide Session,
+        Delete or Cancel (the default)."""
+        conversation_id = self.session_tabs.tabData(index)
+        if not conversation_id or self._store_gone():
+            return
+        problem = self.app.conversation_removal_problem(conversation_id)
+        if problem:
+            QtWidgets.QMessageBox.information(
+                self, "This Session cannot be deleted yet", problem)
+            return
+        conversation = self.app.store.get_conversation(conversation_id)
+        if conversation is None:
+            return
+        inventory = self.app.conversation_removal_inventory(conversation_id)
+        runs, messages = len(inventory.session_ids), len(inventory.transmission_ids)
+        lines = [f"\u2022 {runs} monitoring run(s)",
+                 f"\u2022 {messages} message(s) with their transcripts, "
+                 f"translations, notes, tags and search entries",
+                 f"\u2022 {len(inventory.owned)} recording file(s) in "
+                 f"BabelFishR's Recordings folder"]
+        if inventory.shared:
+            lines.append(f"\u2022 NOT deleted: {len(inventory.shared)} file(s) "
+                         f"another Session's message still uses")
+        if inventory.external:
+            lines.append(f"\u2022 NOT deleted: {len(inventory.external)} file(s) "
+                         f"outside BabelFishR's Recordings folder")
+        lines += ["", "Hide Session keeps all of it instead (View \u203a Show "
+                      "hidden Sessions brings it back). Delete cannot be undone; "
+                      "other Sessions and copies you exported are not touched."]
+        choice = self._choose(
+            f"Delete Session \u201c{conversation.name}\u201d",
+            f"Delete the Session \u201c{conversation.name}\u201d permanently?",
+            "\n".join(lines), [self.HIDE_SESSION_ACTION, self.DELETE_CHOICE],
+            destructive=self.DELETE_CHOICE)
+        if self._store_gone() or not choice:
+            return                                   # Cancel: nothing changed
+        if choice == self.HIDE_SESSION_ACTION:
+            self._hide_session_tab(index)
+            return
+        if (self.timeline.playback.owner
+                and self.timeline.playback.owner in inventory.transmission_ids):
+            self.timeline.playback.stop()
+        problem = self.app.conversation_removal_problem(conversation_id)
+        if problem:
+            QtWidgets.QMessageBox.information(
+                self, "This Session cannot be deleted yet", problem)
+            return
+        report = self.app.delete_conversation_permanently(conversation_id)
+        self._refresh_session_tabs()
+        self._reload_timeline()
+        self._refresh_cleanup_offer()
+        if report is None:
+            return
+        if report.complete:
+            self.status.showMessage(
+                f"\u201c{report.name}\u201d deleted: {len(report.session_ids)} "
+                f"run(s), {len(report.messages)} message(s), "
+                f"{len(report.removed_files)} file(s).", 10000)
+        else:
+            failed = "\n".join(f"{p}\n    {why}" for p, why in report.failed)
+            QtWidgets.QMessageBox.warning(
+                self, "Deletion not finished",
+                f"\u201c{report.name}\u201d is deleted, but {len(report.failed)} "
+                f"file(s) could not be removed:\n\n{failed}\n\nThey are recorded; "
+                f"Retry file cleanup\u2026 (shown under Sessions) tries again.")
+
+    DELETE_CHOICE = "Delete"
 
     CLEAR_HISTORY = "Clear Session History\u2026"
 
@@ -2485,14 +2636,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 + ("They stay attached to their messages and can still be "
                    "played. Fix the cause and choose Clear Session History "
                    "again to retry." if scope == "audio" else
-                   "They are recorded so you can try again from Tools \u203a "
-                   "Finish unfinished deletions."))
+                   "They are recorded so you can try again with Retry file "
+                   "cleanup\u2026 under the Session buttons."))
 
     def _after_history_clear(self, report) -> None:
         """Redraw from the store, so no bubble, waveform or selected panel
         keeps a cleared text or a removed recording."""
         if report is None or self._store_gone():
             return
+        self._refresh_cleanup_offer()
         selected = self.timeline.selected_id
         if report.conversation_id == self.app.conversation_id:
             if self._view_kind == "thread":
@@ -2504,91 +2656,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._on_selection_changed(self.timeline.selected_id)
         self._refresh_session_tabs()
 
-    HIDE_SESSION = "Hide this Session (keep everything)"
-    DELETE_SESSION = "Delete permanently\u2026"
-    CONFIRM_DELETE_SESSION = "Delete this Session permanently"
-
     def _remove_session_tab(self, index: int) -> None:
-        conversation_id = self.session_tabs.tabData(index)
-        if not conversation_id:
-            return
-        problem = self.app.conversation_removal_problem(conversation_id)
-        if problem:
-            QtWidgets.QMessageBox.information(
-                self, "This Session cannot be removed yet", problem)
-            return
-        conversation = self.app.store.get_conversation(conversation_id)
-        if conversation is None:
-            return
-        inventory = self.app.conversation_removal_inventory(conversation_id)
-        runs, messages = len(inventory.session_ids), len(inventory.transmission_ids)
-        choice = self._choose(
-            "Remove Session",
-            f"Remove the Session \u201c{conversation.name}\u201d?",
-            f"It holds {runs} monitoring run(s) and {messages} message(s).\n\n"
-            "Hide this Session keeps all of it - the tab disappears and can "
-            "be brought back from View \u203a Show hidden Sessions.\n\n"
-            "Delete permanently asks again, lists exactly what will be "
-            "deleted, and cannot be undone.",
-            [self.HIDE_SESSION, self.DELETE_SESSION],
-            destructive=self.DELETE_SESSION, default=self.HIDE_SESSION)
-        if self._store_gone():
-            return
-        if choice == self.HIDE_SESSION:
-            self.app.hide_conversation(conversation_id)
-            self._refresh_session_tabs()
-            self._reload_timeline()
-            self.status.showMessage(
-                f"\u201c{conversation.name}\u201d hidden. Everything in it is "
-                f"kept - View \u203a Show hidden Sessions to restore it.", 10000)
-        elif choice == self.DELETE_SESSION:
-            lines = [f"This will permanently delete \u201c{conversation.name}\u201d:",
-                     f"\u2022 {runs} monitoring run(s)",
-                     f"\u2022 {messages} message(s) with their transcripts, "
-                     f"translations, notes, tags and search entries",
-                     f"\u2022 {len(inventory.owned)} recording file(s) in "
-                     f"BabelFishR's Recordings folder"]
-            if inventory.shared:
-                lines.append(f"\u2022 NOT deleted: {len(inventory.shared)} file(s) "
-                             f"another Session's message still uses")
-            if inventory.external:
-                lines.append(f"\u2022 NOT deleted: {len(inventory.external)} file(s) "
-                             f"outside BabelFishR's Recordings folder")
-            lines += ["", "Other Sessions are not touched. Copies you exported or "
-                          "shared elsewhere are not touched. This cannot be undone."]
-            confirm = self._choose(
-                "Delete Session permanently?",
-                f"Delete \u201c{conversation.name}\u201d and everything in it?",
-                "\n".join(lines), [self.CONFIRM_DELETE_SESSION],
-                destructive=self.CONFIRM_DELETE_SESSION)
-            if confirm != self.CONFIRM_DELETE_SESSION or self._store_gone():
-                return
-            if (self.timeline.playback.owner
-                    and self.timeline.playback.owner in inventory.transmission_ids):
-                self.timeline.playback.stop()
-            problem = self.app.conversation_removal_problem(conversation_id)
-            if problem:
-                QtWidgets.QMessageBox.information(
-                    self, "This Session cannot be removed yet", problem)
-                return
-            report = self.app.delete_conversation_permanently(conversation_id)
-            self._refresh_session_tabs()
-            self._reload_timeline()
-            if report is None:
-                return
-            if report.complete:
-                self.status.showMessage(
-                    f"\u201c{report.name}\u201d deleted: {len(report.session_ids)} "
-                    f"run(s), {len(report.messages)} message(s), "
-                    f"{len(report.removed_files)} file(s).", 10000)
-            else:
-                failed = "\n".join(f"{p}\n    {why}" for p, why in report.failed)
-                QtWidgets.QMessageBox.warning(
-                    self, "Deletion not finished",
-                    f"\u201c{report.name}\u201d is deleted, but {len(report.failed)} "
-                    f"file(s) could not be removed:\n\n{failed}\n\nThey are "
-                    f"recorded so you can try again from Tools \u203a Finish "
-                    f"unfinished deletions.")
+        """Older entry point: the same single Delete Session confirmation,
+        which also offers Hide Session."""
+        self._delete_session_tab(index)
 
     def _restore_session_tab(self, index: int) -> None:
         conversation_id = self.session_tabs.tabData(index)
@@ -2738,7 +2809,10 @@ class MainWindow(QtWidgets.QMainWindow):
         message its real language - out of reach. These run the very same
         handlers as the row's own menu.
         """
-        self.message_menu = bar.addMenu("&Message")
+        # Not on the menu bar any more (each card's own menu is the one place
+        # for these); kept as the selected-message actions behind the
+        # keyboard shortcuts, which are attached to the window itself.
+        self.message_menu = QtWidgets.QMenu("Message", self)
         self.message_menu.setObjectName("messageMenu")
         self.message_menu.aboutToShow.connect(self._refresh_message_menu)
 
@@ -2750,6 +2824,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 action.setStatusTip(tip)
             action.triggered.connect(slot)
             self.message_menu.addAction(action)
+            if shortcut:
+                action.setShortcutContext(QtCore.Qt.WindowShortcut)
+                self.addAction(action)            # works with no menu shown
             return action
 
         self.message_play_action = add(
@@ -2766,15 +2843,15 @@ class MainWindow(QtWidgets.QMainWindow):
             "Bookmark", lambda: self._on_selected("bookmark"), "Ctrl+B")
         self.message_bookmark_action.setCheckable(True)
         self.message_menu.addSeparator()
-        self.message_transcribe_action = add(
-            "Transcribe anyway", lambda: self._on_selected("transcribe"))
+        self.message_retry_speech_action = add(
+            "Transcribe as speech\u2026", lambda: self._on_selected("retry-speech"),
+            "Ctrl+L",
+            "Transcribe the selected message as speech - a language you choose, "
+            "or Automatic - then translate it")
+        # The same action: "Transcribe anyway" was a second name for it.
+        self.message_transcribe_action = self.message_retry_speech_action
         self.message_retry_action = add(
             "Retry processing", lambda: self._on_selected("retry"))
-        self.message_retry_speech_action = add(
-            "Retry as speech in...", lambda: self._on_selected("retry-speech"),
-            "Ctrl+L",
-            "Transcribe the selected message again in a language you choose, "
-            "then translate it")
         self.message_export_action = add(
             "Export audio...", lambda: self._on_selected("export"))
         self.message_menu.addSeparator()
@@ -3035,8 +3112,8 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Remove the message from {when}?",
             "Remove from thread keeps the recording and everything about "
             "the message; it disappears from this thread, search, review "
-            "and exports, and can be brought back from View \u203a Show "
-            "removed messages.\n\nDelete permanently asks again, lists "
+            "and exports, and can be brought back from the Removed "
+            "filter above the messages.\n\nDelete permanently asks again, lists "
             "exactly what will be deleted, and cannot be undone.",
             [self.REMOVE_KEEP, self.DELETE_FOREVER],
             destructive=self.DELETE_FOREVER, default=self.REMOVE_KEEP)
@@ -3048,8 +3125,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status.showMessage(
                 self._with_view_count(
                     "Message removed from the thread. Its recording and data "
-                    "are kept - View \u203a Show removed messages to restore "
-                    "it."), 10000)
+                    "are kept - the Removed filter above the messages "
+                    "restores it."), 10000)
         elif choice == self.DELETE_FOREVER:
             self._confirm_and_delete(tx)
 
@@ -3092,6 +3169,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self, "This message cannot be deleted yet", problem)
             return
         report = self.app.delete_permanently(tx.id)
+        self._refresh_cleanup_offer()
         self.timeline.remove(tx.id)
         self._refresh_view()           # a Search or Review view may owe a replacement
         if report is None:
@@ -3107,8 +3185,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self, "Deletion not finished",
                 f"The message is deleted, but {len(report.failed)} file(s) "
                 f"could not be removed:\n\n{failed}\n\nThey are recorded so "
-                f"you can try again from Tools \u203a Finish unfinished "
-                f"deletions.")
+                f"you can try again with Retry file cleanup\u2026 under the "
+                f"Session buttons.")
             self.status.showMessage(self._with_view_count(
                 f"Message deleted; {len(report.failed)} file(s) still on disk."),
                 10000)
@@ -3149,15 +3227,46 @@ class MainWindow(QtWidgets.QMainWindow):
             return message
         return f"{self._view_summary(self.timeline.count())}. {message}"
 
+    def _refresh_cleanup_offer(self) -> None:
+        """Retry file cleanup... is shown only while a past confirmed
+        deletion still has files on disk it could not remove (read from the
+        store, so it is offered again after a restart)."""
+        if self._store_gone():
+            return
+        try:
+            pending = self.app.leftover_deletions()
+        except Exception:  # noqa: BLE001 - an offer is never worth a crash
+            pending = {}
+        count = sum(len(files) for files in pending.values())
+        self.cleanup_button.setVisible(bool(count))
+        self.finish_deletions_action.setEnabled(bool(count))
+        self.cleanup_button.setToolTip(
+            f"{count} file(s) from a confirmed deletion could not be removed "
+            f"yet. Try again." if count else "")
+
     def _finish_unfinished_deletions(self) -> None:
         if self._store_gone():
             return
         before = self.app.leftover_deletions()
         if not before:
+            self._refresh_cleanup_offer()
             QtWidgets.QMessageBox.information(
-                self, "Unfinished deletions", "Nothing is left to delete.")
+                self, "Retry file cleanup", "No files are waiting to be removed.")
             return
-        result = self.app.retry_leftover_deletions()
+        count = sum(len(files) for files in before.values())
+        choice = self._choose(
+            "Retry file cleanup",
+            f"Try again to remove {count} file(s) left by a deletion you "
+            f"confirmed earlier?",
+            "Each file is checked again first: one another message now uses is "
+            "kept, and nothing outside BabelFishR's Recordings folder is touched.",
+            [self.RETRY_CLEANUP])
+        if choice != self.RETRY_CLEANUP or self._store_gone():
+            return                                   # Cancel: nothing changed
+        try:
+            result = self.app.retry_leftover_deletions()
+        finally:
+            self._refresh_cleanup_offer()
         done = len(result.removed) + len(result.already_gone)
         summary = f"Removed {done} file(s)."
         if result.preserved_paths:
@@ -3167,11 +3276,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if result.still:
             remaining = "\n".join(p for files in result.still.values() for p in files)
             QtWidgets.QMessageBox.warning(
-                self, "Unfinished deletions",
-                f"{summary}\n\nStill could not remove:\n\n{remaining}")
+                self, "Retry file cleanup",
+                f"{summary}\n\nStill could not remove:\n\n{remaining}\n\n"
+                f"Retry file cleanup stays offered until they are gone.")
         else:
             QtWidgets.QMessageBox.information(
-                self, "Unfinished deletions", f"{summary} All done.")
+                self, "Retry file cleanup", f"{summary} All done.")
+
+    RETRY_CLEANUP = "Retry file cleanup"
 
     def _search(self) -> None:
         text, ok = QtWidgets.QInputDialog.getText(
@@ -3211,6 +3323,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self._announce_view(len(results))
         self._sync_filters()
 
+    REMOVED_EMPTY = (
+        "No removed messages in this Session.\n\n"
+        "A message you remove from the thread (its \u22ef menu \u203a Remove "
+        "message\u2026) appears here, with Restore to put it back. Its "
+        "recording and text are kept.")
+
+    def _show_removed(self) -> None:
+        """This Session's removed-from-view messages - a store query like
+        Bookmarked, kept true as messages are removed and restored."""
+        if self._store_gone():
+            return
+        results = self._removed_results()
+        self._view_kind, self._view_query = "removed", ""
+        self.timeline.set_transmissions(results, keep_playback=True)
+        self._refollow_after_rebuild()
+        self._announce_view(len(results))
+        self._sync_filters()
+
+    def _removed_results(self):
+        return self.app.store.hidden_transmissions(self.app.conversation_id)
+
     def _bookmarked_results(self):
         # Store.search never returns removed messages; nor does this view.
         return self.app.search("", bookmarked=True)
@@ -3222,7 +3355,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _sync_filters(self) -> None:
         """The filter buttons say which view is on screen - none for Search."""
         buttons = {"thread": self.filter_all, "review": self.filter_review,
-                   "bookmarked": self.filter_bookmarked}
+                   "bookmarked": self.filter_bookmarked,
+                   "removed": self.filter_removed}
+        self.timeline.set_empty_text(
+            self.REMOVED_EMPTY if self._view_kind == "removed" else None)
         target = buttons.get(self._view_kind)
         self.filter_group.setExclusive(False)
         for button in buttons.values():

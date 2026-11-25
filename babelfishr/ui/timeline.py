@@ -46,6 +46,9 @@ STATE_LABELS = {
 }
 
 
+#: The one per-card action for "this is speech" (language or Automatic).
+SPEECH_ACTION = "Transcribe as speech\u2026"
+
 #: What the bubble says while it is filling itself in.
 _IN_FLIGHT = {
     ProcessingState.CAPTURED: "Queued...",
@@ -86,8 +89,9 @@ def _speech_check_note(tx: Transmission) -> str:
                 + ("probably not speech." if verdict == "likely_noise" else "uncertain."))
     confirmed = metadata.get("speech_confirmed") or {}
     if confirmed:
-        language = confirmed.get("source_language", "?")
-        said = f"You marked this as speech in {language}"
+        language = confirmed.get("source_language")
+        said = (f"You marked this as speech in {language}" if language
+                else "You marked this as speech (language detected automatically)")
         check_words = (" Check the new transcript against the audio; saving it with "
                        "Edit transcript and translation marks it reviewed.")
         stage = tx.error.stage if tx.error else ""
@@ -129,10 +133,10 @@ def _speech_check_note(tx: Transmission) -> str:
         return (f"Probably not speech{said}. The transcript may be words "
                 f"invented from noise, so it was not translated automatically. "
                 f"Check it against the original audio. If it is speech, choose "
-                f"Retry as speech in... from the message menu: it is transcribed "
+                f"Transcribe as speech\u2026 from the message menu: it is transcribed "
                 f"again in the language you pick, then translated.")
     return (f"Speech uncertain{said}. Check the transcript against the "
-            f"original audio; Retry as speech in... re-runs it in a language "
+            f"original audio; Transcribe as speech\u2026 re-runs it in a language "
             f"you choose.")
 
 
@@ -154,8 +158,8 @@ def _translation_unresolved_note(tx: Transmission) -> str:
     # No shortcut in the prose: Qt shows Ctrl as Command on macOS, and the
     # menu item itself shows the right key.
     return words + ("The recording and transcript are kept. If this is "
-                    "speech, choose its language with Message > Retry as "
-                    "speech in...")
+                    "speech, choose Transcribe as speech\u2026 in the message's "
+                    "menu.")
 
 
 def operator_checked(tx: Transmission) -> bool:
@@ -199,6 +203,8 @@ def problem_reason(tx: Transmission) -> str:
     if tx.state is ProcessingState.FAILED and tx.error:
         return ("Translation error" if tx.error.stage == "translation"
                 else "Transcription error")
+    if tx.is_static:
+        return "Static"
     if operator_checked(tx) or (tx.signal_metadata or {}).get("processing_stopped"):
         return ""
     metadata = tx.signal_metadata or {}
@@ -242,8 +248,8 @@ def pairing_status(tx: Transmission) -> tuple:
         text = "missing"
     if text == "withheld":
         # A guess, not a transcript: one plain reason, the guess on inspection.
-        words = ("Audio unintelligible" if audio == "ok"
-                 else f"Audio {audio} \u00b7 Audio unintelligible")
+        reason = "Static" if tx.is_static else "Audio unintelligible"
+        words = reason if audio == "ok" else f"Audio {audio} \u00b7 {reason}"
         return words, False
     if audio == "ok" and text == "ok":
         words = "Audio + transcript \u2713"
@@ -672,12 +678,23 @@ class TransmissionBubble(QtWidgets.QFrame):
 
         # Primary recovery action stays visible; everything else is in the menu.
         self.action_button = QtWidgets.QToolButton()
-        self.action_button.setText("Transcribe anyway")
-        self.action_button.setAccessibleName("Transcribe this recording anyway")
+        self.action_button.setText(SPEECH_ACTION)
+        self.action_button.setAccessibleName(
+            "Transcribe this recording as speech, choosing its language or Automatic")
         self.action_button.clicked.connect(
-            lambda: self.transcribeAnywayRequested.emit(self.tx.id))
+            lambda: self.retryAsSpeechRequested.emit(self.tx.id))
         self.action_button.hide()
         controls.addWidget(self.action_button)
+
+        # A removed message, wherever it is shown, can be put back in one
+        # click (also in its menu).
+        self.restore_button = QtWidgets.QToolButton()
+        self.restore_button.setText("Restore")
+        self.restore_button.setAccessibleName("Restore this message to the thread")
+        self.restore_button.clicked.connect(
+            lambda: self.restoreRequested.emit(self.tx.id))
+        self.restore_button.hide()
+        controls.addWidget(self.restore_button)
 
         self.retry_button = QtWidgets.QToolButton()
         self.retry_button.setText("Retry")
@@ -760,9 +777,16 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.bookmark_action.setCheckable(True)
         self.bookmark_action.triggered.connect(self._toggle_bookmark)
         menu.addSeparator()
-        self.transcribe_action = menu.addAction(
-            "Transcribe anyway", lambda: self.transcribeAnywayRequested.emit(
-                self.tx.id))
+        # One way to say "this is speech": choose its language or Automatic,
+        # one job. (Transcribe anyway and Retry as speech in... were two
+        # names for overlapping things.) transcribe_action and
+        # retry_speech_action name this same action for older callers.
+        self.speech_action = menu.addAction(
+            SPEECH_ACTION, lambda: self.retryAsSpeechRequested.emit(self.tx.id))
+        self.speech_action.setToolTip(
+            "Transcribe this recording again as speech - in a language you "
+            "choose, or Automatic - and translate it. Only this recording.")
+        self.transcribe_action = self.retry_speech_action = self.speech_action
         # Digital analysis belongs to KingFishR, which adds its actions here
         # through babelfishr.extensions; BabelFishR registers none.
         from ..extensions import hooks
@@ -770,11 +794,11 @@ class TransmissionBubble(QtWidgets.QFrame):
         for bubble_menu in hooks("bubble_menu"):
             bubble_menu(self, menu)
         menu.addSeparator()
+        # Repeats the saved settings: offered where something did not
+        # finish (a failure, or saved but not processed after Stop).
         self.retry_action = menu.addAction(
             "Retry processing", lambda: self.retryRequested.emit(self.tx.id))
-        self.retry_speech_action = menu.addAction(
-            "Retry as speech in...",
-            lambda: self.retryAsSpeechRequested.emit(self.tx.id))
+        self.retry_action.setToolTip("Run this recording again with the same settings")
         menu.addAction("Export audio...", self._export)
         menu.addSeparator()
         # Two different things, named as two different things. Removing
@@ -837,11 +861,13 @@ class TransmissionBubble(QtWidgets.QFrame):
             self.original_label.setText(original)
             self.original_label.show()
             self.transcript_box.show()
-        elif withheld:
+        elif withheld or tx.is_static:
             # Not traffic: the recogniser's guess for noise is not shown as
             # words. The guess is in the tooltip and in Edit; the audio plays.
-            self.original_label.setText("Audio unintelligible \u2014 no speech "
-                                        "recognised (the engine's guess is withheld)")
+            self.original_label.setText(
+                ("Static" if tx.is_static else "Audio unintelligible")
+                + (" \u2014 no speech recognised (the engine's guess is withheld)"
+                   if withheld else " \u2014 no speech recognised"))
             self.original_label.show()
             self.transcript_box.show()
         elif tx.state in _IN_FLIGHT:
@@ -953,6 +979,7 @@ class TransmissionBubble(QtWidgets.QFrame):
         # way back; an ordinary one offers removal.
         self.remove_action.setVisible(not tx.hidden)
         self.restore_action.setVisible(bool(tx.hidden))
+        self.restore_button.setVisible(bool(tx.hidden))
         self.setProperty("removed", bool(tx.hidden))
         if tx.hidden:
             self.status_label.setText("Removed from thread \u2014 data kept")
@@ -984,6 +1011,13 @@ class TransmissionBubble(QtWidgets.QFrame):
             if action is not None:
                 action.setEnabled(present)
         self.retry_button.setVisible(tx.state is ProcessingState.FAILED and present)
+        # Retry repeats the saved settings, so it is offered only where
+        # something did not finish; otherwise it would read as a third way
+        # of saying "transcribe again".
+        if getattr(self, "retry_action", None) is not None:
+            self.retry_action.setVisible(
+                tx.state is ProcessingState.FAILED
+                or bool((tx.signal_metadata or {}).get("processing_stopped")))
         self.action_button.setVisible(
             present and tx.can_transcribe_anyway
             and tx.state in (ProcessingState.SKIPPED, ProcessingState.COMPLETE))
@@ -1316,6 +1350,7 @@ class TimelineView(QtWidgets.QScrollArea):
             "File \u25b8 Replay WAV file to run a recording through the pipeline.\n\n"
             "Every detected transmission is recorded before it is processed,\n"
             "so nothing is lost if transcription is unavailable.")
+        self._default_empty_text = self.empty_label.text()
         self.empty_label.setAlignment(QtCore.Qt.AlignCenter)
         self.empty_label.setObjectName("emptyState")
         self._layout.insertWidget(0, self.empty_label)
@@ -1604,6 +1639,10 @@ class TimelineView(QtWidgets.QScrollArea):
             if reveal:
                 self.ensureWidgetVisible(bubble, 0, 0)
         self.selectionChanged.emit(tx_id)
+
+    def set_empty_text(self, text: Optional[str]) -> None:
+        """What an empty view says (None: the thread's own welcome)."""
+        self.empty_label.setText(text or self._default_empty_text)
 
     #: Set by the window: plays an original and continues with newer ones.
     original_starter = None

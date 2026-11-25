@@ -202,8 +202,11 @@ def test_menus_and_shortcuts_cannot_reach_the_store_during_final_cleanup(
     QTest.keyClick(window, QtCore.Qt.Key_F, QtCore.Qt.ControlModifier)
     pump(qt_app, 5)
     assert len(searches) == 1, "Ctrl+F did not reach Search before quitting"
-    opened = click_menu_item(qt_app, window, "&View", window.review_action)
+    opened = click_menu_item(qt_app, window, "&View", window.refresh_action)
     assert opened, "the View menu did not open before quitting"
+    from PySide6.QtTest import QTest as _QTest
+    _QTest.mouseClick(window.filter_review, QtCore.Qt.LeftButton)   # was View > Review queue
+    pump(qt_app, 5)
     # A known result, not a tautology: the Review queue view shows exactly
     # what the store's review queue holds (here: nothing needs review), and
     # says so.
@@ -227,7 +230,7 @@ def test_menus_and_shortcuts_cannot_reach_the_store_during_final_cleanup(
         alive_beat(qt_app, ticks)
 
         # Real clicks and keys, exactly as before - the database is closed now.
-        opened = click_menu_item(qt_app, window, "&View", window.review_action)
+        opened = click_menu_item(qt_app, window, "&View", window.refresh_action)
         assert not opened, "the View menu opened during cleanup"
         QTest.keyClick(window, QtCore.Qt.Key_F, QtCore.Qt.ControlModifier)
         QTest.keyClick(window, QtCore.Qt.Key_A, QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier)

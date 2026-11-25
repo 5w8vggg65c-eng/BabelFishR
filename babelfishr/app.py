@@ -653,6 +653,83 @@ class BabelFishRApp:
                 "expected": expected, "basis": resolution.basis,
                 "candidates": []}
 
+    # -- the microphone's start-capture level -----------------------------
+    MIC_THRESHOLD_RANGE = (-80.0, -10.0)
+
+    def microphone_route(self) -> str:
+        """Is the chosen input the Mac's own microphone?
+
+        ``"builtin"`` (chosen by name), ``"system-default-builtin"`` (the
+        deliberately chosen system default, which macOS currently routes to
+        the built-in microphone), ``"system-default-unconfirmed"`` (the
+        deliberately chosen system default, when the hardware list cannot be
+        read to say where it goes), or ``""`` - a USB interface, a receiver,
+        nothing chosen. Never guessed from a fallback."""
+        selection = self.config.audio.input
+        if selection.kind == "receiver" or not selection.confirmed:
+            return ""
+        if selection.use_system_default:
+            try:
+                devices = list_input_devices()
+            except Exception:  # noqa: BLE001 - no backend: cannot tell
+                devices = []
+            default = next((d for d in devices if d.is_default), None)
+            if default is None:
+                return "system-default-unconfirmed"
+            return "system-default-builtin" if default.is_builtin else ""
+        identity = self.selected_input_identity()
+        if identity is not None and not identity.empty and identity.is_builtin:
+            return "builtin"
+        return ""
+
+    def _mic_threshold_applies(self) -> bool:
+        return (self.config.audio.mic_threshold_dbfs is not None
+                and bool(self.microphone_route()))
+
+    def capture_detector_settings(self, live: bool = True):
+        """The gate for a capture: the detector's settings, with the
+        microphone's own start-capture level when the input is the built-in
+        microphone and the operator has set one (never for a replayed file)."""
+        settings = self.config.detector.to_settings()
+        if live and self._mic_threshold_applies():
+            settings = dataclasses.replace(
+                settings, mode="fixed",
+                threshold_dbfs=float(self.config.audio.mic_threshold_dbfs)).validate()
+        return settings
+
+    def mic_gate_dbfs(self) -> Optional[float]:
+        """The start-capture level the microphone uses now: its own setting,
+        else the detector's fixed threshold; None while the detector follows
+        the room (auto) and nothing has been set."""
+        value = self.config.audio.mic_threshold_dbfs
+        if value is not None:
+            return float(value)
+        if self.config.detector.mode == "fixed":
+            return float(self.config.detector.threshold_dbfs)
+        return None
+
+    def set_mic_threshold(self, value: float) -> float:
+        """Set the microphone's start-capture level (dBFS), save it, and -
+        when monitoring the microphone - apply it to the running gate now."""
+        low, high = self.MIC_THRESHOLD_RANGE
+        value = round(max(low, min(high, float(value))), 1)
+        self.config.audio.mic_threshold_dbfs = value
+        try:
+            self.config.save()
+        except OSError:  # noqa: BLE001 - a preference is never worth a crash
+            log.warning("could not save the microphone threshold")
+        capture = self.capture
+        if capture is not None and (capture.mic_gate or (
+                not isinstance(capture.source, ReplayAudioSource)
+                and bool(self.microphone_route()))):
+            capture.mic_gate = True
+            detector = capture.detector
+            # One attribute swap: the capture thread reads the settings for
+            # every frame and sees either the old gate or the new one.
+            detector.settings = dataclasses.replace(
+                detector.settings, mode="fixed", threshold_dbfs=value)
+        return value
+
     # -- session ---------------------------------------------------------
     def start_session(self, source: Optional[AudioSource] = None, *,
                       device: Optional[str] = None,
@@ -805,9 +882,12 @@ class BabelFishRApp:
             self.pipeline.start(session)
         self._session_mode = self.mode
 
+        live = not isinstance(source, ReplayAudioSource)
         self.capture = CaptureService(
             source=source, store=self.store, session=session, config=self.config,
-            events=self.events, pipeline=self.pipeline, profile=profile)
+            events=self.events, pipeline=self.pipeline, profile=profile,
+            detector_settings=self.capture_detector_settings(live=live))
+        self.capture.mic_gate = live and self._mic_threshold_applies()
         self.events.publish("session", session)
         return session
 
@@ -1402,6 +1482,21 @@ class BabelFishRApp:
             if source_language:
                 return pipeline.retry(tx_id, source_language=source_language)
             return pipeline.retry(tx_id)
+
+    def transcribe_as_speech(self, tx_id: str,
+                             source_language: Optional[str] = None) -> bool:
+        """The operator says this recording is speech: transcribe it again,
+        in *source_language* or - None - with its language detected
+        automatically, then translate it; one action, one job. Works on a
+        skipped, held, failed or finished recording; the raw result,
+        corrections (kept as earlier versions) and the audio are kept, and
+        other recordings keep the Session's own language setting."""
+        pipeline = self._processing_pipeline()
+        if pipeline is None:
+            return False
+        with self._row_claims:
+            return pipeline.retry(tx_id, source_language=source_language,
+                                  confirm_speech=True)
 
     def transcribe_anyway(self, tx_id: str) -> bool:
         """Force transcription of a recording the classifier routed away.

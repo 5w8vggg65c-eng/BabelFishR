@@ -88,6 +88,15 @@ class AudioConfig:
     input: InputSelection = dataclasses.field(default_factory=InputSelection)
     """The persisted, operator-confirmed input."""
 
+    mic_threshold_dbfs: Optional[float] = None
+    """The microphone's own start-capture level, set under the live spectrum.
+
+    Applies only when the input is the built-in microphone, or a deliberately
+    chosen system default that resolves to it; a USB interface, a receiver
+    and a replayed file keep the detector's own settings. Unset (the
+    default, and every settings file from before it existed) changes
+    nothing: the detector's mode and threshold apply exactly as before."""
+
     profile_inputs: Dict[str, str] = dataclasses.field(default_factory=dict)
     """profile id -> DeviceIdentity token.
 

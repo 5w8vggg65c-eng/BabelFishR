@@ -135,7 +135,7 @@ def test_a_full_search_replaces_a_row_that_stops_qualifying(qt_app, config, stor
 
 def test_a_full_review_queue_replaces_a_row_the_operator_reviews(qt_app, config, store):
     app, window = full_session_window(qt_app, config, store, conf=0.2)
-    click_menu_item(qt_app, window, "&View", window.review_action)
+    click_filter(qt_app, window.filter_review)           # was View > Review queue
     view = window.timeline
     assert view.count() == LIMIT and "tx0" not in view.order()
     in_view(window, app.review_queue())
@@ -165,7 +165,7 @@ def test_removing_a_shown_message_leaves_the_search_even_while_removed_messages_
     shown, used to leave the now-hidden bubble in a Search that the Store no
     longer answered with it."""
     app, window, general, ops = two_sessions_window(qt_app, config, store)
-    click_menu_item(qt_app, window, "&View", window.show_removed_action)
+    window.show_removed_action.trigger()                # compatibility switch (no longer in View)
     assert window.show_removed_action.isChecked()
     search_via_menu(qt_app, window, monkeypatch, "giraffe")
     assert window.timeline.order() == ["tx1", "tx0"]
@@ -184,7 +184,7 @@ def test_removing_a_shown_message_leaves_the_search_even_while_removed_messages_
     assert "1 match(es)" in message and "removed from the thread" in message
 
     # Show all: the thread, which does show removed messages, has it.
-    click_menu_item(qt_app, window, "&View", window.show_all_action)
+    click_filter(qt_app, window.filter_all)              # was View > Show all
     assert window.timeline.order() == ["tx2", "tx1", "tx0"]
     assert window.timeline._bubbles["tx1"].tx.hidden is True
     window.close()
@@ -245,7 +245,7 @@ def test_a_shown_row_that_is_hidden_or_deleted_by_an_event_leaves(qt_app, config
     assert "0 match(es)" in window.status.currentMessage()
 
     # The Session's own thread, removed messages not shown: the same.
-    click_menu_item(qt_app, window, "&View", window.show_all_action)
+    click_filter(qt_app, window.filter_all)              # was View > Show all
     assert window.timeline.order() == ["tx2"]
     hidden = store.hide_transmission("tx2", hidden=True)
     app.events.publish("updated", hidden)
@@ -264,7 +264,7 @@ def test_the_removed_messages_preference_returns_to_the_thread(qt_app, config, s
     store.hide_transmission("tx0", hidden=True)
     search_via_menu(qt_app, window, monkeypatch, "giraffe")
     assert window.timeline.order() == ["tx1"] == ids(app.search("giraffe"))
-    click_menu_item(qt_app, window, "&View", window.show_removed_action)
+    window.show_removed_action.trigger()                # compatibility switch (no longer in View)
     assert window._view_kind == "thread"
     assert window.timeline.order() == ["tx2", "tx1", "tx0"]
     window.close()
@@ -316,3 +316,15 @@ def test_reconciliation_never_queries_a_closing_store(qt_app, config, store, mon
     window._store_off_limits = False               # let the window close normally
     window.close()
     pump(qt_app, 40)
+
+
+def click_filter(qt_app, button):
+    """A real click on one of the filter buttons over the thread (they
+    replaced the View menu's Show all / Review queue items)."""
+    from PySide6 import QtCore
+    from PySide6.QtTest import QTest
+
+    assert button.isVisible() and button.isEnabled()
+    QTest.mouseClick(button, QtCore.Qt.LeftButton)
+    for _ in range(10):
+        qt_app.processEvents()

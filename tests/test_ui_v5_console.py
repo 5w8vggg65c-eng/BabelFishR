@@ -135,7 +135,7 @@ def test_navigation_is_the_real_menu_bar_under_the_band(console):
     bar = window.menuBar()
     assert bar is window._nav_bar
     titles = [a.text().replace("&", "") for a in bar.actions()]
-    assert titles == ["File", "View", "Message", "Tools", "Help"]
+    assert titles == ["File", "View", "Tools", "Help"]
     band_bottom = window.status_band.mapTo(window, QtCore.QPoint(0, 0)).y() \
         + window.status_band.height()
     assert bar.mapTo(window, QtCore.QPoint(0, 0)).y() >= band_bottom - 1

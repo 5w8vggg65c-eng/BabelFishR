@@ -785,6 +785,29 @@ class Transmission:
 
     #: What every routine display says instead of a withheld guess.
     UNINTELLIGIBLE = "Audio unintelligible"
+    STATIC = "Static"
+
+    @property
+    def is_static(self) -> bool:
+        """Captured static, positively: the recording measured as stationary
+        broadband noise (babelfishr.static) AND no credible speech - no
+        transcript, or only a guess withheld as not speech, and the voice
+        detector did not hear half a second of speech. An operator's
+        correction or "Retry as speech" confirmation always wins. Rows made
+        before the measurement existed carry none and are never called
+        static."""
+        if self.transcript_correction:
+            return False
+        metadata = self.signal_metadata or {}
+        if metadata.get("speech_confirmed"):
+            return False
+        static = metadata.get("static_check") or {}
+        if static.get("verdict") != "static":
+            return False
+        if (self.transcript or "").strip() and not self.guess_withheld:
+            return False
+        seconds = (metadata.get("speech_check") or {}).get("speech_seconds")
+        return not (seconds is not None and seconds >= 0.5)
 
     @property
     def presented_transcript(self) -> str:
@@ -793,6 +816,8 @@ class Transmission:
         unintelligible" for a withheld guess, never the raw guess. The raw
         engine text stays in ``transcript`` for Edit, tooltips and the
         forensic (JSON) export."""
+        if self.is_static:
+            return self.STATIC
         return self.UNINTELLIGIBLE if self.guess_withheld else self.shown_transcript
 
     def published_text(self) -> str:
