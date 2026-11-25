@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import copy
 import pathlib
 from typing import Dict, List, Optional
 
@@ -109,17 +108,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # store query that opened the view, so what arrives cannot widen it.
         self._view_kind = "thread"
         self._view_query = ""
-        #: Monitoring runs stopped in this session. A filtered view's
-        #: automatic reconciliation adds none of their rows (see _may_place)
-        #: except those an explicit open or View > Refresh has shown.
-        self._stopped_here: set = set()
-        #: Rows an explicit open / refresh showed, with their run: id ->
-        #: session id. Only reveals made after a run was stopped count for
-        #: that run (Stop withdraws earlier ones, see _stop_monitoring).
-        self._revealed_ids: Dict[str, str] = {}
-        #: Rows the operator processed by hand (Retry, Transcribe anyway):
-        #: their results are theirs to see.
-        self._manual_ids: set = set()
         self._readiness = None
         self._theming = False
         self._readiness_worker = None
@@ -1202,48 +1190,32 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Not monitoring. Nothing is being recorded.", 8000)
 
     def _stop_monitoring(self) -> None:
-        # Returns at once. The operator's choice: Stop ends this run's
-        # automatic processing and chat updates immediately. Its recordings
-        # are all saved; any not yet processed are marked "saved, not
-        # processed" for Transcribe anyway / Retry. Rows already shown that
-        # were still waiting change to that indicator now; nothing new is
-        # added. Manual jobs carry on. Pressing Stop again is a no-op.
+        # Returns at once. The operator's choice (2026-11-25): Stop cuts the
+        # input off immediately and finishes everything accepted up to that
+        # point - the running job, queued messages, and the message that was
+        # still open - and each result lands in its own session as it
+        # completes. No Retry is needed. Pressing Stop again is a no-op.
         session = self.app.stop_session()
-        if session is not None:
-            self._stopped_here.add(session.id)
-            # A reveal from before Stop does not authorise this run's rows
-            # afterwards: only an explicit open or refresh after Stop does.
-            # Rows on screen stay as they are.
-            self._revealed_ids = {tx_id: run for tx_id, run in self._revealed_ids.items()
-                                  if run != session.id}
-            self._mark_shown_rows_stopped(session.id)
         self.start_button.setText("Start monitoring")
         self._set_controls_enabled(True)
         self._refresh_capture_tab_label()
         # Inputs can be changed again, but only once the watch has stopped.
         self.input_panel.set_monitoring(False)
         self._refresh_context_lines()
-        self._set_state(PipelineState.IDLE)
-        if session is not None:
+        outstanding = self.app.outstanding_work()
+        if outstanding:
+            # Work still being processed and, as one, a capture still
+            # finishing its last recording off this thread.
+            self._set_state(PipelineState.TRANSCRIBING if self._processing_active()
+                            else PipelineState.IDLE)
             self.status.showMessage(
-                "Monitoring stopped. View > Refresh shows saved recordings; "
-                "use Transcribe anyway or Retry for unfinished ones.", 12000)
+                f"Monitoring stopped. Finishing {outstanding} recording(s); "
+                f"each appears in its session as it completes.", 12000)
+        else:
+            self._set_state(PipelineState.IDLE)
+            if session is not None:
+                self.status.showMessage("Monitoring stopped.", 8000)
         self.meter.reset()
-
-    def _mark_shown_rows_stopped(self, run: str) -> None:
-        """Part of the Stop action: rows of *run* on screen that were still
-        waiting or being processed show the stopped indicator. In memory
-        only - the store gets the same marker off this thread."""
-        from ..pipeline import mark_processing_stopped
-
-        for tx_id in self.timeline.order():
-            bubble = self.timeline.bubble(tx_id)
-            tx = bubble.tx if bubble is not None else None
-            if tx is None or tx.session_id != run or tx.state.is_terminal:
-                continue
-            if self.app.is_manually_processing(tx_id):
-                continue                       # a manual job: still its own
-            self.timeline.update(mark_processing_stopped(copy.copy(tx), run))
 
     def _refresh_current_view(self) -> None:
         """View > Refresh: show the current view exactly as the store has it,
@@ -1336,8 +1308,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return                     # the store is closing or closed
         touched = set()             # ids whose row a filtered view must re-read
         for event in self.app.events.drain():
-            if self._from_stopped_run(event):
-                continue               # a stopped run's: nothing on screen changes
+            if self._from_an_earlier_capture(event):
+                continue               # an ended run's meter/activity: not this input
             if event.kind == "level":
                 reading = event.payload
                 self.meter.set_reading(reading.rms_fraction, reading.peak_fraction,
@@ -1393,33 +1365,23 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_view(touched)
         self._refresh_context_lines()
 
-    def _from_stopped_run(self, event) -> bool:
-        """True when *event* belongs to a monitoring run already stopped.
-
-        The operator's choice: Stop ends automatic chat updates at once.
-        Such an event - a level reading, a state, a late transcript or
-        translation, a new recording from the final flush, even one queued
-        before Stop - changes nothing on screen, not even a row already
-        shown: the Stop action itself set those rows' indicator, and a late
-        event (which may carry words never shown, or be older than a manual
-        result since) must not repaint them. Manual work is untagged and
-        never matches.
-        """
+    def _from_an_earlier_capture(self, event) -> bool:
+        """A level reading or capture activity state (Listening, Receiving)
+        from a run that is no longer the one capturing - its drain and final
+        flush run after Stop, or after a quick restart. It says nothing about
+        the input now, so it changes nothing on screen. Transcripts,
+        translations and processing states of that run still land: they
+        finish after Stop by design."""
         run = getattr(event, "run", None)
-        return run is not None and self.app.run_stopped(run)
-
-    def _may_place(self, row) -> bool:
-        """Whether a filtered view's automatic reconciliation may add *row*.
-
-        Not a row of a run stopped in this session that no explicit open or
-        refresh has shown - whether or not its event was received: such a
-        row can be committed before its event is published, even after the
-        view was opened. A row the operator processed by hand, or one an
-        explicit open showed, is theirs.
-        """
-        return (row.session_id not in self._stopped_here
-                or row.id in self._revealed_ids
-                or row.id in self._manual_ids)
+        if run is None:
+            return False
+        session = self.app.session
+        if session is not None and session.id == run:
+            return False
+        if event.kind == "level":
+            return True
+        return event.kind == "state" and event.payload in (
+            PipelineState.LISTENING, PipelineState.RECEIVING, PipelineState.IDLE)
 
     def _admit(self, tx, arrival: bool) -> bool:
         """Show a live transmission or update as the current view allows.
@@ -1474,8 +1436,6 @@ class MainWindow(QtWidgets.QMainWindow):
         for tx_id in shown - set(wanted):
             self.timeline.remove(tx_id)            # stopped qualifying
         for row in results:
-            if row.id not in shown and not self._may_place(row):
-                continue                           # a stopped run's, not revealed: stays out
             if row.id not in shown:
                 self.timeline.place(row)           # newly qualifying, or a replacement
             elif row.id in touched:
@@ -1732,7 +1692,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_transcribe_anyway(self, tx_id: str) -> None:
         # A WAV on disk does not need a microphone. This works with monitoring
         # stopped, and after quitting and reopening the application.
-        self._manual_ids.add(tx_id)
         if self.app.transcribe_anyway(tx_id):
             self.status.showMessage("Transcribing the saved recording...", 8000)
             return
@@ -1743,7 +1702,6 @@ class MainWindow(QtWidgets.QMainWindow):
             + "\n\nThe recording itself is safe.")
 
     def _on_retry(self, tx_id: str) -> None:
-        self._manual_ids.add(tx_id)
         if self.app.retry(tx_id):
             self.status.showMessage("Retrying the saved recording...", 8000)
             return
@@ -1772,7 +1730,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if not ok:
             return
         code = codes[labels.index(label)]
-        self._manual_ids.add(tx_id)
         if self.app.retry(tx_id, source_language=code):
             self.status.showMessage(
                 f"Transcribing the saved recording again as {label}...", 8000)
@@ -2592,15 +2549,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.search_field.selectAll()
 
     def _sync_filters(self) -> None:
-        """The filter buttons say which view is on screen - none for Search.
-
-        Reached only at the end of an explicit open (thread, Search, Review,
-        Bookmarked, View > Refresh), never from automatic reconciliation:
-        the rows shown now count as revealed (see _may_place)."""
-        for tx_id in self.timeline.order():
-            bubble = self.timeline.bubble(tx_id)
-            if bubble is not None:
-                self._revealed_ids[tx_id] = bubble.tx.session_id
+        """The filter buttons say which view is on screen - none for Search."""
         buttons = {"thread": self.filter_all, "review": self.filter_review,
                    "bookmarked": self.filter_bookmarked}
         target = buttons.get(self._view_kind)

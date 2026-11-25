@@ -31,6 +31,7 @@ import logging
 import pathlib
 import queue
 import threading
+import time as _time
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
@@ -421,6 +422,9 @@ class ProcessingPipeline:
         #: For each id in flight, the monitoring run it was accepted for
         #: automatically, or None for manual work (Retry, Transcribe anyway).
         self._origin: Dict[str, Optional[str]] = {}
+        #: When each automatic item was accepted (monotonic), for the
+        #: per-message timing line - how long it waited before processing.
+        self._accepted_at: Dict[str, float] = {}
         #: Monitoring runs that have been stopped: their automatic work is
         #: not started, not saved and not published (see cancel_run).
         self._stopped_runs: set = set()
@@ -440,7 +444,11 @@ class ProcessingPipeline:
         with self._active_lock:
             self._accepting = True
         for index in range(self.worker_count):
-            thread = threading.Thread(target=self._work, daemon=True,
+            # A live run warms its speech engine first, on the worker itself
+            # (never two loads at once, never the GUI thread): the first
+            # message then does not also wait for the model to load.
+            warm = session is not None and index == 0
+            thread = threading.Thread(target=self._work, args=(warm,), daemon=True,
                                       name=f"babelfishr-processing-{index}")
             thread.start()
             self._threads.append(thread)
@@ -554,6 +562,7 @@ class ProcessingPipeline:
                 return False
             self._in_flight.add(tx_id)
             self._origin[tx_id] = run
+            self._accepted_at[tx_id] = _time.monotonic()
             self._idle.clear()
         self._queue.put(tx_id)
         return True
@@ -714,6 +723,7 @@ class ProcessingPipeline:
         with self._active_lock:
             self._in_flight.discard(tx_id)
             self._origin.pop(tx_id, None)
+            self._accepted_at.pop(tx_id, None)
             if not self._in_flight:
                 self._idle.set()
 
@@ -751,7 +761,13 @@ class ProcessingPipeline:
         return True
 
     # -- worker ----------------------------------------------------------
-    def _work(self) -> None:
+    def _work(self, warm: bool = False) -> None:
+        if warm:
+            warm_up = getattr(self.transcription, "warm_up", None)
+            if callable(warm_up):
+                started = _time.monotonic()
+                warm_up()
+                log.info("speech engine ready after %.2f s", _time.monotonic() - started)
         while self._running:
             try:
                 tx_id = self._queue.get(timeout=0.5)
@@ -766,8 +782,14 @@ class ProcessingPipeline:
             # "active" figure that was incremented only here.
             with self._active_lock:
                 self._local.run = self._origin.get(tx_id)
+                accepted = self._accepted_at.get(tx_id)
+            began = _time.monotonic()
             try:
                 self._process(tx_id)
+                # Timing only, never words: where a message's time went.
+                log.info("message %s: waited %.2f s in the queue, processed in %.2f s",
+                         tx_id, (began - accepted) if accepted else 0.0,
+                         _time.monotonic() - began)
             except Exception:  # noqa: BLE001 - a worker must never die
                 log.exception("unhandled error processing %s", tx_id)
             finally:

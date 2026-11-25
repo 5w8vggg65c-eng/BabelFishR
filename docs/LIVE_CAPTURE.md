@@ -32,20 +32,24 @@ chat by itself, one message per utterance, until Stop:
 
 ## Stop
 
-**Stop Monitoring** ends capture and automatic chat updates at once:
+**Stop Monitoring** cuts the input off at once and finishes what was
+already heard:
 
-- Every captured sample is saved, including the message still open at Stop
-  and audio the input had already delivered.
-- Anything not yet processed is kept as **saved, not processed**. Rows on
-  screen that were waiting change to that indicator; recordings saved by the
-  Stop itself are not added to the chat. **View > Refresh** (or opening the
-  thread, Search or Needs Review) shows them; **Transcribe anyway** or
-  **Retry** processes them. They never resume by themselves, also not after
-  a relaunch.
-- A speech-recognition or translation call already running finishes in the
-  background (it cannot be interrupted), but its result is discarded.
-  Starting again straight away queues new messages behind it.
-- Manual jobs (Retry, Transcribe anyway) are not cancelled by Stop.
+- From the moment Stop is pressed, no new audio is taken from the input.
+  Audio it had already delivered is kept.
+- A message still open at Stop ends there - its last words are kept
+  without waiting for the quiet that would normally end it.
+- Every message accepted up to Stop is transcribed and translated as
+  usual - the one being processed, any queued behind it, and that last
+  open one - and each appears in its own session as it completes. No Retry
+  is needed. Until then the window shows **Transcribing** and says how many
+  recordings are still finishing.
+- Starting again straight away is allowed: new messages queue behind the
+  stopped run's unfinished ones, which finish first; each run's messages
+  stay in their own session.
+- Manual jobs (Retry, Transcribe anyway) carry on as before. Messages that
+  build 34 left as **saved, not processed** keep that label and are
+  processed with Transcribe anyway or Retry.
 
 ## No analogue/digital guess
 

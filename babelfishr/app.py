@@ -948,19 +948,12 @@ class BabelFishRApp:
         "Recording into ..." after monitoring had stopped.
         """
         session = self.session
+        # The operator's choice (2026-11-25): Stop cuts the input off at once
+        # (the capture's audio cutoff, below) and finishes everything accepted
+        # up to that cutoff - the running job, the queued ones and the final
+        # flush of a message still open - posting each result in its own
+        # session. Nothing here waits.
         stopped_ids: List[str] = []
-        if session is not None:
-            # The user's choice: Stop ends automatic processing and chat
-            # updates for this run at once. Its queued recordings stay saved
-            # (marked saved-not-processed below); a running engine call
-            # finishes but its result is neither saved nor shown; the final
-            # flush is saved and marked, not processed. Manual work and other
-            # runs carry on. Nothing here waits.
-            self._stopped_runs.add(session.id)
-            for pipeline in (self.pipeline, self.standalone_pipeline):
-                if pipeline is not None:
-                    removed, _running = pipeline.cancel_run(session.id)
-                    stopped_ids.extend(removed)
         if self.capture is not None:
             capture, self.capture = self.capture, None
             # Nothing here waits on audio. The join, the source close and the

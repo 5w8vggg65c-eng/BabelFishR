@@ -264,6 +264,15 @@ class FasterWhisperEngine(TranscriptionEngine):
                  target, device, compute_type, self.local_files_only)
         return self._model
 
+    def warm_up(self) -> None:
+        """Load the model now rather than at the first message. Called on the
+        processing worker when monitoring starts; a failure is left for the
+        first transcription to report in the ordinary way."""
+        try:
+            self._load()
+        except Exception as exc:  # noqa: BLE001
+            log.info("speech model not preloaded: %s", exc)
+
     def close(self) -> None:
         self._model = None
 

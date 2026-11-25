@@ -503,17 +503,15 @@ def _stop_monitoring_body(qt_app, app, window, engine, timer, ticks, wav):
     assert app.session is None and app.capture is None
     assert app.standalone_pipeline is not None
     assert app.standalone_pipeline.pending == 1, "the held job was dropped"
-    # Stop ends automatic processing at once (2026-11-24 decision): the held
-    # engine call still owns the engines (pending), but the window is Idle
-    # and says the recordings are saved, not that it is finishing them.
-    assert "Idle" in window.state_badge.text(), window.state_badge.text()
-    assert "refresh shows saved recordings" in window.status.currentMessage().lower()
+    assert "Transcribing" in window.state_badge.text(), window.state_badge.text()
+    assert "finishing" in window.status.currentMessage().lower()
     assert window.start_button.text() == "Start monitoring"
 
     window._stop_monitoring()             # a second Stop changes nothing
+    # A quick restart is not refused (2026-11-25): it queues behind the
+    # stopped run's unfinished work on the same processor, which owns the
+    # same mode and engines, so that work still finishes first, in order.
     held = app.standalone_pipeline
-    # An immediate restart reuses the processor behind the abandoned call
-    # (same mode and engines) rather than refusing or starting a second one.
     app.start_session(replay_path=wav, name="restart")
     assert app.pipeline is held
     app.stop_session()
@@ -521,9 +519,8 @@ def _stop_monitoring_body(qt_app, app, window, engine, timer, ticks, wav):
     engine.release.set()
     assert held.wait_until_idle(30.0)
     pump(qt_app, 40)
-    tx = app.recent_transmissions()[-1]
-    assert tx.state is ProcessingState.SKIPPED and not tx.transcript
-    assert tx.signal_metadata.get("processing_stopped")
+    tx = app.recent_transmissions()[0]
+    assert tx.state is ProcessingState.COMPLETE and tx.transcript
     assert "Idle" in window.state_badge.text(), window.state_badge.text()
     timer.stop()
     close_and_wait(qt_app, window)
@@ -571,10 +568,8 @@ def _quit_body(qt_app, app, window, engine, timer, ticks, store):
     assert not window.isVisible(), "the window never closed once the work finished"
     assert window._shutdown_complete and not window._timer.isActive()
     assert order[-2:] == ["engine", "store"], order
-    # The held call's result is discarded (Stop/Quit end automatic work);
-    # its row is saved, marked, before the engine and the store close.
-    assert ("save", "skipped") in order and ("save", "complete") not in order
-    assert order.index(("save", "skipped")) < order.index("engine")
+    assert ("save", "complete") in order
+    assert order.index(("save", "complete")) < order.index("engine")
     assert engine.closed
 
     # A late event finds the drain stopped, on the GUI thread, and nothing
@@ -652,10 +647,7 @@ def test_capture_shutdown_keeps_the_final_transmission_and_its_recording(config,
     assert pathlib.Path(txs[0].audio_path).is_file()
     if app.standalone_pipeline is not None:
         assert app.standalone_pipeline.wait_until_idle(30.0)
-    saved = store.get_transmission(txs[0].id)
-    # Kept, and saved-not-processed (Stop ends automatic processing).
-    assert saved.state is ProcessingState.SKIPPED
-    assert saved.signal_metadata.get("processing_stopped")
+    assert store.get_transmission(txs[0].id).state is ProcessingState.COMPLETE
     assert app.close()
 
 

@@ -170,8 +170,9 @@ the current one.
 | 33 | `4b17f63` (the lean split) | GitHub runner, and candidate tests on the owner's Mac, below | no - not installed yet |
 | 34 | `9b3125b` (3 s message quiet, immediate Stop, no "possibly digital") | GitHub runner, local probes of the packaged candidate, and installation on the owner's Mac, below | yes, installed Nov 24, 2026 on the project owner's Mac |
 
-Changes committed after `9b3125b` are not built yet; build 34 is the tested
-and installed binary.
+Changes committed after `9b3125b` are not built yet - among them, Stop now
+finishes every message accepted up to the cutoff instead of leaving it for
+Retry; build 34 is the tested and installed binary.
 
 ### Build 34 (`9b3125b`, Nov 24, 2026): runner checks, local candidate probes, installation
 
