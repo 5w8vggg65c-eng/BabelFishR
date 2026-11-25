@@ -1,0 +1,60 @@
+name: macOS operator preview
+
+# Request one installer by including [build macOS preview] in the tip commit.
+on:
+  push:
+    branches:
+      - claude/ui-preview-field-console
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: contains(github.event.head_commit.message, '[build macOS preview]')
+    name: Test and package the Apple Silicon preview
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build, verify and sign the preview
+        env:
+          BABELFISHR_SKIP_TESTS: "0"
+          BABELFISHR_MAKE_DMG: "1"
+          BABELFISHR_REPORT_DIR: build-reports
+        run: |
+          set -euo pipefail
+          [[ "$(uname -m)" == arm64 ]] || { echo "::error::An Apple Silicon runner is required"; exit 1; }
+          mkdir -p build-reports
+          git rev-parse HEAD | tee build-reports/source-commit.txt
+          ./packaging/build_macos.sh 2>&1 | tee build-reports/build-log.txt
+          cd dist
+          shasum -a 256 -c BabelFishR-macOS-arm64.dmg.sha256
+          cat BabelFishR-macOS-arm64.dmg.sha256
+
+      - name: Upload the installer and its checksum
+        uses: actions/upload-artifact@v5
+        with:
+          name: BabelFishR-macOS-arm64-dmg
+          path: |
+            dist/BabelFishR-macOS-arm64.dmg
+            dist/BabelFishR-macOS-arm64.dmg.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload build and test reports
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: BabelFishR-macOS-reports
+          path: build-reports/
+          if-no-files-found: warn
+          retention-days: 30
