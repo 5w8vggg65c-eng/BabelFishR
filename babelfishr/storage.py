@@ -17,8 +17,11 @@ import os
 import pathlib
 import shutil
 import sqlite3
+import stat
 import threading
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+import unicodedata
+from typing import (Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set,
+                    Tuple)
 
 from .models import (ContentClass, Conversation, ErrorInfo, ProcessingState,
                      RadioProfile, Session, SourceLanguageMode,
@@ -1123,8 +1126,8 @@ class Store:
         quotation mark is written ``\\"`` and a non-ASCII character as a
         ``\\uXXXX`` escape - so exactly those paths were never found, and a
         file another message still used could be deleted. Every reference is
-        decoded, then keyed by :func:`_same_file_key`, the normalisation the
-        ownership check applies to a candidate.
+        decoded, then keyed by :func:`_file_keys` - the file's filesystem
+        identity where it exists - exactly as a candidate is keyed.
 
         A row whose analysis record cannot be read is remembered as
         unreadable rather than treated as referencing nothing: while any such
@@ -1344,7 +1347,7 @@ class Store:
         real = pathlib.Path(os.path.realpath(path))
         if not any(_is_within(real, root) for root in roots):
             return "external", "outside BabelFishR's Recordings folder"
-        others = references.by_key.get(_same_file_key(path), set()) - clearing
+        others = references.ids_for(path) - clearing
         if others:
             return "shared", f"still used by message {sorted(others)[0]}"
         unreadable = references.unreadable - clearing
@@ -1363,6 +1366,7 @@ class Store:
             rows = self.conversation_rows(conversation_id)
             references = self.retained_references()
             clearing = {tx.id for tx in rows}
+            seen_files: Set[str] = set()      # by identity: two spellings, one file
             for tx in rows:
                 inventory.transmission_ids.append(tx.id)
                 inventory.hidden += int(tx.hidden)
@@ -1374,12 +1378,14 @@ class Store:
                 inventory.tags += int(bool(tx.tags))
                 inventory.bookmarks += int(tx.bookmarked)
                 for path in self._audio_candidates(tx):
+                    keys = _file_keys(path)
+                    if keys & seen_files:
+                        continue
+                    seen_files |= keys
                     kind, _ = self._sort_audio(path, roots, references, clearing)
                     if kind == "owned" and not os.path.lexists(path):
                         kind = "missing"
-                    pile = getattr(inventory, kind)
-                    if path not in pile:
-                        pile.append(path)
+                    getattr(inventory, kind).append(path)
         return inventory
 
     def clear_conversation_history(self, conversation_id: str, scope: str,
@@ -1411,6 +1417,7 @@ class Store:
         report = HistoryClearReport(conversation_id=conversation_id,
                                     name=conversation.name, scope=scope)
         if scope == "both":
+            shared_by: Dict[str, str] = {}
             with self._lock:
                 references = self.retained_references()
                 for tx in self.conversation_rows(conversation_id):
@@ -1424,6 +1431,43 @@ class Store:
                     report.failed += one.failed
                     report.kept_external += one.inventory.external
                     report.kept_shared += one.inventory.shared
+                    for path in one.inventory.shared:
+                        shared_by.setdefault(path, tx.id)
+            # A file judged shared only because another message of this same
+            # Session still held it at that moment (a second name of it) is
+            # no one's now: remove it, with the same ownership checks.
+            references = self.retained_references()
+            roots = [pathlib.Path(os.path.realpath(r)) for r in owned_roots if r]
+            for path in dict.fromkeys(report.kept_shared):
+                if not os.path.lexists(path) or pathlib.Path(path).is_symlink():
+                    continue
+                real = pathlib.Path(os.path.realpath(path))
+                if not any(_is_within(real, root) for root in roots):
+                    continue
+                if references.ids_for(path) or references.unreadable:
+                    continue
+                try:
+                    pathlib.Path(path).unlink()
+                    report.removed.append(path)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    report.failed.append((path, f"{type(exc).__name__}: {exc}"))
+                    # On that message's tombstone, so Finish unfinished
+                    # deletions can try again.
+                    owner = shared_by[path]
+                    row = self._conn.execute(
+                        "SELECT leftover_files FROM deleted_transmissions WHERE id = ?",
+                        (owner,)).fetchone()
+                    files = json.loads(row[0] or "[]") if row else []
+                    self._conn.execute(
+                        "UPDATE deleted_transmissions SET leftover_files = ? WHERE id = ?",
+                        (json.dumps(files + [path]), owner))
+                    self._conn.commit()
+            # A file removed with a later message of this pass is not "kept".
+            report.kept_shared = [p for p in dict.fromkeys(report.kept_shared)
+                                  if os.path.lexists(p)]
+            report.kept_external = list(dict.fromkeys(report.kept_external))
             return report
 
         roots = [pathlib.Path(os.path.realpath(r)) for r in owned_roots if r]
@@ -1431,13 +1475,14 @@ class Store:
             rows = self.conversation_rows(conversation_id)
             clearing = {tx.id for tx in rows}
             references = self.retained_references()
+            removed_files: Set[str] = set()   # identities unlinked in this pass
             try:
                 for tx in rows:
                     if scope == "text":
                         changed = _clear_text(tx)
                     else:
                         changed = self._clear_audio(tx, roots, references,
-                                                    clearing, report)
+                                                    clearing, report, removed_files)
                     if not changed:
                         continue
                     tx.history_generation = int(tx.history_generation or 0) + 1
@@ -1460,12 +1505,16 @@ class Store:
         return report
 
     def _clear_audio(self, tx: Transmission, roots, references, clearing,
-                     report: "HistoryClearReport") -> bool:
+                     report: "HistoryClearReport", removed_files: Set[str]) -> bool:
         """Unlink this message's own audio and detach every audio reference
         that is gone or not the app's to remove. One that fails to unlink
         stays on the row."""
         detach: Set[str] = set()
         for path in self._audio_candidates(tx):
+            keys = _file_keys(path)
+            if keys & removed_files and not os.path.lexists(path):
+                detach.add(path)       # another spelling of an entry just removed
+                continue
             kind, reason = self._sort_audio(path, roots, references, clearing)
             if kind == "external":
                 report.kept_external.append(path)
@@ -1482,6 +1531,7 @@ class Store:
                     raise IsADirectoryError(f"not a regular file: {path}")
                 p.unlink()
                 report.removed.append(path)
+                removed_files |= keys
                 detach.add(path)
             except FileNotFoundError:
                 if path not in report.removed and path not in report.already_gone:
@@ -1655,7 +1705,8 @@ class LeftoverRetry:
 
 
 class RetainedReferences:
-    """Which retained transmissions refer to which files, by normalised path.
+    """Which retained transmissions refer to which files, by file identity
+    (see _file_keys).
 
     ``stamp`` is the store's write counter when this was built; the store
     rebuilds rather than reuse a map that any save has outdated.
@@ -1668,7 +1719,15 @@ class RetainedReferences:
 
     def add(self, tx_id: str, path: Optional[str]) -> None:
         if path:
-            self.by_key.setdefault(_same_file_key(path), set()).add(tx_id)
+            for key in _file_keys(path):
+                self.by_key.setdefault(key, set()).add(tx_id)
+
+    def ids_for(self, path: str) -> Set[str]:
+        """Every retained row referring to the same file as *path*."""
+        ids: Set[str] = set()
+        for key in _file_keys(path):
+            ids |= self.by_key.get(key, set())
+        return ids
 
     def forget(self, tx_id: str) -> None:
         """A row is gone: it refers to nothing any more."""
@@ -1678,7 +1737,7 @@ class RetainedReferences:
 
     def why_shared(self, path: str, except_id: str) -> str:
         """Why this file must be kept, or "" when no retained row refers to it."""
-        others = self.by_key.get(_same_file_key(path), set()) - {except_id}
+        others = self.ids_for(path) - {except_id}
         if others:
             return f"still used by message {sorted(others)[0]}"
         unreadable = self.unreadable - {except_id}
@@ -1818,15 +1877,37 @@ def _clear_text(tx: Transmission) -> bool:
     return True
 
 
-def _same_file_key(path: str) -> str:
-    """One spelling for one file - the ownership check's own normalisation.
+def _file_keys(path: str) -> FrozenSet[str]:
+    """The identity of the file *path* names, for sharing decisions.
 
-    ``realpath`` collapses ``/./`` and ``..`` segments and follows symlinks,
-    so a reference written another way, or through a link, names the same
-    key as the candidate it protects. Case is left alone, as the ownership
-    check leaves it: the application only ever stores paths it produced.
+    An existing regular file is identified by the filesystem itself (device
+    and inode), so every spelling that reaches the same directory entry -
+    Receiver.wav and receiver.wav on a case-insensitive volume, NFC and NFD
+    forms of an accented name on APFS, a hard link, a symlinked folder -
+    is one file, and two distinct files with similar names stay two. Names
+    are never case-folded for an existing file, so a case-sensitive volume
+    keeps Receiver.wav and receiver.wav apart.
+
+    Anything else (missing, not a regular file, or unreadable) falls back
+    to a deliberately loose key: the resolved path, Unicode-normalised and
+    case-folded. That can only make two references look *more* alike, so the
+    fallback errs on the side of keeping a file.
     """
-    return os.path.realpath(path)
+    resolved = os.path.realpath(path)
+    keys: Set[str] = set()
+    # The path as the OS opens it, and as resolved lexically: a missing
+    # folder followed by ".." fails the first and resolves in the second.
+    for spelling in dict.fromkeys((path, resolved)):
+        try:
+            st = os.stat(spelling)
+        except (OSError, ValueError):
+            continue
+        if stat.S_ISREG(st.st_mode):
+            keys.add(f"file:{st.st_dev}:{st.st_ino}")
+    if keys:
+        return frozenset(keys)
+    loose = unicodedata.normalize("NFC", resolved).casefold()
+    return frozenset({f"path:{loose}"})
 
 
 def _is_within(path: pathlib.Path, root: pathlib.Path) -> bool:
