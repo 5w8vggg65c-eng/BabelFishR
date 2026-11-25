@@ -114,6 +114,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # One entry per thing that can be wrong, so clearing one cannot hide
         # another that is still true. See _warn.
         self._warnings: Dict[str, str] = {}
+        from ..timefmt import set_display_zone
+
+        set_display_zone(self.app.config.display.timezone)
         self._build_ui()
         self._refresh_devices()
         self._refresh_profiles()
@@ -559,8 +562,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # The rows' own margins and spacing, so the headings sit over them.
         row.setContentsMargins(14, 4, 10, 4)
         row.setSpacing(16)
-        time = QtWidgets.QLabel("TIME")
+        from ..timefmt import is_utc
+
+        time = QtWidgets.QLabel("TIME (UTC)" if is_utc() else "TIME")
         time.setFixedWidth(TIME_COLUMN_WIDTH)
+        self.time_heading = time
         row.addWidget(time)
         # One MESSAGE column: each row shows the transcript at full width,
         # then the translation under it - no half-width translation column.
@@ -906,6 +912,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_action.triggered.connect(self._refresh_current_view)
         view_menu.addAction(self.refresh_action)
 
+        # Show Times In: Local (default) or UTC - display only; stored
+        # instants and exports keep their UTC ISO-8601 values.
+        from ..timefmt import LOCAL, UTC, zone_label
+
+        times_menu = view_menu.addMenu("Show Times In")
+        self.time_zone_group = QtGui.QActionGroup(self)
+        self.time_zone_group.setExclusive(True)
+        self.time_zone_actions = {}
+        for zone, label in ((LOCAL, zone_label() if self._time_zone() == LOCAL
+                             else "Local"), (UTC, "UTC")):
+            action = QtGui.QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(self._time_zone() == zone)
+            action.triggered.connect(lambda _=False, z=zone: self._set_time_zone(z))
+            self.time_zone_group.addAction(action)
+            times_menu.addAction(action)
+            self.time_zone_actions[zone] = action
+
         self.show_hidden_sessions_action = QtGui.QAction("Show hidden Sessions", self)
         self.show_hidden_sessions_action.setCheckable(True)
         self.show_hidden_sessions_action.setToolTip(
@@ -1229,6 +1253,30 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_bookmarked()
         else:
             self._reload_timeline()
+
+    def _time_zone(self) -> str:
+        from ..timefmt import display_zone
+
+        return display_zone()
+
+    def _set_time_zone(self, zone: str) -> None:
+        """View > Show Times In: show every time in *zone*, at once, on the
+        messages already shown and on those still arriving; remembered."""
+        from ..timefmt import LOCAL, UTC, set_display_zone, zone_label
+
+        set_display_zone(zone)
+        self.app.config.display.timezone = zone
+        try:
+            self.app.config.save()
+        except OSError:  # noqa: BLE001 - a preference is never worth a crash
+            pass
+        for key, action in self.time_zone_actions.items():
+            action.setChecked(key == zone)
+        self.time_zone_actions[LOCAL].setText(zone_label() if zone == LOCAL else "Local")
+        self.time_heading.setText("TIME (UTC)" if zone == UTC else "TIME")
+        self.timeline.redraw_times()
+        self._refresh_selected_panel()
+        self.status.showMessage(f"Times are shown in {zone_label()}.", 6000)
 
     def _on_quiet_seconds(self, value: float) -> None:
         """Takes effect from the next Start (the running gate keeps its own
@@ -2233,10 +2281,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.selected_bookmark_button.setChecked(False)
             self.selected_play_button.setText("Play original")
             return
-        start = tx.started_at.astimezone()
-        end = (tx.ended_at or tx.started_at).astimezone()
+        from ..timefmt import span
+
         self.selected_range.setText(
-            f"{start:%H:%M:%S}\u2013{end:%H:%M:%S}  ({float(tx.duration or 0.0):.1f} s)")
+            f"{span(tx.started_at, tx.ended_at)}  ({float(tx.duration or 0.0):.1f} s)")
         self.selected_play_button.setEnabled(bool(tx.audio_path))
         self.selected_play_button.setText(
             "Pause" if self._original_state(tx) == "playing"
@@ -2406,7 +2454,9 @@ class MainWindow(QtWidgets.QMainWindow):
         tx = self.app.store.get_transmission(tx_id)
         if tx is None:
             return
-        when = tx.started_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        from ..timefmt import stamp
+
+        when = stamp(tx.started_at)
         choice = self._choose(
             "Remove message",
             f"Remove the message from {when}?",

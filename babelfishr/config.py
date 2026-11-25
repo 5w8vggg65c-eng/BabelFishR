@@ -256,6 +256,15 @@ class ReceiverConfig:
 
 
 @dataclasses.dataclass
+class DisplayConfig:
+    """How the interface shows things; never what is stored."""
+
+    timezone: str = "local"
+    """``local`` (default) or ``utc``: the zone operator-visible times are
+    shown in. Stored instants and exports are unaffected."""
+
+
+@dataclasses.dataclass
 class SetupState:
     """What the operator has already chosen. Persisted across restarts."""
 
@@ -296,6 +305,7 @@ class Config:
     sdr: SdrConfig = dataclasses.field(default_factory=SdrConfig)
     receiver: ReceiverConfig = dataclasses.field(default_factory=ReceiverConfig)
     setup: SetupState = dataclasses.field(default_factory=SetupState)
+    display: DisplayConfig = dataclasses.field(default_factory=DisplayConfig)
     mode: str = "online-setup"
     """``field-offline``, ``online-setup`` or ``record-only``."""
 
@@ -366,7 +376,7 @@ class Config:
             "audio": cfg.audio, "detector": cfg.detector, "asr": cfg.asr,
             "translate": cfg.translate, "recording": cfg.recording,
             "session": cfg.session, "analysis": cfg.analysis, "sdr": cfg.sdr,
-            "receiver": cfg.receiver, "setup": cfg.setup,
+            "receiver": cfg.receiver, "setup": cfg.setup, "display": cfg.display,
         }
         for name, obj in sections.items():
             values = dict(data.get(name) or {})

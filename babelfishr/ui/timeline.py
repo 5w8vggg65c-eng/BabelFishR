@@ -183,13 +183,16 @@ def _transcript_caption(tx: Transmission) -> tuple:
 
 
 def _local_stamp(when) -> str:
-    """``2026-09-07 10:41:20``: the local date and time of one transmission.
+    """``2026-09-07 10:41:20``: the date and time of one transmission, in
+    the zone chosen under View > Show Times In (``... UTC`` when UTC).
 
     The header used to show only the time, which is enough while reading
     today's traffic and misleading for anything older - a bubble from last
     week looked exactly like one from an hour ago.
     """
-    return when.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    from ..timefmt import stamp
+
+    return stamp(when)
 
 
 def _frequency_suffix(provenance) -> str:
@@ -687,7 +690,12 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.header.setText("  ·  ".join(_escape(part) for part in meta))
         # TIME column: the local time of day this transmission began - the
         # clock on this computer, the same value as the header's.
-        self.time_label.setText(tx.started_at.astimezone().strftime("%H:%M:%S"))
+        from ..timefmt import bare_clock
+
+        # The column's own heading says the zone (TIME or TIME (UTC)); the
+        # hover and the header line give the full date and time with it.
+        self.time_label.setText(bare_clock(tx.started_at))
+        self.time_label.setToolTip(_local_stamp(tx.started_at))
         self.time_label.setAccessibleName(f"Time {_local_stamp(tx.started_at)}")
 
         # The transcript is the message. It is the primary content of the
@@ -1416,6 +1424,12 @@ class TimelineView(QtWidgets.QScrollArea):
     def selected_transmission(self) -> Optional[Transmission]:
         bubble = self._bubbles.get(self.selected_id) if self.selected_id else None
         return bubble.tx if bubble is not None else None
+
+    def redraw_times(self) -> None:
+        """Re-render every bubble's times after the display zone changed.
+        The rows themselves are unchanged."""
+        for bubble in list(self._bubbles.values()):
+            bubble.update_from(bubble.tx)
 
     def bubble(self, tx_id: str) -> Optional[TransmissionBubble]:
         return self._bubbles.get(tx_id)
