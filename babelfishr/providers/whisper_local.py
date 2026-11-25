@@ -119,7 +119,8 @@ class FasterWhisperEngine(TranscriptionEngine):
                  models_root: Optional[str] = None,
                  condition_on_previous_text: bool = False,
                  local_files_only: bool = True,
-                 model_path: Optional[str] = None):
+                 model_path: Optional[str] = None,
+                 shared_language_encode: bool = False):
         self.model_size = model
         self.device = device
         self.compute_type = compute_type
@@ -132,6 +133,12 @@ class FasterWhisperEngine(TranscriptionEngine):
         #: An explicit directory containing a converted model, used in the
         #: field so loading cannot depend on a shared cache being intact.
         self.model_path = model_path
+        #: Off by default, pending a native bench. With automatic language,
+        #: identify the language from the encoder output of exactly the
+        #: window that is then decoded, so the encoder runs once instead of
+        #: twice per short clip. See _detect_on_decode_window for what is
+        #: and is not identical to faster-whisper's own detection.
+        self.shared_language_encode = bool(shared_language_encode)
         self._model: Any = None
         #: One model load at a time: a preload on a worker of one processor
         #: and a transcription on another (a retiring one, or several
@@ -286,6 +293,75 @@ class FasterWhisperEngine(TranscriptionEngine):
     def close(self) -> None:
         self._model = None
 
+    def _encode_reuse(self, model) -> Optional["_EncodeReuse"]:
+        """The model's encode() wrapped once in an exact-reuse cache, or None
+        when the model has no instance encode() to wrap (stand-ins)."""
+        current = getattr(model, "encode", None)
+        if isinstance(current, _EncodeReuse):
+            return current
+        if not callable(current):
+            return None
+        with self._load_lock:
+            current = getattr(model, "encode", None)
+            if isinstance(current, _EncodeReuse):
+                return current
+            try:
+                # WhisperModel calls self.encode(...) for both language
+                # detection and decoding, so an instance attribute is seen
+                # by both.
+                wrapper = _EncodeReuse(current)
+                setattr(model, "encode", wrapper)
+            except Exception:  # noqa: BLE001 - optional, never fatal
+                return None
+            return wrapper
+
+    def _detect_on_decode_window(self, model, samples: np.ndarray
+                                 ) -> Optional[Tuple[str, float]]:
+        """``(language, probability)`` from the encoder output of the first
+        window faster-whisper will decode, or None to leave detection to
+        faster-whisper itself.
+
+        faster-whisper 1.2.1 ``transcribe(language=None)`` runs
+        ``detect_language`` on ``pad_or_trim(features[..., :3000])`` and
+        then, with ``encoder_output=None``, encodes the first decode window
+        again: ``pad_or_trim(features[:, :min(3000, content_frames)])`` with
+        ``content_frames = features.shape[-1] - 1``. For a clip of 30 s or
+        more both inputs are the same 3000 frames (the exact-reuse cache then
+        saves the second pass by itself). For a shorter clip - every live
+        clip - they differ in exactly one column: the final 10 ms frame,
+        which detection sees and decoding does not. This method builds the
+        decode window exactly as generate_segments does, encodes it once,
+        and takes the top language as ``detect_language`` does with its
+        default single segment. The decode that follows is then
+        byte-for-byte the input faster-whisper would decode; the language
+        decision is made without that one trailing frame, which is why this
+        is off until a native bench shows the same decisions.
+        """
+        extractor = getattr(model, "feature_extractor", None)
+        native = getattr(model, "model", None)
+        if (extractor is None or native is None
+                or not getattr(native, "is_multilingual", False)):
+            return None
+        try:
+            features = extractor(samples)
+            frames = int(getattr(extractor, "nb_max_frames", 3000))
+            content_frames = features.shape[-1] - 1
+            if content_frames < 1:
+                return None
+            window = features[:, :min(frames, content_frames)]
+            if window.shape[-1] < frames:
+                # As faster_whisper.audio.pad_or_trim: zeros after the end.
+                window = np.pad(window, [(0, 0), (0, frames - window.shape[-1])])
+            results = native.detect_language(model.encode(window))[0]
+            token, probability = results[0]
+            language = str(token)[2:-2]
+        except Exception as exc:  # noqa: BLE001 - fall back to the stock path
+            log.debug("shared-encode language detection unavailable: %s", exc)
+            return None
+        if not language:
+            return None
+        return language, float(probability)
+
     # -- transcription ---------------------------------------------------
     def transcribe(self, audio: np.ndarray, sample_rate: int, *,
                    language: Optional[str] = None,
@@ -313,6 +389,17 @@ class FasterWhisperEngine(TranscriptionEngine):
         decode = {"temperature": 0.0} if single_pass else {}
         started = time.monotonic()
 
+        # Within this call an encoder pass over byte-identical input is done
+        # once (see _EncodeReuse): the same deterministic function of the
+        # same bytes, so nothing about the result can change.
+        reuse = self._encode_reuse(model)
+        if reuse is not None:
+            reuse.arm()
+        detected = None
+        if language is None and self.shared_language_encode:
+            detected = self._detect_on_decode_window(model, samples)
+        call_language = detected[0] if detected else language
+
         initial_prompt = None
         if vocabulary:
             # Whisper accepts a text prompt that biases decoding toward these
@@ -322,7 +409,7 @@ class FasterWhisperEngine(TranscriptionEngine):
         try:
             segments, info = model.transcribe(
                 samples,
-                language=language,
+                language=call_language,
                 beam_size=self.beam_size,
                 initial_prompt=initial_prompt,
                 # Our detector has already isolated the transmission; Whisper's
@@ -335,6 +422,8 @@ class FasterWhisperEngine(TranscriptionEngine):
             collected = list(segments)
         except Exception as exc:  # noqa: BLE001
             raise EngineError(f"whisper transcription failed: {exc}") from exc
+        finally:
+            passes, reused = reuse.disarm() if reuse is not None else (None, 0)
 
         parts: List[TranscriptSegment] = []
         logprobs: List[float] = []
@@ -376,19 +465,29 @@ class FasterWhisperEngine(TranscriptionEngine):
                                            for seg in collected) if t is not None]
         # Aggregate figures only - no words, no audio.
         log.info("whisper: %.1f s audio, language %s, VAD voiced %s, decode %s, "
-                 "highest temperature used %s, %.2f s",
+                 "highest temperature used %s, encoder passes %s (%d reused), %.2f s",
                  samples.size / float(TARGET_RATE),
-                 "specified" if language else "automatic",
+                 "specified" if language else (
+                     "automatic, on the decode window" if detected else "automatic"),
                  "unknown" if voiced is None else f"{voiced / float(TARGET_RATE):.2f} s",
                  "single pass at temperature 0" if single_pass else "default fallback",
                  f"{max(temperatures):.1f}" if temperatures else "n/a",
+                 "n/a" if passes is None else passes, reused,
                  time.monotonic() - started)
+
+        if detected:
+            # Recorded per transmission exactly as automatic detection is:
+            # the language found and its probability (faster-whisper itself
+            # reports 1.0 for a language it was given).
+            result_language, result_confidence = detected[0], _safe_float(detected[1])
+        else:
+            result_language = getattr(info, "language", None) or language
+            result_confidence = _safe_float(getattr(info, "language_probability", None))
 
         return TranscriptionResult(
             text=full_text,
-            language=getattr(info, "language", None) or language,
-            language_confidence=_safe_float(
-                getattr(info, "language_probability", None)),
+            language=result_language,
+            language_confidence=result_confidence,
             confidence=overall, segments=parts, engine=self.id,
             engine_version=self.version, no_speech=no_speech,
             no_speech_probability=no_speech_probability, speech_ratio=speech_ratio,
@@ -406,6 +505,51 @@ class FasterWhisperEngine(TranscriptionEngine):
         if peak > 1.0:
             data = data / peak
         return data.astype(np.float32)
+
+
+class _EncodeReuse:
+    """Wraps ``WhisperModel.encode``: while armed on the calling thread, an
+    encode of input byte-identical to the previous one returns the previous
+    output instead of running the encoder again.
+
+    Exact by construction - the encoder is a deterministic function of its
+    input and the same bytes go in - and narrow: one entry, per thread, only
+    between arm() and disarm() inside one FasterWhisperEngine.transcribe()
+    call. Reusing an encoder output for detection and decoding is what
+    faster-whisper itself does across its temperature fallbacks. Any
+    difference in shape, type or a single bit runs the encoder as usual.
+    """
+
+    def __init__(self, encode):
+        self._encode = encode
+        self._local = threading.local()
+
+    def arm(self) -> None:
+        self._local.armed, self._local.entry = True, None
+        self._local.passes = self._local.reused = 0
+
+    def disarm(self) -> Tuple[int, int]:
+        """End the call: ``(encoder passes run, passes reused)``."""
+        local = self._local
+        counts = (getattr(local, "passes", 0), getattr(local, "reused", 0))
+        local.armed, local.entry = False, None
+        return counts
+
+    def __call__(self, features, *args, **kwargs):
+        local = self._local
+        if not getattr(local, "armed", False) or args or kwargs:
+            return self._encode(features, *args, **kwargs)
+        key = np.ascontiguousarray(features)
+        entry = local.entry
+        if (entry is not None and entry[0].shape == key.shape
+                and entry[0].dtype == key.dtype
+                and np.array_equal(entry[0].view(np.uint8), key.view(np.uint8))):
+            local.reused += 1
+            return entry[1]
+        output = self._encode(features)
+        local.passes += 1
+        local.entry = (key.copy(), output)
+        return output
 
 
 _telemetry_disabled = False
