@@ -691,6 +691,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sequence.currentChanged.connect(self._on_sequence_current)
         self.sequence.stateChanged.connect(lambda _s: self._refresh_playback_bar())
         self.timeline.original_starter = self._start_sequence
+        self.timeline.forward_skipper = lambda: self.sequence.skip_forward(5000)
 
     def _start_sequence(self, tx_id: str, path: str) -> bool:
         """The operator's Play on one original: it plays, then the newer ones."""

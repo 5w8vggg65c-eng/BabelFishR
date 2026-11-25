@@ -203,7 +203,8 @@ def problem_reason(tx: Transmission) -> str:
         return ""
     metadata = tx.signal_metadata or {}
     verdict = (metadata.get("speech_check") or {}).get("verdict")
-    if verdict == "likely_noise" and not metadata.get("speech_confirmed"):
+    if tx.guess_withheld or (verdict == "likely_noise"
+                             and not metadata.get("speech_confirmed")):
         return "Audio unintelligible"
     if tx.state is ProcessingState.SKIPPED:
         return "Audio unintelligible"
@@ -228,7 +229,9 @@ def pairing_status(tx: Transmission) -> tuple:
         audio = "cleared"
     else:
         audio = "missing"
-    if (tx.display_transcript or "").strip():
+    if tx.guess_withheld:
+        text = "withheld"
+    elif (tx.display_transcript or "").strip():
         text = "ok"
     elif "text" in cleared:
         text = "cleared"
@@ -237,6 +240,11 @@ def pairing_status(tx: Transmission) -> tuple:
         text = "pending"
     else:
         text = "missing"
+    if text == "withheld":
+        # A guess, not a transcript: one plain reason, the guess on inspection.
+        words = ("Audio unintelligible" if audio == "ok"
+                 else f"Audio {audio} \u00b7 Audio unintelligible")
+        return words, False
     if audio == "ok" and text == "ok":
         words = "Audio + transcript \u2713"
     elif audio == "ok":
@@ -258,6 +266,14 @@ def details_for_inspection(tx: Transmission) -> str:
     the error message, the speech check's evidence, why a translation was
     not attempted, the skip reason. Never shown as text on the card."""
     parts: List[str] = []
+    if tx.withheld_ending:
+        parts.append(f"Withheld from the end, not supported by the recording: "
+                     f"\u201c{tx.withheld_ending}\u201d. The full engine text is kept "
+                     f"(Edit transcript and translation).")
+    if tx.guess_withheld:
+        parts.append(f"Engine guess, withheld as not speech: \u201c{tx.transcript.strip()}\u201d. "
+                     f"Edit transcript and translation to correct it, or Retry as "
+                     f"speech in... to transcribe it again as speech.")
     if tx.state is ProcessingState.FAILED and tx.error:
         parts.append(f"{tx.error.stage} failed: {tx.error.message}")
     for note in (_speech_check_note(tx), _translation_unresolved_note(tx),
@@ -812,10 +828,20 @@ class TransmissionBubble(QtWidgets.QFrame):
         # The transcript is the message. It is the primary content of the
         # bubble, in plain words, with no engine or language prefix competing
         # with it - the language already appears in the header line.
-        original = tx.display_transcript
+        original = tx.shown_transcript
+        withheld = tx.guess_withheld
+        self.transcript_box.setToolTip(details_for_inspection(tx)
+                                       if withheld or tx.withheld_ending else "")
         if original:
             # Only the words: "edited" is said in the caption.
             self.original_label.setText(original)
+            self.original_label.show()
+            self.transcript_box.show()
+        elif withheld:
+            # Not traffic: the recogniser's guess for noise is not shown as
+            # words. The guess is in the tooltip and in Edit; the audio plays.
+            self.original_label.setText("Audio unintelligible \u2014 no speech "
+                                        "recognised (the engine's guess is withheld)")
             self.original_label.show()
             self.transcript_box.show()
         elif tx.state in _IN_FLIGHT:
@@ -840,7 +866,7 @@ class TransmissionBubble(QtWidgets.QFrame):
         # A translation row only when there is genuinely another language to
         # read. "already in English" under an English transcript is a line of
         # noise in every bubble of an English-speaking operator's thread.
-        translated = tx.display_translation
+        translated = tx.shown_translation
         if translated and _differs(tx.source_language, tx.target_language):
             # Only the words: the language and "edited" are in the caption.
             self.translated_label.setText(translated)
@@ -1065,9 +1091,16 @@ class TransmissionBubble(QtWidgets.QFrame):
         if self._player.owner == self.tx.id:
             self._player.rewind()
 
+    #: Set by the list: +5 s through the window's continuous playback, which
+    #: moves to the next recording when this one has 5 s or less left.
+    skip_forward = None
+
     def _on_forward_clicked(self) -> None:
         if self._player.owner == self.tx.id:
-            self._player.forward()
+            if self.skip_forward is not None:
+                self.skip_forward()
+            else:
+                self._player.forward()
 
     def _toggle_play(self) -> None:  # noqa: D401 - the menu's Play / Pause
         from .waveform import same_audio
@@ -1456,6 +1489,7 @@ class TimelineView(QtWidgets.QScrollArea):
         self.empty_label.hide()
         bubble = TransmissionBubble(tx, self._player, follow_player=False)
         bubble.start_original = self._start_original
+        bubble.skip_forward = self._skip_forward
         bubble.correctionRequested.connect(self.correctionRequested)
         bubble.tagsChanged.connect(self.tagsChanged)
         bubble.bookmarkToggled.connect(self.bookmarkToggled)
@@ -1561,6 +1595,15 @@ class TimelineView(QtWidgets.QScrollArea):
 
     #: Set by the window: plays an original and continues with newer ones.
     original_starter = None
+
+    #: Set by the window: +5 s that may move continuous playback onwards.
+    forward_skipper = None
+
+    def _skip_forward(self) -> None:
+        if self.forward_skipper is not None:
+            self.forward_skipper()
+        else:
+            self._player.forward()
 
     def _start_original(self, tx_id: str, path: str) -> None:
         if self.original_starter is not None:

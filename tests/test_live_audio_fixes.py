@@ -224,7 +224,9 @@ def test_capture_persists_every_part_in_order_with_its_own_audio(config, store, 
 
 # --- 2. probably-not-speech -----------------------------------------------
 
-def result(text="Thank you for watching.", ratio=None, nsp=None, confidence=0.9,
+# Neutral radio words: the evidence table below is about the evidence, not
+# the stock sign-offs (tests/test_signoff_noise.py covers those).
+def result(text="Unit two, copy, over.", ratio=None, nsp=None, confidence=0.9,
            language="en", language_confidence=0.95, seconds="auto", duration=4.0):
     if seconds == "auto":
         seconds = None if ratio is None else round(ratio * duration, 2)

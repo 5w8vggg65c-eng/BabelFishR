@@ -27,6 +27,8 @@ CSV_COLUMNS = [
     "transcription_engine", "translation_engine",
     # Appended, so existing columns keep their positions.
     "needs_review", "translation_status",
+    # A recogniser's guess for noise is not put in the transcript column.
+    "transcript_status", "withheld_guess",
 ]
 
 
@@ -35,7 +37,11 @@ def to_json(transmissions: Sequence[Transmission],
     payload: Dict[str, object] = {
         "format": "babelfishr.transmissions.v1",
         "exported_at": iso(utcnow()),
-        "transmissions": [t.to_dict() for t in transmissions],
+        # Machine-readable: every stored value as it is, plus whether the
+        # transcript is a withheld guess, so no reader takes it for traffic.
+        "transmissions": [dict(t.to_dict(), guess_withheld=t.guess_withheld,
+                               withheld_ending=t.withheld_ending)
+                          for t in transmissions],
     }
     if session is not None:
         payload["session"] = session.to_dict()
@@ -52,6 +58,17 @@ def to_csv(transmissions: Sequence[Transmission]) -> str:
         row["translation_status"] = ("not attempted: language unresolved"
                                      if unresolved else "")
         row["tags"] = ",".join(tx.tags)
+        if tx.withheld_ending:
+            row["transcript"] = tx.shown_transcript
+            row["translation"] = tx.shown_translation
+            row["withheld_guess"] = tx.withheld_ending
+            row["transcript_status"] = "unsupported sign-off withheld from the end"
+        if tx.guess_withheld:
+            row["withheld_guess"] = tx.transcript
+            row["transcript"] = ""
+            row["transcript_status"] = "audio unintelligible: engine guess withheld"
+            if not tx.translation_correction:
+                row["translation"] = ""
         writer.writerow({k: row.get(k, "") for k in CSV_COLUMNS})
     return buffer.getvalue()
 
@@ -99,12 +116,20 @@ def to_markdown(transmissions: Sequence[Transmission],
         if meta:
             lines.append("*" + " | ".join(meta) + "*")
         lines.append("")
-        if tx.display_transcript:
+        if tx.guess_withheld:
+            # Not traffic: said plainly, with the engine's guess labelled.
+            lines.append("**Original:** *Audio unintelligible - no speech "
+                         "recognised. Engine guess withheld as not speech:* "
+                         f"\u201c{tx.transcript.strip()}\u201d")
+        elif tx.shown_transcript:
             lines.append(f"**Original ({tx.source_language or 'unknown'}):** "
-                         f"{tx.display_transcript}")
-        if tx.display_translation:
+                         f"{tx.shown_transcript}")
+        if tx.withheld_ending:
+            lines.append("*Withheld from the end (not supported by the recording):* "
+                         f"\u201c{tx.withheld_ending}\u201d")
+        if tx.shown_translation:
             lines.append(f"**Translated ({tx.target_language}):** "
-                         f"{tx.display_translation}")
+                         f"{tx.shown_translation}")
         if tx.state.value == "failed" and tx.error:
             lines.append(f"**Error ({tx.error.stage}):** {tx.error.message}")
         unresolved = (tx.signal_metadata or {}).get("translation_unresolved") or {}

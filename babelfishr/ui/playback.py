@@ -374,7 +374,26 @@ class PlaybackController(QtCore.QObject):
             self.positionChanged.emit(self.owner, self.backend.position(),
                                       self._duration_ms)
 
+    def end_early(self, tx_id: str) -> bool:
+        """Stop *tx_id*'s clip before its end on the caller's behalf (the
+        sequence skipping to the next recording): no finished, failed or
+        stopped report follows, so nothing reads it as a natural end or as
+        the operator's Stop. False when *tx_id* is not what is playing."""
+        if self.owner != tx_id or not self.controllable:
+            return False
+        self._stop_backend()
+        self._ended_by_backend = None
+        self._retire()
+        return True
+
     def _on_finished(self) -> None:
+        if self.owner is not None and self.controllable:
+            # A late "end of media" from the clip just replaced arrives while
+            # the new one is near its start: it is not the new clip's end.
+            duration = self._duration_ms or self.backend.duration()
+            if duration >= 1500 and self.backend.position() < duration - 1000:
+                log.debug("ignoring a stale end-of-media report for %s", self.owner)
+                return
         ended = self.owner or self._ended_by_backend
         self._ended_by_backend = None
         self._retire()

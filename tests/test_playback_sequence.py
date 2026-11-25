@@ -125,6 +125,7 @@ def test_finish_reported_before_the_stop_also_advances(qt_app, tmp_path):
     """Some players report completion first and the stop after it."""
     backend, controller, session, player, _ = rig(qt_app, tmp_path)
     player.start("a", session.paths["a"])
+    backend._position = backend._duration          # at its end, as a real player is
     backend.finished.emit()
     backend._set(STOPPED)
     pump(qt_app)

@@ -300,14 +300,17 @@ def test_held_and_uncertain_transcripts_say_so_and_show_every_word(qt_app, windo
         dict(transcript="Sample text, ordinary."),
     ])
     held, uncertain, plain = (window.timeline.bubble(tx.id) for tx in made)
-    # Every word is still shown; the card says only the short reason.
+    # A guess held as noise is not shown as traffic: the card says Audio
+    # unintelligible, and the guess is there on inspection (and in Edit).
     assert held.transcript_caption.text() == "TRANSCRIPT"
     assert held.original_label.isVisibleTo(held)
-    assert held_text in held.original_label.text()
-    assert held.original_label.textInteractionFlags() & QtCore.Qt.TextSelectableByMouse
+    assert held_text not in held.original_label.text()
+    assert "Audio unintelligible" in held.original_label.text()
+    assert held_text in held.transcript_box.toolTip()
     assert held.notes_label.isHidden()
-    assert held.pairing_label.text().endswith("Audio unintelligible")
+    assert held.pairing_label.text() == "Audio unintelligible"
     assert "Probably not speech" in held.pairing_label.toolTip()
+    assert held_text in held.pairing_label.toolTip()
 
     # Marginal but readable: no warning at all.
     assert uncertain.transcript_caption.text() == "TRANSCRIPT"

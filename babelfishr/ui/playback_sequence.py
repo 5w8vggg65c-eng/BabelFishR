@@ -144,6 +144,34 @@ class SequencePlayer(QtCore.QObject):
         if owned:
             self.controller.stop()
 
+    def skip_forward(self, delta_ms: int = 5000) -> None:
+        """The playing card's +5 s.
+
+        More than *delta_ms* left: an ordinary seek. *delta_ms* or less left
+        while continuous playback owns the clip: this clip is over - the
+        sequence moves once to the START of the next playable recording,
+        by the same rules as a natural end (missing files skipped, waiting
+        while the Session is live, the end of the Session). A second press
+        before the next clip starts, a Stop, a Pause or a stale end report
+        cannot advance twice or restart anything.
+        """
+        controller = self.controller
+        owned = (self._state == PLAYING and not self._resolved and not self._starting
+                 and controller.controllable
+                 and controller.owner == self._current_id
+                 and controller.path == self._current_path)
+        if not owned:
+            controller.skip(delta_ms)
+            return
+        position, duration = controller.position_for(self._current_id)
+        if duration <= 0 or duration - position > delta_ms:
+            controller.skip(delta_ms)
+            return
+        self._resolved = True                 # this clip's end is decided
+        controller.end_early(self._current_id)
+        self._errors = 0
+        self._schedule_advance()
+
     def cancel(self) -> None:
         """End the sequence without touching the controller.
 

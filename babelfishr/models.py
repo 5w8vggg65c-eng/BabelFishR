@@ -698,6 +698,108 @@ class Transmission:
         return bool(self.transcript_correction or self.translation_correction)
 
     @property
+    def guess_withheld(self) -> bool:
+        """The recogniser's text is a guess with no intelligible speech behind
+        it, and is not shown as traffic: the speech check held it as noise,
+        or it is a stock video sign-off the recorded evidence does not
+        support. Worked out from what is stored, so older records are judged
+        the same way without rewriting them. An operator correction or a
+        "Retry as speech in..." confirmation always wins."""
+        if self.transcript_correction or not (self.transcript or "").strip():
+            return False
+        metadata = self.signal_metadata or {}
+        if metadata.get("speech_confirmed"):
+            return False
+        check = metadata.get("speech_check") or {}
+        if check.get("verdict") == "likely_noise":
+            return True
+        kind = stock_signoff(self.transcript)
+        if not kind:
+            return False
+        texts = [s.get("text") if isinstance(s, dict) else getattr(s, "text", "")
+                 for s in (self.transcript_segments or [])]
+        if any(t and t.strip() and not stock_signoff(t) for t in texts):
+            return False        # real words too: see withheld_ending
+        return signoff_is_noise(kind, check.get("speech_seconds"),
+                                check.get("speech_ratio"),
+                                check.get("no_speech_probability"),
+                                check.get("transcript_confidence",
+                                          self.transcript_confidence))
+
+    def _ending_split(self):
+        """(kept segments, withheld ending text) when the transcript ends in
+        a stock sign-off the recording does not support, else None.
+
+        Real words often come first ("The rain is easing.") and a recogniser
+        then adds "Thanks for watching" over the unvoiced tail - timestamped
+        past the end of the recording, or with low confidence. Only trailing
+        segments that are themselves stock phrases AND unsupported are
+        withheld; a sign-off within the audio with a confident engine (one a
+        person said) is kept, and so is everything before it."""
+        if self.transcript_correction or not self.transcript_segments:
+            return None
+        if (self.signal_metadata or {}).get("speech_confirmed"):
+            return None
+        segments = [s if isinstance(s, TranscriptSegment) else TranscriptSegment(
+            float(s.get("start") or 0.0), float(s.get("end") or 0.0),
+            str(s.get("text") or ""), s.get("confidence"))
+            for s in self.transcript_segments]
+        duration = float(self.duration or 0.0)
+        cut = len(segments)
+        while cut > 0:
+            seg = segments[cut - 1]
+            if not stock_signoff(seg.text):
+                break
+            beyond = duration > 0 and (seg.start >= duration - 0.05
+                                       or seg.end > duration + 0.75)
+            doubtful = seg.confidence is not None and seg.confidence < 0.5
+            if not (beyond or doubtful):
+                break
+            cut -= 1
+        kept = [s for s in segments[:cut] if (s.text or "").strip()]
+        if cut == len(segments) or not kept:
+            return None                       # nothing to withhold, or nothing else said
+        ending = " ".join(s.text.strip() for s in segments[cut:])
+        return kept, ending
+
+    @property
+    def withheld_ending(self) -> str:
+        """The unsupported stock sign-off withheld from the end of an
+        otherwise real transcript, or "". The raw text keeps it."""
+        if self.guess_withheld:
+            return ""
+        split = self._ending_split()
+        return split[1] if split else ""
+
+    @property
+    def shown_transcript(self) -> str:
+        """The original-language text to present as traffic: "" for a
+        withheld guess, and without an unsupported sign-off at its end (the
+        raw candidate stays in ``transcript``)."""
+        if self.guess_withheld:
+            return ""
+        split = None if self.transcript_correction else self._ending_split()
+        if split:
+            return " ".join(s.text.strip() for s in split[0])
+        return self.display_transcript
+
+    @property
+    def shown_translation(self) -> str:
+        if self.translation_correction:
+            return self.translation_correction
+        if self.guess_withheld:
+            return ""
+        text = self.display_translation
+        if text and self.withheld_ending:
+            # An older translation still carries the ending: drop trailing
+            # sentences that are themselves stock sign-offs.
+            sentences = _re.split(r"(?<=[.!?\u3002])\s+", text.strip())
+            while sentences and stock_signoff(sentences[-1]):
+                sentences.pop()
+            text = " ".join(sentences)
+        return text
+
+    @property
     def frequency_is_measured(self) -> bool:
         """True only when something actually measured it. Never for typed values."""
         return (self.frequency_mhz is not None
@@ -792,6 +894,8 @@ class Transmission:
         check = metadata.get("speech_check") or {}
         if (check.get("verdict") in ("likely_noise", "uncertain")
                 and not (self.reviewed and self.has_correction)):
+            return True
+        if self.guess_withheld:
             return True
         # Saved, not processed: monitoring was stopped first (pipeline
         # PROCESSING_STOPPED). It waits for Transcribe anyway / Retry.
@@ -891,3 +995,85 @@ class Transmission:
         ]
         known = {f.name for f in dataclasses.fields(cls)}
         return cls(**{k: v for k, v in d.items() if k in known})
+
+
+# --- stock sign-offs: recognition output with no speech behind it ----------------
+#
+# Fed room noise, speech recognisers trained on subtitled video often return a
+# stock video sign-off ("Thanks for watching!", "Takk for at du så på.",
+# "Please subscribe", subtitle credits). The words alone never decide: each
+# tier is judged against the local speech evidence recorded with the message
+# (voice-detector seconds, the engine's no-speech estimate and confidence), so
+# a sign-off genuinely spoken over the radio - clear speech, confident engine -
+# is kept, and a short real "thank you" is withheld only when the evidence says
+# nothing was spoken.
+
+import re as _re
+import unicodedata as _ud
+
+#: Video sign-offs and subtitle credits: withheld unless speech is clearly
+#: evident.
+_SIGNOFF_PATTERNS = [_re.compile(p) for p in (
+    r"\b(thank you|thanks|thank u)( (so|very) much)? (for|4) (watching|viewing)\b",
+    r"\b(please )?(like (and|&) )?subscribe\b",
+    r"\bsubtitles? (by|created by)( the)? amara ?org( community)?\b",
+    r"\bamara ?org( community)?\b", r"\buntertitel\b",
+    r"\b(tusen )?takk for (at (du|dere) (så|ser|har sett) (på)?|å se|å ha sett)\b",
+    r"\bdanke (fürs|für's|für das) zuschauen\b",
+    r"\bmerci d avoir regardé\b", r"\bgracias por (ver|mirar)\b",
+    r"\bobrigad[oa] por (assistir|ver)\b", r"\bgrazie per la visione\b",
+    r"\bспасибо за просмотр\b", r"ご視聴ありがとうございました",
+)]
+#: A bare thanks on its own: withheld only when the evidence says no speech.
+_BARE_THANKS = _re.compile(
+    r"^((thank you|thanks|thank u)( (so|very) much)?|(tusen )?takk|danke( schön)?|"
+    r"merci( beaucoup)?|gracias|obrigad[oa]|grazie|спасибо|ありがとうございました)$")
+
+
+def _normal(text: str) -> str:
+    text = _ud.normalize("NFC", text or "").lower().replace("\u2019", "'")
+    text = _re.sub(r"[^\w\s']+", " ", text).replace("'", " ")
+    return " ".join(text.split())
+
+
+def stock_signoff(text: str) -> str:
+    """``"signoff"``, ``"thanks"`` or ``""`` for a whole transcript.
+
+    Only a transcript that is essentially just the stock phrase counts (at
+    most two other words, twelve in all): a real message that happens to
+    contain "thank you" is never matched."""
+    words = _normal(text)
+    if not words:
+        return ""
+    if _BARE_THANKS.match(words):
+        return "thanks"
+    count = len(words.split())
+    for pattern in _SIGNOFF_PATTERNS:
+        match = pattern.search(words)
+        if match and count <= 12:
+            rest = (words[:match.start()] + " " + words[match.end():]).split()
+            if len(rest) <= 2:
+                return "signoff"
+    return ""
+
+
+def signoff_is_noise(kind: str, seconds=None, ratio=None, nsp=None,
+                     confidence=None) -> bool:
+    """Judge a stock phrase against the local speech evidence.
+
+    A video sign-off is kept only with clear speech: the voice detector found
+    at least a second (or 30% of the clip), the engine's no-speech estimate is
+    under 0.3 and its confidence at least 0.6. A bare thanks is withheld only
+    when the evidence says no speech: under a quarter second of voice, or a
+    no-speech estimate of 0.4 or more. With no evidence at all, a sign-off is
+    withheld and a bare thanks is kept."""
+    if kind == "signoff":
+        voiced = (seconds >= 1.0 if seconds is not None
+                  else ratio >= 0.3 if ratio is not None else False)
+        return not (voiced and (nsp is None or nsp < 0.3)
+                    and (confidence is None or confidence >= 0.6))
+    if kind == "thanks":
+        return bool((seconds is not None and seconds < 0.25)
+                    or (seconds is None and ratio is not None and ratio < 0.02)
+                    or (nsp is not None and nsp >= 0.4))
+    return False

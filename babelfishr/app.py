@@ -1387,7 +1387,29 @@ class BabelFishRApp:
         ``conversation_id=None`` explicitly to search everything.
         """
         filters.setdefault("conversation_id", self.conversation_id)
-        return self.store.search(query, **filters)
+        results = self.store.search(query, **filters)
+        if not query.strip():
+            return results
+        # A withheld guess is not traffic: its words do not make it a match.
+        # It is still found by what the operator wrote (notes, tags,
+        # corrections), and listed in the thread and the Review queue.
+        terms = [t.lower() for t in query.split() if t.strip()]
+
+        def found_by_operator(tx) -> bool:
+            own = " ".join(filter(None, (tx.notes, " ".join(tx.tags),
+                                         tx.transcript_correction,
+                                         tx.translation_correction))).lower()
+            return all(term.strip('"*') in own for term in terms)
+
+        def found_in_traffic(tx) -> bool:
+            shown = " ".join(filter(None, (tx.shown_transcript,
+                                           tx.shown_translation))).lower()
+            return all(term.strip('"*') in shown for term in terms)
+
+        return [tx for tx in results
+                if not (tx.guess_withheld or tx.withheld_ending)
+                or found_by_operator(tx)
+                or (tx.withheld_ending and found_in_traffic(tx))]
 
     def retry(self, tx_id: str, source_language: Optional[str] = None) -> bool:
         """Retry a recording - monitoring or not. With *source_language*, the

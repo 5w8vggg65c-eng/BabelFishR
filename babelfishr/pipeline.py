@@ -268,7 +268,10 @@ def assess_speech(result) -> Optional[dict]:
     nsp = getattr(result, "no_speech_probability", None)
     confidence = getattr(result, "confidence", None)
     loop_kind, loop_reason = degenerate_text(text)
-    if ratio is None and nsp is None and not loop_kind:
+    from .models import signoff_is_noise, stock_signoff
+
+    stock = stock_signoff(text)
+    if ratio is None and nsp is None and not loop_kind and not stock:
         return None
     engine_doubts = nsp is not None and nsp >= NO_SPEECH_PROBABILITY
     engine_unsure = confidence is not None and confidence < NO_SPEECH_CONFIDENCE
@@ -295,6 +298,15 @@ def assess_speech(result) -> Optional[dict]:
         if vad_heard_none or engine_doubts:
             likely_noise = True
         reasons.append(f"the transcript repeats itself: {loop_reason}")
+    if stock and signoff_is_noise(stock, seconds, ratio, nsp, confidence):
+        # A stock video sign-off ("Thanks for watching") or a bare thanks,
+        # without the speech evidence that would make it a real call: the
+        # classic recognition output for room noise. Judged by the evidence,
+        # not the words alone (see models.signoff_is_noise).
+        likely_noise = True
+        reasons.append("the transcript is a stock sign-off that speech recognition "
+                       "produces from background noise, and the audio shows no "
+                       "clear speech")
     if vad_heard_none:
         reasons.append("the local voice detector heard almost no speech")
     if engine_doubts:
@@ -1044,8 +1056,11 @@ class ProcessingPipeline:
                                               "stage": "translation",
                                               "message": missing})
                 return
+            # Translate what is shown as traffic: an unsupported stock
+            # sign-off at the end is not translated (models.withheld_ending).
             result = self.translation.translate(
-                tx.transcript, target, source_language=tx.source_language,
+                tx.shown_transcript or tx.transcript, target,
+                source_language=tx.source_language,
                 glossary=self.glossary.mapping(tx.source_language) or None,
                 do_not_translate=self.glossary.protected(tx.source_language) or None)
         except (EngineError, EngineUnavailable) as exc:
