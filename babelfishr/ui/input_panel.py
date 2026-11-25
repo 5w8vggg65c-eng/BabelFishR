@@ -16,8 +16,10 @@ physical interface is found again after a replug or a reboot; and if it is
 rather than quietly recording the laptop microphone.
 
 The active input is on screen the whole time it is being used, with a live
-level meter beside it, because "which device am I actually listening to" is a
-question the operator must never have to go looking for an answer to.
+meter beside it - an orange audio-frequency spectrum, with the level column,
+clipping lamp and peak/RMS readout alongside (widgets.SpectrumWidget) -
+because "which device am I actually listening to" is a question the operator
+must never have to go looking for an answer to.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from PySide6 import QtCore, QtWidgets
 
 from ..audio.devices import (AudioDevice, DeviceIdentity, backend_available,
                              list_input_devices, resolve_input, unique_labels)
-from .widgets import LevelMeterWidget
+from .widgets import SpectrumWidget
 
 #: Combo box entry kinds, stored as item data.
 NONE = "none"
@@ -118,9 +120,10 @@ class InputPanel(QtWidgets.QWidget):
             QtCore.Qt.TextSelectableByMouse)
         status.addWidget(self.status_label)
 
-        self.meter = LevelMeterWidget()
-        self.meter.setToolTip("Live level on the selected input")
-        self.meter.setAccessibleName("Input level")
+        # The visible meter: a live frequency spectrum of the selected input,
+        # with its level, peak and clipping shown alongside.
+        self.meter = SpectrumWidget()
+        self.meter.setAccessibleName("Input spectrum and level")
         status.addWidget(self.meter, 1)
         layout.addLayout(status)
 
@@ -226,6 +229,8 @@ class InputPanel(QtWidgets.QWidget):
             return
         data = self.device_box.currentData() or {"kind": NONE}
         kind = data.get("kind")
+        # Whatever the meter showed belonged to the previous input.
+        self.meter.reset()
         if kind == NONE:
             self.app.config.clear_input_selection()
         elif kind == SYSTEM_DEFAULT:
@@ -472,6 +477,9 @@ class InputPanel(QtWidgets.QWidget):
         nothing about that input (such as "it is recording the room") is
         true while it runs.
         """
+        if bool(monitoring) != self._monitoring:
+            # Start or Stop: nothing on the meter is about this run.
+            self.meter.reset()
         self._monitoring = bool(monitoring)
         self._replaying = bool(monitoring and replay)
         for widget in (self.device_box, self.rescan_button,
@@ -483,8 +491,10 @@ class InputPanel(QtWidgets.QWidget):
         self.refresh_status()
 
     def set_reading(self, rms: float, peak: float, clipped: bool,
-                    clip_count: int) -> None:
-        self.meter.set_reading(rms, peak, clipped, clip_count)
+                    clip_count: int, spectrum=None) -> None:
+        """A live reading; *spectrum* is its audio.spectrum.SpectrumFrame,
+        when the producer computed one."""
+        self.meter.set_reading(rms, peak, clipped, clip_count, spectrum=spectrum)
 
     def report_audio_status(self, kind: str, message: str) -> None:
         """React to the capture thread losing or regaining the device."""

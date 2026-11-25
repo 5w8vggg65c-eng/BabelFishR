@@ -39,6 +39,7 @@ import numpy as np
 from .audio.meter import LevelMeter, LevelReading
 from .audio.safety import SafetyRecorder
 from .audio.source import AudioBlock, AudioSource
+from .audio.spectrum import SpectrumAnalyzer
 from .audio.wavefile import write_wav
 from .config import Config
 from .detect import DetectedTransmission, RadioActivityDetector
@@ -1115,9 +1116,17 @@ class CaptureService:
         self._stop_requested = False
         self.state = PipelineState.IDLE
         self.transmissions_captured = 0
+        # Level readings (and the spectrum they carry) are published about
+        # every 0.1 s of audio, or every block if blocks are longer. Not
+        # faster: the UI drains the bus at 10 Hz, and a faster-than-real-time
+        # replay must not crowd transmissions out of the bounded queue.
         self._level_divisor = max(1, int(0.1 * source.sample_rate
                                          / max(config.audio.block_size, 1)))
         self._block_count = 0
+        #: The visible INPUT spectrum. Fed here, on the capture thread - the
+        #: PortAudio callback only queues blocks - and computed only when a
+        #: reading is published. Fixed memory: one ring, no history.
+        self.spectrum = SpectrumAnalyzer()
 
     #: How long stop() waits for the audio thread before reporting that it
     #: is still running. A bound on the caller's wait, not on the thread.
@@ -1377,8 +1386,10 @@ class CaptureService:
 
     def _handle_block(self, block: AudioBlock) -> None:
         reading = self.meter.update(block)
+        self.spectrum.feed(block.samples, block.sample_rate)
         self._block_count += 1
         if self._block_count % self._level_divisor == 0:
+            reading.spectrum = self.spectrum.frame()
             self.events.publish("level", reading, run=self.session.id)
         self.safety.feed(block)
 

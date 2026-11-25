@@ -1,4 +1,4 @@
-"""Small custom widgets: level meter and compact waveform."""
+"""Small custom widgets: level meter, live input spectrum, compact waveform."""
 
 from __future__ import annotations
 
@@ -78,6 +78,264 @@ class LevelMeterWidget(QtWidgets.QWidget):
         if self._clipped:
             painter.fillRect(rect.right() - 10, rect.top() + 1, 9, height,
                              QtGui.QColor("#f85149"))
+        painter.end()
+
+
+def _format_hz(hz: float) -> str:
+    return f"{hz / 1000:g}k" if hz >= 1000 else f"{hz:g}"
+
+
+class SpectrumWidget(QtWidgets.QWidget):
+    """The visible INPUT meter: a live, orange audio-frequency spectrum.
+
+    Horizontal axis: audio frequency, log-spaced bands (60 Hz up to the
+    lower of 10 kHz and the input's Nyquist frequency), with 100 / 1k / 4k
+    ticks. Vertical axis: each band's magnitude, -90..0 dBFS, with faint
+    -20 / -40 / -60 dBFS rules. A held peak cap sits above each bar.
+
+    The gain information the bar meter carried is kept beside it: a slim
+    level column on the right (RMS fill, peak-hold tick and the same -40 /
+    -20 / -12 / -6 dBFS marks on a -60..0 scale), the clipping lamp at its
+    top, a "CLIP n" count, and the peak/RMS readout in dBFS.
+
+    It clears itself to flat when told (Stop, a change of input, a lost
+    device) and also when readings stop arriving, so a stalled input can
+    never leave a frozen spectrum that looks live.
+    """
+
+    #: Readings older than this are stale: the spectrum falls flat.
+    STALE_MS = 700
+    LEVEL_COLUMN = 12
+    AXIS_HEIGHT = 12
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        self.setMinimumHeight(56)
+        self.setMinimumWidth(180)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                           QtWidgets.QSizePolicy.Fixed)
+        self._rms = 0.0
+        self._peak = 0.0
+        self._clipped = False
+        self._clip_count = 0
+        self._levels: tuple = ()
+        self._peaks: tuple = ()
+        self._edges: tuple = ()
+        self._sample_rate = 0
+        self._stale = QtCore.QTimer(self)
+        self._stale.setSingleShot(True)
+        self._stale.setInterval(self.STALE_MS)
+        self._stale.timeout.connect(self._went_stale)
+        self.setToolTip(
+            "Live input spectrum: frequency across, level up (dBFS). The "
+            "column on the right is the overall level - aim for speech peaks "
+            "around -12 dBFS; red means the input clipped.")
+
+    def sizeHint(self) -> QtCore.QSize:  # noqa: N802
+        return QtCore.QSize(240, 64)
+
+    # -- feeding -----------------------------------------------------------
+    def set_reading(self, rms_fraction: float, peak_fraction: float,
+                    clipped: bool, clip_count: int = 0, spectrum=None) -> None:
+        self._rms = max(0.0, min(1.0, float(rms_fraction)))
+        self._peak = max(0.0, min(1.0, float(peak_fraction)))
+        self._clipped = bool(clipped)
+        self._clip_count = int(clip_count)
+        if spectrum is not None:
+            self._set_frame(spectrum)
+        self._stale.start()
+        self.update()
+
+    def set_spectrum(self, spectrum) -> None:
+        self._set_frame(spectrum)
+        self._stale.start()
+        self.update()
+
+    def _set_frame(self, frame) -> None:
+        self._levels = tuple(frame.levels_dbfs)
+        self._peaks = tuple(frame.peaks_dbfs)
+        self._edges = tuple(frame.edges_hz)
+        self._sample_rate = int(frame.sample_rate)
+
+    def clear_spectrum(self) -> None:
+        """Flat: no bars, no caps. The band layout (axis) is kept."""
+        self._levels = self._peaks = ()
+        self.update()
+
+    def reset(self) -> None:
+        """Everything flat: Stop, a different input, a lost device."""
+        self._stale.stop()
+        self._rms = self._peak = 0.0
+        self._clipped = False
+        self._clip_count = 0
+        self._levels = self._peaks = ()
+        self._edges = ()
+        self._sample_rate = 0
+        self.update()
+
+    def _went_stale(self) -> None:
+        self._rms = self._peak = 0.0
+        self._clipped = False
+        self.clear_spectrum()
+
+    # -- inspection (tests, accessibility) -------------------------------
+    @property
+    def sample_rate(self) -> int:
+        return self._sample_rate
+
+    @property
+    def edges_hz(self) -> tuple:
+        return self._edges
+
+    def bar_fractions(self) -> tuple:
+        """0..1 height of every band as drawn; () when flat."""
+        from ..audio.spectrum import FLOOR_DBFS
+
+        span = -FLOOR_DBFS
+        return tuple(min(1.0, max(0.0, (v - FLOOR_DBFS) / span))
+                     for v in self._levels)
+
+    @property
+    def flat(self) -> bool:
+        return not any(self.bar_fractions())
+
+    # -- drawing ---------------------------------------------------------
+    def _x_for_hz(self, hz: float, left: float, width: float) -> float:
+        low, high = self._edges[0], self._edges[-1]
+        return left + width * (np.log(hz / low) / np.log(high / low))
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802
+        from ..audio.spectrum import FLOOR_DBFS
+        from . import theme
+
+        t = theme.tokens(self)
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, False)
+        rect = self.rect().adjusted(0, 0, -1, -1)
+        painter.fillRect(rect, QtGui.QColor(t["surface"]))
+        painter.setPen(QtGui.QColor(t["border"]))
+        painter.drawRect(rect)
+
+        font = QtGui.QFont(self.font())
+        font.setPointSizeF(max(7.0, font.pointSizeF() * 0.78))
+        painter.setFont(font)
+        metrics = QtGui.QFontMetrics(font)
+        muted = QtGui.QColor(t["text_muted"])
+
+        column = self.LEVEL_COLUMN
+        show_axis = rect.height() >= 48
+        axis = self.AXIS_HEIGHT if show_axis else 0
+        plot = QtCore.QRectF(rect.left() + 2, rect.top() + 2,
+                             rect.width() - column - 6, rect.height() - axis - 3)
+        span = -FLOOR_DBFS
+
+        def y_for(db: float) -> float:
+            fraction = min(1.0, max(0.0, (db - FLOOR_DBFS) / span))
+            return plot.bottom() - fraction * plot.height()
+
+        # Magnitude rules.
+        painter.setPen(QtGui.QColor(t["border"]))
+        for db in (-20, -40, -60):
+            y = y_for(db)
+            painter.drawLine(QtCore.QPointF(plot.left(), y),
+                             QtCore.QPointF(plot.right(), y))
+        if plot.height() >= 36:
+            painter.setPen(muted)
+            for db in (-20, -60):
+                painter.drawText(QtCore.QPointF(plot.left() + 1,
+                                                y_for(db) - 1), f"{db}")
+
+        # Bars.
+        bars = len(self._levels)
+        if bars:
+            orange = QtGui.QColor(t["spectrum"])
+            cap = QtGui.QColor(t["spectrum_peak"])
+            step = plot.width() / bars
+            gap = 1.0 if step >= 3 else 0.0
+            for index, level in enumerate(self._levels):
+                x = plot.left() + index * step
+                top = y_for(level)
+                if top < plot.bottom() - 0.5:
+                    painter.fillRect(QtCore.QRectF(x, top, step - gap,
+                                                   plot.bottom() - top), orange)
+                if index < len(self._peaks) and self._peaks[index] > FLOOR_DBFS + 0.5:
+                    py = y_for(self._peaks[index])
+                    painter.fillRect(QtCore.QRectF(x, py - 1, step - gap, 2), cap)
+
+        # Frequency axis.
+        if show_axis and len(self._edges) > 1:
+            painter.setPen(muted)
+            baseline = rect.bottom() - 2
+            last_right = -1e9
+            ticks = [hz for hz in (100, 1000, 4000) if
+                     self._edges[0] <= hz <= self._edges[-1]]
+            ticks.append(self._edges[-1])
+            for hz in ticks:
+                x = self._x_for_hz(hz, plot.left(), plot.width())
+                label = _format_hz(round(hz / 100) * 100 if hz >= 1000 else hz)
+                width = metrics.horizontalAdvance(label)
+                left = min(x - width / 2, plot.right() - width)
+                left = max(left, plot.left())
+                if left <= last_right + 4:
+                    continue
+                painter.drawLine(QtCore.QPointF(x, plot.bottom()),
+                                 QtCore.QPointF(x, plot.bottom() + 2))
+                painter.drawText(QtCore.QPointF(left, baseline), label)
+                last_right = left + width
+        elif show_axis:
+            painter.setPen(muted)
+            painter.drawText(QtCore.QRectF(plot.left(), plot.bottom(),
+                                           plot.width(), axis),
+                             QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
+                             "frequency (no input)")
+
+        # Gain readout and clipping, top right of the plot.
+        if self._rms > 0 or self._peak > 0 or self._clip_count:
+            def db_text(fraction: float) -> str:
+                return "<-60" if fraction <= 0 else f"{fraction * 60 - 60:.0f}"
+
+            text = f"pk {db_text(self._peak)}  rms {db_text(self._rms)} dBFS"
+            painter.setPen(QtGui.QColor(t["text"]))
+            box = QtCore.QRectF(plot.left(), plot.top(), plot.width() - 2,
+                                metrics.height())
+            painter.drawText(box, QtCore.Qt.AlignRight | QtCore.Qt.AlignTop, text)
+            if self._clip_count:
+                painter.setPen(QtGui.QColor(t["error"]))
+                box.translate(0, metrics.height())
+                painter.drawText(box, QtCore.Qt.AlignRight | QtCore.Qt.AlignTop,
+                                 f"CLIP {self._clip_count}")
+
+        # Level column: -60..0 dBFS bottom to top, the old bar meter's job.
+        col = QtCore.QRectF(rect.right() - column - 1, rect.top() + 2,
+                            column, rect.height() - 4)
+        painter.setPen(QtGui.QColor(t["border"]))
+        painter.drawRect(col)
+        lamp = 5.0
+        meter = QtCore.QRectF(col.left() + 1, col.top() + lamp + 1,
+                              col.width() - 1, col.height() - lamp - 1)
+        if self._rms > 0:
+            gradient = QtGui.QLinearGradient(0, meter.bottom(), 0, meter.top())
+            gradient.setColorAt(0.0, QtGui.QColor(t["ok"]))
+            gradient.setColorAt(0.75, QtGui.QColor(t["warning"]))
+            gradient.setColorAt(0.95, QtGui.QColor(t["error"]))
+            height = meter.height() * self._rms
+            painter.fillRect(QtCore.QRectF(meter.left(), meter.bottom() - height,
+                                           meter.width(), height),
+                             QtGui.QBrush(gradient))
+        painter.setPen(muted)
+        for db in (-40, -20, -12, -6):
+            y = meter.bottom() - meter.height() * ((db + 60) / 60.0)
+            painter.drawLine(QtCore.QPointF(meter.left(), y),
+                             QtCore.QPointF(meter.left() + 3, y))
+        if self._peak > 0:
+            y = meter.bottom() - meter.height() * self._peak
+            painter.setPen(QtGui.QPen(QtGui.QColor(t["text"]), 2))
+            painter.drawLine(QtCore.QPointF(meter.left(), y),
+                             QtCore.QPointF(meter.right(), y))
+        lamp_colour = (QtGui.QColor(t["error"]) if self._clipped
+                       else QtGui.QColor(t["surface_raised"]))
+        painter.fillRect(QtCore.QRectF(col.left() + 1, col.top() + 1,
+                                       col.width() - 1, lamp), lamp_colour)
         painter.end()
 
 

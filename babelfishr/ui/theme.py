@@ -48,6 +48,9 @@ CONSOLE = {
     "disabled_text": "#7A898E",
     "statusbar": "#131B1E",
     "selected_bg": "#11282C",      # a faint turquoise tint, not a fill
+    # The live INPUT spectrum: orange bars, a paler cap for the held peak.
+    "spectrum": "#FF9F43",         # 9.1:1 on the pane
+    "spectrum_peak": "#FFD08A",
 }
 
 DAYLIGHT = {
@@ -66,6 +69,8 @@ DAYLIGHT = {
     "disabled_text": "#6B7A80",
     "statusbar": "#E9EDEE",
     "selected_bg": "#DCF1F2",
+    "spectrum": "#B34E00",         # 4.8:1 on the window: a burnt orange
+    "spectrum_peak": "#7A3500",
 }
 
 #: Status colours. Every use is paired with a text label or symbol.

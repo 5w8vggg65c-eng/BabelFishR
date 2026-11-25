@@ -1743,7 +1743,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                        reading.clipped, reading.clip_count)
                 self.input_panel.set_reading(
                     reading.rms_fraction, reading.peak_fraction,
-                    reading.clipped, reading.clip_count)
+                    reading.clipped, reading.clip_count,
+                    spectrum=getattr(reading, "spectrum", None))
                 self.clip_label.setText(
                     f"⚠ clipping ({reading.clip_count})" if reading.clip_count else "")
             elif event.kind == "state":
