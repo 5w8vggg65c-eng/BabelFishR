@@ -272,7 +272,10 @@ def test_clear_stops_the_read_in_progress(widget, tmp_path, monkeypatch):
 
 
 def test_shutdown_and_deletion_end_the_worker(qt_app, tmp_path, monkeypatch):
-    fake = _SlowCompute()
+    # Long reads (20 s if never cancelled): late in a full suite run the GUI
+    # thread reached the deletion about 2.4 s after the read began, so a 2 s
+    # read could finish first. Measured: cancelled at chunk 477 of 4000.
+    fake = _SlowCompute(chunks=4000)
     monkeypatch.setattr(waveform, "compute_envelope", fake)
 
     first = RecordingWaveform()
