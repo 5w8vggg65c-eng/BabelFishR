@@ -712,17 +712,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if not self._sequence_conversation or self._store_gone():
             return None
+        # Page by page to the end of the Session - a page boundary is not
+        # the end. Bounded by the Session's own rows: only rows that name a
+        # recording are read, and a missing file costs one stat.
         after = tx_id
-        for _ in range(20):                     # bounded: pages of 50
+        while True:
             rows = self.app.store.newer_in_conversation(
-                self._sequence_conversation, after)
+                self._sequence_conversation, after, limit=500, with_audio=True)
             if not rows:
                 return None
             for row in rows:
                 if original_present(row):
                     return row.id, row.audio_path
             after = rows[-1].id
-        return None
 
     def _sequence_live(self) -> bool:
         """The Session being played is the one monitoring records into now."""

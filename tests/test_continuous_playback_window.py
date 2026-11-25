@@ -334,3 +334,25 @@ def test_the_bar_is_named_and_offers_one_pause_and_a_startable_new_row(rig):
     w.playback_stop_button.click()
     pump(rig.qt, 20)
     assert rig.controller.owner is None and not w.sequence.active
+
+
+def test_a_long_run_of_missing_originals_is_crossed(rig):
+    """1,001 newer rows whose files are gone, then a playable one: the scan
+    goes past every page boundary to it (it used to give up after 20 pages
+    of 50 and end the sequence)."""
+    import time as _time
+
+    for i in range(1001):
+        rig.add(f"gone{i:04d}", "a-run2", 100 + i * 0.001, file=False)
+    rig.add("after-the-gap", "a-run2", 200)
+    w = rig.window
+    w._sequence_conversation = rig.a.id
+    started = _time.monotonic()
+    assert w._next_original_after("t4") == ("after-the-gap", rig.path("after-the-gap"))
+    assert _time.monotonic() - started < 2.0, "the scan stalled the window"
+    assert w._next_original_after("after-the-gap") is None      # the real end
+    # And through the window: t4 finishes, the gap is crossed.
+    w.timeline.bubble("t4").play_button.click()
+    pump(rig.qt)
+    rig.finish()
+    assert rig.loads()[-1] == rig.path("after-the-gap")
