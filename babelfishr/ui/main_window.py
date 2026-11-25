@@ -1296,17 +1296,28 @@ class MainWindow(QtWidgets.QMainWindow):
         box.setStandardButtons(QtWidgets.QMessageBox.Apply | QtWidgets.QMessageBox.Close)
         box.button(QtWidgets.QMessageBox.Apply).setText("Use suggested threshold")
         if box.exec() == QtWidgets.QMessageBox.Apply:
-            self.app.config.detector.mode = "fixed"
-            self.app.config.detector.threshold_dbfs = result.recommended_threshold_dbfs
-            self.status.showMessage(
-                f"Detection threshold set to {result.recommended_threshold_dbfs} dBFS",
-                8000)
+            self._apply_calibration(result.recommended_threshold_dbfs)
+
+    def _apply_calibration(self, threshold_dbfs: float) -> None:
+        """The operator chose the suggested threshold: use it and save it, so
+        it is still in force after a relaunch (it used to change only the
+        running copy). Nothing else in the settings changes."""
+        self.app.config.detector.mode = "fixed"
+        self.app.config.detector.threshold_dbfs = threshold_dbfs
+        try:
+            self.app.config.save()
+            saved = ""
+        except OSError as exc:  # noqa: BLE001 - say so; the running value stands
+            saved = f" (not saved: {exc})"
+        self.status.showMessage(
+            f"Detection threshold set to {threshold_dbfs} dBFS{saved}", 8000)
 
     # -- events ----------------------------------------------------------
     def _drain_events(self) -> None:
         if self._shutdown_complete or self._store_off_limits:
             return                     # the store is closing or closed
         touched = set()             # ids whose row a filtered view must re-read
+        badge_changed = False       # queue length or a continuing part changed
         for event in self.app.events.drain():
             if self._from_an_earlier_capture(event):
                 continue               # an ended run's meter/activity: not this input
@@ -1328,6 +1339,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 # Review view admits only what its own query admits.
                 if self._admit(event.payload, arrival=event.kind == "transmission"):
                     touched.add(event.payload.id)
+                badge_changed = True
             elif event.kind == "audio-status":
                 payload = event.payload or {}
                 kind = payload.get("kind", "")
@@ -1364,6 +1376,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # One query for the whole drained batch, not one per event.
             self._refresh_view(touched)
         self._refresh_context_lines()
+        if badge_changed:
+            self._refresh_state_badge()
 
     def _from_an_earlier_capture(self, event) -> bool:
         """A level reading or capture activity state (Listening, Receiving)
@@ -1558,6 +1572,7 @@ class MainWindow(QtWidgets.QMainWindow):
         state = getattr(self, "_state", PipelineState.IDLE)
         text, tone, symbol = STATE_TEXT.get(
             state, (str(state).title(), "idle", "\u25cb"))
+        text = self._badge_detail(state, text)
         # Symbol plus word, so the state is never carried by colour alone.
         self.state_badge.setText(f"{symbol} {text}")
         # On the teal band the state is read by its word (and symbol), in
@@ -1573,6 +1588,29 @@ class MainWindow(QtWidgets.QMainWindow):
                     " Segmenting is off: long activity reaches speech recognition "
                     "only when it ends.")
         self.state_badge.setToolTip(tip)
+
+    def _badge_detail(self, state, text: str) -> str:
+        """Say what the work is: Finishing (monitoring stopped, accepted
+        messages still being processed), how many messages wait behind the
+        one being processed, and whether audio is arriving continuously
+        (handed on in parts rather than ending in quiet)."""
+        working = (PipelineState.TRANSCRIBING, PipelineState.TRANSLATING)
+        if state in working:
+            pipelines = [p for p in (self.app.pipeline, self.app.standalone_pipeline)
+                         if p is not None]
+            pending = sum(p.visible_pending for p in pipelines)
+            automatic = sum(getattr(p, "automatic_pending", 0) for p in pipelines)
+            if self.app.capture is None and automatic:
+                # A stopped run's messages; a manual job alone stays
+                # "Transcribing".
+                text = "Finishing"
+            if pending > 1:
+                text += f" \u00b7 {pending - 1} queued"
+        elif state is PipelineState.RECEIVING:
+            capture = self.app.capture
+            if capture is not None and getattr(capture.detector, "continuing", False):
+                text += " \u00b7 continuous"
+        return text
 
     def _refresh_mode_badge(self) -> None:
         """Label the operating-mode control and mark the current choice.
@@ -1746,6 +1784,14 @@ class MainWindow(QtWidgets.QMainWindow):
         tx = self.app.store.get_transmission(tx_id)
         if tx is None or not tx.audio_path:
             QtWidgets.QMessageBox.warning(self, "Export", "No audio for this clip.")
+            return
+        if not pathlib.Path(tx.audio_path).exists():
+            # Removed outside BabelFishR (e.g. a cleanup): say so plainly;
+            # the transcript and translation are kept.
+            QtWidgets.QMessageBox.warning(
+                self, "Export",
+                "The original recording is no longer on disk, so it cannot be "
+                "exported. The transcript and translation are kept.")
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Export clip", f"{tx.id}.wav", "WAV files (*.wav)")

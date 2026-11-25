@@ -527,6 +527,12 @@ class RadioActivityDetector(TransmissionDetector):
         return self._open
 
     @property
+    def continuing(self) -> bool:
+        """The open message continues parts already handed on: the audio has
+        not gone quiet for the message-ending time."""
+        return self._open and self._continues_previous
+
+    @property
     def noise_floor_dbfs(self) -> float:
         return self.floor.value
 

@@ -197,7 +197,8 @@ def test_the_stop_button_shows_finishing_and_posts_each_result(qt_app, config, s
         window._stop_monitoring()                     # the button's handler
         message = window.status.currentMessage().lower()
         assert "finishing" in message and "its session" in message
-        assert "Transcribing" in window.state_badge.text(), window.state_badge.text()
+        # Stopped with accepted work: "Finishing", and how many wait behind.
+        assert "Finishing" in window.state_badge.text(), window.state_badge.text()
         asr.release.set()
         assert _wait(lambda: _all_complete(store, session.id, 2))
         for _ in range(5):

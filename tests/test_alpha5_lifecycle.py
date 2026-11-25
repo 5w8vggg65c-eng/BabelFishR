@@ -503,7 +503,9 @@ def _stop_monitoring_body(qt_app, app, window, engine, timer, ticks, wav):
     assert app.session is None and app.capture is None
     assert app.standalone_pipeline is not None
     assert app.standalone_pipeline.pending == 1, "the held job was dropped"
-    assert "Transcribing" in window.state_badge.text(), window.state_badge.text()
+    # The stopped run's held message is still being processed: "Finishing"
+    # (2026-11-25: the badge tells finishing work from live transcribing).
+    assert "Finishing" in window.state_badge.text(), window.state_badge.text()
     assert "finishing" in window.status.currentMessage().lower()
     assert window.start_button.text() == "Start monitoring"
 

@@ -616,6 +616,14 @@ class ProcessingPipeline:
                        or self._origin.get(tx_id) is None)
 
     @property
+    def automatic_pending(self) -> int:
+        """Accepted work that came from a monitoring run (not Retry /
+        Transcribe anyway)."""
+        with self._active_lock:
+            return sum(1 for tx_id in self._in_flight
+                       if self._origin.get(tx_id) is not None)
+
+    @property
     def has_manual_work(self) -> bool:
         with self._active_lock:
             return any(self._origin.get(tx_id) is None for tx_id in self._in_flight)

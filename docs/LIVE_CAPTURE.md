@@ -42,8 +42,9 @@ already heard:
 - Every message accepted up to Stop is transcribed and translated as
   usual - the one being processed, any queued behind it, and that last
   open one - and each appears in its own session as it completes. No Retry
-  is needed. Until then the window shows **Transcribing** and says how many
-  recordings are still finishing.
+  is needed. Until then the activity indicator shows **Finishing** (with how
+  many are queued behind the one being processed) and the status line says
+  how many recordings are still finishing.
 - Starting again straight away is allowed: new messages queue behind the
   stopped run's unfinished ones, which finish first; each run's messages
   stay in their own session.
@@ -61,6 +62,22 @@ flatness and distribution measurements are still recorded. Messages saved by
 an earlier version keep the stored value (and exports include it), but the
 window shows no badge for it. Demodulating or decoding RF belongs to KingFishR;
 BabelFishR takes already-decoded ordinary audio.
+
+## What the activity indicator says
+
+- **Transcribing · 2 queued**: one message is being processed and two more
+  wait behind it, in order.
+- **Finishing**: monitoring has stopped and the messages accepted before
+  Stop are still being processed.
+- **Audio active (est.) · continuous**: the input has not been quiet for the
+  message-ending time, so the audio is being handed on in parts (about
+  `segment_seconds` each) while it continues. If this shows during what
+  should be quiet, the input's quiet is above the close threshold - check
+  the level meter and clipping, or recalibrate.
+
+**Calibrate** measures the idle input; choosing **Use suggested threshold**
+now saves that threshold (mode fixed) to the settings, so it is still used
+after a relaunch. Nothing else in the settings changes.
 
 ## Receiver status versus audio activity
 
