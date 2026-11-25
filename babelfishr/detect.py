@@ -349,8 +349,10 @@ class TransmissionDetector(abc.ABC):
         """Consume a block; return transmissions completed by it."""
 
     @abc.abstractmethod
-    def flush(self) -> List[DetectedTransmission]:
-        """End of stream: emit anything still open."""
+    def flush(self, cutoff: bool = False) -> List[DetectedTransmission]:
+        """End of stream: emit anything still open. ``cutoff`` is the
+        operator's Stop: an open burst keeps every sample through the cutoff
+        (no hang wait, no tail trim, no minimum duration)."""
 
     @abc.abstractmethod
     def reset(self) -> None:
@@ -573,15 +575,25 @@ class RadioActivityDetector(TransmissionDetector):
             self._pending = self._pending[count * self.frame_size:]
         return out
 
-    def flush(self) -> List[DetectedTransmission]:
+    def flush(self, cutoff: bool = False) -> List[DetectedTransmission]:
         out: List[DetectedTransmission] = []
         if self._open:
             if self._pending.size:
                 self._buffer.append(self._pending.copy())
-            # Stop (or a break in the stream) ends the audio, not the
-            # transmitter: a recording already handed on in parts keeps its
-            # last samples rather than losing them to squelch-tail trimming.
-            found = self._close(keep_tail=self._continues_previous)
+            if cutoff:
+                # The operator pressed Stop with this burst still open: every
+                # sample up to the cutoff is kept - the partial last frame
+                # too - without waiting for the hang time, trimming back to
+                # the post-roll or a squelch tail, or dropping a burst
+                # shorter than min_duration. The gate had already opened on
+                # it; the input ended because the operator ended it.
+                found = self._close(cutoff=True)
+            else:
+                # The end of a file or a break in the stream ends the audio,
+                # not the transmitter: a recording already handed on in parts
+                # keeps its last samples rather than losing them to
+                # squelch-tail trimming.
+                found = self._close(keep_tail=self._continues_previous)
             if found is not None:
                 out.append(found)
         self._pending = np.zeros(0, dtype=np.float64)
@@ -729,8 +741,8 @@ class RadioActivityDetector(TransmissionDetector):
         self._last_active_samples = self._pre_samples
         self._continues_previous = False
 
-    def _close(self, truncated: bool = False,
-               keep_tail: bool = False) -> Optional[DetectedTransmission]:
+    def _close(self, truncated: bool = False, keep_tail: bool = False,
+               cutoff: bool = False) -> Optional[DetectedTransmission]:
         audio = np.concatenate(self._buffer) if self._buffer else np.zeros(0)
         stats = list(self._frame_stats)
         pre_samples = self._pre_samples
@@ -748,14 +760,14 @@ class RadioActivityDetector(TransmissionDetector):
         self._consecutive = 0
         self._last_active_samples = 0
 
-        # Cut the hang-time silence, keeping the configured post-roll.
-        keep = min(audio.size,
-                   last_active + int(self.settings.post_roll * self.sample_rate))
-        audio = audio[:keep]
-
         trimmed = 0.0
-        if self.settings.trim_squelch_tail and not keep_tail:
-            audio, trimmed = self._trim_tail(audio, stats)
+        if not cutoff:
+            # Cut the hang-time silence, keeping the configured post-roll.
+            keep = min(audio.size,
+                       last_active + int(self.settings.post_roll * self.sample_rate))
+            audio = audio[:keep]
+            if self.settings.trim_squelch_tail and not keep_tail:
+                audio, trimmed = self._trim_tail(audio, stats)
 
         duration = audio.size / float(self.sample_rate)
         # The signal runs from the end of the pre-roll to the last frame that
@@ -767,7 +779,8 @@ class RadioActivityDetector(TransmissionDetector):
         signal_start = max(0, pre_samples - self.settings.open_frames * self.frame_size)
         signal_duration = max(
             0.0, (min(last_active, audio.size) - signal_start) / float(self.sample_rate))
-        if signal_duration < self.settings.min_duration and not continues_previous:
+        if (signal_duration < self.settings.min_duration and not continues_previous
+                and not cutoff):
             # Crackle. A short last part of a segmented recording is not
             # crackle - it is the end of audio already partly handed on, and
             # dropping it would leave a hole in the recording.

@@ -763,11 +763,7 @@ class ProcessingPipeline:
     # -- worker ----------------------------------------------------------
     def _work(self, warm: bool = False) -> None:
         if warm:
-            warm_up = getattr(self.transcription, "warm_up", None)
-            if callable(warm_up):
-                started = _time.monotonic()
-                warm_up()
-                log.info("speech engine ready after %.2f s", _time.monotonic() - started)
+            self._preload()
         while self._running:
             try:
                 tx_id = self._queue.get(timeout=0.5)
@@ -795,6 +791,22 @@ class ProcessingPipeline:
             finally:
                 self._local.run = None
                 self._release(tx_id)
+
+    def _preload(self) -> None:
+        """Load the speech model on this worker before any message, through
+        the engine's optional preload() hook (not warm_up(), which is the
+        readiness self-test and transcribes a fixture). A failure is logged
+        and the worker carries on: the first real message reports it."""
+        preload = getattr(self.transcription, "preload", None)
+        if not callable(preload):
+            return
+        started = _time.monotonic()
+        try:
+            preload()
+        except Exception as exc:  # noqa: BLE001 - a worker must never die
+            log.warning("speech model not preloaded: %s", exc)
+            return
+        log.info("speech model loaded in %.2f s", _time.monotonic() - started)
 
     def _engine_gate(self, stage: str) -> None:
         """Refuse an engine call once this processor has been told to stop.
@@ -1086,6 +1098,8 @@ class CaptureService:
         #: lost - the WAV and the row exist - but they are pending, and the
         #: application must not report them finished.
         self.unprocessed: List[str] = []
+        #: Set by stop()/stop_async(): the run ends at the operator's cutoff.
+        self._stop_requested = False
         self.state = PipelineState.IDLE
         self.transmissions_captured = 0
         self._level_divisor = max(1, int(0.1 * source.sample_rate
@@ -1161,6 +1175,10 @@ class CaptureService:
         queue until the stopper closed the device - after the audio thread
         had already drained it - so post-Stop audio could reach the last
         recording."""
+        # An operator cutoff only if the input had not already ended on its
+        # own (a replay that reached its end keeps end-of-file rules).
+        if not getattr(self.source, "finished", False):
+            self._stop_requested = True
         close = getattr(self.source, "close_intake", None)
         if close is None:
             return
@@ -1269,7 +1287,9 @@ class CaptureService:
                 return
             self._finished = True
         self._drain_source()
-        for detected in self.detector.flush():
+        # A Stop request (the audio cutoff) keeps all of an open burst; the
+        # end of a file keeps the ordinary end-of-stream rules.
+        for detected in self.detector.flush(cutoff=self._stop_requested):
             self._capture(detected, tuning=getattr(self, "_block_tuning", None))
         self.safety.close()
         self._set_state(PipelineState.IDLE)

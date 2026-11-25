@@ -25,6 +25,7 @@ vocabulary in as an initial prompt.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import enum
 import pathlib
@@ -132,6 +133,10 @@ class FasterWhisperEngine(TranscriptionEngine):
         #: field so loading cannot depend on a shared cache being intact.
         self.model_path = model_path
         self._model: Any = None
+        #: One model load at a time: a preload on a worker of one processor
+        #: and a transcription on another (a retiring one, or several
+        #: workers) must not both construct the model.
+        self._load_lock = threading.Lock()
         self.version = f"faster-whisper/{model}"
 
     # -- availability ----------------------------------------------------
@@ -221,6 +226,12 @@ class FasterWhisperEngine(TranscriptionEngine):
     def _load(self):
         if self._model is not None:
             return self._model
+        with self._load_lock:
+            if self._model is not None:
+                return self._model
+            return self._load_locked()
+
+    def _load_locked(self):
         try:
             from faster_whisper import WhisperModel
         except Exception as exc:  # noqa: BLE001
@@ -264,14 +275,13 @@ class FasterWhisperEngine(TranscriptionEngine):
                  target, device, compute_type, self.local_files_only)
         return self._model
 
-    def warm_up(self) -> None:
-        """Load the model now rather than at the first message. Called on the
-        processing worker when monitoring starts; a failure is left for the
-        first transcription to report in the ordinary way."""
-        try:
-            self._load()
-        except Exception as exc:  # noqa: BLE001
-            log.info("speech model not preloaded: %s", exc)
+    def preload(self) -> None:
+        """Load the model ahead of the first message (the processing worker
+        calls this when monitoring starts). Only a load: no transcription and
+        no readiness claim - warm_up() remains the readiness self-test. Any
+        failure propagates; the caller logs it and the first real message
+        reports it in the ordinary way."""
+        self._load()
 
     def close(self) -> None:
         self._model = None

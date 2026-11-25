@@ -329,31 +329,204 @@ def test_each_message_logs_its_timing_but_no_words(config, store, caplog):
         app.close()
 
 
-class _WarmASR(MockTranscriptionEngine):
-    id = "test-warm-asr"
-    name = "warm-asr"
+class _PreloadASR(MockTranscriptionEngine):
+    id = "test-preload-asr"
+    name = "preload-asr"
 
-    def __init__(self):
+    def __init__(self, fail_preload=False):
         super().__init__()
-        self.warmed_on = None
-        self.calls_before_warm = None
+        self.fail_preload = fail_preload    # not .fail: the mock's own switch
+        self.preloaded_on = None
+        self.calls_before_preload = None
+        self.warm_up_calls = 0
 
-    def warm_up(self):
-        self.warmed_on = threading.current_thread().name
-        self.calls_before_warm = self.calls
+    def preload(self):
+        self.preloaded_on = threading.current_thread().name
+        self.calls_before_preload = self.calls
+        if self.fail_preload:
+            raise RuntimeError("model files unreadable (test)")
+
+    def warm_up(self):                       # the readiness self-test
+        self.warm_up_calls += 1
+        raise AssertionError("monitoring must not run the readiness self-test")
 
 
-def test_start_warms_the_speech_engine_on_the_worker_before_any_message(config, store):
-    asr = _WarmASR()
+def test_start_preloads_the_speech_model_on_the_worker(config, store):
+    asr = _PreloadASR()
     app, source, session = _start(config, store, asr=asr)
     try:
-        assert _wait(lambda: asr.warmed_on is not None, timeout=5.0)
-        assert asr.warmed_on.startswith("babelfishr-processing")
-        assert asr.calls_before_warm == 0
+        assert _wait(lambda: asr.preloaded_on is not None, timeout=5.0)
+        assert asr.preloaded_on.startswith("babelfishr-processing")
+        assert asr.calls_before_preload == 0 and asr.warm_up_calls == 0
     finally:
         app.stop_session()
         app.close()
 
+
+def test_a_failed_preload_still_processes_and_settles_the_work(config, store, caplog):
+    caplog.set_level(logging.WARNING, logger="babelfishr.pipeline")
+    asr = _PreloadASR(fail_preload=True)
+    app, source, session = _start(config, store, asr=asr)
+    try:
+        assert _wait(lambda: asr.preloaded_on is not None, timeout=5.0)
+        _push(source, [{"gap": 0.5}, VOICE, QUIET, VOICE, QUIET])
+        assert _wait(lambda: _all_complete(store, session.id, 2))
+        assert any("not preloaded" in r.getMessage() for r in caplog.records)
+        app.stop_session()
+        assert _wait(lambda: app.outstanding_work() == 0)
+        assert asr.warm_up_calls == 0
+    finally:
+        app.close()
+
+
+def _whisper_with_fake_library(tmp_path, monkeypatch, constructor):
+    """A real FasterWhisperEngine over a complete model folder, with the
+    faster_whisper module replaced by a stand-in (no weights here)."""
+    import sys
+    import types
+
+    from babelfishr.providers.whisper_local import FasterWhisperEngine, model_directory_for
+    from test_model_layout import _write_complete_model
+
+    fake = types.ModuleType("faster_whisper")
+    fake.WhisperModel = constructor
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake)
+    _write_complete_model(model_directory_for(tmp_path, "small"))
+    return FasterWhisperEngine(model="small", models_root=str(tmp_path),
+                               local_files_only=True)
+
+
+def test_concurrent_preloads_construct_the_model_once(tmp_path, monkeypatch):
+    built = []
+    gate = threading.Event()
+
+    class SlowModel:
+        def __init__(self, *args, **kwargs):
+            built.append(threading.current_thread().name)
+            gate.wait(5.0)
+
+    engine = _whisper_with_fake_library(tmp_path, monkeypatch, SlowModel)
+    threads = [threading.Thread(target=engine.preload, name=f"p{i}") for i in range(3)]
+    for t in threads:
+        t.start()
+    time.sleep(0.2)
+    gate.set()
+    for t in threads:
+        t.join(5.0)
+    assert len(built) == 1, f"the model was constructed {len(built)} times"
+    assert engine._model is not None
+
+
+def test_a_failed_preload_raises_and_claims_nothing(tmp_path, monkeypatch):
+    def broken(*args, **kwargs):
+        raise RuntimeError("bad weights (test)")
+
+    engine = _whisper_with_fake_library(tmp_path, monkeypatch, broken)
+    with pytest.raises(Exception):
+        engine.preload()
+    assert engine._model is None, "a failed load must not leave a model in place"
+
+
+def test_the_readiness_self_test_is_unchanged(tmp_path, monkeypatch):
+    """warm_up() still loads AND transcribes a fixture and returns the
+    result (Field Check relies on it); preload() does not replace it."""
+    from babelfishr.providers.base import TranscriptionResult
+
+    engine = _whisper_with_fake_library(tmp_path, monkeypatch, lambda *a, **k: object())
+    calls = []
+    result = TranscriptionResult(text="ok", language="en", language_confidence=1.0,
+                                 confidence=1.0, segments=[], engine="faster-whisper",
+                                 engine_version="test")
+    monkeypatch.setattr(engine, "transcribe",
+                        lambda audio, rate, **kw: (calls.append(audio.size), result)[1])
+    assert engine.warm_up() is result
+    assert calls, "the readiness self-test did not transcribe"
+
+
+# --- 5. the operator cutoff keeps every sample of an open burst, exactly -------
+
+def _q(x):
+    """As the WAV writer stores it: int16 of x * 32767, truncated."""
+    return (np.asarray(x) * 32767.0).astype("<i2")
+
+
+def _detect(audio, cutoff, **overrides):
+    import datetime as dt
+
+    from babelfishr.audio.source import AudioBlock
+    from babelfishr.detect import DetectorSettings, RadioActivityDetector
+
+    settings = DetectorSettings(mode="fixed", threshold_dbfs=-20.0, **overrides)
+    det = RadioActivityDetector(SR, settings)
+    t0 = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    emitted = []
+    for i in range(0, audio.size, 1000):            # blocks not frame-aligned
+        emitted += det.push(AudioBlock(samples=audio[i:i + 1000], sample_rate=SR,
+                                       timestamp=t0 + dt.timedelta(seconds=i / SR),
+                                       offset=i / SR))
+    return emitted, det.flush(cutoff=cutoff)
+
+
+def _loud(seconds, seed=1):
+    from babelfishr.testing import speech_like
+
+    x = speech_like(seconds, SR, level_dbfs=-14.0, seed=seed)
+    return x / np.max(np.abs(x)) * 0.7
+
+
+def _silence(seconds):
+    return np.zeros(int(seconds * SR))
+
+
+def test_cutoff_keeps_a_short_open_burst_and_its_partial_last_frame():
+    audio = np.concatenate([_silence(0.6), _loud(0.12)])
+    audio = audio[: audio.size - 337]               # ends mid-frame
+    emitted, flushed = _detect(audio, cutoff=True)
+    assert emitted == [] and len(flushed) == 1
+    (found,) = flushed
+    start = int(round(found.start_offset * SR))
+    assert np.array_equal(found.audio, audio[start:]), "samples before the cutoff were lost"
+    assert found.audio.size == audio.size - start
+    # Ordinary end-of-stream rules are unchanged: under min_duration, dropped.
+    assert _detect(audio, cutoff=False)[1] == []
+
+
+def test_cutoff_keeps_the_quiet_after_speech_without_waiting_or_trimming():
+    """Stop 0.6 s into the quiet after the last word (inside the hang): the
+    cutoff keeps all of it; the ordinary flush trims back to the post-roll."""
+    audio = np.concatenate([_silence(0.6), _loud(1.0), _silence(0.6)])
+    _, (cut,) = _detect(audio, cutoff=True, hang_time=1.0, post_roll=0.2)
+    start = int(round(cut.start_offset * SR))
+    assert np.array_equal(cut.audio, audio[start:])
+    assert cut.trimmed_tail == 0.0
+    _, (ordinary,) = _detect(audio, cutoff=False, hang_time=1.0, post_roll=0.2)
+    assert ordinary.audio.size < cut.audio.size
+
+
+def test_stop_saves_exactly_the_pre_cutoff_samples_of_an_open_burst(config, store):
+    """End to end through the app: the saved WAV is exactly the pushed audio
+    from the message start to the cutoff (as int16), including a short
+    burst under min_duration and a partial last block."""
+    app, source, session = _start(config, store)
+    try:
+        audio = np.concatenate([_silence(0.6), _loud(0.2)])[:-123]
+        for i in range(0, audio.size, 777):
+            source.push(audio[i:i + 777])
+        assert _wait(lambda: app.capture is not None and source._queue.empty()
+                     and app.capture.detector.open)
+        app.stop_session()
+        assert _wait(lambda: len(_rows(store, session.id)) == 1 and app.outstanding_work() == 0)
+        (tx,) = _rows(store, session.id)
+        saved, rate = read_wav(tx.audio_path)
+        expected = _q(audio)
+        got = np.round(saved * 32768.0).astype("<i2")
+        # The saved samples are the tail of the pushed audio, ending at the cutoff.
+        assert got.size <= expected.size
+        assert np.array_equal(got, expected[expected.size - got.size:]), (
+            "the saved recording is not the pre-cutoff audio, sample for sample")
+        assert got.size >= int(0.2 * SR) - 123        # the whole short burst
+    finally:
+        app.close()
 
 
 @pytest.fixture(scope="module")
@@ -486,6 +659,12 @@ def test_buffered_pre_stop_audio_survives_and_post_stop_audio_is_not_saved(
     # Finished, not left for Retry (2026-11-25): everything up to the cutoff.
     assert rows and all(t.state is ProcessingState.COMPLETE and t.transcript for t in rows)
     assert _marked_samples(saved) == 0, "audio delivered after Stop was saved"
+    # Exact: the saved samples are the delivered pre-Stop voice's last ones,
+    # as int16, ending where the voice ended (the cutoff).
+    got = np.round(saved * 32768.0).astype("<i2")
+    expected = _q(voice.astype(np.float32).astype(np.float64))
+    tail = min(got.size, expected.size)
+    assert np.array_equal(got[-tail:], expected[-tail:]), "pre-Stop samples differ"
     # Every voice sample delivered before Stop is in the recording (the
     # queued part reached the final flush through the drain).
     assert saved.size >= voice.size
