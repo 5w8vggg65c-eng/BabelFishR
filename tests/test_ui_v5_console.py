@@ -503,7 +503,7 @@ def test_the_waveform_marker_belongs_to_the_original_file_only(qt_app, console,
     backend.advance(500)
     pump(qt_app)
     assert not window.waveform.marker_visible, "the original's playhead followed another file"
-    assert window.selected_play_button.text() == "Play original"
+    assert window.selected_play_button.text() == "Play selected"
 
     controller.play(made[0].id, made[0].audio_path)
     backend.advance(500)
@@ -528,11 +528,13 @@ def test_play_original_replaces_the_decoded_audio_and_never_pauses_it(
     assert ("pause",) not in backend.calls, "Play original paused the decoded audio"
     assert controller.path == made[0].audio_path
     assert controller.state_for(made[0].id) == "playing"
-    assert window.selected_play_button.text() == "Pause"
-
-    window.selected_play_button.click()           # now it is the original: pause
+    # One pause action: the bar's Pause, not a second one on Play.
+    assert window.selected_play_button.text() == "Now playing"
+    assert not window.selected_play_button.isEnabled()
+    window.playback_pause_button.click()          # now it is the original: pause
     pump(qt_app)
     assert controller.state_for(made[0].id) == "paused"
+    assert window.playback_pause_button.text() == "Resume"
 
 
 def test_play_original_over_decoded_audio_keeps_control_with_a_real_style_player(
@@ -568,7 +570,7 @@ def test_play_original_over_decoded_audio_keeps_control_with_a_real_style_player
     assert controller.owner == made[0].id
     assert controller.path == made[0].audio_path
     assert controller.state_for(made[0].id) == "playing"
-    assert window.selected_play_button.text() == "Pause"
+    assert window.selected_play_button.text() == "Now playing"
 
     controller.stop()
     assert backend.state() == STOPPED, "the original could not be stopped"

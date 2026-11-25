@@ -354,12 +354,16 @@ L2-10. Look at a few message cards. *Good:* no yellow paragraphs, no
     Move one WAV of a throwaway message out of the Recordings folder in
     Finder, click the message: *Good:* **Audio missing**, Play original
     greyed. Put it back and choose **View → Refresh**: the check returns.
-L2-11. With nothing selected, the playback bar says **Select a transmission
-    to play.** and Play is greyed. Click a message: *Good:* nothing plays.
-    Press **Play original** on an older message. *Good:* it plays, then each
-    newer message of the same Session in turn, the playing card
-    highlighted; **■ Stop playback** stops it (Stop monitoring is separate),
-    **Pause/Resume** pauses. Browsing other messages meanwhile does not
+L2-11. The fixed **AUDIO PLAYBACK** bar, with nothing selected, says
+    **Select a transmission to play.** and **Play selected** is greyed.
+    Click a message: *Good:* nothing plays. Press **Play original** on an
+    older message (or select it and **Play selected**). *Good:* it plays,
+    then each newer message of the same Session in turn, the playing card
+    highlighted. With the playing message selected, Play reads **Now
+    playing** and is greyed: the bar's single **Pause/Resume** pauses, and
+    selecting another message makes **Play selected** start that one.
+    **■ Stop playback** stops the Session's playback (Stop monitoring is
+    separate). Browsing other messages meanwhile does not
     interrupt it. It stops after the newest message unless that Session is
     being monitored, in which case it waits for the next one until Stop.
 

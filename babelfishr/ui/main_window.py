@@ -601,7 +601,10 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setSpacing(6)
         title_row = QtWidgets.QHBoxLayout()
         title_row.setSpacing(24)
-        title = QtWidgets.QLabel("SELECTED AUDIO")
+        # The fixed playback controls, found in one place: Play the chosen
+        # transmission, Pause/Resume and Stop whatever is playing.
+        panel.setAccessibleName("Audio playback")
+        title = QtWidgets.QLabel("AUDIO PLAYBACK")
         title.setObjectName("selectedTitle")
         title_row.addWidget(title)
         self.selected_range = QtWidgets.QLabel("")
@@ -612,9 +615,10 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(title_row)
         buttons = QtWidgets.QHBoxLayout()
         buttons.setSpacing(12)
-        self.selected_play_button = QtWidgets.QPushButton("Play original")
+        self.selected_play_button = QtWidgets.QPushButton("Play selected")
         self.selected_play_button.setObjectName("primaryAction")
-        self.selected_play_button.setAccessibleName("Play the selected original recording")
+        self.selected_play_button.setAccessibleName(
+            "Play the selected transmission and the newer ones after it")
         self.selected_play_button.clicked.connect(self._play_selected)
         buttons.addWidget(self.selected_play_button)
         # Playback, whatever is playing: separate from Stop monitoring, and
@@ -629,8 +633,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.playback_stop_button.setObjectName("textAction")
         self.playback_stop_button.setAccessibleName("Stop playback")
         self.playback_stop_button.setToolTip(
-            "Stop playing, including continuing to newer transmissions. "
-            "Monitoring is not affected.")
+            "Stop playback for this Session, including continuing to newer "
+            "transmissions and waiting for new ones. Monitoring is not affected.")
         self.playback_stop_button.setEnabled(False)
         self.playback_stop_button.clicked.connect(self._stop_playback)
         buttons.addWidget(self.playback_stop_button)
@@ -2672,7 +2676,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.selected_range.setText("")
             self.selected_hint.setText("Select a transmission to play.")
             self.selected_bookmark_button.setChecked(False)
-            self.selected_play_button.setText("Play original")
+            self.selected_play_button.setText("Play selected")
             return
         from ..timefmt import span
 
@@ -2681,10 +2685,20 @@ class MainWindow(QtWidgets.QMainWindow):
         from .timeline import original_present
 
         present = original_present(tx)
-        self.selected_play_button.setEnabled(present)
-        self.selected_play_button.setText(
-            "Pause" if self._original_state(tx) == "playing"
-            and self.timeline.playback.controllable else "Play original")
+        # One action per situation: Pause/Resume belongs to the bar's own
+        # button. When the chosen row is the recording already playing (or
+        # paused), Play says so and does nothing; any other playable row
+        # can be started from here.
+        current = self._original_state(tx)
+        if current == "playing":
+            self.selected_play_button.setText("Now playing")
+            self.selected_play_button.setEnabled(False)
+        elif current == "paused":
+            self.selected_play_button.setText("Paused")
+            self.selected_play_button.setEnabled(False)
+        else:
+            self.selected_play_button.setText("Play selected")
+            self.selected_play_button.setEnabled(present)
         blocked = self.selected_bookmark_button.blockSignals(True)
         self.selected_bookmark_button.setChecked(bool(tx.bookmarked))
         self.selected_bookmark_button.setText(
@@ -2712,17 +2726,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # the ORIGINAL: pause/resume only when the original itself is what is
         # playing. The message's decoded audio (same id, other file) is
         # replaced by the original, never paused by this button.
-        controller = self.timeline.playback
-        if self._original_state(tx) == "playing":
-            controller.pause()
-        else:
-            # Resumes a paused original; otherwise starts it - and what
-            # follows it - replacing anything else playing, including this
-            # message's decoded audio.
-            if self._original_state(tx) == "paused":
-                controller.play(tx.id, tx.audio_path)
-            else:
-                self._start_sequence(tx.id, tx.audio_path)
+        if self._original_state(tx) in ("playing", "paused"):
+            return                      # already the current one: Pause/Resume is the bar's
+        # Starts it - and what follows it - replacing anything else playing,
+        # including this message's decoded audio.
+        self._start_sequence(tx.id, tx.audio_path)
         self._refresh_selected_panel()
 
     def _original_state(self, tx) -> str:

@@ -297,3 +297,40 @@ def test_an_external_player_never_cascades(qt_app, config, store, tmp_path):
         assert not made.window.sequence.active
     finally:
         made.close()
+
+
+# --- the fixed bar: AUDIO PLAYBACK, one action per situation -------------------------
+
+def test_the_bar_is_named_and_offers_one_pause_and_a_startable_new_row(rig):
+    from PySide6 import QtWidgets
+
+    w = rig.window
+    assert w.selected_panel.accessibleName() == "Audio playback"
+    titles = [l.text() for l in w.selected_panel.findChildren(QtWidgets.QLabel)]
+    assert "AUDIO PLAYBACK" in titles and "SELECTED AUDIO" not in titles
+    w.timeline.select("t0")
+    w.selected_play_button.click()
+    pump(rig.qt)
+    # The current recording is selected: Play is not a second Pause.
+    assert w.selected_play_button.text() == "Now playing"
+    assert not w.selected_play_button.isEnabled()
+    pauses = [b for b in w.selected_panel.findChildren(QtWidgets.QPushButton)
+              if b.isEnabled() and b.text() in ("Pause", "Resume")]
+    assert pauses == [w.playback_pause_button]
+    w.playback_pause_button.click()
+    pump(rig.qt)
+    assert w.selected_play_button.text() == "Paused"
+    assert w.playback_pause_button.text() == "Resume"
+    # Another playable row is still startable from the bar.
+    w.timeline.select("t3")
+    assert w.selected_play_button.text() == "Play selected"
+    assert w.selected_play_button.isEnabled()
+    w.selected_play_button.click()
+    pump(rig.qt)
+    assert rig.loads()[-1] == rig.path("t3") and rig.controller.owner == "t3"
+    # Stop ends the Session's playback whatever is selected.
+    w.timeline.select(None)
+    assert w.playback_stop_button.isEnabled()
+    w.playback_stop_button.click()
+    pump(rig.qt, 20)
+    assert rig.controller.owner is None and not w.sequence.active
