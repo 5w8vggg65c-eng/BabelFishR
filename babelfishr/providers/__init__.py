@@ -87,6 +87,7 @@ def _transcription_factories(config=None, mode=None
             beam_size=getattr(asr, "beam_size", 5),
             models_root=str(paths.models),
             model_path=getattr(asr, "model_path", None) or None,
+            shared_language_encode=bool(getattr(asr, "shared_language_encode", False)),
             # Downloads only ever happen in preparation mode.
             local_files_only=not mode.allows_downloads,
         ),
