@@ -739,6 +739,11 @@ class ProcessingPipeline:
         tx = self.store.get_transmission(tx_id)
         if tx is None:
             return False
+        if not tx.audio_path and "audio" in (
+                (tx.signal_metadata or {}).get("history_cleared") or {}):
+            # Clear Session History removed the recording: queuing would
+            # only fail.
+            return False
         if source_language:
             tx.source_language = source_language
             tx.source_language_mode = SourceLanguageMode.SPECIFIED

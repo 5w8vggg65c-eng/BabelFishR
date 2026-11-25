@@ -678,6 +678,11 @@ class Transmission:
     bookmarked: bool = False
     reviewed: bool = False
 
+    history_generation: int = 0
+    """Bumped each time Clear Session History changes this row. A copy
+    loaded before a clear carries the older number, so the store refuses to
+    save it and the window does not draw it (see Store.is_stale)."""
+
     # ---- derived ------------------------------------------------------
     @property
     def display_transcript(self) -> str:

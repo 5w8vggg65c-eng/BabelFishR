@@ -645,10 +645,11 @@ class TransmissionBubble(QtWidgets.QFrame):
         for bubble_menu in hooks("bubble_menu"):
             bubble_menu(self, menu)
         menu.addSeparator()
-        menu.addAction("Retry processing",
-                       lambda: self.retryRequested.emit(self.tx.id))
-        menu.addAction("Retry as speech in...",
-                       lambda: self.retryAsSpeechRequested.emit(self.tx.id))
+        self.retry_action = menu.addAction(
+            "Retry processing", lambda: self.retryRequested.emit(self.tx.id))
+        self.retry_speech_action = menu.addAction(
+            "Retry as speech in...",
+            lambda: self.retryAsSpeechRequested.emit(self.tx.id))
         menu.addAction("Export audio...", self._export)
         menu.addSeparator()
         # Two different things, named as two different things. Removing
@@ -779,6 +780,15 @@ class TransmissionBubble(QtWidgets.QFrame):
                 details.append(_escape(str(warning)))
         if tx.notes:
             details.append(f"Note: {_escape(tx.notes)}")
+        cleared = (tx.signal_metadata or {}).get("history_cleared") or {}
+        if "text" in cleared and not tx.display_transcript:
+            details.append("<i>Transcript and translation cleared (Clear Session "
+                           "History). Retry transcribes the recording again.</i>"
+                           if tx.audio_path else
+                           "<i>Transcript and translation cleared (Clear Session "
+                           "History).</i>")
+        if "audio" in cleared and not tx.audio_path:
+            details.append("<i>Recording removed (Clear Session History).</i>")
         if details:
             self.notes_label.setText("<br>".join(details))
             self.notes_label.show()
@@ -830,6 +840,15 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.decoded_action.setVisible(bool(tx.decoded_audio_path))
 
         self.play_action.setEnabled(bool(tx.audio_path))
+        # A recording removed by Clear Session History cannot be retried.
+        audio_cleared = not tx.audio_path and "audio" in (
+            (tx.signal_metadata or {}).get("history_cleared") or {})
+        for action in (getattr(self, "retry_action", None),
+                       getattr(self, "retry_speech_action", None)):
+            if action is not None:
+                action.setEnabled(not audio_cleared)
+        if audio_cleared:
+            self.retry_button.hide()
         # A removed message, when shown at all, says so and offers only the
         # way back; an ordinary one offers removal.
         self.remove_action.setVisible(not tx.hidden)

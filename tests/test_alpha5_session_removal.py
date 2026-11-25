@@ -1,8 +1,8 @@
 """Removing a whole Session tab: hide it with everything kept, or delete it.
 
 The choice is the operator's at the moment of removal, offered by name; the
-policy is not decided in code. General is refused with the reason, because
-whether it may ever be removed is a decision that has not been made. Every
+policy is not decided in code. General's tab is permanent and is refused
+with the reason; its contents can be emptied with Clear Session History. Every
 destructive test runs in a disposable temporary home.
 """
 
@@ -131,8 +131,11 @@ def test_general_cannot_be_removed_and_says_why(qt_app, config, store, wav,
                                                               store, wav)
     action = menu_action(window, tab_index_for(window, general), "Remove Session")
     assert not action.isEnabled()
-    assert "decision" in action.toolTip()
-    assert "decision" in app.conversation_removal_problem(general)
+    # The tab is permanent; emptying it is Clear Session History's job.
+    assert "Clear Session History" in action.toolTip()
+    assert "always kept" in app.conversation_removal_problem(general)
+    clear = menu_action(window, tab_index_for(window, general), "Clear Session History")
+    assert clear.isEnabled()
     with pytest.raises(ValueError):
         store.hide_conversation(general, hidden=True)
     with pytest.raises(ValueError):

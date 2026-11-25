@@ -1238,8 +1238,8 @@ class BabelFishRApp:
 
     # -- removing whole Sessions ---------------------------------------------
     GENERAL_REMOVAL_PENDING = (
-        "General is the default Session and is kept for now. Whether it can be "
-        "removed or cleared is a decision that has not been made yet.")
+        "General is the default Session and its tab is always kept. To empty "
+        "it, use Clear Session History\u2026 instead.")
 
     def conversation_removal_problem(self, conversation_id: str) -> str:
         """Why this Session cannot be removed right now, or "" when it can."""
@@ -1278,6 +1278,64 @@ class BabelFishRApp:
                                                             self.owned_roots())
         if report is not None and self._conversation_id == conversation_id:
             self.select_conversation(self.store.default_conversation().id)
+        return report
+
+    # -- clearing a Session's history (the Session stays) --------------------
+    def history_clear_problem(self, conversation_id: str) -> str:
+        """Why this Session's history cannot be cleared right now, or "".
+
+        Anything that may still write to one of its messages refuses it:
+        monitoring recording into it; a stopped run's capture still saving its
+        last message, or its end-of-run write not landed yet; a message saved
+        but not yet handed to a processor; or a message running or queued in
+        any processor (manual Retry or Transcribe anyway included).
+        """
+        conversation = self.store.get_conversation(conversation_id)
+        if conversation is None:
+            return "That Session no longer exists."
+        runs = set(self.store.session_ids_for_conversation(conversation_id))
+        if self.capture is not None and (
+                self._capture_conversation_id == conversation_id
+                or (self.session is not None and self.session.id in runs)):
+            return ("Monitoring is recording into this Session. Stop monitoring "
+                    "first, then clear it.")
+        self._reap()
+        lingering = self._lingering_capture
+        if lingering is not None and getattr(lingering.session, "id", None) in runs:
+            return ("The last message from Stop is still being saved into this "
+                    "Session. Wait a moment, then try again.")
+        self._reap_session_ends()
+        if any(end.session_id in runs for end in self._session_ends):
+            return ("The end of the last monitoring run is still being recorded "
+                    "in this Session. Wait a moment, then try again.")
+        ids = {tx.id: tx for tx in self.store.conversation_rows(conversation_id)}
+        if any(tx_id in ids for tx_id in self._unprocessed):
+            return ("A message in this Session is waiting to be processed. Wait "
+                    "for it to finish, then try again.")
+        if any(self._held_by_a_processor(tx_id) for tx_id in ids):
+            return ("A message in this Session is still being processed or is "
+                    "queued. Wait for it to finish, then try again.")
+        return ""
+
+    def history_inventory(self, conversation_id: str):
+        return self.store.history_inventory(conversation_id, self.owned_roots())
+
+    def clear_conversation_history(self, conversation_id: str, scope: str):
+        """Clear a Session's history in *scope*; keep the Session.
+
+        The check and the clear are one step with respect to manual
+        admission (Retry, Transcribe anyway hold the same claim), so nothing
+        can be queued for one of its messages in between. Raises
+        ProcessingBusy with the reason when refused.
+        """
+        with self._row_claims:
+            problem = self.history_clear_problem(conversation_id)
+            if problem:
+                raise ProcessingBusy(problem)
+            report = self.store.clear_conversation_history(
+                conversation_id, scope, self.owned_roots())
+        if report is not None:
+            self.events.publish("history-cleared", report)
         return report
 
     def retry_leftover_deletions(self):

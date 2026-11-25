@@ -282,7 +282,8 @@ monitoring**.
 tabs, name it `Throwaway`, and record one short message into it.
 
 38. Right-click the **General** tab. *Good:* **Remove Session…** is greyed out;
-    hovering it explains that General is kept for now.
+    hovering it says the General tab is always kept and points to **Clear
+    Session History…**, which is available.
 39. Right-click the **Throwaway** tab and choose **Remove Session…**. The box
     says how many runs and messages it holds and offers **Hide this Session
     (keep everything)** or **Delete permanently…**. Click **Cancel**. *Good:*
@@ -299,6 +300,40 @@ tabs, name it `Throwaway`, and record one short message into it.
     count. Click **Delete this Session permanently**.
     *Good:* the tab is gone; General is selected and unchanged; **View → Show
     hidden Sessions** does not show it. Quit and reopen: still gone.
+
+## L2. Times, Session Options and Clear Session History (new)
+
+Use a new `Throwaway2` Session with three or four short messages in it, at
+least one of them edited and one removed from view. Do not use a Session
+holding anything you want to keep.
+
+L2-1. **View → Show Times In → UTC**. *Good:* the TIME heading reads **TIME
+    (UTC)**; message headers, hover text and the SELECTED AUDIO range end in
+    **UTC**. Exports are unchanged. Quit and reopen: still UTC. Switch back to
+    **Local**.
+L2-2. Click **Session options** at the bottom. *Good:* a roomy window opens
+    over the transcript; the transcript, waveform and meters do not move or
+    shrink; there is no checkbox at its top left. **Timestamp time zone**
+    at its top changes the same setting as **View → Show Times In** (each
+    follows the other), and stays usable while monitoring. **Escape**,
+    **Close** and the button each close it. Drag its corner to resize it.
+L2-3. Right-click **Throwaway2** → **Clear Session History…**. *Good:* one
+    window with **Transcripts only**, **Audio files only** and **Both**,
+    each listing what is deleted and what is kept with this Session's
+    counts. **Clear permanently** stays greyed until the confirmation box is
+    ticked; picking another scope unticks it. Click **Cancel**. *Good:*
+    nothing changes.
+L2-4. Repeat with **Transcripts only** and confirm. *Good:* the tab, name and
+    colour stay; each message keeps its time, note and bookmark and still
+    plays, and says its transcript was cleared. Searching for one of its
+    words finds nothing.
+L2-5. Repeat with **Audio files only**. *Good:* Play is unavailable, the
+    waveform says there is no recording, the messages say the recording was
+    removed. Other Sessions still play.
+L2-6. Repeat with **Both**. *Good:* the thread is empty, the tab stays, and a
+    new monitoring run into **Throwaway2** works as usual.
+L2-7. While monitoring into **Throwaway2**, try **Clear Session History…**.
+    *Good:* it is refused with the reason; clearing another Session works.
 
 ## M. Stopping and quitting while a transcription is still running (new)
 

@@ -27,7 +27,7 @@ from .models import (ContentClass, Conversation, ErrorInfo, ProcessingState,
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 #: Layout of the search index and its maintenance table (meta key
 #: ``fts_layout``). 1: the index alone, maintained by deleting and rewriting
@@ -147,6 +147,7 @@ CREATE TABLE IF NOT EXISTS transmissions (
     bookmarked                  INTEGER DEFAULT 0,
     reviewed                    INTEGER DEFAULT 0,
     hidden                      INTEGER DEFAULT 0,
+    history_generation          INTEGER DEFAULT 0,
     FOREIGN KEY (session_id) REFERENCES sessions (id)
 );
 
@@ -235,6 +236,8 @@ _ADDED_COLUMNS = (
     ("conversations", "color", "TEXT DEFAULT ''"),
     ("transmissions", "hidden", "INTEGER DEFAULT 0"),
     ("conversations", "hidden", "INTEGER DEFAULT 0"),
+    # Schema 7: Clear Session History's per-row generation (stale writers).
+    ("transmissions", "history_generation", "INTEGER DEFAULT 0"),
 )
 _BOOL_FIELDS = ("clipped", "bookmarked", "reviewed", "auto_processed", "hidden")
 
@@ -597,6 +600,11 @@ class Store:
                 # The operator deleted this message; a late result from a
                 # worker that still held it must not recreate the row.
                 log.info("refusing to save deleted transmission %s", tx.id)
+                return tx
+            if self._stale_against_store(tx):
+                # Loaded before Clear Session History changed the row: saving
+                # it would bring back cleared text or a removed recording.
+                log.info("refusing a stale save of %s (history cleared)", tx.id)
                 return tx
             self._conn.execute(
                 f"INSERT INTO transmissions ({columns}) VALUES ({placeholders}) "
@@ -1289,6 +1297,214 @@ class Store:
                     result.still[tx_id] = remaining
         return result
 
+    # ---- Clear Session History ---------------------------------------------
+    def _stale_against_store(self, tx: Transmission) -> bool:
+        row = self._conn.execute(
+            "SELECT history_generation FROM transmissions WHERE id = ?",
+            (tx.id,)).fetchone()
+        return row is not None and int(row[0] or 0) > int(tx.history_generation or 0)
+
+    def is_stale(self, tx: Transmission) -> bool:
+        """This copy of a message predates a Clear Session History of it."""
+        with self._lock:
+            return self._stale_against_store(tx)
+
+    def conversation_rows(self, conversation_id: str) -> List[Transmission]:
+        """Every message of one named Session, removed-from-view ones too."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT t.* FROM transmissions t JOIN sessions s ON s.id = t.session_id "
+                "WHERE s.conversation_id = ? ORDER BY t.started_at",
+                (conversation_id,)).fetchall()
+            return [_from_row(r) for r in rows]
+
+    def _audio_candidates(self, tx: Transmission) -> List[str]:
+        """The message's audio: original, processed and decoded/derived."""
+        out: List[str] = []
+        for path in (tx.audio_path, tx.processed_audio_path):
+            if path and path not in out:
+                out.append(path)
+        for attempt in tx.analysis_attempts:
+            if attempt.input_is_derived and attempt.input_path \
+                    and attempt.input_path not in out:
+                out.append(attempt.input_path)
+            for artifact in attempt.artifacts:
+                if artifact.kind in AUDIO_ARTIFACT_KINDS and artifact.path \
+                        and artifact.path not in out:
+                    out.append(artifact.path)
+        return out
+
+    def _sort_audio(self, path: str, roots, references: "RetainedReferences",
+                    clearing: Set[str]) -> Tuple[str, str]:
+        """("owned" | "external" | "shared", reason) for one audio file,
+        judged against rows *outside* the set being cleared."""
+        p = pathlib.Path(path)
+        if p.is_symlink():
+            return "external", "a link, never followed"
+        real = pathlib.Path(os.path.realpath(path))
+        if not any(_is_within(real, root) for root in roots):
+            return "external", "outside BabelFishR's Recordings folder"
+        others = references.by_key.get(_same_file_key(path), set()) - clearing
+        if others:
+            return "shared", f"still used by message {sorted(others)[0]}"
+        unreadable = references.unreadable - clearing
+        if unreadable:
+            return "shared", (f"the analysis record of message {sorted(unreadable)[0]} "
+                              f"could not be read, so it may still use this file")
+        return "owned", ""
+
+    def history_inventory(self, conversation_id: str,
+                          owned_roots: Sequence[str]) -> "HistoryInventory":
+        """What Clear Session History would touch, for each scope."""
+        inventory = HistoryInventory(conversation_id=conversation_id)
+        roots = [pathlib.Path(os.path.realpath(r)) for r in owned_roots if r]
+        with self._lock:
+            inventory.session_ids = self.session_ids_for_conversation(conversation_id)
+            rows = self.conversation_rows(conversation_id)
+            references = self.retained_references()
+            clearing = {tx.id for tx in rows}
+            for tx in rows:
+                inventory.transmission_ids.append(tx.id)
+                inventory.hidden += int(tx.hidden)
+                inventory.with_text += int(_has_text(tx))
+                inventory.corrections += int(bool(
+                    tx.transcript_correction or tx.translation_correction
+                    or (tx.signal_metadata or {}).get("superseded_corrections")))
+                inventory.notes += int(bool(tx.notes))
+                inventory.tags += int(bool(tx.tags))
+                inventory.bookmarks += int(tx.bookmarked)
+                for path in self._audio_candidates(tx):
+                    kind, _ = self._sort_audio(path, roots, references, clearing)
+                    if kind == "owned" and not os.path.lexists(path):
+                        kind = "missing"
+                    pile = getattr(inventory, kind)
+                    if path not in pile:
+                        pile.append(path)
+        return inventory
+
+    def clear_conversation_history(self, conversation_id: str, scope: str,
+                                   owned_roots: Sequence[str]
+                                   ) -> Optional["HistoryClearReport"]:
+        """Clear one named Session's history; the Session itself stays.
+
+        *scope* is ``"text"`` (recognised and translated text, corrections,
+        their earlier versions, segments and search entries - rows, audio,
+        notes, tags and bookmarks kept), ``"audio"`` (the app's own audio
+        files - rows and text kept) or ``"both"`` (every message, with its
+        audio, notes and bookmarks, deleted through the single-message path
+        so each leaves a tombstone).
+
+        Every message is included, removed-from-view ones too. Rows of other
+        Sessions are untouched, and a file one of them uses is kept. A file
+        outside the Recordings folder is never deleted. Changed rows get a
+        new history_generation in the same transaction, so a copy a writer
+        loaded earlier cannot be saved over them. A file that will not go
+        stays on its row (still playable, reported); running the clear again
+        retries it. The caller (the app) refuses while anything may still
+        write to the Session.
+        """
+        if scope not in HISTORY_SCOPES:
+            raise ValueError(f"unknown scope {scope!r}")
+        conversation = self.get_conversation(conversation_id)
+        if conversation is None:
+            return None
+        report = HistoryClearReport(conversation_id=conversation_id,
+                                    name=conversation.name, scope=scope)
+        if scope == "both":
+            with self._lock:
+                references = self.retained_references()
+                for tx in self.conversation_rows(conversation_id):
+                    one = self.delete_transmission_permanently(tx.id, owned_roots,
+                                                               references)
+                    if one is None:
+                        continue
+                    report.deleted.append(tx.id)
+                    report.removed += one.removed
+                    report.already_gone += one.already_gone
+                    report.failed += one.failed
+                    report.kept_external += one.inventory.external
+                    report.kept_shared += one.inventory.shared
+            return report
+
+        roots = [pathlib.Path(os.path.realpath(r)) for r in owned_roots if r]
+        with self._lock:
+            rows = self.conversation_rows(conversation_id)
+            clearing = {tx.id for tx in rows}
+            references = self.retained_references()
+            try:
+                for tx in rows:
+                    if scope == "text":
+                        changed = _clear_text(tx)
+                    else:
+                        changed = self._clear_audio(tx, roots, references,
+                                                    clearing, report)
+                    if not changed:
+                        continue
+                    tx.history_generation = int(tx.history_generation or 0) + 1
+                    payload = _to_row(tx)
+                    self._conn.execute(
+                        f"UPDATE transmissions SET "
+                        f"{', '.join(f'{k} = ?' for k in payload if k != 'id')} "
+                        f"WHERE id = ?",
+                        (*[v for k, v in payload.items() if k != "id"], tx.id))
+                    if self.fts_enabled:
+                        self._index_fts(tx)
+                    else:
+                        self._mark_index_stale()
+                    report.changed.append(tx.id)
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+            self._writes += 1
+        return report
+
+    def _clear_audio(self, tx: Transmission, roots, references, clearing,
+                     report: "HistoryClearReport") -> bool:
+        """Unlink this message's own audio and detach every audio reference
+        that is gone or not the app's to remove. One that fails to unlink
+        stays on the row."""
+        detach: Set[str] = set()
+        for path in self._audio_candidates(tx):
+            kind, reason = self._sort_audio(path, roots, references, clearing)
+            if kind == "external":
+                report.kept_external.append(path)
+                detach.add(path)
+                continue
+            if kind == "shared":
+                report.kept_shared.append(path)
+                report.reasons[path] = reason
+                detach.add(path)
+                continue
+            p = pathlib.Path(path)
+            try:
+                if p.is_dir():
+                    raise IsADirectoryError(f"not a regular file: {path}")
+                p.unlink()
+                report.removed.append(path)
+                detach.add(path)
+            except FileNotFoundError:
+                if path not in report.removed and path not in report.already_gone:
+                    report.already_gone.append(path)
+                detach.add(path)
+            except OSError as exc:
+                report.failed.append((path, f"{type(exc).__name__}: {exc}"))
+        if not detach:
+            return False
+        if tx.audio_path in detach:
+            tx.audio_path = None
+        if tx.processed_audio_path in detach:
+            tx.processed_audio_path = None
+        for attempt in tx.analysis_attempts:
+            if attempt.input_is_derived and attempt.input_path in detach:
+                attempt.input_path = ""
+            attempt.artifacts = [a for a in attempt.artifacts
+                                 if not (a.kind in AUDIO_ARTIFACT_KINDS
+                                         and a.path in detach)]
+        tx.signal_metadata = dict(tx.signal_metadata or {},
+                                  history_cleared=_cleared_marks(tx, "audio"))
+        return True
+
     # ---- search --------------------------------------------------------
     def search(self, query: str = "", *, session_id: Optional[str] = None,
                conversation_id: Optional[str] = None,
@@ -1516,6 +1732,90 @@ class ConversationReport:
     @property
     def complete(self) -> bool:
         return not self.failed
+
+
+#: Clear Session History's scopes.
+HISTORY_SCOPES = ("text", "audio", "both")
+#: Analysis artifacts that are audio (removed by an audio clear); logs and
+#: metadata files are not audio and stay.
+AUDIO_ARTIFACT_KINDS = ("decoded-audio", "derived-input")
+
+
+@dataclasses.dataclass
+class HistoryInventory:
+    """What Clear Session History would touch in one named Session."""
+
+    conversation_id: str
+    session_ids: List[str] = dataclasses.field(default_factory=list)
+    transmission_ids: List[str] = dataclasses.field(default_factory=list)
+    hidden: int = 0
+    with_text: int = 0
+    corrections: int = 0
+    notes: int = 0
+    tags: int = 0
+    bookmarks: int = 0
+    owned: List[str] = dataclasses.field(default_factory=list)
+    external: List[str] = dataclasses.field(default_factory=list)
+    shared: List[str] = dataclasses.field(default_factory=list)
+    #: Referenced, ours, but already not on disk.
+    missing: List[str] = dataclasses.field(default_factory=list)
+
+    @property
+    def messages(self) -> int:
+        return len(self.transmission_ids)
+
+
+@dataclasses.dataclass
+class HistoryClearReport:
+    """What Clear Session History actually did."""
+
+    conversation_id: str
+    name: str
+    scope: str
+    changed: List[str] = dataclasses.field(default_factory=list)
+    deleted: List[str] = dataclasses.field(default_factory=list)
+    removed: List[str] = dataclasses.field(default_factory=list)
+    already_gone: List[str] = dataclasses.field(default_factory=list)
+    failed: List[Tuple[str, str]] = dataclasses.field(default_factory=list)
+    kept_external: List[str] = dataclasses.field(default_factory=list)
+    kept_shared: List[str] = dataclasses.field(default_factory=list)
+    reasons: Dict[str, str] = dataclasses.field(default_factory=dict)
+
+    @property
+    def complete(self) -> bool:
+        return not self.failed
+
+
+def _has_text(tx: Transmission) -> bool:
+    return bool(tx.transcript or tx.translation or tx.transcript_correction
+                or tx.translation_correction or tx.transcript_segments
+                or (tx.signal_metadata or {}).get("superseded_corrections"))
+
+
+def _cleared_marks(tx: Transmission, scope: str) -> Dict[str, str]:
+    marks = dict((tx.signal_metadata or {}).get("history_cleared") or {})
+    marks[scope] = iso(utcnow())
+    return marks
+
+
+def _clear_text(tx: Transmission) -> bool:
+    """Purge recognised and translated text, every correction and earlier
+    correction, and the timed segments. Notes, tags, bookmarks, the
+    recording and the processing record stay."""
+    if not _has_text(tx):
+        return False
+    tx.transcript = ""
+    tx.translation = ""
+    tx.transcript_correction = None
+    tx.translation_correction = None
+    tx.corrected_at = None
+    tx.transcript_segments = []
+    tx.transcript_confidence = None
+    metadata = dict(tx.signal_metadata or {})
+    metadata.pop("superseded_corrections", None)
+    metadata["history_cleared"] = _cleared_marks(tx, "text")
+    tx.signal_metadata = metadata
+    return True
 
 
 def _same_file_key(path: str) -> str:

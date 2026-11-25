@@ -457,6 +457,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setup_content.setLayout(self._build_controls())
         outer = QtWidgets.QVBoxLayout(self.setup_box)
         outer.setContentsMargins(10, 6, 10, 8)
+        # The timestamp zone: the same setting as View > Show Times In, kept
+        # in step both ways, and a display choice only - so, unlike the
+        # options below it, it stays available while monitoring.
+        zone_row = QtWidgets.QHBoxLayout()
+        zone_label = QtWidgets.QLabel("Timestamp time zone:")
+        self.time_zone_box = QtWidgets.QComboBox()
+        self.time_zone_box.addItem("Local", "local")
+        self.time_zone_box.addItem("UTC", "utc")
+        self.time_zone_box.setAccessibleName("Timestamp time zone")
+        self.time_zone_box.setToolTip(
+            "Show message times in this computer's local time or in UTC. "
+            "Stored times and exports are not changed. Also in View \u203a "
+            "Show Times In.")
+        zone_label.setBuddy(self.time_zone_box)
+        from ..timefmt import display_zone
+
+        self.time_zone_box.setCurrentIndex(self.time_zone_box.findData(display_zone()))
+        self.time_zone_box.currentIndexChanged.connect(
+            lambda _i: self._set_time_zone(self.time_zone_box.currentData()))
+        zone_row.addWidget(zone_label)
+        zone_row.addWidget(self.time_zone_box)
+        zone_row.addStretch(1)
+        outer.addLayout(zone_row)
         outer.addWidget(self.setup_content)
         from .session_options import SessionOptionsDialog
 
@@ -1274,6 +1297,11 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         for key, action in self.time_zone_actions.items():
             action.setChecked(key == zone)
+        box = getattr(self, "time_zone_box", None)
+        if box is not None and box.currentData() != zone:
+            box.blockSignals(True)
+            box.setCurrentIndex(box.findData(zone))
+            box.blockSignals(False)
         self.time_zone_actions[LOCAL].setText(zone_label() if zone == LOCAL else "Local")
         self.time_heading.setText("TIME (UTC)" if zone == UTC else "TIME")
         self.timeline.redraw_times()
@@ -1465,6 +1493,12 @@ class MainWindow(QtWidgets.QMainWindow):
         could never come back, and one that had just been removed from view
         was ignored before the view could be reconciled.
         """
+        if self.app.store.is_stale(tx):
+            # Queued before Clear Session History changed this row: draw the
+            # row as it is now, never the old text or recording path.
+            fresh = self.app.store.get_transmission(tx.id)
+            if fresh is not None:
+                tx = fresh
         if self._view_kind == "thread":
             if self._belongs_here(tx):
                 if arrival:
@@ -1793,11 +1827,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.app.retry(tx_id):
             self.status.showMessage("Retrying the saved recording...", 8000)
             return
+        tx = self.app.store.get_transmission(tx_id)
         QtWidgets.QMessageBox.information(
             self, "Retry",
             (self.app.processing_problem(tx_id)
              or "The recording could not be queued again.")
-            + "\n\nThe recording itself is safe.")
+            + ("\n\nThe recording itself is safe."
+               if tx is not None and tx.audio_path else ""))
 
     def _on_retry_as_speech(self, tx_id: str) -> None:
         """Re-run one message as speech in a language the operator chooses.
@@ -1943,6 +1979,11 @@ class MainWindow(QtWidgets.QMainWindow):
         reset.setEnabled(bool(conversation and conversation.color))
         reset.triggered.connect(lambda: self._color_session_tab(index, reset=True))
         menu.addSeparator()
+        clear = menu.addAction(self.CLEAR_HISTORY)
+        clear.setEnabled(conversation is not None)
+        clear.setToolTip("Delete this Session's transcripts, audio files, or "
+                         "both. The Session and its tab stay.")
+        clear.triggered.connect(lambda: self._clear_session_history(index))
         if conversation is not None and conversation.hidden:
             restore = menu.addAction("Restore Session")
             restore.triggered.connect(lambda: self._restore_session_tab(index))
@@ -1955,6 +1996,86 @@ class MainWindow(QtWidgets.QMainWindow):
                 remove.setToolTip(self.app.GENERAL_REMOVAL_PENDING)
             remove.triggered.connect(lambda: self._remove_session_tab(index))
         return menu
+
+    CLEAR_HISTORY = "Clear Session History\u2026"
+
+    def _run_clear_dialog(self, dialog) -> bool:
+        """Shown modally; tests substitute this (a modal box waits for a person)."""
+        return dialog.exec() == QtWidgets.QDialog.Accepted
+
+    def _clear_session_history(self, index: int) -> None:
+        from ..app import ProcessingBusy
+        from .clear_history import ClearHistoryDialog
+
+        conversation_id = self.session_tabs.tabData(index)
+        if not conversation_id or self._store_gone():
+            return
+        conversation = self.app.store.get_conversation(conversation_id)
+        if conversation is None:
+            return
+        problem = self.app.history_clear_problem(conversation_id)
+        if problem:
+            QtWidgets.QMessageBox.information(
+                self, "This Session's history cannot be cleared yet", problem)
+            return
+        inventory = self.app.history_inventory(conversation_id)
+        dialog = ClearHistoryDialog(conversation.name, inventory, self)
+        accepted = self._run_clear_dialog(dialog)
+        scope = dialog.scope()
+        dialog.deleteLater()
+        if not accepted or self._store_gone():
+            self.status.showMessage("Clear Session History cancelled. Nothing "
+                                    "was changed.", 6000)
+            return
+        # Nothing may be playing a file while it is unlinked.
+        owner = self.timeline.playback.owner
+        if scope != "text" and owner and owner in inventory.transmission_ids:
+            self.timeline.playback.stop()
+        try:
+            report = self.app.clear_conversation_history(conversation_id, scope)
+        except ProcessingBusy as exc:
+            QtWidgets.QMessageBox.information(
+                self, "This Session's history cannot be cleared yet", str(exc))
+            return
+        self._after_history_clear(report)
+        if report is None:
+            return
+        what = {"text": "transcripts", "audio": "audio files",
+                "both": "messages and audio"}[scope]
+        if report.complete:
+            self.status.showMessage(
+                f"\u201c{report.name}\u201d: {what} cleared "
+                f"({len(report.changed) + len(report.deleted)} message(s), "
+                f"{len(report.removed)} file(s) removed"
+                + (f", {len(report.already_gone)} already missing"
+                   if report.already_gone else "") + ").", 10000)
+        else:
+            failed = "\n".join(f"{p}\n    {why}" for p, why in report.failed)
+            QtWidgets.QMessageBox.warning(
+                self, "Clear not finished",
+                f"{len(report.failed)} file(s) in \u201c{report.name}\u201d could "
+                f"not be removed:\n\n{failed}\n\n"
+                + ("They stay attached to their messages and can still be "
+                   "played. Fix the cause and choose Clear Session History "
+                   "again to retry." if scope == "audio" else
+                   "They are recorded so you can try again from Tools \u203a "
+                   "Finish unfinished deletions."))
+
+    def _after_history_clear(self, report) -> None:
+        """Redraw from the store, so no bubble, waveform or selected panel
+        keeps a cleared text or a removed recording."""
+        if report is None or self._store_gone():
+            return
+        selected = self.timeline.selected_id
+        if report.conversation_id == self.app.conversation_id:
+            if self._view_kind == "thread":
+                self._reload_timeline()
+            else:
+                self._refresh_view(set(report.changed))
+            if selected in self.timeline.order():
+                self.timeline.select(selected)   # the same message, as it is now
+        self._on_selection_changed(self.timeline.selected_id)
+        self._refresh_session_tabs()
 
     HIDE_SESSION = "Hide this Session (keep everything)"
     DELETE_SESSION = "Delete permanently\u2026"

@@ -163,3 +163,42 @@ def test_the_selected_time_range_follows_the_zone(qt_app, config, store):
     finally:
         window.close()
         app.close()
+
+
+def test_session_options_has_the_same_setting_in_step_with_the_view_menu(
+        qt_app, config, store, tmp_path):
+    config.source_path = str(tmp_path / "settings.toml")
+    config.save()
+    app, window = _window(config, store)
+    try:
+        box = window.time_zone_box
+        assert box.window() is window.session_options_dialog
+        assert box.accessibleName() == "Timestamp time zone"
+        assert box.currentData() == "local"
+        # The dialog changes the menu, the heading and the saved setting ...
+        box.setCurrentIndex(box.findData("utc"))
+        assert window.time_zone_actions["utc"].isChecked()
+        assert window.time_heading.text() == "TIME (UTC)"
+        assert Config.load(config.source_path).display.timezone == "utc"
+        # ... and the menu changes the dialog.
+        window.time_zone_actions["local"].trigger()
+        assert box.currentData() == "local"
+        assert timefmt.display_zone() == timefmt.LOCAL
+        # A display choice: still available while monitoring.
+        window._set_controls_enabled(False)
+        assert box.isEnabled()
+        assert not window.quiet_seconds_box.isEnabled()
+        window._set_controls_enabled(True)
+    finally:
+        window.close()
+        app.close()
+
+
+def test_a_saved_utc_shows_in_the_dialog_at_launch(qt_app, config, store):
+    config.display.timezone = "utc"
+    app, window = _window(config, store)
+    try:
+        assert window.time_zone_box.currentData() == "utc"
+    finally:
+        window.close()
+        app.close()
