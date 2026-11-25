@@ -375,6 +375,40 @@ def is_processing_stopped(tx: Transmission) -> bool:
     return bool((tx.signal_metadata or {}).get(PROCESSING_STOPPED))
 
 
+@dataclasses.dataclass(frozen=True)
+class RunningJob:
+    """A message a worker holds right now."""
+
+    tx_id: str
+    stage: str
+    """``"waiting to start"``, ``"transcription"`` or ``"translation"``."""
+    seconds: float
+    """How long the worker has held it."""
+    manual: bool
+    """Retry / Transcribe anyway, rather than a monitoring run's own work."""
+
+
+@dataclasses.dataclass(frozen=True)
+class QueueSnapshot:
+    """What the processor holds, read in one go: the jobs running and the
+    ids waiting, in the exact order the workers will take them. Work of a
+    stopped run that only finishes unseen is left out, as in
+    ProcessingPipeline.visible_pending."""
+
+    running: tuple = ()
+    waiting: tuple = ()
+
+    def position(self, tx_id: str) -> Optional[int]:
+        """1 for the next to be taken, 2 after it...; 0 while running;
+        None when it is not held here."""
+        if any(job.tx_id == tx_id for job in self.running):
+            return 0
+        try:
+            return self.waiting.index(tx_id) + 1
+        except ValueError:
+            return None
+
+
 class _Abandon(Exception):
     """Internal: the item's monitoring run was stopped; stop at this stage."""
 
@@ -428,6 +462,9 @@ class ProcessingPipeline:
         #: Monitoring runs that have been stopped: their automatic work is
         #: not started, not saved and not published (see cancel_run).
         self._stopped_runs: set = set()
+        #: Ids a worker holds now -> [stage, monotonic start], for
+        #: queue_snapshot(). Guarded by the accounting lock.
+        self._running_jobs: Dict[str, list] = {}
         self._local = threading.local()
 
     # -- lifecycle -------------------------------------------------------
@@ -615,6 +652,36 @@ class ProcessingPipeline:
                        if self._origin.get(tx_id) not in self._stopped_runs
                        or self._origin.get(tx_id) is None)
 
+    def queue_snapshot(self) -> QueueSnapshot:
+        """Which message is being processed, at what stage and for how long,
+        and which wait behind it, in order - read from the queue itself, not
+        inferred from counts."""
+        now = _time.monotonic()
+        with self._active_lock:
+            with self._queue.mutex:
+                queued = list(self._queue.queue)
+            hidden = self._stopped_runs
+
+            def shown(tx_id):
+                origin = self._origin.get(tx_id)
+                return origin is None or origin not in hidden
+
+            running = tuple(
+                RunningJob(tx_id=tx_id, stage=stage, seconds=round(now - began, 2),
+                           manual=self._origin.get(tx_id) is None)
+                for tx_id, (stage, began) in self._running_jobs.items()
+                if shown(tx_id))
+            waiting = tuple(tx_id for tx_id in queued
+                            if tx_id is not None and tx_id in self._in_flight
+                            and tx_id not in self._running_jobs and shown(tx_id))
+        return QueueSnapshot(running=running, waiting=waiting)
+
+    def _set_stage(self, tx_id: str, stage: str) -> None:
+        with self._active_lock:
+            job = self._running_jobs.get(tx_id)
+            if job is not None:
+                job[0] = stage
+
     @property
     def automatic_pending(self) -> int:
         """Accepted work that came from a monitoring run (not Retry /
@@ -792,7 +859,8 @@ class ProcessingPipeline:
             with self._active_lock:
                 self._local.run = self._origin.get(tx_id)
                 accepted = self._accepted_at.get(tx_id)
-            began = _time.monotonic()
+                began = _time.monotonic()
+                self._running_jobs[tx_id] = ["waiting to start", began]
             try:
                 self._process(tx_id)
                 # Timing only, never words: where a message's time went.
@@ -803,6 +871,8 @@ class ProcessingPipeline:
                 log.exception("unhandled error processing %s", tx_id)
             finally:
                 self._local.run = None
+                with self._active_lock:
+                    self._running_jobs.pop(tx_id, None)
                 self._release(tx_id)
 
     def _preload(self) -> None:
@@ -865,6 +935,9 @@ class ProcessingPipeline:
                 self.store.save_transmission(tx)
                 self._publish("updated", tx)
                 return
+            except Exception as exc:  # noqa: BLE001 - an engine broke unexpectedly
+                self._fail_unexpectedly(tx, exc)
+                return
 
             if tx.state is not ProcessingState.FAILED:
                 tx.state = ProcessingState.COMPLETE
@@ -883,6 +956,29 @@ class ProcessingPipeline:
             # already saved and published above; this is only the activity
             # signal. The window resolves it against the actual capture.
             self._publish("state", PipelineState.COMPLETE)
+
+    def _fail_unexpectedly(self, tx: Transmission, exc: BaseException) -> None:
+        """An engine (or anything under it) raised something other than the
+        handled engine errors. This message is recorded as failed at the stage
+        it was in - never left showing Transcribing - and is retryable; the
+        worker carries on with the next message. Before, the worker's
+        catch-all logged it and moved on, but the row stayed TRANSCRIBING (or
+        TRANSLATING) for good, and was re-queued at the next launch."""
+        log.error("message %s: unexpected %s during processing",
+                  tx.id, type(exc).__name__, exc_info=exc)
+        if self.run_stopped(self._current_run()):
+            mark_processing_stopped(tx, self._current_run())
+            self.store.save_transmission(tx)
+            self._publish("updated", tx)
+            return
+        stage = {ProcessingState.TRANSLATING: "translation",
+                 ProcessingState.TRANSCRIBED: "translation"}.get(tx.state, "transcription")
+        message = f"{stage} failed unexpectedly ({type(exc).__name__}: {exc})"
+        tx.fail(stage, message)
+        self.store.save_transmission(tx)
+        self._publish("updated", tx)
+        self._publish("error", {"transmission": tx.id, "stage": stage,
+                                "message": message})
 
     def _load_audio(self, tx: Transmission):
         from .audio.wavefile import read_wav
@@ -904,6 +1000,7 @@ class ProcessingPipeline:
         self.store.save_transmission(tx)
         self._publish("updated", tx)
         self._publish("state", PipelineState.TRANSCRIBING)
+        self._set_stage(tx.id, "transcription")
 
         language = None
         if tx.source_language_mode is SourceLanguageMode.SPECIFIED:
@@ -1016,6 +1113,7 @@ class ProcessingPipeline:
         self.store.save_transmission(tx)
         self._publish("updated", tx)
         self._publish("state", PipelineState.TRANSLATING)
+        self._set_stage(tx.id, "translation")
 
         try:
             self._engine_gate("translation")
