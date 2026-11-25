@@ -1141,12 +1141,10 @@ class ProcessingPipeline:
             tx.translation = ""
             tx.translation_engine = ""
             return
-        metadata = tx.signal_metadata or {}
-        check = metadata.get("speech_check") or {}
-        if check.get("verdict") == "likely_noise" and not metadata.get("speech_confirmed"):
-            # Probably not speech: translating it would only add a confident
-            # sentence about noise. The transcript stays, marked for review.
-            # "Retry as speech in..." (retry with a source language) lifts this.
+        words = tx.shown_transcript
+        if not words.strip():
+            # Only published words can enter the translator. A retry can recover
+            # speech, while a stock sign-off on noise stays in the raw record.
             tx.translation = ""
             tx.translation_engine = ""
             return
@@ -1186,7 +1184,7 @@ class ProcessingPipeline:
             # Translate what is shown as traffic: an unsupported stock
             # sign-off at the end is not translated (models.withheld_ending).
             result = self.translation.translate(
-                tx.shown_transcript or tx.transcript, target,
+                words, target,
                 source_language=tx.source_language,
                 glossary=self.glossary.mapping(tx.source_language) or None,
                 do_not_translate=self.glossary.protected(tx.source_language) or None)

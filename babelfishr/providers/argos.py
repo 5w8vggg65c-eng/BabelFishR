@@ -4,9 +4,8 @@ Fully local: language pairs are downloaded once, then translation runs on the
 machine with nothing leaving it.  Quality is below a frontier model's, but for
 an operator who cannot send traffic to a third party it is the right default.
 
-Argos cannot be instructed, so the glossary is applied mechanically: protected
-terms are swapped for placeholders before translation and restored afterwards,
-and preferred renderings are substituted in the output.
+Protected terms are copied directly from the source. Argos translates the
+surrounding text, where preferred glossary renderings are also applied.
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .base import (EngineError, EngineUnavailable, PrivacyProfile,
                    TranslationEngine, TranslationResult)
-from .glossary import protect_terms, restore_terms
+from .glossary import translate_around_terms
 
 log = logging.getLogger(__name__)
 
@@ -568,10 +567,15 @@ class ArgosTranslateEngine(TranslationEngine):
                     f"'babelfishr languages --install {source_language} "
                     f"{target_language}'.")
 
-        protected, mapping = protect_terms(text, list(do_not_translate or ()))
+        def translate_span(span: str) -> str:
+            result = translate.translate(span, source_language, target_language)
+            for term, preferred in (glossary or {}).items():
+                if preferred:
+                    result = result.replace(term, preferred)
+            return result
+
         try:
-            translated = translate.translate(protected, source_language,
-                                             target_language)
+            translated = translate_around_terms(text, do_not_translate or (), translate_span)
         except FileNotFoundError as exc:
             # With the splitter pinned to the pack's own files, a missing one
             # surfaces here rather than as a download attempt.
@@ -581,11 +585,6 @@ class ArgosTranslateEngine(TranslationEngine):
                 f"Reinstall that pack in Online / Setup mode.") from exc
         except Exception as exc:  # noqa: BLE001
             raise EngineError(f"argos translation failed: {exc}") from exc
-
-        translated = restore_terms(translated, mapping)
-        for term, preferred in (glossary or {}).items():
-            if preferred:
-                translated = translated.replace(term, preferred)
 
         return TranslationResult(
             text=translated.strip(), source_language=source_language,

@@ -113,7 +113,8 @@ def test_session_actions_button_hide_and_one_delete_question(qt_app, config, sto
     defaults = []
 
     def box_exec(self):
-        defaults.append((self.windowTitle(), self.defaultButton().text().replace("&", ""),
+        # macOS sheets show the question in the body and omit the window title.
+        defaults.append((self.text(), self.defaultButton().text().replace("&", ""),
                          [b.text().replace("&", "") for b in self.buttons()]))
         return 0                                            # closed with Cancel
 
@@ -121,8 +122,9 @@ def test_session_actions_button_hide_and_one_delete_question(qt_app, config, sto
     menu_action(window, tab_index_for(window, ops), "Delete Session").trigger()
     pump(qt_app)
     assert len(defaults) == 1
-    title, default, labels = defaults[0]
-    assert "Ops" in title and default == "Cancel"
+    question, default, labels = defaults[0]
+    assert "Delete the Session “Ops” permanently?" == question
+    assert default == "Cancel"
     assert {"Hide Session", "Delete", "Cancel"} <= set(labels)
     assert snapshot(ops) == before and not store.get_conversation(ops).hidden
 

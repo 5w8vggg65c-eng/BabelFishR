@@ -453,7 +453,7 @@ def test_segmenting_never_overrides_a_shorter_archival_cap():
 def test_retry_as_speech_lifts_the_noise_hold_and_translates(config, store, tmp_path):
     """"Retry as speech in...": transcribed again in the chosen language and
     translated, which editing the text by hand would not do."""
-    transcription = ScriptedTranscription(result("Gracias por ver el video.", ratio=0.01,
+    transcription = ScriptedTranscription(result("Unidad dos, adelante.", ratio=0.01,
                                                  nsp=0.8, language="es"))
     translation = PairTranslation(pairs=(("es", "en"),))
     app, tx = run_one(config, store, tmp_path, transcription, translation,
@@ -477,6 +477,25 @@ def test_retry_as_speech_lifts_the_noise_hold_and_translates(config, store, tmp_
     app.correct(tx.id, transcript=tx.transcript, translation=tx.translation)
     tx = store.get_transmission(tx.id)
     assert not tx.needs_review and tx.id not in {t.id for t in store.review_queue()}
+
+
+@pytest.mark.parametrize("language", [None, "es"])
+def test_retry_on_unvoiced_signoff_keeps_the_guess_out_of_translation(
+        config, store, tmp_path, language):
+    transcription = ScriptedTranscription(result("Gracias por ver el video.", ratio=0.0,
+                                                 nsp=0.8, language="es"))
+    translation = PairTranslation(pairs=(("es", "en"),))
+    _, tx = run_one(config, store, tmp_path, transcription, translation, target_language="en")
+    _retry(config, store, transcription, translation, tx.id, source_language=language,
+           confirm_speech=True)
+    tx = store.get_transmission(tx.id)
+    assert tx.signal_metadata["speech_confirmed"]["source_language"] == language
+    assert tx.transcript == "Gracias por ver el video."
+    assert tx.guess_withheld and not tx.shown_transcript
+    assert not tx.translation and translation.calls == 0
+    pytest.importorskip("PySide6")
+    from babelfishr.ui.timeline import _speech_check_note
+    assert "new guess still lacks speech evidence" in _speech_check_note(tx)
 
 
 def test_retry_as_speech_fixes_a_wrong_automatic_language(config, store, tmp_path):

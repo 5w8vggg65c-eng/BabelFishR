@@ -614,7 +614,10 @@ class RadioActivityDetector(TransmissionDetector):
         if not self._open:
             self.floor.update(level, self.frame_dt)
 
-        loud = level >= self.open_threshold()
+        # The level meter clamps zero to its floor. A threshold there must
+        # still let a recording close between two signals.
+        above_floor = level > dbfs(0.0)
+        loud = above_floor and level >= self.open_threshold()
         self._consecutive = self._consecutive + 1 if loud else 0
 
         if not self._open:
@@ -641,7 +644,7 @@ class RadioActivityDetector(TransmissionDetector):
         if loud:
             self._active_frames += 1
 
-        holding = level >= self.close_threshold()
+        holding = above_floor and level >= self.close_threshold()
         if not holding:
             self._hang_remaining -= self.frame_dt
             if self._hang_remaining <= 0:

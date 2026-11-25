@@ -534,7 +534,7 @@ def test_a_note_reviewed_row_from_an_older_version_stays_consistent(qt_app, conf
     assert problem_reason(tx) == "Audio unintelligible"
 
 
-def test_retry_as_speech_confirmation_alone_shows_check(qt_app, config, store, tmp_path):
+def test_confirming_a_retry_still_withholds_an_unvoiced_signoff(qt_app, config, store, tmp_path):
     from babelfishr.ui.timeline import _transcript_caption
 
     tx = _held(store, tmp_path)
@@ -542,7 +542,7 @@ def test_retry_as_speech_confirmation_alone_shows_check(qt_app, config, store, t
                               speech_confirmed={"source_language": "es", "by": "operator"})
     assert _transcript_caption(tx)[0] == "TRANSCRIPT"
     from babelfishr.ui.timeline import problem_reason
-    assert problem_reason(tx) == ""          # the operator said it is speech
+    assert problem_reason(tx) == "Audio unintelligible"
     assert tx.needs_review
 
 

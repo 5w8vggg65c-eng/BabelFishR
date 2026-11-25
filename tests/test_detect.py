@@ -237,6 +237,15 @@ def test_silence_produces_nothing():
     assert detect_in_array(silence(5.0, SR), SR) == []
 
 
+def test_digital_silence_closes_the_gate_at_its_lowest_setting():
+    settings = DetectorSettings(mode="fixed", threshold_dbfs=-120.0, hang_time=0.25)
+    quiet = np.zeros(3 * SR)
+    assert detect_in_array(quiet, SR, settings) == []
+    tone = np.sin(2 * np.pi * 440 * np.arange(SR) / SR) * 0.1
+    parts = detect_in_array(np.concatenate([quiet, tone, quiet, tone, quiet]), SR, settings)
+    assert len(parts) == 2 and all(part.duration < 2 for part in parts)
+
+
 def test_settings_validation_rejects_nonsense():
     with pytest.raises(ValueError):
         DetectorSettings(open_margin_db=2.0, close_margin_db=8.0).validate()

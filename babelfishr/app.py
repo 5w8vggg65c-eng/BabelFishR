@@ -107,7 +107,6 @@ class _FinalCleanup:
             if self.running or self.done:
                 return
             self.started = True
-            self.error = None
             self._thread = threading.Thread(target=self._attempt, daemon=True,
                                             name="babelfishr-cleanup")
             self._thread.start()
@@ -115,6 +114,7 @@ class _FinalCleanup:
     def _attempt(self) -> None:
         try:
             self._run()
+            self.error = None
             self.done = True
         except Exception as exc:  # noqa: BLE001 - recorded, reported, retried
             log.exception("final cleanup failed")
@@ -169,7 +169,6 @@ class _SessionEnd:
         with self._lock:
             if self.running or self.done:
                 return
-            self.error = None
             self._thread = threading.Thread(target=self._attempt, daemon=True,
                                             name="babelfishr-session-end")
             self._thread.start()
@@ -190,6 +189,7 @@ class _SessionEnd:
                         # only as a stopped indicator on a row already shown.
                         self.events.publish("updated", tx, run=self.session_id)
             self.store.close_session(self.session_id, ended_at=self.ended_at)
+            self.error = None
             self.done = True
         except Exception as exc:  # noqa: BLE001 - recorded, reported, retried
             log.exception("recording the end of run %s failed", self.session_id)

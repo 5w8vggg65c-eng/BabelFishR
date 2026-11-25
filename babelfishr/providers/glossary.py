@@ -12,7 +12,7 @@ import dataclasses
 import json
 import pathlib
 import re
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
 #: Categories are informational, but they keep a long list navigable in the UI.
 CATEGORIES = ("callsign", "unit", "place", "terminology", "acronym",
@@ -122,12 +122,35 @@ class Glossary:
 _TOKEN = "␂{}␃"  # unlikely to appear in speech or be translated
 
 
-def protect_terms(text: str, terms: Sequence[str]) -> tuple:
-    """Replace protected terms with placeholders. Returns ``(text, mapping)``.
+def translate_around_terms(text: str, terms: Sequence[str],
+                           translate: Callable[[str], str]) -> str:
+    """Pass ordinary text to the translator and copy protected spans verbatim."""
+    alternatives = sorted({term for term in terms if term}, key=len, reverse=True)
+    if not alternatives:
+        return translate(text)
+    pattern = "(" + "|".join(re.escape(term) for term in alternatives) + ")"
+    parts = re.split(pattern, text, flags=re.IGNORECASE)
+    if len(parts) == 1:
+        return translate(text)
+    for index in range(0, len(parts), 2):
+        span = parts[index]
+        if any(char.isalnum() for char in span):
+            # A comma after a callsign, for example, belongs at that boundary
+            # even when the translation engine normalises a fragment's edges.
+            followed_by_term = index + 1 < len(parts)
+            start = re.match(r"[^\w\s¡¿]*\s*" if index else r"\s*", span).end()
+            end = re.search(r"\W*\Z" if followed_by_term else r"\s*\Z", span).start()
+            translated = translate(span[start:end]).strip()
+            if followed_by_term:
+                # Argos often completes a partial sentence with a period.
+                # The original separator follows here. Keep dotted initials.
+                translated = re.sub(r"(?<=[^\W\d_]{2})[.。]\Z", "", translated)
+            parts[index] = span[:start] + translated + span[end:]
+    return "".join(parts)
 
-    For engines that cannot be instructed (offline MT models), this is the only
-    reliable way to stop a callsign being "translated" into a word.
-    """
+
+def protect_terms(text: str, terms: Sequence[str]) -> tuple:
+    """Replace terms with placeholders for consumers that preserve the tokens."""
     mapping: Dict[str, str] = {}
     out = text
     for index, term in enumerate(sorted(set(terms), key=len, reverse=True)):

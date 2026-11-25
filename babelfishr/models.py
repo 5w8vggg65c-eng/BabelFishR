@@ -703,15 +703,14 @@ class Transmission:
         it, and is not shown as traffic: the speech check held it as noise,
         or it is a stock video sign-off the recorded evidence does not
         support. Worked out from what is stored, so older records are judged
-        the same way without rewriting them. An operator correction or a
-        "Retry as speech in..." confirmation always wins."""
+        the same way without rewriting them. A manual correction supplies
+        the words. Requesting another decode still requires voice evidence
+        for a stock sign-off."""
         if self.transcript_correction or not (self.transcript or "").strip():
             return False
         metadata = self.signal_metadata or {}
-        if metadata.get("speech_confirmed"):
-            return False
         check = metadata.get("speech_check") or {}
-        if check.get("verdict") == "likely_noise":
+        if check.get("verdict") == "likely_noise" and not metadata.get("speech_confirmed"):
             return True
         kind = stock_signoff(self.transcript)
         if not kind:
@@ -737,8 +736,6 @@ class Transmission:
         withheld; a sign-off within the audio with a confident engine (one a
         person said) is kept, and so is everything before it."""
         if self.transcript_correction or not self.transcript_segments:
-            return None
-        if (self.signal_metadata or {}).get("speech_confirmed"):
             return None
         segments = [s if isinstance(s, TranscriptSegment) else TranscriptSegment(
             float(s.get("start") or 0.0), float(s.get("end") or 0.0),
@@ -793,14 +790,12 @@ class Transmission:
         broadband noise (babelfishr.static) AND no credible speech - no
         transcript, or only a guess withheld as not speech, and the voice
         detector did not hear half a second of speech. An operator's
-        correction or "Retry as speech" confirmation always wins. Rows made
+        correction supplies the words directly. Rows made
         before the measurement existed carry none and are never called
         static."""
         if self.transcript_correction:
             return False
         metadata = self.signal_metadata or {}
-        if metadata.get("speech_confirmed"):
-            return False
         static = metadata.get("static_check") or {}
         if static.get("verdict") != "static":
             return False
@@ -816,9 +811,17 @@ class Transmission:
         unintelligible" for a withheld guess, never the raw guess. The raw
         engine text stays in ``transcript`` for Edit, tooltips and the
         forensic (JSON) export."""
+        words = self.shown_transcript
+        if words.strip():
+            return words
+        metadata = self.signal_metadata or {}
+        if metadata.get("processing_stopped") or "text" in (metadata.get("history_cleared") or {}):
+            return ""
         if self.is_static:
             return self.STATIC
-        return self.UNINTELLIGIBLE if self.guess_withheld else self.shown_transcript
+        if self.guess_withheld or self.state in (ProcessingState.COMPLETE, ProcessingState.SKIPPED):
+            return self.UNINTELLIGIBLE
+        return ""
 
     def published_text(self) -> str:
         """Every word a search may match: the published transcript and

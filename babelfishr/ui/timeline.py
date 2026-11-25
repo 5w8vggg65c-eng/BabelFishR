@@ -107,6 +107,10 @@ def _speech_check_note(tx: Transmission) -> str:
             return f"{said}. It is being processed again in that language."
         if tx.state is not ProcessingState.COMPLETE:
             return f"{said}. It was not transcribed again ({tx.state.value})."
+        if tx.guess_withheld:
+            return (f"{said}. The new guess still lacks speech evidence. "
+                    "Listen to the recording and use Edit transcript and translation "
+                    "if you can identify the words.")
         if tx.translation:
             return (f"{said}. It was transcribed again in that language and "
                     f"translated.{check_words}")
@@ -278,8 +282,8 @@ def details_for_inspection(tx: Transmission) -> str:
                      f"(Edit transcript and translation).")
     if tx.guess_withheld:
         parts.append(f"Engine guess, withheld as not speech: \u201c{tx.transcript.strip()}\u201d. "
-                     f"Edit transcript and translation to correct it, or Retry as "
-                     f"speech in... to transcribe it again as speech.")
+                     f"Use Edit transcript and translation to correct the words, "
+                     f"or {SPEECH_ACTION} to run recognition again.")
     if tx.state is ProcessingState.FAILED and tx.error:
         parts.append(f"{tx.error.stage} failed: {tx.error.message}")
     for note in (_speech_check_note(tx), _translation_unresolved_note(tx),

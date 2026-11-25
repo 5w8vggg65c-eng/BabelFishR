@@ -130,6 +130,28 @@ def test_a_missing_pack_file_is_reported_as_such(monkeypatch, fake_stanza):
     assert "Online / Setup" in message
 
 
+def test_callsigns_bypass_argos_and_glossary_substitutions(monkeypatch, fake_stanza):
+    calls = []
+
+    def translate(text, source, target):
+        calls.append(text)
+        return {"buenos días": "good morning.", "adelante": "go ahead",
+                "¿me recibe?": "Do you copy?"}[text]
+
+    engine = _engine_with_fake_translate(monkeypatch, fake_stanza, translate)
+    result = engine.translate("buenos días  KD8XYZ-2, kd8XyZ!  adelante", "en",
+                              source_language="es", do_not_translate=["KD8XYZ", "KD8XYZ-2"],
+                              glossary={"morning": "day", "KD8XYZ": "wrong"})
+    assert result.text == "good day  KD8XYZ-2, kd8XyZ!  go ahead"
+    assert calls == ["buenos días", "adelante"]
+    assert engine.translate("KD8XYZ", "en", source_language="es",
+                            do_not_translate=["KD8XYZ"]).text == "KD8XYZ"
+    assert calls == ["buenos días", "adelante"]
+    result = engine.translate("buenos días, KD8XYZ, ¿me recibe?", "en",
+                              source_language="es", do_not_translate=["KD8XYZ"])
+    assert result.text == "good morning, KD8XYZ, Do you copy?"
+
+
 # ---- the real stanza, network refused (where stanza is installed) ----------------------
 
 @pytest.fixture

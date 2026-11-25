@@ -128,7 +128,12 @@ def test_real_translation_preserves_protected_terms():
         pytest.skip("need a non-English source pack")
     result = engine.translate("KD8XYZ", "en", source_language=source,
                               do_not_translate=["KD8XYZ"])
-    assert "KD8XYZ" in result.text
+    assert result.text == "KD8XYZ"
+    if source == "es":
+        inline = engine.translate("Buenos días, KD8XYZ.", "en", source_language=source,
+                                  do_not_translate=["KD8XYZ"])
+        assert inline.text.endswith(", KD8XYZ.") and ".," not in inline.text
+        assert "buenos" not in inline.text.casefold()
 
 
 def test_field_check_passes_with_real_engines():

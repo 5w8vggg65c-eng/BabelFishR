@@ -56,6 +56,7 @@ def test_one_action_one_job_and_the_language_is_this_recordings_alone(
         config, store, tmp_path, language):
     app, tx, asr, mt = _held(config, store, tmp_path)
     app.correct(tx.id, transcript="gracias")             # an earlier correction
+    asr.scripted = result("Unidad dos, adelante.", ratio=0.2, nsp=0.12, language="es")
     asked_before = len(asr.asked)
     assert app.transcribe_as_speech(tx.id, language)
     done = _wait_done(app, tx.id)
@@ -65,7 +66,8 @@ def test_one_action_one_job_and_the_language_is_this_recordings_alone(
     assert confirmed["source_language"] == language
     assert confirmed["automatic"] is (language is None)
     assert done.state is ProcessingState.COMPLETE
-    assert done.translation, "known speech is translated"
+    assert done.shown_transcript == "Unidad dos, adelante."
+    assert done.translation, "recovered speech is translated"
     assert not done.guess_withheld
     assert done.signal_metadata["superseded_corrections"][-1]["transcript"] == "gracias"
     assert done.audio_path

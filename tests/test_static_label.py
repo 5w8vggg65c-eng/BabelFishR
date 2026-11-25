@@ -4,8 +4,8 @@ Positive acoustic evidence from the recording itself - stationary,
 broadband, noise-like, above a quiet floor - and no credible speech. Never
 from the speech engine's silence probability alone. Silence, a steady tone,
 a digital signal, crackle and speech mixed with static are not static.
-Audible speech, an operator's correction and a Retry-as-speech confirmation
-win. Older rows carry no measurement and stay "Audio unintelligible".
+Audible speech and an operator's correction win. Older rows carry no static
+measurement and stay "Audio unintelligible".
 Generated audio only.
 """
 
@@ -70,7 +70,7 @@ def test_static_needs_the_absence_of_credible_speech():
                                 "speech_check": {"verdict": "likely_noise"}}).is_static
     assert not _tx(transcript="Unit four, copy, over.").is_static, "speech wins"
     assert not _tx(transcript="", transcript_correction="faint call, unit four").is_static
-    assert not _tx(transcript="", signal_metadata={
+    assert _tx(transcript="", signal_metadata={
         "static_check": {"verdict": "static"},
         "speech_confirmed": {"source_language": "en"}}).is_static
     assert not _tx(transcript="", signal_metadata={
@@ -79,6 +79,11 @@ def test_static_needs_the_absence_of_credible_speech():
     old = Transmission(session_id="s", transcript="", state=ProcessingState.COMPLETE,
                        signal_metadata={"speech_check": {"verdict": "likely_noise"}})
     assert not old.is_static, "an unmeasured older row is never called static"
+    assert old.presented_transcript == "Audio unintelligible"
+    tone = _tx(transcript="", state=ProcessingState.SKIPPED, signal_metadata={})
+    assert tone.presented_transcript == "Audio unintelligible"
+    tone.signal_metadata["history_cleared"] = {"text": True}
+    assert tone.presented_transcript == ""
 
 
 def test_static_is_said_in_readable_exports_and_kept_apart_from_unintelligible():

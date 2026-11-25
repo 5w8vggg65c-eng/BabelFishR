@@ -144,7 +144,7 @@ def test_a_previous_builds_noise_records_are_withheld_on_display():
         assert tx.needs_review
 
 
-def test_corrections_confirmations_and_genuine_speech_take_precedence():
+def test_signoff_requires_voice_evidence_or_a_manual_correction():
     corrected = _old(transcript_correction="Takk, over.",
                      signal_metadata={"speech_check": {"verdict": "likely_noise"}})
     confirmed = _old(signal_metadata={"speech_check": {"verdict": "likely_noise"},
@@ -154,7 +154,8 @@ def test_corrections_confirmations_and_genuine_speech_take_precedence():
                                                      "speech_seconds": 2.4,
                                                      "no_speech_probability": 0.03}})
     ordinary = _old(transcript="Bil to, kom inn.", signal_metadata={})
-    for tx in (corrected, confirmed, genuine, ordinary):
+    assert confirmed.guess_withheld and not confirmed.shown_transcript
+    for tx in (corrected, genuine, ordinary):
         assert not tx.guess_withheld, tx.transcript
     assert corrected.shown_transcript == "Takk, over."
 
@@ -273,6 +274,8 @@ def test_an_outro_past_the_end_of_the_recording_is_withheld_and_the_words_kept(
     assert tx.withheld_ending == "Thanks for watching!"
     assert tx.translation and "watching" not in tx.translation.lower()
     assert "Zuschauen" not in tx.translation
+    tx.signal_metadata["speech_confirmed"] = {"source_language": "en"}
+    assert tx.shown_transcript == "The rain is easing."
 
 
 @pytest.mark.parametrize("start,end,conf,withheld", [
