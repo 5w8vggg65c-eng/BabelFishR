@@ -757,10 +757,11 @@ def test_collapsing_and_expanding_opens_no_popups_and_keeps_values(qt_app,
     values = [c.currentIndex() for c in combos]
 
     for _ in range(4):
-        window.setup_box.setChecked(False)
+        window.session_options_dialog.reject()        # Close / Escape
         pump(qt_app)
         assert not window.setup_content.isVisible()
-        window.setup_box.setChecked(True)
+        assert not window.session_options_button.isChecked()
+        window.session_options_button.click()
         pump(qt_app)
         assert window.setup_content.isVisible()
 
@@ -780,22 +781,19 @@ def test_collapsing_and_expanding_opens_no_popups_and_keeps_values(qt_app,
     window.hide()
 
 
-def test_the_panel_toggle_does_not_walk_every_descendant():
-    """The defect was the implementation, so the implementation is checked.
-
-    findChildren(QWidget) reaches a combo box's popup view and a scroll
-    area's scrollbars; calling setVisible on those is what produced the
-    dangling dropdowns. The behavioural test above is the real guard - this
-    one names the cause so a future edit cannot reintroduce it quietly.
-    """
+def test_the_options_dialog_does_not_walk_every_descendant():
+    """findChildren(QWidget) reaches combo popups and scrollbars; showing
+    those directly left dropdowns hanging open. Opening and closing the
+    dialog must not do that."""
     import ast
     import inspect
 
     from babelfishr.ui.main_window import MainWindow
+    from babelfishr.ui.session_options import SessionOptionsDialog
 
-    source = inspect.getsource(MainWindow._toggle_setup_panel)
-    tree = ast.parse(source.lstrip())
-    calls = {node.func.attr for node in ast.walk(tree)
-             if isinstance(node, ast.Call)
-             and isinstance(node.func, ast.Attribute)}
-    assert "findChildren" not in calls
+    for fn in (MainWindow._show_session_options, SessionOptionsDialog.open_over):
+        tree = ast.parse(inspect.getsource(fn).lstrip())
+        calls = {node.func.attr for node in ast.walk(tree)
+                 if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute)}
+        assert "findChildren" not in calls

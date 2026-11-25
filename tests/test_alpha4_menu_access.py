@@ -205,12 +205,12 @@ def test_collapsing_session_options_leaves_the_menus_alone(qt_app, config,
     bar = window.menuBar()
     before = bar.geometry()
     for _ in range(3):
-        window.setup_box.setChecked(False)
+        window.session_options_button.click()          # open
         pump(qt_app)
         assert bar.isVisible() and bar.isEnabled()
         assert bar.geometry() == before
         assert all(a.isEnabled() for a in bar.actions())
-        window.setup_box.setChecked(True)
+        window.session_options_button.click()          # close
         pump(qt_app)
         assert bar.isVisible() and bar.geometry() == before
     window.close()

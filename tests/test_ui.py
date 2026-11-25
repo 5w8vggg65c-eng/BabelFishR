@@ -216,14 +216,15 @@ def test_readiness_indicator_reflects_capability(qt_app, config, store):
     window.close()
 
 
-def test_setup_panel_collapses(qt_app, config, store):
+def test_session_options_has_no_title_checkbox(qt_app, config, store):
+    """Session Options opens from its button; the old top-left collapse
+    checkbox is gone."""
     from babelfishr.app import BabelFishRApp
     from babelfishr.ui.main_window import MainWindow
 
     window = MainWindow(BabelFishRApp(config=config, store=store))
-    assert window.setup_box.isCheckable() and window.setup_box.isChecked()
-    window.setup_box.setChecked(False)
-    assert not window.setup_box.isChecked()
+    assert not window.setup_box.isCheckable()
+    assert window.setup_box.window() is window.session_options_dialog
     window.close()
 
 

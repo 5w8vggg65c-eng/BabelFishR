@@ -293,7 +293,8 @@ def test_the_input_panel_is_outside_the_collapsible_setup_box(qt_app, app,
 
     wired(builtin_mic(), radio_interface())
     window = MainWindow(app)
-    window.setup_box.setChecked(False)
+    window.session_options_button.setChecked(True)
+    window.session_options_dialog.reject()
     qt_app.processEvents()
 
     assert window.input_panel.isVisibleTo(window.input_box)

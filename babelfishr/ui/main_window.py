@@ -446,25 +446,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timeline.playbackReplaced.connect(self._follow_playback)
         right_layout.addWidget(self.timeline, 1)
 
-        # Session Options: the existing panel, shown by its button.
+        # Session Options: the existing controls, in a dialog opened over the
+        # transcript by the bottom button (see _show_session_options). It is a
+        # separate window, so nothing in this layout moves or shrinks.
         self.setup_box = QtWidgets.QGroupBox("Session Options")
         self.setup_box.setObjectName("setupPanel")
-        self.setup_box.setCheckable(True)
-        self.setup_box.setChecked(True)
-        self.setup_box.setToolTip("Collapse Session Options to give the "
-                                  "message list more room")
         self.setup_box.setAccessibleName("Session Options")
-        # One child widget holds every control, and collapsing hides that one
-        # widget (see _toggle_setup_panel).
         self.setup_content = QtWidgets.QWidget(self.setup_box)
         self.setup_content.setObjectName("setupPanelContent")
         self.setup_content.setLayout(self._build_controls())
         outer = QtWidgets.QVBoxLayout(self.setup_box)
         outer.setContentsMargins(10, 6, 10, 8)
         outer.addWidget(self.setup_content)
-        self.setup_box.toggled.connect(self._toggle_setup_panel)
-        self.setup_box.hide()
-        right_layout.addWidget(self.setup_box)
+        from .session_options import SessionOptionsDialog
+
+        self.session_options_dialog = SessionOptionsDialog(self.setup_box, self)
+        self.session_options_dialog.finished.connect(self._session_options_closed)
 
         # -- right: SELECTED AUDIO ------------------------------------------------
         right_layout.addWidget(self._build_selected_panel())
@@ -493,8 +490,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session_options_button.setObjectName("secondaryAction")
         self.session_options_button.setCheckable(True)
         self.session_options_button.setToolTip(
-            "Radio profile, source language and translation language")
-        self.session_options_button.toggled.connect(self.setup_box.setVisible)
+            "Radio profile, source language and translation language "
+            "(opens over the transcript)")
+        self.session_options_button.toggled.connect(self._show_session_options)
         action_row.addWidget(self.session_options_button)
         self.export_button = QtWidgets.QPushButton("Export")
         self.export_button.setObjectName("secondaryAction")
@@ -786,16 +784,20 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(self.channel_label, 3, 0, 1, 6)
         return grid
 
-    def _toggle_setup_panel(self, expanded: bool) -> None:
-        """Collapse to the title bar by hiding exactly one widget.
+    def _show_session_options(self, shown: bool) -> None:
+        """Open the Session Options dialog over the transcript, or close it."""
+        dialog = self.session_options_dialog
+        if shown:
+            dialog.open_over(self.timeline)
+        elif dialog.isVisible():
+            dialog.close()
 
-        Never findChildren(QWidget): that set includes each combo box's popup
-        view and each scroll area's scrollbars and viewport, and showing those
-        directly is what left dropdowns hanging open and scrollbars floating
-        after a collapse-expand cycle.
-        """
-        self.setup_content.setVisible(expanded)
-        self.setup_box.setFlat(not expanded)
+    def _session_options_closed(self, _result: int = 0) -> None:
+        # Closed by Close, Escape or the window's own button: the bottom
+        # button shows that it is closed.
+        self.session_options_button.blockSignals(True)
+        self.session_options_button.setChecked(False)
+        self.session_options_button.blockSignals(False)
 
     def _apply_mode(self, value: str) -> bool:  # noqa: D401
         """Change the mode, or explain why nothing changed.
