@@ -755,11 +755,14 @@ def test_the_automatic_first_run_setup_refreshes_the_main_window(qt_app,
     window._show_assistant()
     assert calls == ["refreshed"]
 
-    # And the automatic first-run path, taken from run() itself.
+    # And the automatic repair path (assets gone on a returning profile),
+    # taken from launch() itself. On a first launch the console is built
+    # only after the assistant closes (tests/test_first_launch.py), so it
+    # reads the operator's choices directly.
     source = pathlib.Path(ui_package.__file__).read_text(encoding="utf-8")
-    body = source[source.index("def _first_run_setup"):]
+    body = source[source.index("def _repair_setup"):]
     assert "refresh_after_setup" in body.split("QtCore.QTimer")[0], (
-        "the automatic first-run assistant does not refresh the window")
+        "the automatic repair assistant does not refresh the window")
     window.hide()
 
 

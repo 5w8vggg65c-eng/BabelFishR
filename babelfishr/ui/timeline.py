@@ -1275,10 +1275,12 @@ class TimelineView(QtWidgets.QScrollArea):
         self.empty_label.setObjectName("emptyState")
         self._layout.insertWidget(0, self.empty_label)
 
-    def clear(self) -> None:
+    def clear(self, keep_playback: bool = False) -> None:
         # Leaving a thread stops its audio: nothing keeps playing with its
-        # controls out of sight.
-        self.playback.stop()
+        # controls out of sight. Changing the filter within the same thread
+        # (keep_playback) does not: the window keeps the playing card shown.
+        if not keep_playback:
+            self.playback.stop()
         for bubble in list(self._bubbles.values()):
             self._layout.removeWidget(bubble)
             bubble.deleteLater()
@@ -1516,14 +1518,15 @@ class TimelineView(QtWidgets.QScrollArea):
         if tx.id == self.selected_id:
             self.selectedUpdated.emit(tx.id)
 
-    def set_transmissions(self, transmissions: List[Transmission]) -> None:
+    def set_transmissions(self, transmissions: List[Transmission],
+                          keep_playback: bool = False) -> None:
         """Replace the thread. ``transmissions`` may be in either order.
 
         Sorted here rather than trusted, because the callers differ: the
         thread wants newest-first, while search and export have their own
         deliberate orders and must not be quietly re-sorted by a view.
         """
-        self.clear()
+        self.clear(keep_playback=keep_playback)
         newest_first = sorted(
             transmissions, key=lambda t: (t.started_at, t.id), reverse=True)
         for tx in newest_first:
@@ -1565,27 +1568,46 @@ class TimelineView(QtWidgets.QScrollArea):
         else:
             self._player.play(tx_id, path)
 
-    def mark_now_playing(self, tx_id: Optional[str]) -> None:
-        """Highlight the card continuous playback is on, and keep it in view
-        only while the operator is following along (the previous one was
-        on screen); browsing elsewhere is never pulled back."""
+    def mark_now_playing(self, tx_id: Optional[str], reveal: bool = True) -> None:
+        """Highlight the card playback is on and bring it into view - at each
+        new clip, even if the operator had scrolled away. The scroll runs
+        once layout has settled; a later call (the next clip, Stop, a
+        Session change) makes a pending one stale."""
         previous = getattr(self, "_now_playing", None)
-        follow = False
-        if previous and previous in self._bubbles:
+        if previous and previous in self._bubbles and previous != tx_id:
             old = self._bubbles[previous]
             old.setProperty("nowPlaying", False)
             old.style().unpolish(old)
             old.style().polish(old)
-            top = old.mapTo(self.viewport(), QtCore.QPoint(0, 0)).y()
-            follow = -old.height() < top < self.viewport().height()
         self._now_playing = tx_id
+        self._reveal_token = getattr(self, "_reveal_token", 0) + 1
         bubble = self._bubbles.get(tx_id) if tx_id else None
+        if bubble is None:
+            return
+        bubble.setProperty("nowPlaying", True)
+        bubble.style().unpolish(bubble)
+        bubble.style().polish(bubble)
+        if reveal:
+            token = self._reveal_token
+            QtCore.QTimer.singleShot(0, lambda: self._reveal_now_playing(token))
+
+    def _reveal_now_playing(self, token: int, tries: int = 10) -> None:
+        if token != getattr(self, "_reveal_token", 0):
+            return                            # superseded: Stop, a new clip, a new view
+        if self._pending_anchor is not None and self._anchor_passes > 0 and tries > 0:
+            # Let the reading-position passes for this change settle first,
+            # so the card's geometry is final - then move deliberately.
+            QtCore.QTimer.singleShot(0, lambda: self._reveal_now_playing(token, tries - 1))
+            return
+        bubble = self._bubbles.get(self._now_playing or "")
         if bubble is not None:
-            bubble.setProperty("nowPlaying", True)
-            bubble.style().unpolish(bubble)
-            bubble.style().polish(bubble)
-            if follow:
-                self.ensureWidgetVisible(bubble, 0, 0)
+            # A deliberate move: no earlier anchor may put the view back.
+            self._pending_anchor = None
+            self.ensureWidgetVisible(bubble, 0, 0)
+
+    @property
+    def now_playing(self) -> Optional[str]:
+        return getattr(self, "_now_playing", None)
 
     def selected_transmission(self) -> Optional[Transmission]:
         bubble = self._bubbles.get(self.selected_id) if self.selected_id else None

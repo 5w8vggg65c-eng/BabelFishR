@@ -363,7 +363,22 @@ L2-11. The fixed **AUDIO PLAYBACK** bar, with nothing selected, says
     playing** and is greyed: the bar's single **Pause/Resume** pauses, and
     selecting another message makes **Play selected** start that one.
     **■ Stop playback** stops the Session's playback (Stop monitoring is
-    separate). Browsing other messages meanwhile does not
+    separate).
+L2-12. While continuous playback runs, scroll far down the list. *Good:* at
+    each new clip the waveform switches to the recording being heard (its
+    own playhead moving), the playing card is highlighted and brought back
+    into view. Clicking another message only selects it (Play selected);
+    the waveform stays on what is heard until Stop. In **Bookmarked** or
+    **Needs review**, a playing clip outside that filter is shown while it
+    plays (the bar says "not in this view") and goes away afterwards; the
+    filter stays selected.
+L2-13. First launch on a fresh profile (a new user account, or with
+    BabelFishR's data folder moved aside temporarily - never deleting real
+    data): *Good:* **Set up BabelFishR** is the first and only window; the
+    console appears only after it is closed; nothing downloads until
+    **Prepare now**; the mode is **Online / Setup** afterwards (also after
+    preparing) unless **Record only for now** was chosen. A returning
+    profile opens straight to the console in its saved mode. Browsing other messages meanwhile does not
     interrupt it. It stops after the newest message unless that Session is
     being monitored, in which case it waits for the next one until Stop.
 

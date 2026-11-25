@@ -34,26 +34,52 @@ def run(config_path: Optional[str] = None, argv: Optional[list] = None) -> int:
     qt_app.setOrganizationName(product().name)
     apply_theme(qt_app)
 
-    app = BabelFishRApp(config=config)
+    launch(qt_app, BabelFishRApp(config=config))
+    return qt_app.exec()
+
+
+def launch(qt_app, app):
+    """Show the first window(s) and return the console.
+
+    A fresh profile (no completed setup) sees Set up BabelFishR first, as
+    the only window: the console is not even built until the operator has
+    made their choices, so it cannot flash up behind the assistant. Nothing
+    is downloaded and nothing is monitored unless the operator asks. The
+    mode stays Online / Setup unless they choose another (Record only).
+    A returning profile keeps its saved mode and goes straight to the
+    console; if its speech model or language packs have gone missing, the
+    assistant follows over the console as before.
+    """
+    from PySide6 import QtCore
+
+    from .main_window import MainWindow
+    from .setup_assistant import SetupAssistant
+
+    config = app.config
+    first_run = config.needs_first_run_setup
+    if first_run:
+        quits = qt_app.quitOnLastWindowClosed()
+        qt_app.setQuitOnLastWindowClosed(False)   # closing it must not end the app
+        try:
+            SetupAssistant(app, None, first_run=True).exec()
+        finally:
+            qt_app.setQuitOnLastWindowClosed(quits)
     window = MainWindow(app)
     window.show()
 
     # Guide the operator rather than leaving them at an app that cannot
-    # transcribe and will not say why. Not only on a genuine first launch: a
-    # model that was deleted, moved or left half-downloaded is the same
-    # situation from the operator's side, and the flag alone would miss it.
-    if config.needs_first_run_setup or not _has_usable_assets(config):
-        from .setup_assistant import SetupAssistant
-
-        def _first_run_setup() -> None:
+    # transcribe and will not say why: a model that was deleted, moved or
+    # left half-downloaded is the same situation from their side.
+    if not first_run and not _has_usable_assets(config):
+        def _repair_setup() -> None:
             SetupAssistant(app, window).exec()
             # The same refresh the manually opened assistant gets. Without it
             # the operator finished preparation and the window still showed
             # the pre-setup mode, engines and readiness until they restarted.
             window.refresh_after_setup()
 
-        QtCore.QTimer.singleShot(200, _first_run_setup)
-    return qt_app.exec()
+        QtCore.QTimer.singleShot(200, _repair_setup)
+    return window
 
 
 def _has_usable_assets(config) -> bool:

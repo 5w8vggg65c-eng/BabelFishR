@@ -40,9 +40,13 @@ LANGUAGES = [
 class SetupAssistant(QtWidgets.QDialog):
     """Choose assets, prepare them here, and verify offline readiness."""
 
-    def __init__(self, app, parent: Optional[QtWidgets.QWidget] = None):
+    def __init__(self, app, parent: Optional[QtWidgets.QWidget] = None,
+                 first_run: bool = False):
         super().__init__(parent)
         self.app = app
+        #: The very first launch: preparing does not change the mode - the
+        #: operator starts in Online / Setup unless they choose otherwise.
+        self.first_run = first_run
         self.setWindowTitle("Set up BabelFishR")
         self.resize(680, 640)
         self._worker = None
@@ -281,7 +285,15 @@ class SetupAssistant(QtWidgets.QDialog):
                 asr_model=payload.get("asr_model") or self.selected_model(),
                 language_pairs=payload.get("language_pairs")
                 or self.language_pairs())
-            self.app.set_mode(OperatingMode.FIELD_OFFLINE.value)
+            if self.first_run:
+                # First launch: stay in Online / Setup. Field Offline is the
+                # operator's choice to make (the mode in the header) when
+                # they go off the network.
+                self._append("You are in Online / Setup. Choose Field Offline "
+                             "from the mode in the window's header when you "
+                             "go offline.")
+            else:
+                self.app.set_mode(OperatingMode.FIELD_OFFLINE.value)
         else:
             # Something did not work. Keep whatever genuinely did.
             self._persist_partial_success(result, payload)

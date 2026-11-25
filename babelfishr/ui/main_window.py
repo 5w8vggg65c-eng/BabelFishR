@@ -732,8 +732,80 @@ class MainWindow(QtWidgets.QMainWindow):
                     and self.app.capture_conversation_id == self._sequence_conversation)
 
     def _on_sequence_current(self, tx_id) -> None:
-        self.timeline.mark_now_playing(tx_id)
+        self._follow_playing_clip()
         self._refresh_playback_bar()
+
+    # -- following what is heard ------------------------------------------------
+    def _playing_original(self):
+        """The transmission whose ORIGINAL is playing or paused, or None (a
+        decoded copy or a preview is not followed)."""
+        from .playback import PAUSED, PLAYING
+        from .waveform import same_audio
+
+        controller = self.timeline.playback
+        owner = controller.owner
+        if not owner or controller.state_for(owner) not in (PLAYING, PAUSED) \
+                or self._store_gone():
+            return None
+        tx = self.app.store.get_transmission(owner)
+        if tx is None or not same_audio(controller.path or "", tx.audio_path or ""):
+            return None
+        return tx
+
+    def _follow_playing_clip(self) -> None:
+        """The waveform shows the recording being heard, with its playhead;
+        its card is shown, highlighted and brought into view at each new
+        clip. In a filtered view a playing card outside the filter is shown
+        while it plays (and said so), never hidden; the filter stays."""
+        tx = self._playing_original()
+        followed = getattr(self, "_followed_clip", None)
+        if tx is None:
+            if followed is not None:
+                self._followed_clip = None
+                self._drop_transient_card()
+                self.timeline.mark_now_playing(None)
+                self._show_selection_waveform()
+            return
+        if tx.id == followed and tx.id in self.timeline.order():
+            return
+        self._followed_clip = tx.id
+        if tx.id not in self.timeline.order():
+            self._drop_transient_card()
+            if self._in_this_conversation(tx) and not tx.hidden:
+                self.timeline.place(tx)
+                self._transient_card = tx.id
+        elif getattr(self, "_transient_card", None) not in (None, tx.id):
+            self._drop_transient_card()
+        self.waveform.show_recording(tx.id, tx.audio_path)
+        self.timeline.mark_now_playing(tx.id)
+
+    def _refollow_after_rebuild(self) -> None:
+        """After a view is rebuilt in the same Session, the playing card is
+        shown (transiently if the view does not hold it) and highlighted."""
+        self._transient_card = None
+        self._followed_clip = None
+        self._follow_playing_clip()
+        if self._followed_clip is None:
+            self.timeline.mark_now_playing(None, reveal=False)
+
+    def _drop_transient_card(self) -> None:
+        """Take away a card that was shown only because it was playing, if
+        the view's own query does not hold it."""
+        transient = getattr(self, "_transient_card", None)
+        self._transient_card = None
+        if not transient or transient not in self.timeline.order():
+            return
+        if self._view_kind == "thread":
+            return                                # it belongs to the thread anyway
+        if transient not in {t.id for t in self._view_results()}:
+            self.timeline.remove(transient)
+
+    def _show_selection_waveform(self) -> None:
+        tx = self.timeline.selected_transmission()
+        if tx is None:
+            self.waveform.clear()
+        else:
+            self.waveform.show_recording(tx.id, tx.audio_path)
 
     def _stop_playback(self) -> None:
         """Stop playback: the clip and the continuation, waiting included.
@@ -742,6 +814,7 @@ class MainWindow(QtWidgets.QMainWindow):
         controller = self.timeline.playback
         if controller.owner is not None:
             controller.stop()
+        self._follow_playing_clip()
         self.timeline.mark_now_playing(None)
         self._refresh_playback_bar()
 
@@ -777,12 +850,15 @@ class MainWindow(QtWidgets.QMainWindow):
             verb = "Paused" if state == PAUSED else "Playing"
             more = (" \u00b7 continues with newer transmissions"
                     if sequence is not None and sequence.active else "")
-            text = f"{verb} {when}{more}"
+            outside = (" \u00b7 shown here while it plays (not in this view)"
+                       if getattr(self, "_transient_card", None) == owner else "")
+            text = f"{verb} {when}{more}{outside}"
         else:
             text = ""
         self.playback_line.setText(text)
 
     def _on_playback_changed_for_panel(self, _affected) -> None:
+        self._follow_playing_clip()
         self._refresh_selected_panel()
         if hasattr(self, "playback_line"):
             self._refresh_playback_bar()
@@ -1799,7 +1875,10 @@ class MainWindow(QtWidgets.QMainWindow):
         results = self._view_results()
         wanted = {t.id: t for t in results}
         shown = set(self.timeline.order())
+        playing = getattr(self, "_transient_card", None)
         for tx_id in shown - set(wanted):
+            if tx_id == playing:
+                continue                           # shown while it plays (see _follow_playing_clip)
             self.timeline.remove(tx_id)            # stopped qualifying
         for row in results:
             if row.id not in shown:
@@ -2209,8 +2288,7 @@ class MainWindow(QtWidgets.QMainWindow):
         conversation_id = self.session_tabs.tabData(index)
         if not conversation_id:
             return
-        if (getattr(self, "sequence", None) is not None and self.sequence.active
-                and conversation_id != self._sequence_conversation):
+        if conversation_id != self.app.conversation_id:
             self._stop_playback()           # never carried into another Session
         self.app.select_conversation(conversation_id)
         self._persist_selected_session()
@@ -2539,7 +2617,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._view_kind, self._view_query = "thread", ""
         self.timeline.set_transmissions(self.app.recent_transmissions(
-            include_hidden=self._showing_removed()))
+            include_hidden=self._showing_removed()), keep_playback=True)
+        self._refollow_after_rebuild()
         self._sync_filters()
 
     def _showing_removed(self) -> bool:
@@ -2555,14 +2634,18 @@ class MainWindow(QtWidgets.QMainWindow):
         """Show the selected message's own recording, or say why there is none."""
         tx = self.timeline.selected_transmission()
         if tx is None:
-            self.waveform.clear()
+            if getattr(self, "_followed_clip", None) is None:
+                self.waveform.clear()
         else:
             # Re-check the original on disk: a file removed or restored
             # outside BabelFishR shows on the card as soon as it is chosen.
             bubble = self.timeline.bubble(tx.id)
             if bubble is not None:
                 bubble.refresh_pairing()
-            self.waveform.show_recording(tx.id, tx.audio_path)
+            # While an original is playing the waveform shows what is heard;
+            # choosing a message only targets it (Play selected).
+            if getattr(self, "_followed_clip", None) is None:
+                self.waveform.show_recording(tx.id, tx.audio_path)
         self._refresh_selected_panel()
         self._refresh_message_menu()
 
@@ -3029,7 +3112,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         results = self.app.search(text)
         self._view_kind, self._view_query = "search", text
-        self.timeline.set_transmissions(results)
+        self.timeline.set_transmissions(results, keep_playback=True)
+        self._refollow_after_rebuild()
         self._announce_view(len(results))
         self._sync_filters()
 
@@ -3044,7 +3128,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         results = self._bookmarked_results()
         self._view_kind, self._view_query = "bookmarked", ""
-        self.timeline.set_transmissions(results)
+        self.timeline.set_transmissions(results, keep_playback=True)
+        self._refollow_after_rebuild()
         self._announce_view(len(results))
         self._sync_filters()
 
@@ -3080,7 +3165,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         results = self.app.review_queue()
         self._view_kind, self._view_query = "review", ""
-        self.timeline.set_transmissions(results)
+        self.timeline.set_transmissions(results, keep_playback=True)
+        self._refollow_after_rebuild()
         self._announce_view(len(results))
         self._sync_filters()
 
