@@ -67,16 +67,21 @@ def test_bubble_separates_original_from_translation(qt_app):
     assert bubble.translated_label.text() == "hello"
 
 
-def test_failed_bubble_offers_retry_and_reassures(qt_app):
+def test_failed_bubble_offers_retry_with_a_short_status(qt_app, tmp_path):
+    """A translation failure: Retry, the short status, and the detail on
+    deliberate inspection (the status tooltip) - no paragraph on the card."""
     from babelfishr.ui.timeline import TimelineView
 
-    tx = Transmission(transcript="kept")
+    wav = tmp_path / "kept.wav"
+    wav.write_bytes(b"RIFF synthetic")
+    tx = Transmission(transcript="kept", audio_path=str(wav))
     tx.fail("translation", "api down")
     view = TimelineView()
     bubble = view.add(tx)
     assert bubble.retry_button.isVisibleTo(bubble)
-    assert "api down" in bubble.error_label.text()
-    assert "safe" in bubble.error_label.text().lower()
+    assert bubble.pairing_label.text() == "Audio + transcript \u2713 \u00b7 Translation error"
+    assert "api down" in bubble.pairing_label.toolTip()
+    assert bubble.error_label.isHidden()
 
 
 def test_provisional_text_is_marked_as_such(qt_app):
@@ -256,17 +261,21 @@ def test_secondary_actions_live_in_an_overflow_menu(qt_app):
     assert not any("specific mode" in label for label in labels)
 
 
-def test_skipped_recording_offers_transcribe_anyway(qt_app):
+def test_skipped_recording_offers_transcribe_anyway(qt_app, tmp_path):
     from babelfishr.models import ContentClass
     from babelfishr.ui.timeline import TimelineView
 
-    tx = Transmission(audio_path="/tmp/x.wav", state=ProcessingState.SKIPPED,
+    wav = tmp_path / "x.wav"
+    wav.write_bytes(b"RIFF synthetic")
+    tx = Transmission(audio_path=str(wav), state=ProcessingState.SKIPPED,
                       content_class=ContentClass.NOISE,
                       skip_reason="Classified as noise. The recording is kept.")
     view = TimelineView()
     bubble = view.add(tx)
     assert bubble.action_button.isVisibleTo(bubble)
-    assert "recording is kept" in bubble.notes_label.text()
+    assert bubble.pairing_label.text() == "Transcript missing \u00b7 Audio unintelligible"
+    assert "recording is kept" in bubble.pairing_label.toolTip()
+    assert bubble.notes_label.isHidden()
 
 
 def test_digital_result_is_shown_with_decoded_playback(qt_app):

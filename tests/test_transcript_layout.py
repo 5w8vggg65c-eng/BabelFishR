@@ -199,16 +199,19 @@ def test_metadata_chips_and_notes_sit_outside_the_transcript_box(qt_app, window_
         box = bubble.transcript_box
         chips = _chips(bubble)
         texts = [c.text() for c in chips]
-        assert "clipped" in texts
-        assert "continuous audio: continues in the next message" in texts
-        for widget in [bubble.header, bubble.notes_label] + chips:
+        # Operator marks only: no clipped / confidence / continuous chips.
+        assert texts == ["#sample"]
+        assert "CLIPPED" not in bubble.header.text()
+        for widget in [bubble.header, bubble.notes_label, bubble.pairing_label] + chips:
             assert widget.isVisibleTo(bubble), widget.objectName()
             assert not _inside(widget, box)
             assert not _overlaps(widget, box, bubble), widget.objectName()
-        # The speech-check note is unchanged, and outside the box.
+        # The note stays; the speech-check paragraph does not (it is in the
+        # status tooltip, for deliberate inspection).
+        assert bubble.notes_label.text() == "Note: Sample note."
         from babelfishr.ui.timeline import _speech_check_note
-        assert _speech_check_note(bubble.tx).split(" (")[0] in bubble.notes_label.text()
-        assert "Speech uncertain" in bubble.notes_label.text()
+        assert _speech_check_note(bubble.tx).split(" (")[0] in bubble.pairing_label.toolTip()
+        assert "Speech uncertain" not in bubble.notes_label.text()
 
 
 @pytest.mark.parametrize("text", [LONG_ENGLISH, ARABIC, JAPANESE, GEORGIAN],
@@ -297,16 +300,20 @@ def test_held_and_uncertain_transcripts_say_so_and_show_every_word(qt_app, windo
         dict(transcript="Sample text, ordinary."),
     ])
     held, uncertain, plain = (window.timeline.bubble(tx.id) for tx in made)
-    assert "HELD FOR REVIEW" in held.transcript_caption.text()
-    assert held.transcript_box.property("held") == "held"
+    # Every word is still shown; the card says only the short reason.
+    assert held.transcript_caption.text() == "TRANSCRIPT"
     assert held.original_label.isVisibleTo(held)
     assert held_text in held.original_label.text()
     assert held.original_label.textInteractionFlags() & QtCore.Qt.TextSelectableByMouse
-    assert "Probably not speech" in held.notes_label.text()
+    assert held.notes_label.isHidden()
+    assert held.pairing_label.text().endswith("Audio unintelligible")
+    assert "Probably not speech" in held.pairing_label.toolTip()
 
-    assert "CHECK" in uncertain.transcript_caption.text()
-    assert "HELD" not in uncertain.transcript_caption.text()
+    # Marginal but readable: no warning at all.
+    assert uncertain.transcript_caption.text() == "TRANSCRIPT"
     assert "Sample text, maybe speech." in uncertain.original_label.text()
+    assert "unintelligible" not in uncertain.pairing_label.text()
+    assert "error" not in uncertain.pairing_label.text()
 
     assert plain.transcript_caption.text() == "TRANSCRIPT"
 
@@ -400,7 +407,9 @@ def test_the_window_fits_the_laptop_width_with_every_chip(qt_app, window_with):
         assert right <= window.width(), "a row runs past the window"
         chips = _chips(bubble)
         texts = " ".join(c.text() for c in chips)
-        assert "clipped" in texts and "continuous audio" in texts
+        assert "clipped" not in texts and "continuous audio" not in texts
+        assert bubble.pairing_label.isVisibleTo(bubble)
+        assert _inside(bubble.pairing_label, bubble)
         for chip in chips:
             assert _inside(chip, bubble), f"chip {chip.text()!r} runs out of its row"
         assert bubble.review_label.text() != "–"          # the review mark shows
@@ -461,7 +470,9 @@ def test_a_note_alone_does_not_certify_the_words(qt_app, config, store, tmp_path
     assert tx.notes == "heard a carrier, nothing else"
     assert not tx.reviewed and tx.needs_review
     assert tx.id in {t.id for t in store.review_queue()}
-    assert _transcript_caption(tx)[0] == "TRANSCRIPT · HELD FOR REVIEW"
+    assert _transcript_caption(tx)[0] == "TRANSCRIPT"
+    from babelfishr.ui.timeline import problem_reason
+    assert problem_reason(tx) == "Audio unintelligible"
 
 
 def test_retry_as_speech_after_a_correction_is_unchecked_again(qt_app, config, store,
@@ -485,7 +496,9 @@ def test_retry_as_speech_after_a_correction_is_unchecked_again(qt_app, config, s
     assert not tx.reviewed and tx.needs_review
     assert tx.display_transcript == "equipo uno en posicion"
     assert tx.signal_metadata["superseded_corrections"][-1]["transcript"] == "gracias por ver"
-    assert _transcript_caption(tx)[0] == "TRANSCRIPT · CHECK"
+    assert _transcript_caption(tx)[0] == "TRANSCRIPT"
+    from babelfishr.ui.timeline import problem_reason
+    assert problem_reason(tx) == ""          # the operator said it is speech
 
 
 # ---- review findings ------------------------------------------------------------------
@@ -513,7 +526,9 @@ def test_a_note_reviewed_row_from_an_older_version_stays_consistent(qt_app, conf
     tx = _held(store, tmp_path, reviewed=True, notes="carrier only")
     tx = store.get_transmission(tx.id)
     assert tx.needs_review and tx.id in {t.id for t in store.review_queue()}
-    assert _transcript_caption(tx)[0] == "TRANSCRIPT · HELD FOR REVIEW"
+    assert _transcript_caption(tx)[0] == "TRANSCRIPT"
+    from babelfishr.ui.timeline import problem_reason
+    assert problem_reason(tx) == "Audio unintelligible"
 
 
 def test_retry_as_speech_confirmation_alone_shows_check(qt_app, config, store, tmp_path):
@@ -522,7 +537,9 @@ def test_retry_as_speech_confirmation_alone_shows_check(qt_app, config, store, t
     tx = _held(store, tmp_path)
     tx.signal_metadata = dict(tx.signal_metadata,
                               speech_confirmed={"source_language": "es", "by": "operator"})
-    assert _transcript_caption(tx)[0] == "TRANSCRIPT · CHECK"
+    assert _transcript_caption(tx)[0] == "TRANSCRIPT"
+    from babelfishr.ui.timeline import problem_reason
+    assert problem_reason(tx) == ""          # the operator said it is speech
     assert tx.needs_review
 
 

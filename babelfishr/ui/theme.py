@@ -275,6 +275,12 @@ QMenu::item:disabled {{ color: {t['disabled_text']}; }}
 #noteText {{ color: {t['warning']}; font-size: 12px; }}
 #provisional {{ color: {t['text_muted']}; font-style: italic; }}
 #statusText {{ color: {t['text_muted']}; font-size: 11px; }}
+/* The card's one audio + transcript status: quiet when all is well, the
+   warning colour (with its own words, never colour alone) when not. */
+#pairingStatus {{ color: {t['text_muted']}; font-size: 11px; }}
+#pairingStatus[ok="false"] {{ color: {t['warning']}; }}
+/* The card continuous playback is on. */
+#bubble[nowPlaying="true"] {{ border-right: 4px solid {t['accent']}; }}
 #emptyState {{ color: {t['text_muted']}; padding: 48px 24px; font-size: 13px; }}
 #reviewMark {{ padding: 2px 8px; font-size: 13px; }}
 #reviewMark[tone="check"] {{ color: {t['warning']}; background: {t['surface_raised']}; }}

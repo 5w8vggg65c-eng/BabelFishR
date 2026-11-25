@@ -25,7 +25,11 @@ classifiers = [
 
 # The core runs on numpy alone: replay, detection, storage, export and the
 # mock engines all work with no other dependency.
-dependencies = ["numpy>=1.21"]
+# tzdata: the official IANA time zone database as a small offline package,
+# so named regions (America/Denver, Asia/Kathmandu) and their daylight
+# saving history resolve the same on every platform - Windows has no system
+# copy - and inside the frozen app, with no network lookup.
+dependencies = ["numpy>=1.21", "tzdata>=2024.1"]
 
 [project.optional-dependencies]
 audio = ["sounddevice>=0.4.6"]

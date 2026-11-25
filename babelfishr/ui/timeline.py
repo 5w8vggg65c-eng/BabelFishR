@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import contextlib
 import pathlib
 from typing import Dict, List, Optional
@@ -163,6 +165,108 @@ def operator_checked(tx: Transmission) -> bool:
     return bool(tx.reviewed and tx.has_correction)
 
 
+def original_present(tx: Transmission) -> bool:
+    """The ORIGINAL recording is on disk as a regular file. A stored path
+    alone is not enough, and a processed or decoded copy does not count.
+    Only the file's type is checked; its audio is never read."""
+    path = tx.audio_path
+    if not path:
+        return False
+    try:
+        return os.path.isfile(path)
+    except (OSError, ValueError):
+        return False
+
+
+def _cleared(tx: Transmission) -> dict:
+    return (tx.signal_metadata or {}).get("history_cleared") or {}
+
+
+#: States in which the transcript is still to come.
+_TEXT_PENDING = (ProcessingState.CAPTURED, ProcessingState.TRANSCRIBING)
+
+
+def problem_reason(tx: Transmission) -> str:
+    """The one short reason a card may show, or "".
+
+    "Transcription error" only when recognition itself failed;
+    "Translation error" when only the translation did (never reported as a
+    recognition failure); "Audio unintelligible" when no intelligible speech
+    was found - skipped as not speech, held as probably invented from noise,
+    or recognised to nothing. Readable but uncertain speech, and anything the
+    operator has checked, gets no reason.
+    """
+    if tx.state is ProcessingState.FAILED and tx.error:
+        return ("Translation error" if tx.error.stage == "translation"
+                else "Transcription error")
+    if operator_checked(tx) or (tx.signal_metadata or {}).get("processing_stopped"):
+        return ""
+    metadata = tx.signal_metadata or {}
+    verdict = (metadata.get("speech_check") or {}).get("verdict")
+    if verdict == "likely_noise" and not metadata.get("speech_confirmed"):
+        return "Audio unintelligible"
+    if tx.state is ProcessingState.SKIPPED:
+        return "Audio unintelligible"
+    if (tx.state is ProcessingState.COMPLETE and not (tx.display_transcript or "").strip()
+            and "text" not in _cleared(tx)):
+        return "Audio unintelligible"
+    return ""
+
+
+def pairing_status(tx: Transmission) -> tuple:
+    """(text, ok) for the card's one audio + transcript check.
+
+    Audio is the original recording, checked on disk; the transcript is the
+    original-language text (an operator's correction counts, a translation
+    alone does not). Intentional clears say so; text still being produced
+    says pending. A short reason (see problem_reason) is appended.
+    """
+    cleared = _cleared(tx)
+    if original_present(tx):
+        audio = "ok"
+    elif "audio" in cleared and not tx.audio_path:
+        audio = "cleared"
+    else:
+        audio = "missing"
+    if (tx.display_transcript or "").strip():
+        text = "ok"
+    elif "text" in cleared:
+        text = "cleared"
+    elif tx.state in _TEXT_PENDING and not (tx.signal_metadata or {}).get(
+            "processing_stopped"):
+        text = "pending"
+    else:
+        text = "missing"
+    if audio == "ok" and text == "ok":
+        words = "Audio + transcript \u2713"
+    elif audio == "ok":
+        words = f"Transcript {text}"
+    elif text == "ok" or (text == "pending" and audio != "ok"):
+        words = f"Audio {audio}"
+    elif audio == text:
+        words = f"Audio and transcript {audio}"
+    else:
+        words = f"Audio {audio} \u00b7 transcript {text}"
+    reason = problem_reason(tx)
+    if reason:
+        words += f" \u00b7 {reason}"
+    return words, audio == "ok" and text == "ok" and not reason
+
+
+def details_for_inspection(tx: Transmission) -> str:
+    """The technical detail behind a card's status, for its tooltip only:
+    the error message, the speech check's evidence, why a translation was
+    not attempted, the skip reason. Never shown as text on the card."""
+    parts: List[str] = []
+    if tx.state is ProcessingState.FAILED and tx.error:
+        parts.append(f"{tx.error.stage} failed: {tx.error.message}")
+    for note in (_speech_check_note(tx), _translation_unresolved_note(tx),
+                 tx.skip_reason or ""):
+        if note:
+            parts.append(note)
+    return "\n\n".join(parts)
+
+
 def _transcript_caption(tx: Transmission) -> tuple:
     """The transcript box's caption and its tone, from the speech check.
 
@@ -171,14 +275,12 @@ def _transcript_caption(tx: Transmission) -> tuple:
     ``uncertain`` - or a held one the operator has since marked as speech -
     gets the milder "check" marker. The words themselves are always shown.
     """
-    metadata = tx.signal_metadata or {}
-    verdict = (metadata.get("speech_check") or {}).get("verdict")
+    # The speech check's verdict is no longer spelled out on the card (the
+    # operator found it noise): the card's one status line says "Audio
+    # unintelligible" when that is the finding, and the detail is in its
+    # tooltip.
     if operator_checked(tx):
         return "TRANSCRIPT \u00b7 CHECKED BY OPERATOR", "none"
-    if verdict == "likely_noise" and not metadata.get("speech_confirmed"):
-        return "TRANSCRIPT \u00b7 HELD FOR REVIEW", "held"
-    if verdict in ("likely_noise", "uncertain"):
-        return "TRANSCRIPT \u00b7 CHECK", "check"
     return "TRANSCRIPT", "none"
 
 
@@ -545,6 +647,13 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.play_button.clicked.connect(self._on_play_clicked)
         controls.addWidget(self.play_button)
 
+        # The card's one status: is the original recording on disk, and is
+        # there a transcript for it (see pairing_status).
+        self.pairing_label = QtWidgets.QLabel()
+        self.pairing_label.setObjectName("pairingStatus")
+        self.pairing_label.setWordWrap(True)
+        controls.addWidget(self.pairing_label, 1)
+
         # Primary recovery action stays visible; everything else is in the menu.
         self.action_button = QtWidgets.QToolButton()
         self.action_button.setText("Transcribe anyway")
@@ -680,8 +789,9 @@ class TransmissionBubble(QtWidgets.QFrame):
             if tx.language_confidence is not None:
                 language += f" {tx.language_confidence:.0%}"
             meta.append(language)
-        if tx.clipped:
-            meta.append("CLIPPED")
+        # No CLIPPED: the operator found it on every card and of no use; the
+        # value stays recorded (and exported). The audio + transcript check
+        # below the text is the status the card shows instead.
         # Whatever an SDR, a radio or a decoder actually supplied - and
         # nothing else. Absent values produce no entry at all rather than a
         # dash an operator could read as a measurement of zero, and anything
@@ -745,25 +855,13 @@ class TransmissionBubble(QtWidgets.QFrame):
             self.translated_label.hide()
             self.translation_box.hide()
 
-        if tx.state is ProcessingState.FAILED and tx.error:
-            self.error_label.setText(
-                f"⚠ {tx.error.stage} failed: {_escape(tx.error.message)}<br>"
-                f"<i>The recording is safe. Use Retry once the cause is fixed.</i>")
-            self.error_label.show()
-            self.retry_button.show()
-        else:
-            self.error_label.hide()
-            self.retry_button.hide()
+        # No paragraphs of explanation on the card: its one status line (see
+        # refresh_pairing) carries the short reason, and the technical detail
+        # is in that line's tooltip.
+        self.error_label.hide()
+        self.retry_button.setVisible(tx.state is ProcessingState.FAILED)
 
         details: List[str] = []
-        if tx.skip_reason:
-            details.append(_escape(tx.skip_reason))
-        speech_note = _speech_check_note(tx)
-        if speech_note:
-            details.append(_escape(speech_note))
-        unresolved_note = _translation_unresolved_note(tx)
-        if unresolved_note:
-            details.append(_escape(unresolved_note))
         attempt = tx.latest_analysis
         if attempt is not None:
             line = (f"Digital analysis ({attempt.engine} "
@@ -780,15 +878,6 @@ class TransmissionBubble(QtWidgets.QFrame):
                 details.append(_escape(str(warning)))
         if tx.notes:
             details.append(f"Note: {_escape(tx.notes)}")
-        cleared = (tx.signal_metadata or {}).get("history_cleared") or {}
-        if "text" in cleared and not tx.display_transcript:
-            details.append("<i>Transcript and translation cleared (Clear Session "
-                           "History). Retry transcribes the recording again.</i>"
-                           if tx.audio_path else
-                           "<i>Transcript and translation cleared (Clear Session "
-                           "History).</i>")
-        if "audio" in cleared and not tx.audio_path:
-            details.append("<i>Recording removed (Clear Session History).</i>")
         if details:
             self.notes_label.setText("<br>".join(details))
             self.notes_label.show()
@@ -797,18 +886,13 @@ class TransmissionBubble(QtWidgets.QFrame):
 
         self._rebuild_chips(tx)
 
-        status_bits: List[str] = []
-        pending = STATE_LABELS.get(tx.state, "")
-        if (tx.signal_metadata or {}).get("processing_stopped"):
-            # Not "not speech": monitoring was stopped before processing.
-            pending = "saved, not processed (monitoring stopped)"
-        if pending:
-            status_bits.append(pending)
-        if (tx.signal_metadata or {}).get("translation_unresolved"):
-            status_bits.append("translation not attempted")
-        if tx.needs_review and tx.state is not ProcessingState.FAILED:
-            status_bits.append("needs review")
-        self.status_label.setText("  ·  ".join(status_bits))
+        # Only what the operator must act on: a recording saved but not
+        # processed because monitoring stopped. Routine states (queued,
+        # needs review, translation not attempted) are not repeated here:
+        # the text box, the REVIEW column and the status line say them.
+        self.status_label.setText(
+            "saved, not processed (monitoring stopped)"
+            if (tx.signal_metadata or {}).get("processing_stopped") else "")
         # REVIEW column: the word, never only a colour.
         if tx.state is ProcessingState.FAILED:
             review, tone = "FAILED", "failed"
@@ -835,20 +919,8 @@ class TransmissionBubble(QtWidgets.QFrame):
         can_force = tx.can_transcribe_anyway and tx.state in (
             ProcessingState.SKIPPED, ProcessingState.COMPLETE)
         self.action_button.setVisible(can_force)
-        self.transcribe_action.setEnabled(bool(tx.audio_path))
-
         self.decoded_action.setVisible(bool(tx.decoded_audio_path))
-
-        self.play_action.setEnabled(bool(tx.audio_path))
-        # A recording removed by Clear Session History cannot be retried.
-        audio_cleared = not tx.audio_path and "audio" in (
-            (tx.signal_metadata or {}).get("history_cleared") or {})
-        for action in (getattr(self, "retry_action", None),
-                       getattr(self, "retry_speech_action", None)):
-            if action is not None:
-                action.setEnabled(not audio_cleared)
-        if audio_cleared:
-            self.retry_button.hide()
+        self.refresh_pairing()
         # A removed message, when shown at all, says so and offers only the
         # way back; an ordinary one offers removal.
         self.remove_action.setVisible(not tx.hidden)
@@ -860,6 +932,34 @@ class TransmissionBubble(QtWidgets.QFrame):
         # from the controller in one place.
         self._render_playback()
 
+    def refresh_pairing(self) -> None:
+        """Re-check the original recording on disk and redraw the card's
+        audio + transcript status, and Play/Retry with it. Cheap (one stat),
+        so it runs on every update, on selection and on a view refresh -
+        which is how a file removed or restored outside BabelFishR shows."""
+        tx = self.tx
+        words, ok = pairing_status(tx)
+        self.pairing_label.setText(words)
+        self.pairing_label.setAccessibleName(f"Status: {words}")
+        self.pairing_label.setToolTip(details_for_inspection(tx) or words)
+        if self.pairing_label.property("ok") != ok:
+            self.pairing_label.setProperty("ok", ok)
+            self.pairing_label.style().unpolish(self.pairing_label)
+            self.pairing_label.style().polish(self.pairing_label)
+        present = original_present(tx)
+        # Nothing to play or re-process without the original recording.
+        self.play_action.setEnabled(present)
+        self.play_button.setEnabled(present)
+        self.transcribe_action.setEnabled(present)
+        for action in (getattr(self, "retry_action", None),
+                       getattr(self, "retry_speech_action", None)):
+            if action is not None:
+                action.setEnabled(present)
+        self.retry_button.setVisible(tx.state is ProcessingState.FAILED and present)
+        self.action_button.setVisible(
+            present and tx.can_transcribe_anyway
+            and tx.state in (ProcessingState.SKIPPED, ProcessingState.COMPLETE))
+
     def _rebuild_chips(self, tx: Transmission) -> None:
         """Compact metadata chips: class, confidence, tags, digital result."""
         while self.chip_row.count() > 0:
@@ -867,23 +967,11 @@ class TransmissionBubble(QtWidgets.QFrame):
             if item.widget():
                 item.widget().deleteLater()
 
+        # The operator's own marks only. Automatic diagnostics (content
+        # class, confidence, clipped, continuous-audio part) are no longer
+        # chips: the operator found them noise. They stay recorded, in
+        # search and in exports.
         chips: List[tuple] = []
-        label = CONTENT_LABELS.get(tx.content_class.value, tx.content_class.value)
-        if (tx.content_class is not ContentClass.SPEECH
-                and tx.content_class.value not in UNBADGED_CLASSES):
-            chips.append((label, "warning"))
-        if tx.transcript_confidence is not None and tx.transcript:
-            tone = "warning" if tx.transcript_confidence < 0.6 else "plain"
-            chips.append((f"confidence {tx.transcript_confidence:.0%}", tone))
-        if tx.clipped:
-            chips.append(("clipped", "error"))
-        segment = (tx.signal_metadata or {}).get("segment") or {}
-        if segment.get("continues_previous") and segment.get("continued"):
-            chips.append(("continuous audio: middle part", "plain"))
-        elif segment.get("continued"):
-            chips.append(("continuous audio: continues in the next message", "plain"))
-        elif segment.get("continues_previous"):
-            chips.append(("continuous audio: last part", "plain"))
         for tag in tx.tags:
             chips.append((f"#{tag}", "accent"))
         if tx.bookmarked:
@@ -949,8 +1037,22 @@ class TransmissionBubble(QtWidgets.QFrame):
     def is_long_recording(self) -> bool:
         return float(self.tx.duration or 0.0) > LONG_RECORDING_SECONDS
 
+    #: Set by the list: starts the original *and what follows it* (the
+    #: window's continuous playback). None: play just this one.
+    start_original = None
+
+    def _start_original(self) -> None:
+        """The operator's deliberate Play on this card's original."""
+        if not original_present(self.tx):
+            self.refresh_pairing()           # gone since drawn: say so, play nothing
+            return
+        if self.start_original is not None:
+            self.start_original(self.tx.id, self.tx.audio_path)
+        else:
+            self._player.play(self.tx.id, self.tx.audio_path)
+
     def _on_play_clicked(self) -> None:
-        self._player.play(self.tx.id, self.tx.audio_path)
+        self._start_original()
 
     def _on_pause_clicked(self) -> None:
         self._player.toggle(self.tx.id, self.tx.audio_path)
@@ -968,7 +1070,16 @@ class TransmissionBubble(QtWidgets.QFrame):
             self._player.forward()
 
     def _toggle_play(self) -> None:  # noqa: D401 - the menu's Play / Pause
-        self._player.toggle(self.tx.id, self.tx.audio_path)
+        from .waveform import same_audio
+
+        playing_this = (self._player.owner == self.tx.id
+                        and same_audio(getattr(self._player, "path", None) or "",
+                                       self.tx.audio_path or "")
+                        and self._player.state_for(self.tx.id) in (PLAYING, PAUSED))
+        if playing_this:
+            self._player.toggle(self.tx.id, self.tx.audio_path)
+        else:
+            self._start_original()
 
     def _on_playback_position(self, owner: str, position_ms: int,
                               duration_ms: int) -> None:
@@ -977,6 +1088,8 @@ class TransmissionBubble(QtWidgets.QFrame):
 
     def _on_player_changed(self, affected) -> None:
         if self.tx.id in affected:
+            # A play that failed because the file has gone shows on the card.
+            self.refresh_pairing()
             self._render_playback()
 
     def _render_playback(self) -> None:
@@ -1017,7 +1130,8 @@ class TransmissionBubble(QtWidgets.QFrame):
         else:
             self.playback_bar.hide()
             self.play_button.setText("Play original")
-            self.play_button.setEnabled(True)
+            # Only with the original actually on disk (see refresh_pairing).
+            self.play_button.setEnabled(original_present(self.tx))
             self.play_button.show()
             self.play_action.setText("Play original recording")
         if error:
@@ -1223,6 +1337,7 @@ class TimelineView(QtWidgets.QScrollArea):
             return
         with self._anchored():
             for bubble in bubbles:
+                bubble.refresh_pairing()          # a failed play may mean the file went
                 bubble._render_playback()
 
     def _on_playback_position(self, owner: str, position_ms: int,
@@ -1338,6 +1453,7 @@ class TimelineView(QtWidgets.QScrollArea):
         geometry, so the reading position lands a bubble's height off."""
         self.empty_label.hide()
         bubble = TransmissionBubble(tx, self._player, follow_player=False)
+        bubble.start_original = self._start_original
         bubble.correctionRequested.connect(self.correctionRequested)
         bubble.tagsChanged.connect(self.tagsChanged)
         bubble.bookmarkToggled.connect(self.bookmarkToggled)
@@ -1439,6 +1555,37 @@ class TimelineView(QtWidgets.QScrollArea):
             if reveal:
                 self.ensureWidgetVisible(bubble, 0, 0)
         self.selectionChanged.emit(tx_id)
+
+    #: Set by the window: plays an original and continues with newer ones.
+    original_starter = None
+
+    def _start_original(self, tx_id: str, path: str) -> None:
+        if self.original_starter is not None:
+            self.original_starter(tx_id, path)
+        else:
+            self._player.play(tx_id, path)
+
+    def mark_now_playing(self, tx_id: Optional[str]) -> None:
+        """Highlight the card continuous playback is on, and keep it in view
+        only while the operator is following along (the previous one was
+        on screen); browsing elsewhere is never pulled back."""
+        previous = getattr(self, "_now_playing", None)
+        follow = False
+        if previous and previous in self._bubbles:
+            old = self._bubbles[previous]
+            old.setProperty("nowPlaying", False)
+            old.style().unpolish(old)
+            old.style().polish(old)
+            top = old.mapTo(self.viewport(), QtCore.QPoint(0, 0)).y()
+            follow = -old.height() < top < self.viewport().height()
+        self._now_playing = tx_id
+        bubble = self._bubbles.get(tx_id) if tx_id else None
+        if bubble is not None:
+            bubble.setProperty("nowPlaying", True)
+            bubble.style().unpolish(bubble)
+            bubble.style().polish(bubble)
+            if follow:
+                self.ensureWidgetVisible(bubble, 0, 0)
 
     def selected_transmission(self) -> Optional[Transmission]:
         bubble = self._bubbles.get(self.selected_id) if self.selected_id else None

@@ -334,6 +334,34 @@ L2-6. Repeat with **Both**. *Good:* the thread is empty, the tab stays, and a
     new monitoring run into **Throwaway2** works as usual.
 L2-7. While monitoring into **Throwaway2**, try **Clear Session History…**.
     *Good:* it is refused with the reason; clearing another Session works.
+L2-8. In **Session options** choose **Timestamp time zone: UTC**. *Good:* a
+    **UTC offset or region** dropdown appears under it (it is hidden under
+    Local). Type `Denver` and pick **Denver — America/Denver**. *Good:* the
+    TIME heading reads **TIME (Denver)**; message headers and hover end in
+    **MDT (UTC-06:00)** or **MST (UTC-07:00)** for each message's own date.
+    Try `+05:45` and **UTC / Zulu**. **View → Show Times In → UTC Offset or
+    Region…** opens the same dropdown. Quit and reopen: the choice is kept.
+L2-9. Drag **Session options** narrow (about phone width) and short. *Good:*
+    no sideways scroll bar ever; labels move above their fields and long
+    text wraps; everything is reached by scrolling down; **Close** stays
+    visible.
+L2-10. Look at a few message cards. *Good:* no yellow paragraphs, no
+    CLIPPED, no confidence or "continuous audio" chips. Each card has one
+    status next to **Play original**: **Audio + transcript ✓**, or **Audio
+    missing** / **Transcript missing** / **Transcript pending** / **…
+    cleared**, plus at most one short reason (**Audio unintelligible**,
+    **Transcription error**, **Translation error**). Hover it for detail.
+    Move one WAV of a throwaway message out of the Recordings folder in
+    Finder, click the message: *Good:* **Audio missing**, Play original
+    greyed. Put it back and choose **View → Refresh**: the check returns.
+L2-11. With nothing selected, the playback bar says **Select a transmission
+    to play.** and Play is greyed. Click a message: *Good:* nothing plays.
+    Press **Play original** on an older message. *Good:* it plays, then each
+    newer message of the same Session in turn, the playing card
+    highlighted; **■ Stop playback** stops it (Stop monitoring is separate),
+    **Pause/Resume** pauses. Browsing other messages meanwhile does not
+    interrupt it. It stops after the newest message unless that Session is
+    being monitored, in which case it waits for the next one until Stop.
 
 ## M. Stopping and quitting while a transcription is still running (new)
 

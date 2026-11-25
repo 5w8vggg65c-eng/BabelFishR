@@ -116,8 +116,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._warnings: Dict[str, str] = {}
         from ..timefmt import set_display_zone
 
-        set_display_zone(self.app.config.display.timezone)
+        zone_problem = set_display_zone(self.app.config.display.timezone,
+                                        self.app.config.display.utc_zone)
         self._build_ui()
+        if zone_problem:
+            self._warn(zone_problem, source="time-zone")
         self._refresh_devices()
         self._refresh_profiles()
         self._report_engines()
@@ -457,29 +460,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setup_content.setLayout(self._build_controls())
         outer = QtWidgets.QVBoxLayout(self.setup_box)
         outer.setContentsMargins(10, 6, 10, 8)
-        # The timestamp zone: the same setting as View > Show Times In, kept
-        # in step both ways, and a display choice only - so, unlike the
-        # options below it, it stays available while monitoring.
-        zone_row = QtWidgets.QHBoxLayout()
-        zone_label = QtWidgets.QLabel("Timestamp time zone:")
-        self.time_zone_box = QtWidgets.QComboBox()
-        self.time_zone_box.addItem("Local", "local")
-        self.time_zone_box.addItem("UTC", "utc")
-        self.time_zone_box.setAccessibleName("Timestamp time zone")
-        self.time_zone_box.setToolTip(
-            "Show message times in this computer's local time or in UTC. "
-            "Stored times and exports are not changed. Also in View \u203a "
-            "Show Times In.")
-        zone_label.setBuddy(self.time_zone_box)
-        from ..timefmt import display_zone
-
-        self.time_zone_box.setCurrentIndex(self.time_zone_box.findData(display_zone()))
-        self.time_zone_box.currentIndexChanged.connect(
-            lambda _i: self._set_time_zone(self.time_zone_box.currentData()))
-        zone_row.addWidget(zone_label)
-        zone_row.addWidget(self.time_zone_box)
-        zone_row.addStretch(1)
-        outer.addLayout(zone_row)
         outer.addWidget(self.setup_content)
         from .session_options import SessionOptionsDialog
 
@@ -583,9 +563,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # The rows' own margins and spacing, so the headings sit over them.
         row.setContentsMargins(14, 4, 10, 4)
         row.setSpacing(16)
-        from ..timefmt import is_utc
+        from ..timefmt import heading, zone_label
 
-        time = QtWidgets.QLabel("TIME (UTC)" if is_utc() else "TIME")
+        time = QtWidgets.QLabel(heading())
+        time.setWordWrap(True)          # "TIME (Kathmandu)" wraps, never clips
+        time.setToolTip(f"Times are shown in {zone_label()}")
         time.setFixedWidth(TIME_COLUMN_WIDTH)
         self.time_heading = time
         row.addWidget(time)
@@ -635,6 +617,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.selected_play_button.setAccessibleName("Play the selected original recording")
         self.selected_play_button.clicked.connect(self._play_selected)
         buttons.addWidget(self.selected_play_button)
+        # Playback, whatever is playing: separate from Stop monitoring, and
+        # available with no message selected (and while waiting for one).
+        self.playback_pause_button = QtWidgets.QPushButton("Pause")
+        self.playback_pause_button.setObjectName("textAction")
+        self.playback_pause_button.setAccessibleName("Pause or resume playback")
+        self.playback_pause_button.setEnabled(False)
+        self.playback_pause_button.clicked.connect(self._pause_playback)
+        buttons.addWidget(self.playback_pause_button)
+        self.playback_stop_button = QtWidgets.QPushButton("\u25a0 Stop playback")
+        self.playback_stop_button.setObjectName("textAction")
+        self.playback_stop_button.setAccessibleName("Stop playback")
+        self.playback_stop_button.setToolTip(
+            "Stop playing, including continuing to newer transmissions. "
+            "Monitoring is not affected.")
+        self.playback_stop_button.setEnabled(False)
+        self.playback_stop_button.clicked.connect(self._stop_playback)
+        buttons.addWidget(self.playback_stop_button)
         self.selected_bookmark_button = QtWidgets.QPushButton("Bookmark")
         self.selected_bookmark_button.setObjectName("textAction")
         self.selected_bookmark_button.setCheckable(True)
@@ -650,6 +649,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.selected_hint.setObjectName("selectedHint")
         self.selected_hint.setWordWrap(True)
         layout.addWidget(self.selected_hint)
+        self.playback_line = QtWidgets.QLabel("")
+        self.playback_line.setObjectName("selectedHint")
+        self.playback_line.setAccessibleName("Playback")
+        self.playback_line.setWordWrap(True)
+        layout.addWidget(self.playback_line)
         self.selected_panel = panel
         return panel
 
@@ -665,9 +669,117 @@ class MainWindow(QtWidgets.QMainWindow):
         self._followed_playback = controller
         self.waveform.set_playback(controller)
         controller.changed.connect(self._on_playback_changed_for_panel)
+        self._install_sequence(controller)
+
+    # -- continuous playback ---------------------------------------------------
+    def _install_sequence(self, controller) -> None:
+        """One SequencePlayer per playback controller: Play on an original
+        continues with each newer transmission of the same Session until
+        Stop (see playback_sequence)."""
+        from .playback_sequence import SequencePlayer
+
+        old = getattr(self, "sequence", None)
+        if old is not None:
+            old.cancel()
+        self._sequence_conversation = ""
+        self.sequence = SequencePlayer(controller, self._next_original_after,
+                                       self._sequence_live, parent=self)
+        self.sequence.currentChanged.connect(self._on_sequence_current)
+        self.sequence.stateChanged.connect(lambda _s: self._refresh_playback_bar())
+        self.timeline.original_starter = self._start_sequence
+
+    def _start_sequence(self, tx_id: str, path: str) -> bool:
+        """The operator's Play on one original: it plays, then the newer ones."""
+        from .timeline import original_present
+
+        tx = self.app.store.get_transmission(tx_id)
+        if tx is None or not original_present(tx):
+            return False
+        session = self.app.store.get_session(tx.session_id)
+        self._sequence_conversation = (session.conversation_id if session else "") or ""
+        started = self.sequence.start(tx_id, tx.audio_path)
+        self._refresh_playback_bar()
+        return started
+
+    def _next_original_after(self, tx_id: str):
+        """(id, path) of the next newer playable original in the Session
+        being played, or None: hidden ones and missing files are skipped."""
+        from .timeline import original_present
+
+        if not self._sequence_conversation or self._store_gone():
+            return None
+        after = tx_id
+        for _ in range(20):                     # bounded: pages of 50
+            rows = self.app.store.newer_in_conversation(
+                self._sequence_conversation, after)
+            if not rows:
+                return None
+            for row in rows:
+                if original_present(row):
+                    return row.id, row.audio_path
+            after = rows[-1].id
+        return None
+
+    def _sequence_live(self) -> bool:
+        """The Session being played is the one monitoring records into now."""
+        return bool(self.app.capture is not None and self._sequence_conversation
+                    and self.app.capture_conversation_id == self._sequence_conversation)
+
+    def _on_sequence_current(self, tx_id) -> None:
+        self.timeline.mark_now_playing(tx_id)
+        self._refresh_playback_bar()
+
+    def _stop_playback(self) -> None:
+        """Stop playback: the clip and the continuation, waiting included.
+        Separate from Stop monitoring."""
+        self.sequence.stop()
+        controller = self.timeline.playback
+        if controller.owner is not None:
+            controller.stop()
+        self.timeline.mark_now_playing(None)
+        self._refresh_playback_bar()
+
+    def _pause_playback(self) -> None:
+        controller = self.timeline.playback
+        if controller.owner is None or not controller.controllable:
+            return
+        controller.toggle(controller.owner, controller.path)
+        self._refresh_playback_bar()
+
+    def _refresh_playback_bar(self) -> None:
+        """The playback bar's Pause/Stop and its one line of state."""
+        from .playback import PAUSED, PLAYING
+
+        controller = self.timeline.playback
+        owner = controller.owner
+        state = controller.state_for(owner) if owner else ""
+        sequence = getattr(self, "sequence", None)
+        waiting = bool(sequence is not None and sequence.waiting)
+        active = bool(owner and state in (PLAYING, PAUSED)) or waiting \
+            or bool(sequence is not None and sequence.active)
+        self.playback_stop_button.setEnabled(active)
+        self.playback_pause_button.setEnabled(
+            bool(owner and state in (PLAYING, PAUSED) and controller.controllable))
+        self.playback_pause_button.setText("Resume" if state == PAUSED else "Pause")
+        if waiting:
+            text = "Waiting for the next transmission\u2026"
+        elif owner and state in (PLAYING, PAUSED):
+            tx = self.app.store.get_transmission(owner) if not self._store_gone() else None
+            from ..timefmt import clock
+
+            when = clock(tx.started_at) if tx is not None else ""
+            verb = "Paused" if state == PAUSED else "Playing"
+            more = (" \u00b7 continues with newer transmissions"
+                    if sequence is not None and sequence.active else "")
+            text = f"{verb} {when}{more}"
+        else:
+            text = ""
+        self.playback_line.setText(text)
 
     def _on_playback_changed_for_panel(self, _affected) -> None:
         self._refresh_selected_panel()
+        if hasattr(self, "playback_line"):
+            self._refresh_playback_bar()
 
     def _wire_pane_links(self) -> None:
         """Left-pane links run the real View actions, nothing of their own."""
@@ -736,49 +848,124 @@ class MainWindow(QtWidgets.QMainWindow):
         self.state_badge.setFont(font)
         row.addWidget(self.state_badge)
 
-    def _build_controls(self) -> QtWidgets.QGridLayout:
-        grid = QtWidgets.QGridLayout()
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(6)
+    def _compact_combo(self, box: QtWidgets.QComboBox) -> QtWidgets.QComboBox:
+        """A combo box whose longest item never sets the form's minimum
+        width: it shrinks to a few characters and elides, and the full item
+        is in its tooltip and popup."""
+        box.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        box.setMinimumContentsLength(8)
+        box.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                          QtWidgets.QSizePolicy.Fixed)
+        # currentTextChanged also fires when items are first filled in.
+        box.currentTextChanged.connect(
+            lambda text, b=box: b.setToolTip(text) if not b.property(
+                "fixedTip") else None)
+        return box
 
-        grid.addWidget(QtWidgets.QLabel("Radio profile"), 0, 3)
-        self.profile_box = QtWidgets.QComboBox()
-        self.profile_box.setMinimumWidth(200)
+    def _build_controls(self) -> QtWidgets.QFormLayout:
+        """Session Options as one form that grows downwards.
+
+        A label moves above its field when the window is too narrow for both
+        on one line, long text wraps, and no combo box is wider than the
+        space it is given, so the dialog never needs to scroll sideways.
+        """
+        form = QtWidgets.QFormLayout()
+        form.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
+        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+        form.setLabelAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(8)
+        self.options_form = form
+
+        def label(text: str) -> QtWidgets.QLabel:
+            widget = QtWidgets.QLabel(text)
+            widget.setWordWrap(True)
+            return widget
+
+        # The timestamp zone: the same setting as View > Show Times In, kept
+        # in step both ways, and a display choice only - so, unlike the
+        # options below it, it stays available while monitoring.
+        from .. import timefmt
+
+        self.time_zone_box = self._compact_combo(QtWidgets.QComboBox())
+        self.time_zone_box.addItem("Local", timefmt.LOCAL)
+        self.time_zone_box.addItem("UTC", timefmt.UTC)
+        self.time_zone_box.setAccessibleName("Timestamp time zone")
+        self.time_zone_box.setProperty("fixedTip", True)
+        self.time_zone_box.setToolTip(
+            "Show message times in this computer's local time or in UTC. "
+            "Stored times and exports are not changed. Also in View \u203a "
+            "Show Times In.")
+        self.time_zone_box.setCurrentIndex(
+            self.time_zone_box.findData(timefmt.display_zone()))
+        self.time_zone_box.currentIndexChanged.connect(
+            lambda _i: self._set_time_zone(self.time_zone_box.currentData()))
+        zone_label = label("Timestamp time zone")
+        zone_label.setBuddy(self.time_zone_box)
+        form.addRow(zone_label, self.time_zone_box)
+
+        # Under UTC: which offset or named region. Searchable: type part of
+        # a city, a region or an offset ("Denver", "Kathmandu", "+05:45").
+        self.utc_zone_box = self._compact_combo(QtWidgets.QComboBox())
+        self.utc_zone_box.setEditable(True)
+        self.utc_zone_box.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.utc_zone_box.setAccessibleName("UTC offset or region")
+        self.utc_zone_box.lineEdit().setPlaceholderText("Type a city, region or offset")
+        for text, key in timefmt.choices():
+            self.utc_zone_box.addItem(text, key)
+        completer = QtWidgets.QCompleter(self.utc_zone_box.model(), self.utc_zone_box)
+        completer.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+        completer.setFilterMode(QtCore.Qt.MatchContains)
+        completer.setCompletionMode(QtWidgets.QCompleter.PopupCompletion)
+        self.utc_zone_box.setCompleter(completer)
+        completer.activated[str].connect(self._on_utc_zone_text)
+        self.utc_zone_box.activated.connect(self._on_utc_zone_index)
+        self.utc_zone_box.lineEdit().editingFinished.connect(
+            lambda: self._on_utc_zone_text(self.utc_zone_box.currentText()))
+        self.utc_zone_label = label("UTC offset or region")
+        self.utc_zone_label.setBuddy(self.utc_zone_box)
+        form.addRow(self.utc_zone_label, self.utc_zone_box)
+        self._sync_utc_zone_box()
+
+        self.profile_box = self._compact_combo(QtWidgets.QComboBox())
         self.profile_box.currentIndexChanged.connect(self._on_profile_changed)
-        grid.addWidget(self.profile_box, 0, 4)
-
         self.profile_button = QtWidgets.QToolButton()
         self.profile_button.setText("+")
         self.profile_button.setToolTip("Add a radio/channel profile")
         self.profile_button.clicked.connect(self._new_profile)
-        grid.addWidget(self.profile_button, 0, 5)
+        profile_row = QtWidgets.QHBoxLayout()
+        profile_row.setContentsMargins(0, 0, 0, 0)
+        profile_row.addWidget(self.profile_box, 1)
+        profile_row.addWidget(self.profile_button)
+        form.addRow(label("Radio profile"), profile_row)
 
-        grid.addWidget(QtWidgets.QLabel("Source language"), 1, 0)
-        self.source_mode_box = QtWidgets.QComboBox()
+        self.source_mode_box = self._compact_combo(QtWidgets.QComboBox())
         self.source_mode_box.addItem("Detect automatically", "automatic")
         self.source_mode_box.addItem("Specified", "specified")
         self.source_mode_box.currentIndexChanged.connect(self._on_source_mode)
-        grid.addWidget(self.source_mode_box, 1, 1)
-
-        self.source_language_box = QtWidgets.QComboBox()
+        self.source_language_box = self._compact_combo(QtWidgets.QComboBox())
         for code, name in COMMON_LANGUAGES:
             self.source_language_box.addItem(f"{name} ({code})", code)
         self.source_language_box.setEnabled(False)
-        grid.addWidget(self.source_language_box, 1, 2, 1, 2)
+        source = QtWidgets.QVBoxLayout()
+        source.setContentsMargins(0, 0, 0, 0)
+        source.setSpacing(4)
+        source.addWidget(self.source_mode_box)
+        source.addWidget(self.source_language_box)
+        form.addRow(label("Source language"), source)
 
-        grid.addWidget(QtWidgets.QLabel("Translate into"), 1, 4)
-        self.target_language_box = QtWidgets.QComboBox()
+        self.target_language_box = self._compact_combo(QtWidgets.QComboBox())
         for code, name in COMMON_LANGUAGES:
             self.target_language_box.addItem(f"{name} ({code})", code)
         target = self.app.config.translate.target_language
         index = self.target_language_box.findData(target)
         if index >= 0:
             self.target_language_box.setCurrentIndex(index)
-        grid.addWidget(self.target_language_box, 1, 5)
+        form.addRow(label("Translate into"), self.target_language_box)
 
         # The quiet that ends a message (detector.hang_time), in seconds.
-        quiet_label = QtWidgets.QLabel("End a message after")
-        grid.addWidget(quiet_label, 2, 0)
+        quiet_label = label("End a message after")
         self.quiet_seconds_box = QtWidgets.QDoubleSpinBox()
         # The same bounds DetectorSettings.validate() accepts, so a saved
         # value is shown as what it is.
@@ -797,15 +984,51 @@ class MainWindow(QtWidgets.QMainWindow):
             "is still transcribed in parts while it continues.")
         quiet_label.setBuddy(self.quiet_seconds_box)
         self.quiet_seconds_box.valueChanged.connect(self._on_quiet_seconds)
-        grid.addWidget(self.quiet_seconds_box, 2, 1)
+        form.addRow(quiet_label, self.quiet_seconds_box)
 
         # The operating mode lives in the header, next to readiness, and only
         # there. Two controls for one setting is two things to disagree.
         self.channel_label = QtWidgets.QLabel("No profile selected")
         self.channel_label.setObjectName("sectionLabel")
         self.channel_label.setWordWrap(True)
-        grid.addWidget(self.channel_label, 3, 0, 1, 6)
-        return grid
+        self.channel_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
+                                         QtWidgets.QSizePolicy.Preferred)
+        form.addRow(self.channel_label)
+        return form
+
+    def _sync_utc_zone_box(self) -> None:
+        """Show the saved UTC choice; the row only while UTC is chosen."""
+        from .. import timefmt
+
+        box = getattr(self, "utc_zone_box", None)
+        if box is None:
+            return
+        index = box.findData(timefmt.utc_zone())
+        if index < 0:
+            index = box.findData(timefmt.ZULU)
+        box.blockSignals(True)
+        box.setCurrentIndex(index)
+        box.blockSignals(False)
+        box.setToolTip(f"{box.currentText()}\nTimes are shown in "
+                       f"{timefmt.zone_label()}.")
+        self.options_form.setRowVisible(box, timefmt.is_utc())
+
+    def _on_utc_zone_index(self, index: int) -> None:
+        key = self.utc_zone_box.itemData(index)
+        if key is not None:
+            self._set_time_zone("utc", utc_zone=key)
+
+    def _on_utc_zone_text(self, text: str) -> None:
+        """Typed or picked from the search list: use it if it names an
+        entry; otherwise put the current choice back."""
+        index = self.utc_zone_box.findText(text, QtCore.Qt.MatchFixedString)
+        if index >= 0:
+            if self.utc_zone_box.itemData(index) != self.app.config.display.utc_zone \
+                    or not self.app.config.display.timezone == "utc":
+                self.utc_zone_box.setCurrentIndex(index)
+                self._on_utc_zone_index(index)
+            return
+        self._sync_utc_zone_box()
 
     def _show_session_options(self, shown: bool) -> None:
         """Open the Session Options dialog over the transcript, or close it."""
@@ -954,6 +1177,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.time_zone_group.addAction(action)
             times_menu.addAction(action)
             self.time_zone_actions[zone] = action
+        if self._time_zone() == UTC:
+            self.time_zone_actions[UTC].setText(f"UTC \u2014 {zone_label()}")
+        times_menu.addSeparator()
+        self.utc_zone_action = times_menu.addAction("UTC Offset or Region\u2026")
+        self.utc_zone_action.setToolTip(
+            "Choose UTC/Zulu, a fixed offset or a named region (Session Options)")
+        self.utc_zone_action.triggered.connect(self._choose_utc_zone)
 
         self.show_hidden_sessions_action = QtGui.QAction("Show hidden Sessions", self)
         self.show_hidden_sessions_action.setCheckable(True)
@@ -1039,6 +1269,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for profile in self.app.profiles():
             self.profile_box.addItem(f"{profile.name} - {profile.label()}", profile.id)
         self.profile_box.blockSignals(False)
+        self.profile_box.setToolTip(self.profile_box.currentText())
         self._on_profile_changed()
 
     def _report_engines(self) -> None:
@@ -1284,29 +1515,54 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return display_zone()
 
-    def _set_time_zone(self, zone: str) -> None:
-        """View > Show Times In: show every time in *zone*, at once, on the
-        messages already shown and on those still arriving; remembered."""
-        from ..timefmt import LOCAL, UTC, set_display_zone, zone_label
+    def _set_time_zone(self, zone: str, utc_zone: Optional[str] = None) -> None:
+        """Show every time in *zone* (Local or UTC) - and, under UTC, in
+        *utc_zone* (or the one already chosen) - at once, on messages
+        already shown and on those still arriving; remembered."""
+        from .. import timefmt
 
-        set_display_zone(zone)
-        self.app.config.display.timezone = zone
+        display = self.app.config.display
+        if utc_zone is not None:
+            display.utc_zone = utc_zone
+        problem = timefmt.set_display_zone(zone, display.utc_zone)
+        display.timezone = timefmt.display_zone()
         try:
             self.app.config.save()
         except OSError:  # noqa: BLE001 - a preference is never worth a crash
             pass
         for key, action in self.time_zone_actions.items():
-            action.setChecked(key == zone)
+            action.setChecked(key == display.timezone)
         box = getattr(self, "time_zone_box", None)
-        if box is not None and box.currentData() != zone:
+        if box is not None and box.currentData() != display.timezone:
             box.blockSignals(True)
-            box.setCurrentIndex(box.findData(zone))
+            box.setCurrentIndex(box.findData(display.timezone))
             box.blockSignals(False)
-        self.time_zone_actions[LOCAL].setText(zone_label() if zone == LOCAL else "Local")
-        self.time_heading.setText("TIME (UTC)" if zone == UTC else "TIME")
+        self._sync_utc_zone_box()
+        self.time_zone_actions[timefmt.LOCAL].setText(
+            timefmt.zone_label() if not timefmt.is_utc() else "Local")
+        self.time_zone_actions[timefmt.UTC].setText(
+            f"UTC \u2014 {timefmt.zone_label()}" if timefmt.is_utc() else "UTC")
+        self.time_heading.setText(timefmt.heading())
+        self.time_heading.setToolTip(f"Times are shown in {timefmt.zone_label()}")
         self.timeline.redraw_times()
         self._refresh_selected_panel()
-        self.status.showMessage(f"Times are shown in {zone_label()}.", 6000)
+        if problem:
+            self._warn(problem, source="time-zone")
+        else:
+            self._clear_warning("time-zone")
+            self.status.showMessage(f"Times are shown in {timefmt.zone_label()}.", 6000)
+
+    def _choose_utc_zone(self) -> None:
+        """View > Show Times In > UTC Offset or Region...: the same picker,
+        in Session Options."""
+        if not self.session_options_button.isChecked():
+            self.session_options_button.setChecked(True)
+        else:
+            self.session_options_dialog.raise_()
+        if self.time_zone_box.currentData() != "utc":
+            self._set_time_zone("utc")
+        self.session_options_dialog.scroll.ensureWidgetVisible(self.utc_zone_box)
+        self.utc_zone_box.setFocus(QtCore.Qt.OtherFocusReason)
 
     def _on_quiet_seconds(self, value: float) -> None:
         """Takes effect from the next Start (the running gate keeps its own
@@ -1418,6 +1674,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 if self._admit(event.payload, arrival=event.kind == "transmission"):
                     touched.add(event.payload.id)
                 badge_changed = True
+                sequence = getattr(self, "sequence", None)
+                if sequence is not None and sequence.waiting:
+                    sequence.notify_new_recording()
             elif event.kind == "audio-status":
                 payload = event.payload or {}
                 kind = payload.get("kind", "")
@@ -1450,6 +1709,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.status.showMessage(
                     f"{payload.get('stage', 'processing')} error: "
                     f"{payload.get('message', '')}", 12000)
+        sequence = getattr(self, "sequence", None)
+        if sequence is not None and sequence.waiting and not self._sequence_live():
+            sequence.notify_live_ended()      # monitoring of that Session ended
         if touched:
             # One query for the whole drained batch, not one per event.
             self._refresh_view(touched)
@@ -1941,6 +2203,9 @@ class MainWindow(QtWidgets.QMainWindow):
         conversation_id = self.session_tabs.tabData(index)
         if not conversation_id:
             return
+        if (getattr(self, "sequence", None) is not None and self.sequence.active
+                and conversation_id != self._sequence_conversation):
+            self._stop_playback()           # never carried into another Session
         self.app.select_conversation(conversation_id)
         self._persist_selected_session()
         self._reload_timeline()
@@ -2286,6 +2551,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if tx is None:
             self.waveform.clear()
         else:
+            # Re-check the original on disk: a file removed or restored
+            # outside BabelFishR shows on the card as soon as it is chosen.
+            bubble = self.timeline.bubble(tx.id)
+            if bubble is not None:
+                bubble.refresh_pairing()
             self.waveform.show_recording(tx.id, tx.audio_path)
         self._refresh_selected_panel()
         self._refresh_message_menu()
@@ -2400,7 +2670,7 @@ class MainWindow(QtWidgets.QMainWindow):
             button.setEnabled(has)
         if not has:
             self.selected_range.setText("")
-            self.selected_hint.setText("Select a message to review its original audio.")
+            self.selected_hint.setText("Select a transmission to play.")
             self.selected_bookmark_button.setChecked(False)
             self.selected_play_button.setText("Play original")
             return
@@ -2408,7 +2678,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.selected_range.setText(
             f"{span(tx.started_at, tx.ended_at)}  ({float(tx.duration or 0.0):.1f} s)")
-        self.selected_play_button.setEnabled(bool(tx.audio_path))
+        from .timeline import original_present
+
+        present = original_present(tx)
+        self.selected_play_button.setEnabled(present)
         self.selected_play_button.setText(
             "Pause" if self._original_state(tx) == "playing"
             and self.timeline.playback.controllable else "Play original")
@@ -2418,8 +2691,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "Bookmarked" if tx.bookmarked else "Bookmark")
         self.selected_bookmark_button.blockSignals(blocked)
         self.selected_note_button.setText("Edit note" if tx.notes else "Add note")
-        if not tx.audio_path:
-            hint = "This message has no recording."
+        if not present:
+            hint = ("The original recording of this transmission is missing."
+                    if tx.audio_path else "This transmission has no recording.")
         elif tx.state is ProcessingState.FAILED:
             hint = "Processing failed. The original audio is kept; Retry is in the message's menu."
         elif tx.needs_review:
@@ -2429,9 +2703,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.selected_hint.setText(hint)
 
     def _play_selected(self) -> None:
+        from .timeline import original_present
+
         tx = self.timeline.selected_transmission()
-        if tx is None:
-            return
+        if tx is None or not original_present(tx):
+            return                      # no deliberate target: nothing plays, nothing waits
         # The same controller as the message's own Play button - but this is
         # the ORIGINAL: pause/resume only when the original itself is what is
         # playing. The message's decoded audio (same id, other file) is
@@ -2440,10 +2716,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._original_state(tx) == "playing":
             controller.pause()
         else:
-            # Resumes a paused original; replaces anything else playing,
-            # including this message's decoded audio (the controller stops
-            # the other file first).
-            controller.play(tx.id, tx.audio_path)
+            # Resumes a paused original; otherwise starts it - and what
+            # follows it - replacing anything else playing, including this
+            # message's decoded audio.
+            if self._original_state(tx) == "paused":
+                controller.play(tx.id, tx.audio_path)
+            else:
+                self._start_sequence(tx.id, tx.audio_path)
         self._refresh_selected_panel()
 
     def _original_state(self, tx) -> str:
@@ -2956,6 +3235,10 @@ class MainWindow(QtWidgets.QMainWindow):
     # -- shutdown --------------------------------------------------------
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         if self._shutdown_complete or self._finish_shutdown():
+            # Nothing may continue playing, or start, after the window goes.
+            sequence = getattr(self, "sequence", None)
+            if sequence is not None:
+                sequence.cancel()
             # Stop any waveform read; its worker leaves at the next chunk.
             self.waveform.shutdown()
             super().closeEvent(event)

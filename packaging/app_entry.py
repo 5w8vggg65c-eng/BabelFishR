@@ -37,6 +37,8 @@ REQUIRED_MODULES = (
     "ctranslate2",
     "argostranslate",
     "argostranslate.translate",
+    # The offline IANA time zone database behind the named UTC regions.
+    "tzdata",
 )
 
 # Wanted, but the app degrades honestly without them (timeline.py falls back to
@@ -388,7 +390,17 @@ def main(argv=None) -> int:
         import babelfishr
         from babelfishr import cli  # noqa: F401
 
-        print(f"babelfishr {babelfishr.__version__} imports cleanly")
+        # A named region must resolve from the bundled tzdata, not the
+        # system's copy: with the search path emptied, zoneinfo can only
+        # use the packaged database.
+        import zoneinfo
+
+        zoneinfo.reset_tzpath([])
+        zoneinfo.ZoneInfo.clear_cache()
+        zoneinfo.ZoneInfo("America/Denver")
+        zoneinfo.ZoneInfo("Asia/Kathmandu")
+        print(f"babelfishr {babelfishr.__version__} imports cleanly; "
+              f"time zone regions resolve offline")
         return 0
 
     if argv == ["--selftest-independence"]:

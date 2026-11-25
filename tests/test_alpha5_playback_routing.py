@@ -113,7 +113,10 @@ def controls_agree(view, controller, backend, owner, state):
             assert bubble.pause_button.text().startswith("⏸" if state == PLAYING else "▶")
         else:
             assert bubble.playback_bar.isHidden()
-            assert bubble.play_button.isVisible() and bubble.play_button.isEnabled()
+            # Play is offered exactly when the original is on disk.
+            from babelfishr.ui.timeline import original_present
+            assert bubble.play_button.isVisible()
+            assert bubble.play_button.isEnabled() == original_present(bubble.tx)
 
 
 # ---- routing ------------------------------------------------------------------------
@@ -169,7 +172,8 @@ def test_bs_missing_file_touches_b_only_and_a_retry_clears_bs_error(qt_app, wavs
     click(qt_app, a.play_button)
     backend.advance(700)
     work.reset()
-    click(qt_app, b.play_button)
+    assert not b.play_button.isEnabled()          # its original is missing
+    controller.play("m0030", str(missing))        # a stale route is still refused
     controls_agree(view, controller, backend, "m0010", PLAYING)
     assert controller.position_for("m0010") == (700, 9000)
     assert "Could not play" in b.status_label.text() and "missing" in b.status_label.text()
@@ -177,6 +181,7 @@ def test_bs_missing_file_touches_b_only_and_a_retry_clears_bs_error(qt_app, wavs
     # The file appears; the retry succeeds and B's error line goes away.
     import shutil
     shutil.copy(wavs["long"], missing)
+    b.refresh_pairing()                           # seen on the next look
     work.reset()
     click(qt_app, b.play_button)
     controls_agree(view, controller, backend, "m0030", PLAYING)

@@ -914,6 +914,25 @@ class Store:
         ordered = rows if newest_first else list(reversed(rows))
         return [_from_row(r) for r in ordered]
 
+    def newer_in_conversation(self, conversation_id: str, tx_id: str,
+                              limit: int = 50) -> List[Transmission]:
+        """Messages of one named Session after *tx_id*, oldest first, in the
+        thread's own order (started_at, then insertion), across its runs.
+        Removed-from-view messages are left out. For continuous playback."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT started_at, rowid FROM transmissions WHERE id = ?",
+                (tx_id,)).fetchone()
+            if row is None:
+                return []
+            rows = self._conn.execute(
+                "SELECT t.* FROM transmissions t JOIN sessions s ON s.id = t.session_id "
+                "WHERE s.conversation_id = ? AND t.hidden = 0 AND "
+                "(t.started_at > ? OR (t.started_at = ? AND t.rowid > ?)) "
+                "ORDER BY t.started_at, t.rowid LIMIT ?",
+                (conversation_id, row[0], row[0], row[1], max(1, int(limit)))).fetchall()
+            return [_from_row(r) for r in rows]
+
     def list_transmissions(self, session_id: Optional[str] = None,
                            limit: int = 500, ascending: bool = True,
                            include_hidden: bool = False

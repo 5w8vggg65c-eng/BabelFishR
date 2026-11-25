@@ -46,6 +46,19 @@ except Exception as exc:  # noqa: BLE001
         "the packaged app cannot complete any HTTPS download. "
         f"(pip install certifi)  [{exc}]")
 
+# The IANA time zone database, explicitly: zoneinfo reads it for the named
+# regions in Session Options (Denver, Kathmandu, ...). The frozen app must
+# not depend on the build machine's or the user's system copy.
+try:
+    import tzdata  # noqa: F401
+
+    datas += collect_data_files("tzdata")
+    hidden += collect_submodules("tzdata")
+except Exception as exc:  # noqa: BLE001
+    raise SystemExit(
+        "tzdata is required to build a working bundle: without it the named "
+        f"time zone regions cannot be shown. (pip install tzdata)  [{exc}]")
+
 # Optional engines: include when installed, so a prepared machine can build a
 # self-contained app, but never fail the build when they are absent.
 for package in ("faster_whisper", "argostranslate", "ctranslate2"):

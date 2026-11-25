@@ -208,6 +208,16 @@ class PlaybackController(QtCore.QObject):
     changed = QtCore.Signal(object)
     #: (owner transmission id, position ms, duration ms) - for the label only.
     positionChanged = QtCore.Signal(str, int, int)
+    #: How a recording's playback ended, for code that must tell the three
+    #: apart (continuous playback through a session advances only on the
+    #: first). Each carries the transmission id. ``changed`` alone cannot say
+    #: which happened: every ending looks the same there - no owner.
+    #: Reached its end on its own.
+    clipFinished = QtCore.Signal(str)
+    #: The backend reported an error while it was playing.
+    clipFailed = QtCore.Signal(str)
+    #: Stopped on request (``stop()``) - the operator, a thread switch.
+    clipStopped = QtCore.Signal(str)
 
     def __init__(self, backend: Optional[PlaybackBackend] = None,
                  parent: Optional[QtCore.QObject] = None):
@@ -218,6 +228,15 @@ class PlaybackController(QtCore.QObject):
         self._state: str = STOPPED
         self._duration_ms: int = 0
         self.last_error: Dict[str, str] = {}
+        # The recording the backend stopped of its own accord, kept until
+        # its "finished" or error arrives. Players report the stop first and
+        # the completion after it (the scripted test backend does; whether
+        # QMediaPlayer does depends on the platform), and by then the owner
+        # has been released, so the ending would otherwise belong to nobody.
+        self._ended_by_backend: Optional[str] = None
+        # True while the controller itself is stopping the backend, so the
+        # stop that reports back is not mistaken for the backend's own.
+        self._stopping = False
         self.backend.stateChanged.connect(self._on_backend_state)
         self.backend.positionChanged.connect(self._on_position)
         self.backend.durationChanged.connect(self._on_duration)
@@ -270,14 +289,17 @@ class PlaybackController(QtCore.QObject):
             # Stopped first, so the stop a real player reports as a file
             # loads (QMediaPlayer does, synchronously) retires the OLD
             # playback, not the new owner.
-            self.backend.stop()
+            self._stop_backend()
             self._retire()
+        self._ended_by_backend = None
         self.owner = tx_id
         self.path = str(path)
         self.last_error.pop(tx_id, None)
         self._duration_ms = 0
         self._state = PLAYING
         self.backend.load(self.path)
+        # A player that stops as it loads (QMediaPlayer) did not end anything.
+        self._ended_by_backend = None
         if tx_id in self.last_error:
             # The backend reported an error while loading - synchronously,
             # before returning. _on_error has already retired this request
@@ -306,8 +328,10 @@ class PlaybackController(QtCore.QObject):
     def stop(self) -> None:
         if self.owner is None:
             return
-        self.backend.stop()
+        owner = self.owner
+        self._stop_backend()
         self._retire()
+        self.clipStopped.emit(owner)
 
     def skip(self, delta_ms: int) -> None:
         if self.owner is None or not self.controllable:
@@ -331,6 +355,8 @@ class PlaybackController(QtCore.QObject):
         if state == STOPPED:
             # Reaching the end, an explicit stop, or the backend giving up:
             # in every case this recording is no longer playing.
+            if not self._stopping:
+                self._ended_by_backend = self.owner
             self._retire()
             return
         if state != self._state:
@@ -349,19 +375,27 @@ class PlaybackController(QtCore.QObject):
                                       self._duration_ms)
 
     def _on_finished(self) -> None:
+        ended = self.owner or self._ended_by_backend
+        self._ended_by_backend = None
         self._retire()
+        if ended:
+            self.clipFinished.emit(ended)
 
     def _on_error(self, message: str) -> None:
         owner = self.owner
+        failed = owner or self._ended_by_backend
+        self._ended_by_backend = None
         if owner is not None:
             self.last_error[owner] = message
         with_backend = self.controllable
         if with_backend:
             try:
-                self.backend.stop()
+                self._stop_backend()
             except Exception:  # noqa: BLE001 - already in an error path
                 log.debug("stop after playback error failed", exc_info=True)
         self._retire()
+        if failed:
+            self.clipFailed.emit(failed)
 
     def _fail(self, tx_id: str, message: str) -> None:
         """A request for *this* recording could not be honoured.
@@ -374,13 +408,21 @@ class PlaybackController(QtCore.QObject):
         the backend went on playing A with nothing left to stop it.
         """
         if self.owner == tx_id:
-            self.backend.stop()
+            self._stop_backend()
             self.owner = None
             self.path = ""
             self._state = STOPPED
             self._duration_ms = 0
         self.last_error[tx_id] = message
         self._emit_changed(tx_id)
+
+    def _stop_backend(self) -> None:
+        """Stop the backend on the controller's own initiative."""
+        self._stopping = True
+        try:
+            self.backend.stop()
+        finally:
+            self._stopping = False
 
     def _retire(self) -> None:
         if self.owner is None and self._state == STOPPED:

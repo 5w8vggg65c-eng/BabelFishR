@@ -386,19 +386,25 @@ def test_switching_threads_stops_playback(qt_app, wavs):
 # ---- errors and honesty ----------------------------------------------------
 
 
-def test_a_missing_recording_is_reported_and_leaves_play_usable(qt_app, tmp_path):
+def test_a_missing_recording_disables_play_and_says_so(qt_app, tmp_path):
+    """The operator's request: Play original is not offered for a recording
+    that is not there, and the card says "Audio missing". A file that comes
+    back is playable again once the card is looked at again."""
     backend = make_scripted_backend()
     view, controller = make_view(backend)
     view.show()
-    bubble = view.add(tx("gone", 9.0, str(tmp_path / "does-not-exist.wav")))
+    path = tmp_path / "does-not-exist.wav"
+    bubble = view.add(tx("gone", 9.0, str(path)))
     pump(qt_app)
-    click(qt_app, bubble.play_button)
+    assert not bubble.play_button.isEnabled()
+    assert not bubble.play_action.isEnabled()
+    assert bubble.pairing_label.text() == "Audio missing"
+    bubble._on_play_clicked()                       # a stale route: nothing plays
     assert backend.loaded is None, "a missing file reached the backend"
-    assert controller.owner is None
-    assert bubble.playback_bar.isHidden()
+    assert controller.owner is None and bubble.playback_bar.isHidden()
+    path.write_bytes(b"RIFF synthetic")
+    bubble.refresh_pairing()
     assert bubble.play_button.isEnabled()
-    assert "Could not play" in bubble.status_label.text()
-    assert "missing" in bubble.status_label.text()
 
 
 def test_a_backend_error_mid_playback_leaves_an_honest_state(qt_app, wavs):

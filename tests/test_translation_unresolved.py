@@ -276,10 +276,14 @@ def test_the_bubble_says_translation_was_not_attempted(qt_app, config, store, tm
     app, tx = run_one(config, store, tmp_path, ScriptedTranscription(field_case()),
                       PairTranslation(pairs=()), target_language="en")
     bubble = TransmissionBubble(tx, PlaybackController(SystemOpenBackend()))
-    notes = bubble.notes_label.text()
-    assert "Translation not attempted: language unresolved" in notes
-    assert "'nn' (52%)" in notes and "Retry as speech in" in notes
-    assert "translation not attempted" in bubble.status_label.text()
+    # Not spelled out on the card any more: the detail is on inspection
+    # (the status tooltip), the REVIEW column still says CHECK.
+    assert bubble.notes_label.isHidden()
+    tip = bubble.pairing_label.toolTip()
+    assert "Translation not attempted: language unresolved" in tip
+    assert "'nn' (52%)" in tip and "Retry as speech in" in tip
+    assert "Translation error" not in bubble.pairing_label.text()
+    assert "Transcription error" not in bubble.pairing_label.text()
     assert bubble.review_label.text() == "CHECK"
     assert bubble.error_label.isHidden(), "not shown as a failure"
 

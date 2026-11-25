@@ -438,7 +438,7 @@ def test_text_clear_from_the_window_redraws_the_thread(window, world, monkeypatc
     window._clear_session_history(_tab(window, world.ops.id))
     bubble = window.timeline.bubble(world.a1.id)
     assert bubble.original_label.isHidden()
-    assert "cleared" in bubble.notes_label.text()
+    assert bubble.pairing_label.text() == "Transcript cleared"
     assert bubble.play_action.isEnabled(), "audio stays playable"
     assert window.session_tabs.tabText(_tab(window, world.ops.id)).startswith("Ops")
 
@@ -452,7 +452,7 @@ def test_audio_clear_from_the_window_leaves_no_stale_play_or_waveform(window, wo
     assert not bubble.play_action.isEnabled()
     assert window.timeline.selected_transmission().audio_path is None
     assert not window.selected_play_button.isEnabled()
-    assert "Recording removed" in bubble.notes_label.text()
+    assert bubble.pairing_label.text() == "Audio cleared"
     assert not bubble.retry_action.isEnabled()
     assert not world.app.retry(world.a1.id), "nothing to process"
     assert world.row(world.a1).state is ProcessingState.COMPLETE

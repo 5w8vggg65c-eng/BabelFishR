@@ -53,10 +53,20 @@ def a_is_untouched(backend, controller, a, *, state, position, bar_visible):
     assert a.playback_bar.isVisible() is bar_visible
 
 
+def attempt_missing_b(qt_app, b, controller):
+    """B's original is missing: its Play is disabled and its card says so
+    (the operator cannot start it); a request that reaches the controller
+    anyway (a stale route) is still refused without touching A."""
+    assert not b.play_button.isEnabled()
+    assert b.pairing_label.text() == "Audio missing"
+    controller.play("b", b.tx.audio_path)
+    pump(qt_app)
+
+
 def b_reports_its_error(b, controller):
     assert "missing" in controller.last_error["b"]
     assert "Could not play" in b.status_label.text() and "missing" in b.status_label.text()
-    assert b.play_button.isEnabled() and b.playback_bar.isHidden()
+    assert not b.play_button.isEnabled() and b.playback_bar.isHidden()
 
 
 def test_bs_missing_file_leaves_a_playing_a_long_recording(qt_app, wavs, tmp_path):
@@ -68,7 +78,7 @@ def test_bs_missing_file_leaves_a_playing_a_long_recording(qt_app, wavs, tmp_pat
     assert a.pause_button.text().startswith("⏸")
     mark = len(backend.calls)
 
-    click(qt_app, b.play_button)
+    attempt_missing_b(qt_app, b, controller)
     a_is_untouched(backend, controller, a, state=PLAYING, position=700, bar_visible=True)
     assert a.play_button.isHidden()
     assert a.pause_button.text().startswith("⏸")
@@ -90,7 +100,7 @@ def test_bs_missing_file_leaves_a_playing_a_short_recording(qt_app, wavs, tmp_pa
     assert not a.play_button.isEnabled() and "Playing" in a.play_button.text()
     mark = len(backend.calls)
 
-    click(qt_app, b.play_button)
+    attempt_missing_b(qt_app, b, controller)
     assert controller.owner == "a" and controller.state_for("a") == PLAYING
     assert backend.state() == PLAYING and controller.position_for("a") == (500, 2000)
     assert not a.play_button.isEnabled() and "Playing" in a.play_button.text()
@@ -111,7 +121,7 @@ def test_bs_missing_file_leaves_a_paused(qt_app, wavs, tmp_path):
     assert a.pause_button.text().startswith("▶")
     mark = len(backend.calls)
 
-    click(qt_app, b.play_button)
+    attempt_missing_b(qt_app, b, controller)
     a_is_untouched(backend, controller, a, state=PAUSED, position=700, bar_visible=True)
     assert a.pause_button.text().startswith("▶")
     assert stops_since(backend, mark) == 0
@@ -133,9 +143,11 @@ def test_the_owner_failing_itself_natural_end_stop_and_takeover_still_behave(
         controller.play("a", a.tx.audio_path)              # a fresh request: file gone
         assert controller.owner is None and backend.state() == STOPPED
         assert stops_since(backend, mark) == 1 and "missing" in controller.last_error["a"]
-        assert a.playback_bar.isHidden() and a.play_button.isEnabled()
+        assert a.playback_bar.isHidden() and not a.play_button.isEnabled()
+        assert a.pairing_label.text() == "Audio missing"
     finally:
         (tmp_path / "moved.wav").rename(wavs["long"])
+    a.refresh_pairing()                      # restored: re-checked on the next look
     # Natural end.
     click(qt_app, a.play_button)
     backend.advance(9000)
@@ -159,10 +171,12 @@ def test_the_owner_failing_itself_natural_end_stop_and_takeover_still_behave(
 def test_b_can_be_retried_once_its_recording_exists(qt_app, wavs, tmp_path):
     backend, view, controller, a, b = two_bubbles(qt_app, wavs, tmp_path)
     click(qt_app, a.play_button)
-    click(qt_app, b.play_button)
+    attempt_missing_b(qt_app, b, controller)
     b_reports_its_error(b, controller)
     assert controller.owner == "a"
     shutil.copy(wavs["short"], b.tx.audio_path)            # the file appears
+    b.refresh_pairing()                                    # seen on the next look
+    assert b.pairing_label.text().startswith("Audio + transcript")
     backend.durations[b.tx.audio_path] = 2000
     mark = len(backend.calls)
     click(qt_app, b.play_button)
@@ -179,6 +193,7 @@ def test_a_backend_that_rejects_the_file_on_load_gives_no_false_start(
     Whether a given QtMultimedia build does that is not established here."""
     backend, view, controller, a, b = two_bubbles(qt_app, wavs, tmp_path)
     shutil.copy(wavs["short"], b.tx.audio_path)            # exists, but undecodable
+    b.refresh_pairing()
     real_load = backend.load
 
     def load(path):
@@ -199,6 +214,6 @@ def test_a_backend_that_rejects_the_file_on_load_gives_no_false_start(
     assert backend.state() == STOPPED
     assert "decoded" in controller.last_error["b"]
     assert "Could not play" in b.status_label.text()
-    assert b.play_button.isEnabled() and b.playback_bar.isHidden()
+    assert b.play_button.isEnabled() and b.playback_bar.isHidden()   # the file is there
     assert a.playback_bar.isHidden() and a.play_button.isEnabled()   # A was stopped by the takeover
     assert controller.play("b", b.tx.audio_path) is False

@@ -263,6 +263,12 @@ class DisplayConfig:
     """``local`` (default) or ``utc``: the zone operator-visible times are
     shown in. Stored instants and exports are unaffected."""
 
+    utc_zone: str = "utc"
+    """What ``utc`` shows: ``utc`` (UTC/Zulu), a fixed offset such as
+    ``+05:30``, or an IANA region such as ``America/Denver`` (see
+    babelfishr.timefmt). Kept apart from ``timezone`` so a Build 39 setting
+    reads the same, and switching to Local and back keeps the region."""
+
 
 @dataclasses.dataclass
 class SetupState:

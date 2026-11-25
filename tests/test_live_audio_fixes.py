@@ -621,8 +621,12 @@ def test_held_message_explains_itself_and_offers_retry_as_speech(config, store, 
         bubble = window.timeline.bubble(tx.id)
         details = bubble.findChildren(QtWidgets.QLabel)
         text = " ".join(label.text() for label in details)
-        assert "Probably not speech" in text and "0.0 s of speech" in text
-        assert "Retry as speech in..." in text
+        # One short status on the card; the evidence only on inspection.
+        assert "Probably not speech" not in text
+        assert "Audio unintelligible" in bubble.pairing_label.text()
+        tip = bubble.pairing_label.toolTip()
+        assert "Probably not speech" in tip and "0.0 s of speech" in tip
+        assert "Retry as speech in..." in tip
         menu_texts = [a.text() for a in bubble.menu_button.menu().actions()]
         assert "Retry as speech in..." in menu_texts
 

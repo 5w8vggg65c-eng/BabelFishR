@@ -5,7 +5,8 @@ centred on it. It is a separate, non-modal window, so the transcript, the
 waveform and the input meters keep their size and place and stay live
 underneath. Close, Escape or the button again close it; it can be resized,
 and on a small screen it is fitted to the screen with its contents
-scrolling, so every option stays reachable.
+scrolling downwards - never sideways: labels move above their fields and
+long text wraps - so every option stays reachable.
 """
 
 from __future__ import annotations
@@ -31,6 +32,10 @@ class SessionOptionsDialog(QtWidgets.QDialog):
         self.scroll = QtWidgets.QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        # Downwards only: the form wraps to the width it is given (see
+        # MainWindow._build_controls), so there is never anything to the side.
+        self.scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.scroll.setWidget(content)
         layout.addWidget(self.scroll, 1)
         self.buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
