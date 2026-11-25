@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import dataclasses
 import time
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 
 from ..dsp.filters import dbfs, rms
 from .source import CLIP_THRESHOLD, AudioBlock, AudioSource
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .spectrum import SpectrumFrame
 
 #: Below this the input is almost certainly not connected to anything.
 SILENT_DBFS = -75.0
@@ -33,6 +36,9 @@ class LevelReading:
     peak_hold_dbfs: float
     clipped: bool
     clip_count: int
+    #: The input's live magnitude spectrum at this moment (audio/spectrum.py),
+    #: when the producer computes one. Only the latest frame ever travels.
+    spectrum: Optional["SpectrumFrame"] = None
 
     @property
     def rms_fraction(self) -> float:
