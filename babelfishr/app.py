@@ -1470,7 +1470,8 @@ class BabelFishRApp:
         removed in the BabelFishR folder and its data folders - and records
         the result. That touches the drive: keep it off the window's
         render path. ``probe=False`` does no I/O on the destination at all
-        (one database read for the Session's choice) and returns the last
+        (and no database read once the Session's choice is known - it is
+        never blocked by the store's lock) and returns the last
         recorded result - from readiness, set_save_path, start_session, a
         probing call, or the capture's fallback/restored report - with
         ``checked_at`` set; a custom path never checked in this run of the
@@ -1480,7 +1481,13 @@ class BabelFishRApp:
         from . import savepath
 
         conversation_id = conversation_id or self.conversation_id
-        chosen = self._chosen_save_path(conversation_id)
+        if not probe and conversation_id in self._save_path_cache:
+            # The window's path (Stop, redraws): never wait on the store's
+            # lock, which a long write elsewhere may hold. The choice is
+            # kept current by launch, set_save_path and every store read.
+            chosen = self._save_path_cache[conversation_id]
+        else:
+            chosen = self._chosen_save_path(conversation_id)
         standard = self._standard_dir()
         if not chosen:
             return SavePathInfo(chosen="", owned_dir=None, effective_dir=standard,
@@ -1544,6 +1551,7 @@ class BabelFishRApp:
             if reason:
                 raise SavePathError(savepath.describe(chosen, reason))
         self.store.set_conversation_save_path(conversation_id, chosen)
+        self._save_path_cache[conversation_id] = chosen
         info = self.save_path_info(conversation_id, probe=False)
         self.events.publish("save-path", {
             "state": "changed", "conversation_id": conversation_id,
