@@ -12,8 +12,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..models import (ContentClass, ProcessingState, Provenance,
                       Transmission)
-from .playback import (LONG_RECORDING_SECONDS, PAUSED, PLAYING, SKIP_MS,
-                       PlaybackController, format_clock)
+from .playback import PAUSED, PLAYING, PlaybackController
 from .widgets import TagEditor
 
 #: Fixed widths for the TIME and REVIEW columns, shared with the column
@@ -84,16 +83,17 @@ def _speech_check_note(tx: Transmission) -> str:
     if verdict not in ("likely_noise", "uncertain"):
         return ""
     if operator_checked(tx):
-        return ("You checked and saved this transcript. The automatic speech "
-                "check had marked it "
+        decision = ("You approved this result." if metadata.get("operator_approved")
+                    else "You checked and saved this transcript.")
+        return (decision + " The automatic speech check had marked it "
                 + ("probably not speech." if verdict == "likely_noise" else "uncertain."))
     confirmed = metadata.get("speech_confirmed") or {}
     if confirmed:
         language = confirmed.get("source_language")
         said = (f"You marked this as speech in {language}" if language
                 else "You marked this as speech (language detected automatically)")
-        check_words = (" Check the new transcript against the audio; saving it with "
-                       "Edit transcript and translation marks it reviewed.")
+        check_words = (" Check the new transcript against the audio. Approve it or use "
+                       "Edit to save any corrections.")
         stage = tx.error.stage if tx.error else ""
         if tx.state is ProcessingState.FAILED:
             if stage == "translation":
@@ -158,7 +158,7 @@ def _translation_unresolved_note(tx: Transmission) -> str:
              f"detection guessed '{guessed}' ({shown}), and no {guessed}->{target} "
              f"language pack is installed. ")
     if operator_checked(tx):
-        return words + "You have since checked and saved this message."
+        return words + "You have since checked this message."
     # No shortcut in the prose: Qt shows Ctrl as Command on macOS, and the
     # menu item itself shows the right key.
     return words + ("The recording and transcript are kept. If this is "
@@ -167,10 +167,8 @@ def _translation_unresolved_note(tx: Transmission) -> str:
 
 
 def operator_checked(tx: Transmission) -> bool:
-    """The operator saved this message's transcript/translation (Edit
-    transcript and translation) and it has not been re-recognised since.
-    Not a note, and not Retry as speech: those leave the words unchecked."""
-    return bool(tx.reviewed and tx.has_correction)
+    """The operator approved or corrected the current recognition."""
+    return tx.operator_checked
 
 
 def original_present(tx: Transmission) -> bool:
@@ -243,7 +241,7 @@ def pairing_status(tx: Transmission) -> tuple:
         text = "withheld"
     elif (tx.display_transcript or "").strip():
         text = "ok"
-    elif "text" in cleared:
+    elif "text" in cleared or "transcript" in (tx.signal_metadata or {}).get("operator_cleared_fields", ()):
         text = "cleared"
     elif tx.state in _TEXT_PENDING and not (tx.signal_metadata or {}).get(
             "processing_stopped"):
@@ -392,6 +390,23 @@ class WrappingText(QtWidgets.QTextEdit):
     def text(self) -> str:
         return self._html
 
+    def set_editable(self, editable: bool) -> None:
+        if editable == (not self.isReadOnly()):
+            return
+        self.setReadOnly(not editable)
+        self.setAcceptRichText(False)
+        self.setTextInteractionFlags(QtCore.Qt.TextEditorInteraction if editable else
+                                     QtCore.Qt.TextSelectableByMouse)
+        if editable:
+            self.textChanged.connect(self._fit_edit)
+        else:
+            self.textChanged.disconnect(self._fit_edit)
+
+    def _fit_edit(self) -> None:
+        self._html = self.toPlainText()
+        self._heights.clear()
+        self._fit()
+
     def setWordWrap(self, _on: bool) -> None:      # noqa: N802 - always wraps
         pass
 
@@ -513,6 +528,8 @@ class TransmissionBubble(QtWidgets.QFrame):
     """
 
     correctionRequested = QtCore.Signal(str, str, str)   # tx_id, transcript, translation
+    approvalRequested = QtCore.Signal(str)
+    editingChanged = QtCore.Signal(object)
     tagsChanged = QtCore.Signal(str, list)
     bookmarkToggled = QtCore.Signal(str, bool)
     retryRequested = QtCore.Signal(str)
@@ -532,13 +549,14 @@ class TransmissionBubble(QtWidgets.QFrame):
         super().__init__(parent)
         self.tx = tx
         self._player = player
+        self.editing = False
+        self.request_editor = None
         if follow_player:
             # A bubble on its own listens to the controller itself. Inside a
             # TimelineView it does not: the view hands each change to the
             # bubbles it concerns, so a notification costs work in proportion
             # to the recordings affected, not to the length of the thread.
             self._player.changed.connect(self._on_player_changed)
-            self._player.positionChanged.connect(self._on_playback_position)
         self.setObjectName("bubble")
         self.setFrameShape(QtWidgets.QFrame.StyledPanel)
 
@@ -549,12 +567,8 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.setAccessibleName("Message")
 
         # Columns, as the v5 review list: TIME | MESSAGE | REVIEW. The
-        # MESSAGE column holds the transcript in its own labelled box at the
-        # full width of the text area, the translation (when there is one)
-        # in a second box under it, and the compact metadata, chips, notes
-        # and controls below both. Row 1, the playback bar, spans the whole
-        # row: under the text column alone its buttons would set a minimum
-        # width wider than a narrow list, widening every row past the view.
+        # MESSAGE holds the two text boxes and the editing actions. Playback
+        # belongs to the shared transport so it stays put as the thread moves.
         grid = QtWidgets.QGridLayout(self)
         grid.setContentsMargins(10, 8, 10, 8)
         grid.setHorizontalSpacing(16)
@@ -580,6 +594,13 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.review_label.setAlignment(QtCore.Qt.AlignCenter)
         self.review_label.setFixedWidth(REVIEW_COLUMN_WIDTH)
         review_column.addWidget(self.review_label, 0, QtCore.Qt.AlignRight)
+
+        self.approve_button = QtWidgets.QToolButton()
+        self.approve_button.setText("Approved")
+        self.approve_button.setAccessibleName("Mark this transmission approved")
+        self.approve_button.setToolTip("Mark this result as checked and keep its words")
+        self.approve_button.clicked.connect(lambda: self.approvalRequested.emit(self.tx.id))
+        review_column.addWidget(self.approve_button, 0, QtCore.Qt.AlignHCenter)
 
         self.header = QtWidgets.QLabel()
         self.header.setObjectName("bubbleHeader")
@@ -661,18 +682,6 @@ class TransmissionBubble(QtWidgets.QFrame):
         controls = QtWidgets.QHBoxLayout()
         controls.setSpacing(8)
 
-        # A compact Play on every bubble that has a recording - the operator
-        # asked for it. Longer recordings expand a control bar across the
-        # bottom of this bubble while they play; short ones play straight
-        # through. Still a text chat bubble: no waveform, no analyser.
-        self.play_button = QtWidgets.QToolButton()
-        self.play_button.setObjectName("playButton")
-        self.play_button.setText("Play original")
-        self.play_button.setToolTip("Play this recording")
-        self.play_button.setAccessibleName("Play recording")
-        self.play_button.clicked.connect(self._on_play_clicked)
-        controls.addWidget(self.play_button)
-
         # The card's one status: is the original recording on disk, and is
         # there a transcript for it (see pairing_status).
         self.pairing_label = QtWidgets.QLabel()
@@ -725,43 +734,26 @@ class TransmissionBubble(QtWidgets.QFrame):
         review_column.addStretch(1)
         outer.addLayout(controls)
 
-        # The expanded bar: Play/Pause, Stop, rewind, fast-forward, position.
-        # Hidden until a longer recording is playing; Stop hides it again.
-        self.playback_bar = QtWidgets.QWidget()
-        self.playback_bar.setObjectName("playbackBar")
-        bar = QtWidgets.QHBoxLayout(self.playback_bar)
-        bar.setContentsMargins(0, 2, 0, 0)
-        bar.setSpacing(6)
-        skip_seconds = SKIP_MS // 1000
-        self.rewind_button = QtWidgets.QToolButton()
-        self.rewind_button.setText(f"\u23ea {skip_seconds} s")
-        self.rewind_button.setToolTip(f"Back {skip_seconds} seconds")
-        self.rewind_button.setAccessibleName(f"Rewind {skip_seconds} seconds")
-        self.rewind_button.clicked.connect(self._on_rewind_clicked)
-        bar.addWidget(self.rewind_button)
-        self.pause_button = QtWidgets.QToolButton()
-        self.pause_button.setText("\u23f8 Pause")
-        self.pause_button.setAccessibleName("Pause or resume")
-        self.pause_button.clicked.connect(self._on_pause_clicked)
-        bar.addWidget(self.pause_button)
-        self.stop_button = QtWidgets.QToolButton()
-        self.stop_button.setText("\u23f9 Stop")
-        self.stop_button.setToolTip("Stop playback and hide these controls")
-        self.stop_button.setAccessibleName("Stop playback")
-        self.stop_button.clicked.connect(self._on_stop_clicked)
-        bar.addWidget(self.stop_button)
-        self.forward_button = QtWidgets.QToolButton()
-        self.forward_button.setText(f"\u23e9 {skip_seconds} s")
-        self.forward_button.setToolTip(f"Forward {skip_seconds} seconds")
-        self.forward_button.setAccessibleName(f"Fast forward {skip_seconds} seconds")
-        self.forward_button.clicked.connect(self._on_forward_clicked)
-        bar.addWidget(self.forward_button)
-        self.position_label = QtWidgets.QLabel("")
-        self.position_label.setObjectName("statusText")
-        bar.addWidget(self.position_label)
-        bar.addStretch(1)
-        self.playback_bar.hide()
-        grid.addWidget(self.playback_bar, 1, 0, 1, 3)
+        self.edit_button = QtWidgets.QToolButton()
+        self.edit_button.setText("Edit")
+        self.edit_button.setAccessibleName("Edit transcript and translation")
+        self.edit_button.clicked.connect(self._edit)
+        self.save_edit_button = QtWidgets.QToolButton()
+        self.save_edit_button.setText("Save")
+        self.save_edit_button.setAccessibleName("Save transcript changes")
+        self.save_edit_button.clicked.connect(self._save_edit)
+        self.cancel_edit_button = QtWidgets.QToolButton()
+        self.cancel_edit_button.setText("Cancel")
+        self.cancel_edit_button.setAccessibleName("Cancel transcript changes")
+        self.cancel_edit_button.clicked.connect(self.cancel_edit)
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.setSpacing(6)
+        for button in (self.edit_button, self.save_edit_button, self.cancel_edit_button):
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        outer.addLayout(buttons)
+        self.save_edit_button.hide()
+        self.cancel_edit_button.hide()
         self._watch_children_for_selection()
 
         self.update_from(tx)
@@ -774,7 +766,7 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.decoded_action = menu.addAction("Play decoded audio",
                                              self._play_decoded)
         menu.addSeparator()
-        menu.addAction("Edit transcript and translation...", self._edit)
+        self.edit_action = menu.addAction("Edit transcript and translation...", self._edit)
         menu.addAction("Add or edit note...", self._edit_note)
         menu.addAction("Edit tags...", self._edit_tags)
         self.bookmark_action = menu.addAction("Bookmark")
@@ -817,6 +809,12 @@ class TransmissionBubble(QtWidgets.QFrame):
 
     # -- rendering -------------------------------------------------------
     def update_from(self, tx: Transmission) -> None:
+        if (self.editing and tx.history_generation > self.tx.history_generation
+                and _cleared(tx).get("text") != _cleared(self.tx).get("text")):
+            # Clear Session History also discards an open draft of that text.
+            self.tx = tx
+            self.cancel_edit()
+            return
         self.tx = tx
         # Date and time, from the transmission's own started_at converted to
         # this computer's local zone - never the clock at render time, and
@@ -853,6 +851,92 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.time_label.setToolTip(_local_stamp(tx.started_at))
         self.time_label.setAccessibleName(f"Time {_local_stamp(tx.started_at)}")
 
+        if not self.editing:
+            self._render_words(tx)
+
+        # No paragraphs of explanation on the card: its one status line (see
+        # refresh_pairing) carries the short reason, and the technical detail
+        # is in that line's tooltip.
+        self.error_label.hide()
+        self.retry_button.setVisible(tx.state is ProcessingState.FAILED)
+
+        details: List[str] = []
+        attempt = tx.latest_analysis
+        if attempt is not None:
+            line = (f"Digital analysis ({attempt.engine} "
+                    f"{attempt.engine_version}): {_escape(attempt.summary())}")
+            if attempt.metadata:
+                line += " - " + _escape(", ".join(
+                    f"{k}={v}" for k, v in attempt.metadata.items()
+                    if k != "protocols_mentioned"))
+            if attempt.error:
+                line += f" - {_escape(attempt.error)}"
+            details.append(line)
+            warning = attempt.metadata.get("auto_hunt_warning")
+            if warning:
+                details.append(_escape(str(warning)))
+        if tx.notes:
+            details.append(f"Note: {_escape(tx.notes)}")
+        if details:
+            self.notes_label.setText("<br>".join(details))
+            self.notes_label.show()
+        else:
+            self.notes_label.hide()
+
+        self._rebuild_chips(tx)
+
+        # Only what the operator must act on: a recording saved but not
+        # processed because monitoring stopped. Routine states (queued,
+        # needs review, translation not attempted) are not repeated here:
+        # the text box, the REVIEW column and the status line say them.
+        self.status_label.setText(
+            "saved, not processed (monitoring stopped)"
+            if (tx.signal_metadata or {}).get("processing_stopped") else "")
+        # REVIEW column: the word, never only a colour.
+        if tx.state is ProcessingState.FAILED:
+            review, tone = "FAILED", "failed"
+        elif tx.needs_review:
+            review, tone = "CHECK", "check"
+        elif tx.operator_checked and (tx.signal_metadata or {}).get("operator_approved"):
+            review, tone = "APPROVED", "none"
+        else:
+            review, tone = "\u2013", "none"
+        self.approve_button.setVisible(tx.can_approve and not self.editing)
+        can_edit = tx.state not in _IN_FLIGHT
+        self.edit_action.setEnabled(can_edit)
+        self.edit_button.setEnabled(can_edit)
+        self.review_label.setText(review)
+        self.review_label.setProperty("tone", tone)
+        self.review_label.setAccessibleDescription(
+            {"failed": "Processing failed", "check": "Needs review",
+             "none": "No review needed"}[tone])
+        self.review_label.style().unpolish(self.review_label)
+        self.review_label.style().polish(self.review_label)
+
+        self.bookmark_action.setChecked(tx.bookmarked)
+        self.setProperty("state", tx.state.value)
+        self.setProperty("review", bool(tx.needs_review))
+        self.setProperty("skipped", tx.state is ProcessingState.SKIPPED)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+        # Recovery actions, shown only where they apply.
+        can_force = tx.can_transcribe_anyway and tx.state in (
+            ProcessingState.SKIPPED, ProcessingState.COMPLETE)
+        self.action_button.setVisible(can_force)
+        self.decoded_action.setVisible(bool(tx.decoded_audio_path))
+        self.refresh_pairing()
+        # A removed message, when shown at all, says so and offers only the
+        # way back; an ordinary one offers removal.
+        self.remove_action.setVisible(not tx.hidden)
+        self.restore_action.setVisible(bool(tx.hidden))
+        self.restore_button.setVisible(bool(tx.hidden))
+        self.setProperty("removed", bool(tx.hidden))
+        if tx.hidden:
+            self.status_label.setText("Removed from thread \u2014 data kept")
+        self._render_playback()
+
+    def _render_words(self, tx: Transmission) -> None:
         # The transcript is the message. It is the primary content of the
         # bubble, in plain words, with no engine or language prefix competing
         # with it - the language already appears in the header line.
@@ -913,83 +997,6 @@ class TransmissionBubble(QtWidgets.QFrame):
             self.translated_label.hide()
             self.translation_box.hide()
 
-        # No paragraphs of explanation on the card: its one status line (see
-        # refresh_pairing) carries the short reason, and the technical detail
-        # is in that line's tooltip.
-        self.error_label.hide()
-        self.retry_button.setVisible(tx.state is ProcessingState.FAILED)
-
-        details: List[str] = []
-        attempt = tx.latest_analysis
-        if attempt is not None:
-            line = (f"Digital analysis ({attempt.engine} "
-                    f"{attempt.engine_version}): {_escape(attempt.summary())}")
-            if attempt.metadata:
-                line += " - " + _escape(", ".join(
-                    f"{k}={v}" for k, v in attempt.metadata.items()
-                    if k != "protocols_mentioned"))
-            if attempt.error:
-                line += f" - {_escape(attempt.error)}"
-            details.append(line)
-            warning = attempt.metadata.get("auto_hunt_warning")
-            if warning:
-                details.append(_escape(str(warning)))
-        if tx.notes:
-            details.append(f"Note: {_escape(tx.notes)}")
-        if details:
-            self.notes_label.setText("<br>".join(details))
-            self.notes_label.show()
-        else:
-            self.notes_label.hide()
-
-        self._rebuild_chips(tx)
-
-        # Only what the operator must act on: a recording saved but not
-        # processed because monitoring stopped. Routine states (queued,
-        # needs review, translation not attempted) are not repeated here:
-        # the text box, the REVIEW column and the status line say them.
-        self.status_label.setText(
-            "saved, not processed (monitoring stopped)"
-            if (tx.signal_metadata or {}).get("processing_stopped") else "")
-        # REVIEW column: the word, never only a colour.
-        if tx.state is ProcessingState.FAILED:
-            review, tone = "FAILED", "failed"
-        elif tx.needs_review:
-            review, tone = "CHECK", "check"
-        else:
-            review, tone = "\u2013", "none"
-        self.review_label.setText(review)
-        self.review_label.setProperty("tone", tone)
-        self.review_label.setAccessibleDescription(
-            {"failed": "Processing failed", "check": "Needs review",
-             "none": "No review needed"}[tone])
-        self.review_label.style().unpolish(self.review_label)
-        self.review_label.style().polish(self.review_label)
-
-        self.bookmark_action.setChecked(tx.bookmarked)
-        self.setProperty("state", tx.state.value)
-        self.setProperty("review", bool(tx.needs_review))
-        self.setProperty("skipped", tx.state is ProcessingState.SKIPPED)
-        self.style().unpolish(self)
-        self.style().polish(self)
-
-        # Recovery actions, shown only where they apply.
-        can_force = tx.can_transcribe_anyway and tx.state in (
-            ProcessingState.SKIPPED, ProcessingState.COMPLETE)
-        self.action_button.setVisible(can_force)
-        self.decoded_action.setVisible(bool(tx.decoded_audio_path))
-        self.refresh_pairing()
-        # A removed message, when shown at all, says so and offers only the
-        # way back; an ordinary one offers removal.
-        self.remove_action.setVisible(not tx.hidden)
-        self.restore_action.setVisible(bool(tx.hidden))
-        self.restore_button.setVisible(bool(tx.hidden))
-        self.setProperty("removed", bool(tx.hidden))
-        if tx.hidden:
-            self.status_label.setText("Removed from thread \u2014 data kept")
-        # The menu's Play/Pause label, the buttons and the bar are all drawn
-        # from the controller in one place.
-        self._render_playback()
 
     def refresh_pairing(self) -> None:
         """Re-check the original recording on disk and redraw the card's
@@ -1008,7 +1015,6 @@ class TransmissionBubble(QtWidgets.QFrame):
         present = original_present(tx)
         # Nothing to play or re-process without the original recording.
         self.play_action.setEnabled(present)
-        self.play_button.setEnabled(present)
         self.transcribe_action.setEnabled(present)
         for action in (getattr(self, "retry_action", None),
                        getattr(self, "retry_speech_action", None)):
@@ -1099,10 +1105,6 @@ class TransmissionBubble(QtWidgets.QFrame):
             self.provisional.hide()
 
     # -- playback ----------------------------------------------------------
-    @property
-    def is_long_recording(self) -> bool:
-        return float(self.tx.duration or 0.0) > LONG_RECORDING_SECONDS
-
     def set_queue_note(self, note: str) -> None:
         """Where this held recording is: "transcription · 8 s" or "3rd in
         line" (from the processor's own queue); "" clears it."""
@@ -1127,31 +1129,6 @@ class TransmissionBubble(QtWidgets.QFrame):
         else:
             self._player.play(self.tx.id, self.tx.audio_path)
 
-    def _on_play_clicked(self) -> None:
-        self._start_original()
-
-    def _on_pause_clicked(self) -> None:
-        self._player.toggle(self.tx.id, self.tx.audio_path)
-
-    def _on_stop_clicked(self) -> None:
-        if self._player.owner == self.tx.id:
-            self._player.stop()
-
-    def _on_rewind_clicked(self) -> None:
-        if self._player.owner == self.tx.id:
-            self._player.rewind()
-
-    #: Set by the list: +5 s through the window's continuous playback, which
-    #: moves to the next recording when this one has 5 s or less left.
-    skip_forward = None
-
-    def _on_forward_clicked(self) -> None:
-        if self._player.owner == self.tx.id:
-            if self.skip_forward is not None:
-                self.skip_forward()
-            else:
-                self._player.forward()
-
     def _toggle_play(self) -> None:  # noqa: D401 - the menu's Play / Pause
         from .waveform import same_audio
 
@@ -1164,11 +1141,6 @@ class TransmissionBubble(QtWidgets.QFrame):
         else:
             self._start_original()
 
-    def _on_playback_position(self, owner: str, position_ms: int,
-                              duration_ms: int) -> None:
-        if owner == self.tx.id:
-            self.position_label.setText(format_clock(position_ms, duration_ms))
-
     def _on_player_changed(self, affected) -> None:
         if self.tx.id in affected:
             # A play that failed because the file has gone shows on the card.
@@ -1176,47 +1148,10 @@ class TransmissionBubble(QtWidgets.QFrame):
             self._render_playback()
 
     def _render_playback(self) -> None:
-        """Draw this bubble's playback controls from the controller's truth.
-
-        Idempotent and cheap: called after every transcript update and after
-        every controller change. It reads state; it never changes it, so a
-        translation arriving mid-playback cannot reset the recording.
-        """
-        has_audio = bool(self.tx.audio_path)
+        """Keep the menu shortcut and failure status in sync with the player."""
         state = self._player.state_for(self.tx.id)
+        self.play_action.setText("Pause" if state == PLAYING else "Play original recording")
         error = self._player.last_error.get(self.tx.id, "")
-        if not has_audio:
-            self.play_button.hide()
-            self.playback_bar.hide()
-            return
-        if state == PLAYING or state == PAUSED:
-            if self.is_long_recording and self._player.controllable:
-                self.play_button.hide()
-                self.pause_button.setText(
-                    "\u23f8 Pause" if state == PLAYING else "\u25b6 Play")
-                self.pause_button.setToolTip(
-                    "Pause" if state == PLAYING else "Resume from here")
-                if not self.playback_bar.isVisible():
-                    position, duration = self._player.position_for(self.tx.id)
-                    self.position_label.setText(format_clock(position, duration))
-                self.playback_bar.show()
-            else:
-                # Short: plays through, no extra controls, Play comes back
-                # when it finishes. Uncontrollable backend: same shape,
-                # because a Pause that pauses nothing must not be offered.
-                self.playback_bar.hide()
-                self.play_button.setText("Playing\u2026")
-                self.play_button.setEnabled(False)
-                self.play_button.show()
-            self.play_action.setText("Pause" if state == PLAYING
-                                     else "Play original recording")
-        else:
-            self.playback_bar.hide()
-            self.play_button.setText("Play original")
-            # Only with the original actually on disk (see refresh_pairing).
-            self.play_button.setEnabled(original_present(self.tx))
-            self.play_button.show()
-            self.play_action.setText("Play original recording")
         if error:
             self.status_label.setText(f"Could not play: {error}")
             self.status_label.setToolTip(error)
@@ -1231,26 +1166,52 @@ class TransmissionBubble(QtWidgets.QFrame):
     # -- actions ---------------------------------------------------------
 
     def _edit(self) -> None:
-        dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle("Correct transcript and translation")
-        dialog.resize(560, 320)
-        layout = QtWidgets.QVBoxLayout(dialog)
-        layout.addWidget(QtWidgets.QLabel(
-            "<b>Original transcript</b> (the engine's output is preserved "
-            "separately)"))
-        original = QtWidgets.QPlainTextEdit(self.tx.display_transcript)
-        layout.addWidget(original)
-        layout.addWidget(QtWidgets.QLabel("<b>Translation</b>"))
-        translated = QtWidgets.QPlainTextEdit(self.tx.display_translation)
-        layout.addWidget(translated)
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        if dialog.exec() == QtWidgets.QDialog.Accepted:
-            self.correctionRequested.emit(
-                self.tx.id, original.toPlainText(), translated.toPlainText())
+        if self.editing:
+            self.original_label.setFocus()
+            return
+        if not self.edit_action.isEnabled():
+            return
+        if self.request_editor is not None and not self.request_editor(self.tx.id):
+            return
+        self.selectRequested.emit(self.tx.id)
+        self.editing = True
+        self.editingChanged.emit(self.tx.id)
+        self.original_label.set_editable(True)
+        self.original_label.setText(self.tx.display_transcript)
+        self.original_label.show()
+        self.transcript_box.show()
+        self.transcript_caption.setText("EDIT TRANSCRIPT")
+        self.translated_label.set_editable(True)
+        self.translated_label.setText(self.tx.display_translation)
+        self.translated_label.show()
+        self.translation_box.setVisible(bool(self.tx.display_translation) or
+                                        _differs(self.tx.source_language, self.tx.target_language))
+        self.translation_caption.setText("EDIT TRANSLATION")
+        self.edit_button.hide()
+        self.approve_button.hide()
+        self.save_edit_button.show()
+        self.cancel_edit_button.show()
+        self.original_label.setFocus()
+
+    def _save_edit(self) -> None:
+        if not self.editing:
+            return
+        transcript = self.original_label.toPlainText().strip()
+        translation = self.translated_label.toPlainText().strip()
+        self.correctionRequested.emit(self.tx.id, transcript, translation)
+        self.cancel_edit()
+
+    def cancel_edit(self) -> None:
+        if not self.editing:
+            return
+        self.editing = False
+        self.original_label.set_editable(False)
+        self.translated_label.set_editable(False)
+        self.save_edit_button.hide()
+        self.cancel_edit_button.hide()
+        self.edit_button.show()
+        self.update_from(self.tx)
+        self.editingChanged.emit(None)
 
     def _edit_tags(self) -> None:
         dialog = TagEditor(self.tx.tags, self)
@@ -1306,6 +1267,8 @@ class TimelineView(QtWidgets.QScrollArea):
     """
 
     correctionRequested = QtCore.Signal(str, str, str)
+    approvalRequested = QtCore.Signal(str)
+    editingChanged = QtCore.Signal(object)
     tagsChanged = QtCore.Signal(str, list)
     bookmarkToggled = QtCore.Signal(str, bool)
     retryRequested = QtCore.Signal(str)
@@ -1337,6 +1300,7 @@ class TimelineView(QtWidgets.QScrollArea):
         self._layout.addStretch(1)
         self.setWidget(self._container)
 
+        self.editing_id: Optional[str] = None
         self._bubbles: Dict[str, TransmissionBubble] = {}
         #: Newest first, so index 0 in the layout is the most recent.
         self._order: List[str] = []
@@ -1365,6 +1329,7 @@ class TimelineView(QtWidgets.QScrollArea):
         # (keep_playback) does not: the window keeps the playing card shown.
         if not keep_playback:
             self.playback.stop()
+        self._track_edit(None)
         for bubble in list(self._bubbles.values()):
             self._layout.removeWidget(bubble)
             bubble.deleteLater()
@@ -1378,6 +1343,8 @@ class TimelineView(QtWidgets.QScrollArea):
         bubble = self._bubbles.get(tx_id)
         if bubble is None:
             return False
+        if self.editing_id == tx_id:
+            self._track_edit(None)
         if self.playback.owner == tx_id:
             self.playback.stop()
         with self._anchored():
@@ -1396,28 +1363,20 @@ class TimelineView(QtWidgets.QScrollArea):
     def set_playback(self, controller: PlaybackController) -> None:
         """Use *controller* for every bubble here, present and future.
 
-        The view is the controller's only listener on behalf of its bubbles:
-        each change names the recordings it concerns and only their bubbles
-        are redrawn; each position report goes to the owner's bubble alone.
-        Before, every bubble listened for itself and the view redrew every
-        bubble as well, so one change redrew a thread of N bubbles twice
-        and every position tick reached all N.
+        Only affected cards refresh their menu and playback error. The shared
+        transport receives position changes, independent of the row count.
         """
         if self.playback is not None:
             self.playback.changed.disconnect(self._on_playback_changed)
-            self.playback.positionChanged.disconnect(self._on_playback_position)
         self.playback = controller
         self._player = controller             # what bubbles are handed
         controller.changed.connect(self._on_playback_changed)
-        controller.positionChanged.connect(self._on_playback_position)
         for bubble in self._bubbles.values():
             bubble._player = controller
         self.playbackReplaced.emit(controller)
 
     def _on_playback_changed(self, affected) -> None:
-        # Expanding or collapsing a control bar changes a bubble's height, so
-        # it happens inside the same anchoring every other growth does: the
-        # operator's reading position does not move.
+        # A playback error can add a status line above the operator's place.
         bubbles = [self._bubbles[tx_id] for tx_id in affected if tx_id in self._bubbles]
         if not bubbles:
             return
@@ -1425,12 +1384,6 @@ class TimelineView(QtWidgets.QScrollArea):
             for bubble in bubbles:
                 bubble.refresh_pairing()          # a failed play may mean the file went
                 bubble._render_playback()
-
-    def _on_playback_position(self, owner: str, position_ms: int,
-                              duration_ms: int) -> None:
-        bubble = self._bubbles.get(owner)
-        if bubble is not None:
-            bubble._on_playback_position(owner, position_ms, duration_ms)
 
     def count(self) -> int:
         return len(self._bubbles)
@@ -1540,7 +1493,9 @@ class TimelineView(QtWidgets.QScrollArea):
         self.empty_label.hide()
         bubble = TransmissionBubble(tx, self._player, follow_player=False)
         bubble.start_original = self._start_original
-        bubble.skip_forward = self._skip_forward
+        bubble.request_editor = self._allow_edit
+        bubble.editingChanged.connect(self._track_edit)
+        bubble.approvalRequested.connect(self.approvalRequested)
         bubble.correctionRequested.connect(self.correctionRequested)
         bubble.tagsChanged.connect(self.tagsChanged)
         bubble.bookmarkToggled.connect(self.bookmarkToggled)
@@ -1611,6 +1566,16 @@ class TimelineView(QtWidgets.QScrollArea):
         thread wants newest-first, while search and export have their own
         deliberate orders and must not be quietly re-sorted by a view.
         """
+        if self.editing_id and any(tx.id == self.editing_id for tx in transmissions):
+            # Keep the actual editor, selection, cursor and undo history on
+            # a refresh of this view. Removed results still leave the view.
+            remaining = {tx.id for tx in transmissions}
+            for tx_id in self.order():
+                if tx_id not in remaining:
+                    self.remove(tx_id)
+            for tx in transmissions:
+                self.place(tx)
+            return
         self.clear(keep_playback=keep_playback)
         newest_first = sorted(
             transmissions, key=lambda t: (t.started_at, t.id), reverse=True)
@@ -1644,21 +1609,29 @@ class TimelineView(QtWidgets.QScrollArea):
                 self.ensureWidgetVisible(bubble, 0, 0)
         self.selectionChanged.emit(tx_id)
 
+    def _allow_edit(self, tx_id: str) -> bool:
+        if self.editing_id and self.editing_id != tx_id:
+            current = self._bubbles.get(self.editing_id)
+            if current is not None:
+                self.select(self.editing_id, reveal=True)
+                self.ensureWidgetVisible(current)
+                current.original_label.setFocus()
+                QtWidgets.QToolTip.showText(
+                    QtGui.QCursor.pos(), "Save or cancel this edit first.", current)
+                return False
+        return True
+
+    def _track_edit(self, tx_id) -> None:
+        if tx_id != self.editing_id:
+            self.editing_id = tx_id
+            self.editingChanged.emit(tx_id)
+
     def set_empty_text(self, text: Optional[str]) -> None:
         """What an empty view says (None: the thread's own welcome)."""
         self.empty_label.setText(text or self._default_empty_text)
 
     #: Set by the window: plays an original and continues with newer ones.
     original_starter = None
-
-    #: Set by the window: +5 s that may move continuous playback onwards.
-    forward_skipper = None
-
-    def _skip_forward(self) -> None:
-        if self.forward_skipper is not None:
-            self.forward_skipper()
-        else:
-            self._player.forward()
 
     def _start_original(self, tx_id: str, path: str) -> None:
         if self.original_starter is not None:

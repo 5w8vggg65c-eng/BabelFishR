@@ -12,6 +12,7 @@ from ..app import BabelFishRApp
 from ..audio.devices import backend_available, backend_status
 from ..audio.devices import (AmbiguousInputDevice, InputDeviceMissing,
                              InputNotSelected)
+from ..audio.source import CLIP_THRESHOLD
 from ..config import Config
 from ..models import (ProcessingState, RadioProfile, SourceLanguageMode,
                       Transmission)
@@ -23,7 +24,7 @@ from .input_panel import InputPanel
 def _slug(text: str) -> str:
     safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in text.strip())
     return safe.strip("-").lower() or "session"
-from .timeline import TimelineView
+from .timeline import FlowLayout, TimelineView
 from .widgets import LevelMeterWidget
 
 log = logging.getLogger(__name__)
@@ -189,6 +190,7 @@ class MainWindow(QtWidgets.QMainWindow):
         Every control is an existing one, re-homed; every label shows a real
         state. Nothing here is sample data.
         """
+        from .live_waveform import LiveWaveform
         from .waveform import RecordingWaveform
         from .widgets import SessionListBar
 
@@ -254,12 +256,14 @@ class MainWindow(QtWidgets.QMainWindow):
         left_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         left_scroll.setWidget(left)
         left_scroll.setMinimumWidth(250)
+        self.sidebar = left_scroll
+        self._sidebar_width = 320
         panes.addWidget(left_scroll)
 
         right = QtWidgets.QFrame()
         right.setObjectName("rightPane")
         right_layout = QtWidgets.QVBoxLayout(right)
-        right_layout.setContentsMargins(10, 8, 10, 0)
+        right_layout.setContentsMargins(8, 8, 8, 0)
         right_layout.setSpacing(6)
         panes.addWidget(right)
         panes.setStretchFactor(0, 0)
@@ -286,9 +290,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._session_tab_menu)
         left_layout.addWidget(self.session_tabs)
 
-        session_buttons = QtWidgets.QHBoxLayout()
+        session_buttons = FlowLayout(spacing=5)
         session_buttons.setContentsMargins(0, 2, 0, 2)
-        session_buttons.setSpacing(6)
         self.new_session_button = QtWidgets.QToolButton()
         self.new_session_button.setText("+ New")
         self.new_session_button.setToolTip("Create a new named Session")
@@ -307,13 +310,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # Every action on the selected Session in one visible place - the
         # same menu as right-clicking its tab.
         self.session_actions_button = QtWidgets.QToolButton()
-        self.session_actions_button.setText("Session actions \u25be")
+        self.session_actions_button.setText("Actions \u25be")
         self.session_actions_button.setToolTip(
             "Rename, colour, clear history, hide or delete the selected Session")
         self.session_actions_button.setAccessibleName("Session actions")
         self.session_actions_button.clicked.connect(self._show_session_actions)
         session_buttons.addWidget(self.session_actions_button)
-        session_buttons.addStretch(1)
         left_layout.addLayout(session_buttons)
         # Only while a confirmed deletion still has files left on disk.
         self.cleanup_button = QtWidgets.QPushButton("Retry file cleanup\u2026")
@@ -366,6 +368,8 @@ class MainWindow(QtWidgets.QMainWindow):
         level_row.addWidget(self.meter, 1)
         level_row.addStretch(1)
         self.clip_label = QtWidgets.QLabel("")
+        self.clip_label.setWordWrap(True)
+        self.clip_label.setAccessibleName("Clipped input samples")
         level_row.addWidget(self.clip_label)
         self.calibrate_button = QtWidgets.QPushButton("Calibrate")
         self.calibrate_button.setToolTip(
@@ -377,12 +381,25 @@ class MainWindow(QtWidgets.QMainWindow):
         left_layout.addWidget(self._rule())
 
         # -- left: LOCAL ENGINES ---------------------------------------------
+        from .local_engines import WhisperModelPicker
+
         left_layout.addWidget(self._section_header("LOCAL ENGINES"))
         self.speech_engine_line = QtWidgets.QLabel("Speech: …")
         self.speech_engine_line.setObjectName("engineLine")
+        self.speech_engine_line.setWordWrap(True)
         self.translation_engine_line = QtWidgets.QLabel("Translation: …")
         self.translation_engine_line.setObjectName("engineLine")
+        self.translation_engine_line.setWordWrap(True)
         left_layout.addWidget(self.speech_engine_line)
+        model_row = QtWidgets.QHBoxLayout()
+        self.whisper_model_box = WhisperModelPicker(self.app)
+        model_label = QtWidgets.QLabel("Whisper model")
+        model_label.setObjectName("engineLine")
+        model_label.setBuddy(self.whisper_model_box)
+        model_row.addWidget(model_label)
+        model_row.addWidget(self.whisper_model_box, 1)
+        left_layout.addLayout(model_row)
+        self.whisper_model_box.currentIndexChanged.connect(self._change_whisper_model)
         left_layout.addWidget(self.translation_engine_line)
         self.ready_badge = QtWidgets.QLabel()
         self.ready_badge.setObjectName("readinessLink")
@@ -398,6 +415,15 @@ class MainWindow(QtWidgets.QMainWindow):
         header.setObjectName("paneHeader")
         header_row = QtWidgets.QHBoxLayout(header)
         header_row.setContentsMargins(0, 0, 0, 0)
+        self.sidebar_toggle = QtWidgets.QToolButton()
+        self.sidebar_toggle.setText("Sidebar")
+        self.sidebar_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self.sidebar_toggle.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.sidebar_toggle.setCheckable(True)
+        self.sidebar_toggle.setChecked(True)
+        self.sidebar_toggle.toggled.connect(self._set_sidebar_visible)
+        self._set_sidebar_visible(True)
+        header_row.addWidget(self.sidebar_toggle)
         heading = QtWidgets.QLabel("Transcript and translation")
         heading.setObjectName("paneHeading")
         header_row.addWidget(heading)
@@ -421,7 +447,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # -- right: the selected recording's waveform ---------------------------
         self.waveform = RecordingWaveform()
-        right_layout.addWidget(self.waveform)
+        self.live_waveform = LiveWaveform()
+        self.waveform_stack = QtWidgets.QStackedWidget()
+        self.waveform_stack.addWidget(self.waveform)
+        self.waveform_stack.addWidget(self.live_waveform)
+        right_layout.addWidget(self.waveform_stack)
 
         # -- right: filters and search ------------------------------------------
         filter_row = QtWidgets.QHBoxLayout()
@@ -446,7 +476,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.search_field.setPlaceholderText("Search...")
         self.search_field.setClearButtonEnabled(True)
         self.search_field.setAccessibleName("Search this Session")
-        self.search_field.setMinimumWidth(180)
+        self.search_field.setMinimumWidth(148)
         self.search_field.returnPressed.connect(
             lambda: self._run_search(self.search_field.text()))
         # Emptying the field - its clear button, or deleting the text - ends
@@ -460,6 +490,7 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout.addWidget(self._column_header())
         self.timeline = TimelineView()
         self.timeline.correctionRequested.connect(self._on_correction)
+        self.timeline.approvalRequested.connect(self.app.approve)
         self.timeline.tagsChanged.connect(self._on_tags)
         self.timeline.bookmarkToggled.connect(self._on_bookmark)
         self.timeline.retryRequested.connect(self._on_retry)
@@ -492,14 +523,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session_options_dialog = SessionOptionsDialog(self.setup_box, self)
         self.session_options_dialog.finished.connect(self._session_options_closed)
 
-        # -- right: SELECTED AUDIO ------------------------------------------------
-        right_layout.addWidget(self._build_selected_panel())
+        # The transport stays in one place while the thread scrolls or the
+        # sidebar is collapsed. The trigger belongs to the live input.
+        self.selected_panel = self._build_selected_panel()
+        self.selected_panel.layout().insertWidget(1, self.input_panel.gate_controls)
+        root.addWidget(self.selected_panel)
 
         # -- right: actions -------------------------------------------------------
         actions = QtWidgets.QFrame()
         actions.setObjectName("actionRow")
         action_row = QtWidgets.QHBoxLayout(actions)
-        action_row.setContentsMargins(0, 8, 0, 8)
+        action_row.setContentsMargins(10, 5, 10, 6)
         action_row.setSpacing(12)
         self.open_recording_button = QtWidgets.QPushButton("Open recording")
         self.open_recording_button.setObjectName("primaryAction")
@@ -530,7 +564,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.export_button.clicked.connect(self._export_session)
         action_row.addWidget(self.export_button)
         action_row.addStretch(1)
-        right_layout.addWidget(actions)
+        root.addWidget(actions)
 
         # -- footer status band ---------------------------------------------------
         self.status = self.statusBar()
@@ -545,6 +579,19 @@ class MainWindow(QtWidgets.QMainWindow):
         # Nothing is selected yet: the panel and waveform say so.
         self._refresh_selected_panel()
         self._refresh_cleanup_offer()
+
+    def _set_sidebar_visible(self, visible: bool) -> None:
+        if not visible:
+            self._sidebar_width = self.pane_splitter.sizes()[0] or self._sidebar_width
+        self.sidebar.setVisible(visible)
+        if visible:
+            available = max(self.pane_splitter.width(), self.width())
+            self.pane_splitter.setSizes([self._sidebar_width,
+                                         max(1, available - self._sidebar_width)])
+        self.sidebar_toggle.setArrowType(QtCore.Qt.LeftArrow if visible else QtCore.Qt.RightArrow)
+        action = "Hide sidebar" if visible else "Show sidebar"
+        self.sidebar_toggle.setAccessibleName(action)
+        self.sidebar_toggle.setToolTip(action)
 
     def menuBar(self) -> QtWidgets.QMenuBar:  # noqa: N802
         """The in-window navigation bar (see _build_ui), not a bar QMainWindow
@@ -615,22 +662,16 @@ class MainWindow(QtWidgets.QMainWindow):
         return frame
 
     def _build_selected_panel(self) -> QtWidgets.QFrame:
-        """SELECTED AUDIO: the chosen message's own recording and actions.
+        """A persistent transport under the timeline, shared by all recordings."""
+        from .waveform import PlaybackSeekSlider
 
-        The range shown is the clip's own start and end time on this
-        computer's clock - each message is its own recording, so there is no
-        longer session recording to place it in.
-        """
         panel = QtWidgets.QFrame()
         panel.setObjectName("selectedAudio")
-        layout = QtWidgets.QVBoxLayout(panel)
-        layout.setContentsMargins(4, 8, 4, 4)
-        layout.setSpacing(6)
-        title_row = QtWidgets.QHBoxLayout()
-        title_row.setSpacing(24)
-        # The fixed playback controls, found in one place: Play the chosen
-        # transmission, Pause/Resume and Stop whatever is playing.
         panel.setAccessibleName("Audio playback")
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(4, 6, 4, 4)
+        layout.setSpacing(4)
+        title_row = QtWidgets.QHBoxLayout()
         title = QtWidgets.QLabel("AUDIO PLAYBACK")
         title.setObjectName("selectedTitle")
         title_row.addWidget(title)
@@ -640,31 +681,50 @@ class MainWindow(QtWidgets.QMainWindow):
         title_row.addWidget(self.selected_range)
         title_row.addStretch(1)
         layout.addLayout(title_row)
+
+        self.playback_controls = QtWidgets.QWidget()
+        controls = QtWidgets.QVBoxLayout(self.playback_controls)
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(3)
         buttons = QtWidgets.QHBoxLayout()
-        buttons.setSpacing(12)
+        buttons.setSpacing(6)
         self.selected_play_button = QtWidgets.QPushButton("Play selected")
         self.selected_play_button.setObjectName("primaryAction")
-        self.selected_play_button.setAccessibleName(
-            "Play the selected transmission and the newer ones after it")
+        self.selected_play_button.setAccessibleName("Play selected recording")
         self.selected_play_button.clicked.connect(self._play_selected)
-        buttons.addWidget(self.selected_play_button)
-        # Playback, whatever is playing: separate from Stop monitoring, and
-        # available with no message selected (and while waiting for one).
         self.playback_pause_button = QtWidgets.QPushButton("Pause")
         self.playback_pause_button.setObjectName("textAction")
         self.playback_pause_button.setAccessibleName("Pause or resume playback")
-        self.playback_pause_button.setEnabled(False)
         self.playback_pause_button.clicked.connect(self._pause_playback)
-        buttons.addWidget(self.playback_pause_button)
-        self.playback_stop_button = QtWidgets.QPushButton("\u25a0 Stop playback")
+        self.playback_stop_button = QtWidgets.QPushButton("Stop")
         self.playback_stop_button.setObjectName("textAction")
         self.playback_stop_button.setAccessibleName("Stop playback")
-        self.playback_stop_button.setToolTip(
-            "Stop playback for this Session, including continuing to newer "
-            "transmissions and waiting for new ones. Monitoring is not affected.")
-        self.playback_stop_button.setEnabled(False)
         self.playback_stop_button.clicked.connect(self._stop_playback)
-        buttons.addWidget(self.playback_stop_button)
+        self.playback_rewind_button = QtWidgets.QPushButton("−5 s")
+        self.playback_rewind_button.setAccessibleName("Rewind five seconds")
+        self.playback_rewind_button.clicked.connect(
+            lambda: self.timeline.playback.rewind())
+        self.playback_forward_button = QtWidgets.QPushButton("+5 s")
+        self.playback_forward_button.setAccessibleName("Forward five seconds")
+        self.playback_forward_button.clicked.connect(
+            lambda: self.sequence.skip_forward(5000))
+
+        # Pause and Stop must stay under the pointer across short recordings.
+        for button, longest in ((self.selected_play_button, "Play selected"),
+                                (self.playback_pause_button, "Resume")):
+            button.setMinimumWidth(button.fontMetrics().horizontalAdvance(longest) + 36)
+        for button in (self.selected_play_button, self.playback_pause_button,
+                       self.playback_stop_button, self.playback_rewind_button,
+                       self.playback_forward_button):
+            buttons.addWidget(button)
+
+        self.playback_seek = PlaybackSeekSlider()
+        self.playback_seek.seekRequested.connect(self._seek_playback)
+        buttons.addWidget(self.playback_seek, 1)
+        self.playback_position_label = QtWidgets.QLabel("")
+        self.playback_position_label.setAccessibleName("Playback position")
+        buttons.addWidget(self.playback_position_label)
+
         self.selected_bookmark_button = QtWidgets.QPushButton("Bookmark")
         self.selected_bookmark_button.setObjectName("textAction")
         self.selected_bookmark_button.setCheckable(True)
@@ -674,19 +734,42 @@ class MainWindow(QtWidgets.QMainWindow):
         self.selected_note_button.setObjectName("textAction")
         self.selected_note_button.clicked.connect(self._note_selected)
         buttons.addWidget(self.selected_note_button)
-        buttons.addStretch(1)
-        layout.addLayout(buttons)
-        self.selected_hint = QtWidgets.QLabel("")
-        self.selected_hint.setObjectName("selectedHint")
-        self.selected_hint.setWordWrap(True)
-        layout.addWidget(self.selected_hint)
         self.playback_line = QtWidgets.QLabel("")
         self.playback_line.setObjectName("selectedHint")
         self.playback_line.setAccessibleName("Playback")
         self.playback_line.setWordWrap(True)
-        layout.addWidget(self.playback_line)
+        controls.addWidget(self.playback_line)
+        controls.addLayout(buttons)
+        self.selected_hint = QtWidgets.QLabel("")
+        self.selected_hint.setObjectName("selectedHint")
+        self.selected_hint.setWordWrap(True)
+        layout.addWidget(self.selected_hint)
+        # Keep the transport at the same bottom edge when status or review text wraps.
+        layout.addWidget(self.playback_controls)
         self.selected_panel = panel
+        self._playback_selection_ready = False
+        self.timeline.editingChanged.connect(self._on_playback_editing_changed)
         return panel
+
+    def _on_playback_editing_changed(self, tx_id) -> None:
+        if tx_id is not None:
+            self.sequence.cancel()  # Invalidate a queued advance, leave the current clip alone.
+        elif getattr(self, "_followed_clip", None) is None:
+            self._drop_transient_card()
+        self._refresh_playback_bar()
+
+    def _seek_playback(self, tx_id: str, path: str, position: int) -> None:
+        self.timeline.playback.seek_to(tx_id, path, position)
+
+    def _on_playback_position_for_panel(self, owner: str, position: int, duration: int) -> None:
+        # The backend may deliver a final position change for a previous file.
+        controller = self.timeline.playback
+        if hasattr(self, "playback_seek") and owner == controller.owner:
+            from .playback import format_clock
+
+            self.playback_seek.display(owner, controller.path, position, duration,
+                                       controller.controllable)
+            self.playback_position_label.setText(format_clock(position, duration))
 
     def _follow_playback(self, controller) -> None:
         """The waveform marker and Selected Audio follow whichever playback
@@ -695,11 +778,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if previous is not None and previous is not controller:
             try:
                 previous.changed.disconnect(self._on_playback_changed_for_panel)
+                previous.positionChanged.disconnect(self._on_playback_position_for_panel)
             except (RuntimeError, TypeError):
                 pass
         self._followed_playback = controller
         self.waveform.set_playback(controller)
         controller.changed.connect(self._on_playback_changed_for_panel)
+        controller.positionChanged.connect(self._on_playback_position_for_panel)
         self._install_sequence(controller)
 
     # -- continuous playback ---------------------------------------------------
@@ -718,15 +803,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sequence.currentChanged.connect(self._on_sequence_current)
         self.sequence.stateChanged.connect(lambda _s: self._refresh_playback_bar())
         self.timeline.original_starter = self._start_sequence
-        self.timeline.forward_skipper = lambda: self.sequence.skip_forward(5000)
 
     def _start_sequence(self, tx_id: str, path: str) -> bool:
         """The operator's Play on one original: it plays, then the newer ones."""
         from .timeline import original_present
 
         tx = self.app.store.get_transmission(tx_id)
-        if tx is None or not original_present(tx):
+        if tx is None or not tx.state.is_terminal or not original_present(tx):
             return False
+        if self.timeline.editing_id is not None:
+            self.sequence.cancel()
+            return self.timeline.playback.play(tx.id, tx.audio_path)
         session = self.app.store.get_session(tx.session_id)
         self._sequence_conversation = (session.conversation_id if session else "") or ""
         started = self.sequence.start(tx_id, tx.audio_path)
@@ -804,6 +891,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._transient_card = tx.id
         elif getattr(self, "_transient_card", None) not in (None, tx.id):
             self._drop_transient_card()
+        if self.timeline.editing_id in (None, tx.id):
+            self.timeline.select(tx.id)
         self.waveform.show_recording(tx.id, tx.audio_path)
         self.timeline.mark_now_playing(tx.id)
 
@@ -820,6 +909,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """Take away a card that was shown only because it was playing, if
         the view's own query does not hold it."""
         transient = getattr(self, "_transient_card", None)
+        if transient is not None and self.timeline.editing_id == transient:
+            return  # Keep the draft in this filter until the operator finishes editing.
         self._transient_card = None
         if not transient or transient not in self.timeline.order():
             return
@@ -848,14 +939,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _pause_playback(self) -> None:
         controller = self.timeline.playback
-        if controller.owner is None or not controller.controllable:
+        if not controller.controllable:
             return
-        controller.toggle(controller.owner, controller.path)
+        if controller.owner is None:
+            self.sequence.toggle_between_clips()
+        else:
+            controller.toggle(controller.owner, controller.path)
         self._refresh_playback_bar()
 
     def _refresh_playback_bar(self) -> None:
         """The playback bar's Pause/Stop and its one line of state."""
-        from .playback import PAUSED, PLAYING
+        from .playback import PAUSED, PLAYING, format_clock
 
         controller = self.timeline.playback
         owner = controller.owner
@@ -864,11 +958,24 @@ class MainWindow(QtWidgets.QMainWindow):
         waiting = bool(sequence is not None and sequence.waiting)
         active = bool(owner and state in (PLAYING, PAUSED)) or waiting \
             or bool(sequence is not None and sequence.active)
-        self.playback_stop_button.setEnabled(active)
-        self.playback_pause_button.setEnabled(
-            bool(owner and state in (PLAYING, PAUSED) and controller.controllable))
-        self.playback_pause_button.setText("Resume" if state == PAUSED else "Pause")
-        if waiting:
+        self.playback_controls.setVisible(active or self._playback_selection_ready)
+        self.playback_stop_button.setEnabled(active and controller.controllable)
+        self.playback_pause_button.setEnabled(active and controller.controllable)
+        held = bool(sequence and sequence.paused_between_clips)
+        self.playback_pause_button.setText("Resume" if state == PAUSED or held else "Pause")
+        can_seek = bool(owner and state in (PLAYING, PAUSED) and controller.controllable)
+        for button in (self.playback_rewind_button, self.playback_forward_button):
+            button.setEnabled(can_seek)
+        if owner:
+            self._on_playback_position_for_panel(owner, *controller.position_for(owner))
+        else:
+            tx = self.timeline.selected_transmission()
+            duration = round(tx.duration * 1000) if tx and tx.duration else 0
+            self.playback_seek.display(None, None, 0, duration, False)
+            self.playback_position_label.setText(format_clock(0, duration))
+        if held:
+            text = "Paused between transmissions"
+        elif waiting:
             text = "Waiting for the next transmission\u2026"
         elif owner and state in (PLAYING, PAUSED):
             tx = self.app.store.get_transmission(owner) if not self._store_gone() else None
@@ -888,8 +995,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_playback_changed_for_panel(self, _affected) -> None:
         self._follow_playing_clip()
         self._refresh_selected_panel()
-        if hasattr(self, "playback_line"):
-            self._refresh_playback_bar()
 
     def _wire_pane_links(self) -> None:
         """Left-pane links run the real View actions, nothing of their own."""
@@ -959,10 +1064,6 @@ class MainWindow(QtWidgets.QMainWindow):
         font.setCapitalization(QtGui.QFont.AllUppercase)
         self.state_badge.setFont(font)
         row.addWidget(self.state_badge)
-        from . import theme as _theme
-
-        for widget in (self.mode_button, self.source_label, self.state_badge):
-            _theme.add_band_halo(widget)
 
     def _compact_combo(self, box: QtWidgets.QComboBox) -> QtWidgets.QComboBox:
         """A combo box whose longest item never sets the form's minimum
@@ -1416,9 +1517,32 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Transcription: {summary.transcription}  |  "
             f"Translation: {summary.translation}  |  {backend_status()}")
         # LOCAL ENGINES: what select_engines actually chose, by name.
-        self.speech_engine_line.setText(f"Speech: {summary.transcription}")
+        from ..providers.whisper_local import FasterWhisperEngine
+
+        speech = summary.transcription
+        if isinstance(self.app.transcription, FasterWhisperEngine):
+            device, precision = self.app.transcription.runtime_settings()
+            speech += f" · {device.upper()} / {precision}"
+        self.speech_engine_line.setText(f"Speech: {speech}")
         self.translation_engine_line.setText(f"Translation: {summary.translation}")
+        self.whisper_model_box.refresh_choices()
         self._refresh_context_lines()
+
+    def _change_whisper_model(self, index: int) -> None:
+        from ..app import ModeChangeRefused, ProcessingBusy
+
+        model = self.whisper_model_box.itemData(index)
+        if not model or model == self.app.config.asr.model:
+            return
+        try:
+            self.app.set_whisper_model(model)
+        except (ModeChangeRefused, ProcessingBusy, ValueError, OSError) as exc:
+            self.whisper_model_box.refresh_choices()
+            self.status.showMessage(f"Whisper model unchanged. {exc}", 12000)
+            return
+        self._report_engines()
+        self._refresh_readiness(run_smoke_tests=False)
+        self.status.showMessage(f"Selected Whisper {model} for transcription.", 6000)
 
     # -- diagnostics -----------------------------------------------------
     def diagnostic_report_path(self) -> pathlib.Path:
@@ -1551,10 +1675,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # document. Clearing it here made every earlier transmission look
         # lost, even though the WAVs and the database rows were untouched.
         self.meter.reset()
+        self._show_clipping()
         self._refresh_capture_tab_label()
         self.start_button.setText("Stop monitoring")
         self._set_controls_enabled(False)
         self.input_panel.set_monitoring(True, replay=bool(replay_path))
+        self.live_waveform.reset()
+        self.waveform_stack.setCurrentWidget(self.waveform if replay_path else self.live_waveform)
         self._refresh_context_lines()
 
     def _resolve_input_problem(self, message: str) -> None:
@@ -1583,6 +1710,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if ok:
                 self._start_monitoring()
         elif clicked is choose:
+            self.sidebar_toggle.setChecked(True)
             self.input_box.setVisible(True)
             self.input_panel.refresh_devices()
             self.input_panel.device_box.setFocus()
@@ -1603,6 +1731,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_capture_tab_label()
         # Inputs can be changed again, but only once the watch has stopped.
         self.input_panel.set_monitoring(False)
+        self.waveform_stack.setCurrentWidget(self.waveform)
+        self.live_waveform.reset()
         self._refresh_context_lines()
         outstanding = self.app.outstanding_work()
         if outstanding:
@@ -1618,6 +1748,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if session is not None:
                 self.status.showMessage("Monitoring stopped.", 8000)
         self.meter.reset()
+        self._show_clipping()
 
     def _refresh_current_view(self) -> None:
         """View > Refresh: show the current view exactly as the store has it,
@@ -1698,6 +1829,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     def _set_controls_enabled(self, enabled: bool) -> None:
+        self.whisper_model_box.refresh_availability()
         for widget in (self.profile_box, self.profile_button,
                        self.source_mode_box, self.target_language_box,
                        self.quiet_seconds_box,
@@ -1771,6 +1903,18 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Detection threshold set to {threshold_dbfs} dBFS{saved}", 8000)
 
     # -- events ----------------------------------------------------------
+    def _show_clipping(self, count: int = 0, total: int = 0) -> None:
+        if not count:
+            self.clip_label.clear()
+            self.clip_label.setToolTip("")
+            return
+        self.clip_label.setText(f"{count:,} clipped samples")
+        share = f"{count / total:.2%} of all input samples" if total else "These samples"
+        self.clip_label.setToolTip(
+            f"{share} reached at least {CLIP_THRESHOLD:.1%} of full scale during "
+            "this monitoring run. A single recording can contain many clipped "
+            "samples. Lower the input gain if clipping persists.")
+
     def _drain_events(self) -> None:
         if self._shutdown_complete or self._store_off_limits:
             return                     # the store is closing or closed
@@ -1781,6 +1925,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue               # an ended run's meter/activity: not this input
             if event.kind == "level":
                 reading = event.payload
+                if self.waveform_stack.currentWidget() is self.live_waveform:
+                    self.live_waveform.feed(reading)
                 self.meter.set_reading(reading.rms_fraction, reading.peak_fraction,
                                        reading.clipped, reading.clip_count)
                 self.input_panel.set_reading(
@@ -1788,8 +1934,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     reading.clipped, reading.clip_count,
                     spectrum=getattr(reading, "spectrum", None),
                     rms_dbfs=getattr(reading, "rms_dbfs", None))
-                self.clip_label.setText(
-                    f"⚠ clipping ({reading.clip_count})" if reading.clip_count else "")
+                self._show_clipping(reading.clip_count, reading.sample_count)
             elif event.kind == "state":
                 self._set_state(event.payload)
             elif event.kind in ("transmission", "updated"):
@@ -1842,6 +1987,7 @@ class MainWindow(QtWidgets.QMainWindow):
         now = _t.monotonic()
         if now - getattr(self, "_queue_tick", 0.0) >= 1.0:
             self._queue_tick = now
+            self.whisper_model_box.refresh_availability()
             if any(p is not None and p.visible_pending
                    for p in (self.app.pipeline, self.app.standalone_pipeline)) \
                     or getattr(self, "_queue_notes", None):
@@ -2100,18 +2246,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._queue_notes = notes
 
     def _refresh_state_badge(self) -> None:
-        from . import theme
-
         state = getattr(self, "_state", PipelineState.IDLE)
         text, tone, symbol = STATE_TEXT.get(
             state, (str(state).title(), "idle", "\u25cb"))
         text = self._badge_detail(state, text)
         # Symbol plus word, so the state is never carried by colour alone.
         self.state_badge.setText(f"{symbol} {text}")
-        # On the teal band the state is read by its word (and symbol), in
-        # the band's own high-contrast text colour.
-        self.state_badge.setStyleSheet("")
-        self.state_badge.setProperty("tone", tone)
+        if self.state_badge.property("tone") != tone:
+            self.state_badge.setProperty("tone", tone)
+            self.state_badge.style().unpolish(self.state_badge)
+            self.state_badge.style().polish(self.state_badge)
+            self.state_badge.update()
         self.state_badge.setAccessibleDescription(text)
         tip = STATE_TIPS.get(state, "")
         if state is PipelineState.RECEIVING:
@@ -2211,10 +2356,21 @@ class MainWindow(QtWidgets.QMainWindow):
             f"color: {theme.status_color('working', self)};")
         self.ready_badge.setAccessibleDescription("Checking field readiness")
 
+        # A previous model's slower smoke test may finish after the newly
+        # selected model has already reported its own readiness.
+        self._readiness_request = request = object()
+
+        def finished(report):
+            if request is self._readiness_request:
+                self._render_readiness(report)
+
+        def failed(_message):
+            if request is self._readiness_request:
+                self.ready_badge.setText("\u26a0 Unknown")
+
         self._readiness_worker = run_in_background(
             readiness_job, self.app, run_smoke_tests,
-            on_finished=self._render_readiness,
-            on_failed=lambda message: self.ready_badge.setText("\u26a0 Unknown"))
+            on_finished=finished, on_failed=failed)
 
     def _render_readiness(self, report) -> None:
         from . import theme
@@ -2908,7 +3064,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _refresh_selected_panel(self) -> None:
         tx = self.timeline.selected_transmission()
+        from .timeline import original_present
+
         has = tx is not None
+        present = bool(tx and original_present(tx))
+        self._playback_selection_ready = bool(tx and tx.state.is_terminal and present)
+        self._refresh_playback_bar()
         for button in (self.selected_play_button, self.selected_bookmark_button,
                        self.selected_note_button):
             button.setEnabled(has)
@@ -2922,9 +3083,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.selected_range.setText(
             f"{span(tx.started_at, tx.ended_at)}  ({float(tx.duration or 0.0):.1f} s)")
-        from .timeline import original_present
-
-        present = original_present(tx)
         # One action per situation: Pause/Resume belongs to the bar's own
         # button. When the chosen row is the recording already playing (or
         # paused), Play says so and does nothing; any other playable row
@@ -2938,7 +3096,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.selected_play_button.setEnabled(False)
         else:
             self.selected_play_button.setText("Play selected")
-            self.selected_play_button.setEnabled(present)
+            self.selected_play_button.setEnabled(self._playback_selection_ready)
         blocked = self.selected_bookmark_button.blockSignals(True)
         self.selected_bookmark_button.setChecked(bool(tx.bookmarked))
         self.selected_bookmark_button.setText(
@@ -2948,6 +3106,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if not present:
             hint = ("The original recording of this transmission is missing."
                     if tx.audio_path else "This transmission has no recording.")
+        elif not tx.state.is_terminal:
+            hint = "Playback will be available when this transmission finishes processing."
         elif tx.state is ProcessingState.FAILED:
             hint = "Processing failed. The original audio is kept; Retry is in the message's menu."
         elif tx.needs_review:
@@ -2960,7 +3120,7 @@ class MainWindow(QtWidgets.QMainWindow):
         from .timeline import original_present
 
         tx = self.timeline.selected_transmission()
-        if tx is None or not original_present(tx):
+        if tx is None or not tx.state.is_terminal or not original_present(tx):
             return                      # no deliberate target: nothing plays, nothing waits
         # The same controller as the message's own Play button - but this is
         # the ORIGINAL: pause/resume only when the original itself is what is

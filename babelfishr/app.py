@@ -498,6 +498,48 @@ class BabelFishRApp:
             except OSError as exc:  # noqa: BLE001 - never fatal
                 log.warning("could not persist the operating mode: %s", exc)
 
+    def whisper_model_directory(self, name: str) -> pathlib.Path:
+        """Where this selection would load its weights, including a custom model."""
+        from .providers.whisper_local import model_directory_for
+
+        asr = self.config.asr
+        if name == asr.model and asr.model_path:
+            return pathlib.Path(asr.model_path).expanduser()
+        return model_directory_for(self.config.paths().models, name)
+
+    def can_change_whisper_model(self) -> bool:
+        return (not self.closing and self.session is None
+                and not self.outstanding_work() and not self.shutdown_problem())
+
+    def set_whisper_model(self, name: str) -> None:
+        """Select installed weights without changing a worker holding a recording."""
+        from .providers.whisper_local import MODEL_SIZES, ModelState, inspect_model_directory
+
+        asr = self.config.asr
+        if name == asr.model:
+            return
+        if not self.can_change_whisper_model():
+            raise ProcessingBusy("Stop monitoring and let queued recordings finish "
+                                 "before switching the Whisper model.")
+        if name not in MODEL_SIZES:
+            raise ValueError(f"Unknown Whisper model: {name}")
+        state, _ = inspect_model_directory(self.whisper_model_directory(name))
+        if state is not ModelState.COMPLETE:
+            raise ValueError(f"The {name} Whisper model is {state.value}. "
+                             "Prepare it in Set up for field use first.")
+
+        self._retire_processing()  # atomically closes admission to an idle processor
+        previous = (asr.model, asr.model_path, self.config.setup.asr_model)
+        # The operator has chosen a managed model. A custom path belonging
+        # to the outgoing selection would otherwise silently override it.
+        asr.model, asr.model_path, self.config.setup.asr_model = name, None, name
+        try:
+            self.config.save()
+        except OSError:
+            asr.model, asr.model_path, self.config.setup.asr_model = previous
+            self.select_engines()
+            raise
+
     def select_engines(self, strict: bool = False) -> EngineSummary:
         """Resolve the engines and report exactly what the operator is getting."""
         from .modes import OperatingMode
@@ -756,6 +798,21 @@ class BabelFishRApp:
         """Is the running capture a recorded file (Replay), not an input?"""
         capture = self.capture
         return capture is not None and isinstance(capture.source, ReplayAudioSource)
+
+    def set_live_input_threshold(self, value: Optional[float]) -> None:
+        """Adjust an external input's gate for this watch, or restore its profile."""
+        capture = self.capture
+        if capture is None or self.replaying() or capture.mic_gate:
+            return
+        profile = self.config.detector.to_settings()
+        if value is None:
+            capture.detector.settings = dataclasses.replace(
+                capture.detector.settings, mode=profile.mode, threshold_dbfs=profile.threshold_dbfs)
+        else:
+            low, high = self.MIC_THRESHOLD_RANGE
+            level = round(max(low, min(high, float(value))), 1)
+            capture.detector.settings = dataclasses.replace(
+                capture.detector.settings, mode="fixed", threshold_dbfs=level)
 
     # -- session ---------------------------------------------------------
     def start_session(self, source: Optional[AudioSource] = None, *,
@@ -1556,23 +1613,17 @@ class BabelFishRApp:
                 translation: Optional[str] = None,
                 notes: Optional[str] = None) -> Optional[Transmission]:
         """Record an operator correction without touching the originals."""
-        tx = self.store.get_transmission(tx_id)
-        if tx is None:
-            return None
-        if transcript is not None:
-            tx.transcript_correction = transcript
-        if translation is not None:
-            tx.translation_correction = translation
-        if notes is not None:
-            tx.notes = notes
-        tx.corrected_at = utcnow()
-        if transcript is not None or translation is not None:
-            # Saving the transcript/translation is the operator's check of
-            # the recognised words. A note alone is not: it must not clear a
-            # message from review, or certify words nobody checked.
-            tx.reviewed = True
-        self.store.save_transmission(tx)
-        self.events.publish("updated", tx)
+        tx = self.store.review_transmission(tx_id, transcript=transcript,
+                                            translation=translation, notes=notes)
+        if tx is not None:
+            self.events.publish("updated", tx)
+        return tx
+
+    def approve(self, tx_id: str) -> Optional[Transmission]:
+        """Acknowledge the existing result without changing its words."""
+        tx = self.store.review_transmission(tx_id, approve=True)
+        if tx is not None:
+            self.events.publish("updated", tx)
         return tx
 
     def set_tags(self, tx_id: str, tags: List[str]) -> Optional[Transmission]:

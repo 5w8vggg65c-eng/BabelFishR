@@ -222,9 +222,14 @@ def test_an_ended_runs_meter_does_not_move_after_stop(qt_app, config, store):
     asr.release.set()
     app, window, source, session = _window_monitoring(qt_app, config, store, asr)
     try:
-        window._stop_monitoring()
         reading = LevelReading(rms_dbfs=-6.0, peak_dbfs=-0.1, peak_hold_dbfs=-0.1,
-                               clipped=True, clip_count=7)
+                               clipped=True, clip_count=11_000, sample_count=48_000)
+        app.events.publish("level", reading, run=session.id)
+        window._drain_events()
+        assert window.clip_label.text() == "11,000 clipped samples"
+        assert "22.92%" in window.clip_label.toolTip()
+        window._stop_monitoring()
+        assert window.clip_label.text() == ""
         app.events.publish("level", reading, run=session.id)
         window._drain_events()
         assert window.clip_label.text() == "", "an ended run moved the meter"

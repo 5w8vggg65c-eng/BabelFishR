@@ -481,6 +481,8 @@ def format_clock(position_ms: int, duration_ms: int) -> str:
         seconds = max(0, int(ms)) // 1000
         return f"{seconds // 60}:{seconds % 60:02d}"
 
+    if 0 < duration_ms < 1000:
+        return f"{max(0, position_ms) / 1000:.2f} / {duration_ms / 1000:.2f} s"
     if duration_ms and duration_ms > 0:
         return f"{mmss(position_ms)} / {mmss(duration_ms)}"
     return mmss(position_ms)

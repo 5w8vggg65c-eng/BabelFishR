@@ -1,14 +1,5 @@
-"""Per-bubble playback: a compact Play, and a control bar for longer recordings.
-
-Two kinds of test, kept apart. Most drive the real bubble and view with real
-mouse clicks against a *scripted* backend - the playback seam the controller
-talks to - so pause, stop, seek, completion and errors are deterministic and
-the controller's ownership logic is what is under test. A small final group
-touches QtMultimedia itself and skips, with its reason, where that module is
-not installed (this development environment has PySide6 Essentials only; the
-packaged Mac app has the full module). Neither kind is a physical Mac
-playing sound through a speaker.
-"""
+"""The shared recording transport, tested with short and long WAVs and a
+scripted audio backend. Native QtMultimedia checks run when available."""
 
 from __future__ import annotations
 
@@ -40,12 +31,25 @@ def pump(qt_app, rounds: int = 10) -> None:
 
 
 def click(qt_app, button) -> None:
-    from PySide6 import QtCore
-    from PySide6.QtTest import QTest
+    from PySide6 import QtCore, QtGui
 
     assert button.isVisibleTo(button.window()), f"{button.text()!r} is hidden"
     assert button.isEnabled(), f"{button.text()!r} is disabled"
-    QTest.mouseClick(button, QtCore.Qt.LeftButton)
+    center = button.rect().center()
+    point = QtCore.QPointF(center)
+    screen = QtCore.QPointF(button.mapToGlobal(center))
+    left = QtCore.Qt.LeftButton
+    for event_type, held in ((QtCore.QEvent.MouseButtonPress, left),
+                             (QtCore.QEvent.MouseButtonRelease, QtCore.Qt.NoButton)):
+        event = QtGui.QMouseEvent(event_type, point, screen, left, held, QtCore.Qt.NoModifier)
+        qt_app.sendEvent(button, event)
+    pump(qt_app)
+
+
+def menu_play(qt_app, bubble):
+    """Invoke the original-recording shortcut in the message menu."""
+    assert bubble.play_action.isEnabled()
+    bubble.play_action.trigger()
     pump(qt_app)
 
 
@@ -161,355 +165,202 @@ def wavs(tmp_path):
     return {"short": short, "long": long_, "exact": exact}
 
 
-# ---- short recordings ------------------------------------------------------
+@pytest.fixture
+def console(qt_app, config, store):
+    """The real window, one saved session and a deterministic audio backend."""
+    from babelfishr.app import BabelFishRApp
+    from babelfishr.models import Session
+    from babelfishr.ui.main_window import MainWindow
+    from babelfishr.ui.playback import PlaybackController
+
+    app = BabelFishRApp(config=config, store=store)
+    store.save_session(Session(id="s", conversation_id=store.default_conversation().id))
+    window = MainWindow(app)
+    window.show()
+
+    def open_recordings(*records, controllable=True):
+        backend = make_scripted_backend(controllable=controllable)
+        for record in records:
+            store.save_transmission(record)
+            if record.audio_path:
+                backend.durations[record.audio_path] = round(record.duration * 1000)
+        controller = PlaybackController(backend, parent=window)
+        window.timeline.set_playback(controller)
+        window._reload_timeline()
+        pump(qt_app)
+        return window, controller, backend
+
+    yield open_recordings
+    window.close()
+    app.close()
 
 
-def test_a_short_recording_plays_through_without_expanding(qt_app, wavs):
-    backend = make_scripted_backend()
-    backend.durations[wavs["short"]] = 2000
-    view, controller = make_view(backend)
-    view.show()
-    bubble = view.add(tx("short", 2.0, wavs["short"]))
+@pytest.mark.parametrize("kind,seconds", [("short", 2.0), ("exact", 5.0), ("long", 9.0)])
+def test_all_lengths_get_the_same_fixed_pause_and_stop(qt_app, console, wavs, kind, seconds):
+    window, controller, backend = console(tx("a", seconds, wavs[kind]))
+    bar = window.playback_controls
+    bubble = window.timeline.bubble("a")
+    assert not bar.isVisible() and window.selected_panel.isAncestorOf(bar)
+    assert not bubble.isAncestorOf(bar)
+
+    window.timeline.select("a")
     pump(qt_app)
-
-    assert bubble.play_button.isVisibleTo(view) and bubble.playback_bar.isHidden()
-    click(qt_app, bubble.play_button)
-    assert backend.loaded == wavs["short"]
-    assert controller.owner == "short"
-    assert bubble.playback_bar.isHidden(), "a short recording expanded controls"
-    assert not bubble.play_button.isEnabled()
-    assert "Playing" in bubble.play_button.text()
-
-    backend.advance(2500)                       # it finishes
-    pump(qt_app)
-    assert controller.owner is None
-    assert bubble.play_button.isEnabled() and "Play" in bubble.play_button.text()
-    assert bubble.playback_bar.isHidden()
-    # And it can be played again.
-    click(qt_app, bubble.play_button)
-    assert controller.owner == "short"
-    view.close()
+    assert bar.isVisible() and window.selected_play_button.isEnabled()
+    assert backend.calls == []
+    click(qt_app, window.selected_play_button)
+    assert controller.owner == "a" and backend.loaded == wavs[kind]
+    assert window.playback_pause_button.isEnabled() and window.playback_stop_button.isEnabled()
+    backend.advance(400)
+    click(qt_app, window.playback_pause_button)
+    assert controller.state_for("a") == "paused" and backend.position() == 400
+    assert window.playback_pause_button.text() == "Resume"
+    click(qt_app, window.playback_stop_button)
+    assert controller.owner is None and ("stop",) in backend.calls
+    assert window.selected_play_button.isEnabled() and bar.isVisible()
 
 
-def test_exactly_five_seconds_is_treated_as_short(qt_app, wavs):
-    """The recommended boundary, pending the operator's confirmation."""
-    backend = make_scripted_backend()
-    backend.durations[wavs["exact"]] = 5000
-    view, controller = make_view(backend)
-    bubble = view.add(tx("exact", 5.0, wavs["exact"]))
-    assert not bubble.is_long_recording
-    click(qt_app, bubble.play_button)
-    assert bubble.playback_bar.isHidden()
-    view.close()
-
-
-# ---- long recordings -------------------------------------------------------
-
-
-def test_a_long_recording_expands_controls_and_stop_collapses_them(qt_app, wavs):
-    backend = make_scripted_backend()
-    backend.durations[wavs["long"]] = 9000
-    view, controller = make_view(backend)
-    view.show()
-    bubble = view.add(tx("long", 9.0, wavs["long"]))
-    pump(qt_app)
-    assert bubble.is_long_recording
-
-    click(qt_app, bubble.play_button)
-    assert bubble.playback_bar.isVisibleTo(view), "the control bar did not expand"
-    assert bubble.play_button.isHidden(), "compact Play still shown beside the bar"
-    labels = [b.text() for b in (bubble.rewind_button, bubble.pause_button,
-                                 bubble.stop_button, bubble.forward_button)]
-    assert any("Pause" in t for t in labels)
-    assert any("Stop" in t for t in labels)
-    assert any("5 s" in t for t in labels[:1]) and any("5 s" in t for t in labels[3:])
-    # The bar lives at the bottom of *this* bubble.
-    assert bubble.playback_bar.parent() is bubble
-    assert bubble.playback_bar.y() > bubble.header.y()
-
-    click(qt_app, bubble.stop_button)
-    assert ("stop",) in backend.calls
-    assert controller.owner is None
-    assert bubble.playback_bar.isHidden(), "Stop did not collapse the bar"
-    assert bubble.play_button.isVisibleTo(view) and bubble.play_button.isEnabled()
-    view.close()
-
-
-def test_pause_preserves_position_and_play_resumes_the_same_recording(qt_app,
-                                                                       wavs):
-    backend = make_scripted_backend()
-    backend.durations[wavs["long"]] = 9000
-    view, controller = make_view(backend)
-    view.show()
-    bubble = view.add(tx("long", 9.0, wavs["long"]))
-    pump(qt_app)
-    click(qt_app, bubble.play_button)
+def test_pause_preserves_position_and_play_resumes_the_same_recording(qt_app, console, wavs):
+    window, controller, backend = console(tx("long", 9.0, wavs["long"]))
+    window.timeline.select("long")
+    click(qt_app, window.selected_play_button)
     backend.advance(3000)
-    pump(qt_app)
-    assert "0:03 / 0:09" in bubble.position_label.text()
-
-    click(qt_app, bubble.pause_button)
-    assert backend.state() == "paused"
-    assert backend.position() == 3000, "pausing lost the position"
-    assert "Play" in bubble.pause_button.text()
-    assert bubble.playback_bar.isVisibleTo(view), "pausing collapsed the bar"
-
-    loads_before = [c for c in backend.calls if c[0] == "load"]
-    click(qt_app, bubble.pause_button)            # resume
-    assert backend.state() == "playing"
-    assert backend.position() == 3000, "resume restarted from the beginning"
-    assert [c for c in backend.calls if c[0] == "load"] == loads_before, (
-        "resuming reloaded the file instead of continuing")
-    assert "Pause" in bubble.pause_button.text()
-    view.close()
+    assert "0:03 / 0:09" in window.playback_position_label.text()
+    click(qt_app, window.playback_pause_button)
+    assert controller.state_for("long") == "paused" and backend.position() == 3000
+    mark = len(backend.calls)
+    click(qt_app, window.playback_pause_button)
+    assert backend.calls[mark:] == [("play",)]
+    assert backend.state() == "playing" and backend.position() == 3000
+    assert window.playback_pause_button.text() == "Pause"
 
 
-def test_rewind_and_fast_forward_skip_five_seconds_within_bounds(qt_app, wavs):
-    backend = make_scripted_backend()
-    backend.durations[wavs["long"]] = 9000
-    view, controller = make_view(backend)
-    view.show()
-    bubble = view.add(tx("long", 9.0, wavs["long"]))
-    pump(qt_app)
-    click(qt_app, bubble.play_button)
+def test_rewind_and_fast_forward_skip_five_seconds_within_bounds(qt_app, console, wavs):
+    window, controller, backend = console(tx("long", 9.0, wavs["long"]))
+    window.timeline.select("long")
+    click(qt_app, window.selected_play_button)
     backend.advance(2000)
-    click(qt_app, bubble.forward_button)
+    click(qt_app, window.playback_forward_button)
     assert backend.position() == 7000
-    click(qt_app, bubble.forward_button)
-    assert backend.position() == 9000, "fast-forward ran past the end"
-    click(qt_app, bubble.rewind_button)
+    # The controller clamps a skip to this file. The sequence's separate
+    # boundary action may advance to a later recording when one exists.
+    controller.forward()
+    assert backend.position() == 9000
+    click(qt_app, window.playback_rewind_button)
     assert backend.position() == 4000
-    click(qt_app, bubble.rewind_button)
-    assert backend.position() == 0, "rewind went before the start"
-    assert "0:00 / 0:09" in bubble.position_label.text()
-    view.close()
+    click(qt_app, window.playback_rewind_button)
+    assert backend.position() == 0 and "0:00 / 0:09" in window.playback_position_label.text()
 
 
-def test_natural_completion_collapses_the_bar_and_restores_play(qt_app, wavs):
-    backend = make_scripted_backend()
-    backend.durations[wavs["long"]] = 9000
-    view, controller = make_view(backend)
-    view.show()
-    bubble = view.add(tx("long", 9.0, wavs["long"]))
+def test_natural_completion_leaves_the_selected_recording_playable(qt_app, console, wavs):
+    window, controller, backend = console(tx("short", 2.0, wavs["short"]))
+    window.timeline.select("short")
+    click(qt_app, window.selected_play_button)
+    backend.advance(2500)
     pump(qt_app)
-    click(qt_app, bubble.play_button)
-    assert bubble.playback_bar.isVisibleTo(view)
-    backend.advance(9500)
-    pump(qt_app)
-    assert controller.owner is None
-    assert bubble.playback_bar.isHidden()
-    assert bubble.play_button.isVisibleTo(view) and bubble.play_button.isEnabled()
-    view.close()
+    assert controller.owner is None and window.timeline.selected_id == "short"
+    assert not window.playback_pause_button.isEnabled() and window.playback_controls.isVisible()
+    click(qt_app, window.selected_play_button)
+    assert controller.owner == "short" and backend.position() == 0
 
 
-# ---- ownership -------------------------------------------------------------
-
-
-def test_an_unrelated_bubble_is_not_affected_by_another_recording(qt_app, wavs):
-    """The defect the shared player invited: bubble B must not claim Pause
-    because bubble A is playing."""
-    backend = make_scripted_backend()
-    backend.durations[wavs["long"]] = 9000
-    view, controller = make_view(backend)
-    view.show()
-    a = view.add(tx("a", 9.0, wavs["long"]))
-    b = view.add(tx("b", 9.0, wavs["long"], transcript="other words"))
-    pump(qt_app)
-    click(qt_app, a.play_button)
-
-    assert a.playback_bar.isVisibleTo(view)
-    assert b.playback_bar.isHidden(), "B expanded for A's recording"
-    assert b.play_button.isVisibleTo(view) and b.play_button.isEnabled()
-    assert "Play" in b.play_button.text() and "Playing" not in b.play_button.text()
-    assert b.play_action.text() == "Play original recording"
-    assert a.play_action.text() == "Pause"
-    view.close()
-
-
-def test_starting_another_recording_retires_the_previous_bubble(qt_app, wavs):
-    backend = make_scripted_backend()
-    backend.durations[wavs["long"]] = 9000
-    view, controller = make_view(backend)
-    view.show()
-    a = view.add(tx("a", 9.0, wavs["long"]))
-    b = view.add(tx("b", 9.0, wavs["long"], transcript="other words"))
-    pump(qt_app)
-    click(qt_app, a.play_button)
+def test_starting_another_recording_retires_only_the_previous_owner(qt_app, console, wavs):
+    window, controller, backend = console(tx("a", 9.0, wavs["long"]), tx("b", 2.0, wavs["short"]))
+    first, second = window.timeline.bubble("a"), window.timeline.bubble("b")
+    window.timeline.select("a")
+    click(qt_app, window.selected_play_button)
     backend.advance(2000)
-    click(qt_app, b.play_button)
+    assert first.play_action.text() == "Pause" and second.play_action.text() == "Play original recording"
+    bar = window.playback_controls
+    window.timeline.select("b")
+    click(qt_app, window.selected_play_button)
+    assert controller.owner == "b" and backend.loaded == wavs["short"] and backend.position() == 0
+    assert first.play_action.text() == "Play original recording" and second.play_action.text() == "Pause"
+    assert window.playback_controls is bar and bar.isVisible()
 
-    assert controller.owner == "b"
-    assert a.playback_bar.isHidden(), "A kept its controls after B took over"
-    assert a.play_button.isVisibleTo(view) and a.play_button.isEnabled()
-    assert b.playback_bar.isVisibleTo(view)
-    assert backend.loaded == wavs["long"] and backend.position() == 0
-    view.close()
 
-
-def test_a_transcript_update_does_not_reset_or_rebuild_playback(qt_app, wavs):
-    backend = make_scripted_backend()
-    backend.durations[wavs["long"]] = 9000
-    view, controller = make_view(backend)
-    view.show()
-    bubble = view.add(tx("long", 9.0, wavs["long"]))
-    pump(qt_app)
-    click(qt_app, bubble.play_button)
+def test_a_transcript_update_keeps_the_fixed_bar_and_playback_position(qt_app, console, wavs):
+    window, controller, backend = console(tx("long", 9.0, wavs["long"]))
+    window.timeline.select("long")
+    click(qt_app, window.selected_play_button)
     backend.advance(4000)
-    bar_before = bubble.playback_bar
-    calls_before = list(backend.calls)
-
-    view.update(tx("long", 9.0, wavs["long"],
-                   transcript="corrected words", translation="translated"))
+    bar = window.playback_controls
+    bubble = window.timeline.bubble("long")
+    before = list(backend.calls)
+    window.timeline.update(tx("long", 9.0, wavs["long"], transcript="corrected words",
+                              translation="translated"))
     pump(qt_app)
-    assert backend.calls == calls_before, "an update touched the player"
-    assert backend.position() == 4000 and backend.state() == "playing"
-    assert bubble.playback_bar is bar_before, "the bar was rebuilt"
-    assert bubble.playback_bar.isVisibleTo(view)
+    assert backend.calls == before and controller.position_for("long") == (4000, 9000)
+    assert window.playback_controls is bar and bar.isVisible()
     assert "corrected words" in bubble.original_label.text()
-    view.close()
 
 
 def test_switching_threads_stops_playback(qt_app, wavs):
     backend = make_scripted_backend()
-    backend.durations[wavs["long"]] = 9000
     view, controller = make_view(backend)
     bubble = view.add(tx("long", 9.0, wavs["long"]))
-    click(qt_app, bubble.play_button)
-    assert controller.owner == "long"
+    assert controller.play(bubble.tx.id, bubble.tx.audio_path)
     view.set_transmissions([tx("elsewhere", 1.0, wavs["short"])])
     pump(qt_app)
-    assert controller.owner is None
-    assert ("stop",) in backend.calls
+    assert controller.owner is None and ("stop",) in backend.calls
     view.close()
 
 
-# ---- errors and honesty ----------------------------------------------------
-
-
-def test_a_missing_recording_disables_play_and_says_so(qt_app, tmp_path):
-    """The operator's request: Play original is not offered for a recording
-    that is not there, and the card says "Audio missing". A file that comes
-    back is playable again once the card is looked at again."""
-    backend = make_scripted_backend()
-    view, controller = make_view(backend)
-    view.show()
-    path = tmp_path / "does-not-exist.wav"
-    bubble = view.add(tx("gone", 9.0, str(path)))
-    pump(qt_app)
-    assert not bubble.play_button.isEnabled()
-    assert not bubble.play_action.isEnabled()
+def test_a_missing_recording_disables_play_until_its_original_returns(qt_app, console, tmp_path):
+    path = tmp_path / "missing.wav"
+    window, controller, backend = console(tx("gone", 9.0, str(path)))
+    window.timeline.select("gone")
+    bubble = window.timeline.bubble("gone")
+    assert not window.playback_controls.isVisible() and not bubble.play_action.isEnabled()
     assert bubble.pairing_label.text() == "Audio missing"
-    bubble._on_play_clicked()                       # a stale route: nothing plays
-    assert backend.loaded is None, "a missing file reached the backend"
-    assert controller.owner is None and bubble.playback_bar.isHidden()
+    window._play_selected()
+    assert backend.loaded is None and controller.owner is None
     path.write_bytes(b"RIFF synthetic")
-    bubble.refresh_pairing()
-    assert bubble.play_button.isEnabled()
+    window.timeline.select(None)
+    window.timeline.select("gone")
+    assert window.playback_controls.isVisible() and window.selected_play_button.isEnabled()
 
 
-def test_a_backend_error_mid_playback_leaves_an_honest_state(qt_app, wavs):
-    backend = make_scripted_backend()
-    backend.durations[wavs["long"]] = 9000
-    view, controller = make_view(backend)
-    view.show()
-    bubble = view.add(tx("long", 9.0, wavs["long"]))
-    pump(qt_app)
-    click(qt_app, bubble.play_button)
+def test_a_backend_error_is_shown_and_retry_clears_it(qt_app, console, wavs):
+    window, controller, backend = console(tx("long", 9.0, wavs["long"]))
+    window.timeline.select("long")
+    click(qt_app, window.selected_play_button)
     backend.advance(1000)
     backend.fail("decoder gave up")
     pump(qt_app)
     assert controller.owner is None
-    assert bubble.playback_bar.isHidden()
-    assert bubble.play_button.isEnabled() and "Play" in bubble.play_button.text()
-    assert "decoder gave up" in bubble.status_label.text()
-    # It can be tried again, and the error note clears on a fresh start.
-    click(qt_app, bubble.play_button)
-    assert controller.owner == "long"
-    assert "long" not in controller.last_error
-    view.close()
+    assert "decoder gave up" in window.timeline.bubble("long").status_label.text()
+    click(qt_app, window.selected_play_button)
+    assert controller.owner == "long" and "long" not in controller.last_error
 
 
-def test_an_uncontrollable_backend_never_shows_pause_stop_or_seek(qt_app, wavs):
-    """When only the system player is available, in-app controls would
-    govern nothing. The bubble must not offer them."""
-    backend = make_scripted_backend(controllable=False)
-    backend.durations[wavs["long"]] = 9000
-    view, controller = make_view(backend)
-    view.show()
-    bubble = view.add(tx("long", 9.0, wavs["long"]))
-    pump(qt_app)
-    assert not controller.controllable
-    click(qt_app, bubble.play_button)
-    assert bubble.playback_bar.isHidden(), "controls offered for an external player"
-    assert ("play",) in backend.calls
-    view.close()
+def test_external_playback_has_no_in_app_pause_stop_or_seek(qt_app, console, wavs):
+    window, controller, backend = console(tx("long", 9.0, wavs["long"]), controllable=False)
+    window.timeline.select("long")
+    click(qt_app, window.selected_play_button)
+    assert ("play",) in backend.calls and not controller.controllable
+    assert not window.playback_pause_button.isEnabled()
+    assert not window.playback_stop_button.isEnabled()
+    assert not window.playback_seek.isEnabled()
+    assert not window.playback_rewind_button.isEnabled() and not window.playback_forward_button.isEnabled()
 
 
 def test_the_system_backend_states_its_limitation(monkeypatch):
-    """The real fallback: launches the OS player, cannot control it, says so."""
-    from babelfishr.ui.playback import (PlaybackController, SystemOpenBackend)
+    from babelfishr.ui import playback
 
     launched = []
-    import babelfishr.ui.playback as playback
-
-    monkeypatch.setattr(playback.subprocess, "Popen",
-                        lambda args, **kw: launched.append(args))
-    backend = SystemOpenBackend()
-    assert backend.controllable is False
-    controller = PlaybackController(backend)
-    assert controller.play("x", __file__)      # any existing file
-    assert launched and launched[0][-1] == __file__
-    # Fire and forget: the controller is idle again immediately, so no bubble
-    # can show a Pause for a player this process does not own.
+    monkeypatch.setattr(playback.subprocess, "Popen", lambda args, **kw: launched.append(args))
+    controller = playback.PlaybackController(playback.SystemOpenBackend())
+    assert not controller.controllable
+    assert controller.play("x", __file__) and launched[0][-1] == __file__
     assert controller.owner is None
 
 
-def test_a_bubble_without_a_recording_offers_no_play(qt_app):
-    backend = make_scripted_backend()
-    view, controller = make_view(backend)
-    bubble = view.add(tx("silent", 9.0, None))
-    assert bubble.play_button.isHidden()
-    assert bubble.playback_bar.isHidden()
-    assert not bubble.play_action.isEnabled()
-    view.close()
-
-
-# ---- the reading position ------------------------------------------------------
-
-
-def test_expanding_and_collapsing_the_bar_keeps_the_reading_position(qt_app,
-                                                                     wavs):
-    """The operator is reading an older bubble far down the thread. A bar
-    expanding on a bubble above it must not move what they are reading."""
-    backend = make_scripted_backend()
-    backend.durations[wavs["long"]] = 9000
-    view, controller = make_view(backend)
-    view.resize(420, 260)
-    view.show()
-    pump(qt_app)
-    ids = [f"t{i}" for i in range(14)]
-    for i, tx_id in enumerate(ids):
-        view.append_older(tx(tx_id, 9.0, wavs["long"],
-                             transcript=f"line {i} " * 12))
-    pump(qt_app, 20)
-    reading = view._bubbles[ids[10]]
-    bar = view.verticalScrollBar()
-    bar.setValue(reading.y() - 8)
-    pump(qt_app, 10)
-    before = reading.y() - bar.value()
-    assert not view.at_top(), "the test needs a scrolled-down reading position"
-
-    click(qt_app, view._bubbles[ids[2]].play_button)     # expands above
-    pump(qt_app, 20)
-    assert view._bubbles[ids[2]].playback_bar.isVisibleTo(view)
-    assert abs((reading.y() - bar.value()) - before) <= 1, (
-        "expanding a bar above the reader moved what they were reading")
-
-    click(qt_app, view._bubbles[ids[2]].stop_button)        # collapses above
-    pump(qt_app, 20)
-    assert abs((reading.y() - bar.value()) - before) <= 1, (
-        "collapsing a bar above the reader moved what they were reading")
-    view.close()
+def test_a_message_without_a_recording_offers_no_play(qt_app, console):
+    window, controller, backend = console(tx("silent", 9.0, None))
+    window.timeline.select("silent")
+    assert not window.playback_controls.isVisible() and not window.selected_play_button.isEnabled()
+    assert not window.timeline.bubble("silent").play_action.isEnabled()
+    assert controller.owner is None and backend.calls == []
 
 
 # ---- QtMultimedia itself, where it exists -------------------------------------

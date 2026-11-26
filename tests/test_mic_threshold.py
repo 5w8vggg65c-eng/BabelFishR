@@ -236,13 +236,15 @@ def qt_app():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
-def test_the_control_sits_under_the_spectrum_for_the_microphone_only(qt_app, cfg):
+def test_the_live_microphone_control_displays_rms_and_applies_the_trigger(qt_app, cfg):
     from babelfishr.ui.input_panel import InputPanel
 
     app = _app(cfg)
     try:
         panel = InputPanel(app)
         panel.show()
+        assert not panel.gate_row.isVisible()
+        panel.set_monitoring(True)
         assert panel.gate_row.isVisibleTo(panel)
         assert panel.gate_box.suffix() == " dBFS"
         assert "15 s" in panel.gate_box.toolTip() and "3 s" in panel.gate_box.toolTip()
@@ -250,8 +252,7 @@ def test_the_control_sits_under_the_spectrum_for_the_microphone_only(qt_app, cfg
         assert panel.level_now.text() == "Level now: -47 dBFS (RMS)"
         panel.gate_box.setValue(-36.0)
         assert app.config.audio.mic_threshold_dbfs == -36.0
-        app.microphone_route = lambda: ""                 # a USB interface chosen
-        panel._refresh_gate()
+        panel.set_monitoring(False)
         assert not panel.gate_row.isVisibleTo(panel)
     finally:
         app.close()

@@ -366,8 +366,8 @@ def test_play_menu_and_click_selection_still_work_for_a_row(qt_app, tmp_path):
     pump(qt_app)
     assert view.selected_id == "one", "clicking the transcript did not select the row"
 
-    assert first.play_button.text() == "Play original"
-    QTest.mouseClick(first.play_button, QtCore.Qt.LeftButton)
+    assert first.play_action.isEnabled()
+    first.play_action.trigger()
     pump(qt_app)
     assert backend.loaded == wav and controller.owner == "one"
 

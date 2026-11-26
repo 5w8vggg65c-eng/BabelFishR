@@ -55,19 +55,47 @@ def _mic_session(app):
 
 
 def _shown(panel):
-    return panel.gate_row.isVisibleTo(panel) and panel.level_now.isVisibleTo(panel)
+    return panel.gate_row.isVisible() and panel.level_now.isVisible()
+
+
+def test_collapsing_sidebar_keeps_live_trigger_and_transport_available(qt_app, cfg, monkeypatch):
+    app, window = _window(qt_app, cfg, "builtin")
+    panel = window.input_panel
+    source = CallbackAudioSource(SR, name="bench input")
+    start_session = app.start_session
+    monkeypatch.setattr(app, "start_session",
+                        lambda **kwargs: start_session(source=source, **kwargs))
+    monkeypatch.setattr(panel, "ready_to_monitor", lambda: (True, ""))
+    try:
+        assert window.waveform_stack.currentWidget() is window.waveform
+        assert not _shown(panel)
+        window.start_button.click()
+        assert window.waveform_stack.currentWidget() is window.live_waveform
+        assert _shown(panel)
+        window.sidebar_toggle.click()
+        assert not window.sidebar.isVisible()
+        assert window.selected_panel.isVisible() and _shown(panel)
+        window.sidebar_toggle.click()
+        assert window.sidebar.isVisible()
+        window.start_button.click()
+        assert window.waveform_stack.currentWidget() is window.waveform
+        assert not _shown(panel)
+    finally:
+        window._stop_monitoring()
+        window.close()
 
 
 # --- Replay hides the microphone's gate and readout ---------------------------------
 
-def test_replay_hides_the_gate_and_readout_and_stop_brings_them_back(qt_app, cfg, wav):
+def test_only_live_monitoring_shows_the_gate_and_readout(qt_app, cfg, wav):
     cfg.audio.mic_threshold_dbfs = -30.0
     app, window = _window(qt_app, cfg, "builtin")
     panel = window.input_panel
     try:
-        assert _shown(panel)
+        assert not _shown(panel)
+        assert window.selected_panel.isAncestorOf(panel.gate_box)
         panel.set_reading(0.3, 0.4, False, 0, rms_dbfs=-44.0)
-        assert panel.level_now.text() == "Level now: -44 dBFS (RMS)"
+        assert "-44" not in panel.level_now.text()
 
         window._start_monitoring(replay_path=wav)
         pump(qt_app)
@@ -82,13 +110,15 @@ def test_replay_hides_the_gate_and_readout_and_stop_brings_them_back(qt_app, cfg
         window._stop_monitoring()
         app.wait_for_session_ends(10)
         pump(qt_app)
-        assert _shown(panel) and panel.gate_box.value() == -30.0
+        assert not _shown(panel)
         assert panel.level_now.text() == "Level now: –", "a stale reading came back"
 
         # Back to the microphone: shown, live, and gating.
         source = _mic_session(app)
         panel.set_monitoring(True, replay=False)
-        assert _shown(panel) and app.capture.mic_gate
+        assert _shown(panel) and panel.gate_box.value() == -30 and app.capture.mic_gate
+        window.sidebar_toggle.click()
+        assert not window.sidebar.isVisible() and _shown(panel)
         panel.set_reading(0.2, 0.3, False, 0, rms_dbfs=-51.0)
         assert panel.level_now.text() == "Level now: -51 dBFS (RMS)"
         assert source is app.capture.source
@@ -97,7 +127,7 @@ def test_replay_hides_the_gate_and_readout_and_stop_brings_them_back(qt_app, cfg
         window.close()
 
 
-def test_a_usb_interface_never_shows_it_and_keeps_its_settings(qt_app, cfg, wav):
+def test_usb_trigger_adjusts_only_the_live_watch(qt_app, cfg, wav):
     cfg.audio.mic_threshold_dbfs = -30.0
     app, window = _window(qt_app, cfg, "")
     panel = window.input_panel
@@ -112,8 +142,14 @@ def test_a_usb_interface_never_shows_it_and_keeps_its_settings(qt_app, cfg, wav)
         assert not panel.gate_row.isVisibleTo(panel)
         _mic_session(app)                               # the USB input, live
         panel.set_monitoring(True, replay=False)
-        assert not panel.gate_row.isVisibleTo(panel) and not app.capture.mic_gate
+        assert _shown(panel) and not app.capture.mic_gate
         assert app.capture.detector.settings == cfg.detector.to_settings()
+        panel.gate_box.setValue(-39)
+        assert app.capture.detector.settings.threshold_dbfs == -39
+        assert cfg.audio.mic_threshold_dbfs == -30
+        panel.gate_auto_button.click()
+        assert app.capture.detector.settings == cfg.detector.to_settings()
+        assert cfg.audio.mic_threshold_dbfs == -30
     finally:
         window._stop_monitoring()
         window.close()
@@ -121,7 +157,7 @@ def test_a_usb_interface_never_shows_it_and_keeps_its_settings(qt_app, cfg, wav)
 
 # --- Auto ------------------------------------------------------------------------------
 
-def test_auto_is_offered_only_for_a_fixed_level_and_resets_it_idle(qt_app, cfg):
+def test_auto_is_offered_only_for_a_live_fixed_microphone_level(qt_app, cfg):
     from babelfishr.ui.input_panel import InputPanel
 
     cfg.detector.mode, cfg.detector.threshold_dbfs = "fixed", -33.0
@@ -129,6 +165,8 @@ def test_auto_is_offered_only_for_a_fixed_level_and_resets_it_idle(qt_app, cfg):
     try:
         panel = InputPanel(app)
         panel.show()
+        assert not _shown(panel)
+        panel.set_monitoring(True)
         assert not panel.gate_auto_button.isVisibleTo(panel), "nothing to reset yet"
         assert panel.gate_box.value() == -33.0
         panel.gate_box.setValue(-25.0)
@@ -151,7 +189,7 @@ def test_auto_is_offered_only_for_a_fixed_level_and_resets_it_idle(qt_app, cfg):
         reopened = _app(Config.load(cfg.source_path))
         try:
             assert reopened.config.audio.mic_threshold_dbfs is None
-            assert InputPanel(reopened).gate_auto_button.isHidden()
+            assert InputPanel(reopened).gate_controls.isHidden()
         finally:
             reopened.close()
     finally:

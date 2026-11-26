@@ -86,6 +86,7 @@ class SequencePlayer(QtCore.QObject):
         self._next_after = next_after
         self._is_live = is_live
         self._state = IDLE
+        self._held_between = False
         self._gen = 0
         self._current_id: Optional[str] = None
         self._current_path = ""
@@ -181,6 +182,19 @@ class SequencePlayer(QtCore.QObject):
         """
         self._end(announce=self.active)
 
+    @property
+    def paused_between_clips(self) -> bool:
+        return self._held_between
+
+    def toggle_between_clips(self) -> None:
+        """Pause at an end-of-media boundary or while waiting for live audio."""
+        if not self.active or self.controller.owner is not None:
+            return
+        self._held_between = not self._held_between
+        self.stateChanged.emit(self._state)
+        if not self._held_between and (self.waiting or self._resolved):
+            self._schedule_advance()
+
     def notify_new_recording(self) -> None:
         """A new recording was saved to the session; carry on if waiting."""
         if self._state == WAITING:
@@ -264,7 +278,7 @@ class SequencePlayer(QtCore.QObject):
         self._schedule_advance()
 
     def _advance(self, gen: int) -> None:
-        if gen != self._gen or self._state == IDLE:
+        if gen != self._gen or self._state == IDLE or self._held_between:
             return
         if self._state == PLAYING and self.controller.owner is not None:
             # Something is playing (it can only be another clip by now, which
@@ -353,6 +367,7 @@ class SequencePlayer(QtCore.QObject):
         self._gen += 1
         was = self._state
         self._state = IDLE
+        self._held_between = False
         self._current_id = None
         self._current_path = ""
         self._last_id = None

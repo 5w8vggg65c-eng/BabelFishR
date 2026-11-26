@@ -58,6 +58,9 @@ class InputPanel(QtWidgets.QWidget):
         self._devices = []
         self._loading = False
         self._monitoring = False
+        self._replaying = False
+        self._mic_gate_control = False
+        self._external_gate_override = False
         self._profile_id: Optional[str] = None
         self._build()
         self.refresh_devices()
@@ -127,9 +130,11 @@ class InputPanel(QtWidgets.QWidget):
         status.addWidget(self.meter, 1)
         layout.addLayout(status)
 
-        # Under the spectrum, for the Mac's own microphone only: the level at
-        # which a message starts being recorded, beside the live level. A
-        # USB interface, a receiver and a replayed file keep their settings.
+        # The window places this group in the fixed Audio Playback section.
+        self.gate_controls = QtWidgets.QWidget()
+        gate_layout = QtWidgets.QVBoxLayout(self.gate_controls)
+        gate_layout.setContentsMargins(0, 0, 0, 0)
+        gate_layout.setSpacing(2)
         self.gate_row = QtWidgets.QWidget()
         gate = QtWidgets.QHBoxLayout(self.gate_row)
         gate.setContentsMargins(0, 0, 0, 0)
@@ -143,13 +148,9 @@ class InputPanel(QtWidgets.QWidget):
         self.gate_box.setKeyboardTracking(False)
         self.gate_box.setAccessibleName("Microphone start-recording level")
         self.gate_box.setToolTip(
-            "Sound louder than this starts a message; anything quieter is not "
-            "recorded at all - no message, no card, no WAV. Half a second before "
-            "the start and after the end is kept. Changes apply at once, also "
-            "while listening, and are remembered. A message ends after the set "
-            "seconds of quiet; continuous sound is handed on in parts of about "
-            "15 s, each cut at the quietest point in its last 3 s so a word is "
-            "not split.")
+            "Audio above this level opens a message. Changes apply immediately. "
+            "With the default segment settings, continuous audio is split near "
+            "15 s at a quiet point in the last 3 s.")
         gate_label.setBuddy(self.gate_box)
         self.gate_box.valueChanged.connect(self._on_gate_changed)
         self.gate_state = QtWidgets.QLabel("")
@@ -159,21 +160,17 @@ class InputPanel(QtWidgets.QWidget):
         self.level_now.setObjectName("sectionLabel")
         gate.addWidget(gate_label)
         gate.addWidget(self.gate_box)
-        # Offered only while a fixed level is set for the microphone.
         self.gate_auto_button = QtWidgets.QToolButton()
         self.gate_auto_button.setText("Auto")
-        self.gate_auto_button.setAccessibleName(
-            "Reset the microphone start-recording level to the detector setting")
-        self.gate_auto_button.setToolTip(
-            "Stop using a fixed level for the microphone and go back to the "
-            "detector's own setting (normally: follow the room's level). "
-            "Applies at once, also while listening, and is remembered.")
+        self.gate_auto_button.setAccessibleName("Restore the input's detector profile")
+        self.gate_auto_button.setToolTip("Restore the detector profile for this input")
         self.gate_auto_button.clicked.connect(self._on_gate_auto)
         gate.addWidget(self.gate_auto_button)
         gate.addWidget(self.level_now)
         gate.addStretch(1)
-        layout.addWidget(self.gate_row)
-        layout.addWidget(self.gate_state)
+        gate_layout.addWidget(self.gate_row)
+        gate_layout.addWidget(self.gate_state)
+        layout.addWidget(self.gate_controls)
         self.gate_state.setWordWrap(True)
         self._refresh_gate()
 
@@ -299,24 +296,28 @@ class InputPanel(QtWidgets.QWidget):
         self._refresh_gate()
         self.selectionChanged.emit()
 
-    # -- the microphone's start-recording level ---------------------------
+    # -- the active input's start-recording level -------------------------
     def _refresh_gate(self) -> None:
-        """Shown for the built-in microphone (or a system default that is
-        it, or cannot be told apart); the value is the gate in force."""
-        route = getattr(self.app, "microphone_route", lambda: "")()
-        if getattr(self, "_replaying", False) or getattr(self.app, "replaying", bool)():
-            # A replayed file is not the microphone: neither its level nor
-            # the microphone's gate is about it. Back on Stop.
-            route = ""
-        if not route:
+        """Only an active live input has a trigger to adjust here."""
+        live = (self._monitoring and not self._replaying
+                and not getattr(self.app, "replaying", bool)())
+        self.gate_controls.setVisible(live)
+        if not live:
             self.level_now.setText("Level now: \u2013")
-        self.gate_row.setVisible(bool(route))
-        self.gate_state.setVisible(bool(route))
-        if not route:
             return
-        self.gate_auto_button.setVisible(
-            self.app.config.audio.mic_threshold_dbfs is not None)
-        value = self.app.mic_gate_dbfs()
+        route = self.app.microphone_route()
+        self._mic_gate_control = bool(route)
+        if route:
+            value = self.app.mic_gate_dbfs()
+            overridden = self.app.config.audio.mic_threshold_dbfs is not None
+        else:
+            settings = (self.app.capture.detector.settings if self.app.capture is not None
+                        else self.app.config.detector)
+            value = settings.threshold_dbfs if settings.mode == "fixed" else None
+            overridden = self._external_gate_override
+        self.gate_box.setAccessibleName("Microphone start-recording level" if route
+                                       else "Live input start-recording level")
+        self.gate_auto_button.setVisible(overridden)
         self._loading_gate = True
         try:
             self.gate_box.setValue(value if value is not None
@@ -325,23 +326,32 @@ class InputPanel(QtWidgets.QWidget):
             self._loading_gate = False
         words = []
         if value is None:
-            words.append("Now following the room's own level (automatic); set a "
-                         "level to fix it for the microphone.")
+            words.append("Following the input level automatically.")
+        if not route:
+            words.append("Trigger adjustments apply to this monitoring run.")
         if route == "system-default-unconfirmed":
             words.append("System default input: the hardware list cannot be read "
                          "to confirm it is the built-in microphone; the level "
                          "applies to it as chosen.")
         self.gate_state.setText(" ".join(words))
+        self.gate_state.setVisible(bool(words))
 
     def _on_gate_changed(self, value: float) -> None:
-        if getattr(self, "_loading_gate", False):
+        if getattr(self, "_loading_gate", False) or self.gate_controls.isHidden():
             return
-        self.app.set_mic_threshold(value)
-        self.gate_state.setText("")
-        self.gate_auto_button.setVisible(True)
+        if self._mic_gate_control:
+            self.app.set_mic_threshold(value)
+        else:
+            self.app.set_live_input_threshold(value)
+            self._external_gate_override = True
+        self._refresh_gate()
 
     def _on_gate_auto(self) -> None:
-        self.app.reset_mic_threshold()
+        if self._mic_gate_control:
+            self.app.reset_mic_threshold()
+        else:
+            self.app.set_live_input_threshold(None)
+            self._external_gate_override = False
         self._refresh_gate()
 
     def _on_profile_link(self, checked: bool) -> None:
@@ -578,6 +588,7 @@ class InputPanel(QtWidgets.QWidget):
         if bool(monitoring) != self._monitoring:
             # Start or Stop: nothing on the meter is about this run.
             self.meter.reset()
+            self._external_gate_override = False
         self._monitoring = bool(monitoring)
         self._replaying = bool(monitoring and replay)
         for widget in (self.device_box, self.rescan_button,
@@ -593,7 +604,7 @@ class InputPanel(QtWidgets.QWidget):
         """A live reading; *spectrum* is its audio.spectrum.SpectrumFrame,
         when the producer computed one."""
         self.meter.set_reading(rms, peak, clipped, clip_count, spectrum=spectrum)
-        if self.gate_row.isVisibleTo(self):
+        if not self.gate_controls.isHidden():
             # The reading's own RMS in dBFS; without it, back from the
             # meter's -60..0 dB position.
             level = rms_dbfs if rms_dbfs is not None else rms * 60.0 - 60.0

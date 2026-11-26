@@ -483,7 +483,7 @@ def test_the_default_bubble_has_no_waveform(qt_app):
     assert not hasattr(bubble, "waveform")
     assert not bubble.findChildren(WaveformWidget)
     # A bubble with no recording offers no Play either - nothing to play.
-    assert bubble.play_button.isHidden()
+    assert not bubble.play_action.isEnabled()
     # Playback is also still reachable from the ellipsis menu.
     menu_labels = [a.text() for a in bubble.menu_button.menu().actions()]
     assert "Play original recording" in menu_labels

@@ -19,6 +19,7 @@ from ..dsp.filters import dbfs, rms
 from .source import CLIP_THRESHOLD, AudioBlock, AudioSource
 
 if TYPE_CHECKING:  # pragma: no cover
+    from .envelope import WaveformFrame
     from .spectrum import SpectrumFrame
 
 #: Below this the input is almost certainly not connected to anything.
@@ -39,6 +40,10 @@ class LevelReading:
     #: The input's live magnitude spectrum at this moment (audio/spectrum.py),
     #: when the producer computes one. Only the latest frame ever travels.
     spectrum: Optional["SpectrumFrame"] = None
+    #: Mono input samples metered in this run, including quiet blocks.
+    sample_count: int = 0
+    #: A signed amplitude envelope for the live input display.
+    waveform: Optional["WaveformFrame"] = None
 
     @property
     def rms_fraction(self) -> float:
@@ -56,15 +61,14 @@ class LevelMeter:
     def __init__(self, hold_seconds: float = 1.5, decay_db_per_second: float = 20.0):
         self.hold_seconds = hold_seconds
         self.decay = decay_db_per_second
-        self._peak_hold = -120.0
-        self._last_update: Optional[float] = None
-        self.clip_count = 0
-        self.last: LevelReading = LevelReading(-120.0, -120.0, -120.0, False, 0)
+        self.reset()
 
     def reset(self) -> None:
         self._peak_hold = -120.0
-        self._last_update = None
+        self._last_update: Optional[float] = None
         self.clip_count = 0
+        self.sample_count = 0
+        self.last = LevelReading(-120.0, -120.0, -120.0, False, 0)
 
     def update(self, block: AudioBlock, now: Optional[float] = None) -> LevelReading:
         now = time.monotonic() if now is None else now
@@ -77,10 +81,11 @@ class LevelMeter:
 
         clipped_now = block.clipped_samples
         self.clip_count += clipped_now
+        self.sample_count += block.samples.size
         self.last = LevelReading(
             rms_dbfs=block.rms_dbfs, peak_dbfs=peak_db,
             peak_hold_dbfs=self._peak_hold, clipped=clipped_now > 0,
-            clip_count=self.clip_count,
+            clip_count=self.clip_count, sample_count=self.sample_count,
         )
         return self.last
 

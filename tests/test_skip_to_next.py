@@ -1,12 +1,12 @@
 """+5 s near the end of a clip moves continuous playback to the next one.
 
-With 5 s or less left, the playing card's +5 s advances once to the START of
+With 5 s or less left, the playback panel’s +5 s advances once to the START of
 the next playable original in the same Session - by the same rules as a
 natural end (missing files skipped, waiting while the Session is live, the
 end of the Session). With more left it seeks as before. Pressing twice, a
 Stop, a Pause, retargeting and stale end reports from the player never
 advance twice, restart a clip or cross Sessions; the waveform and the
-scrolled card follow. The real card button is clicked; a scripted backend
+scrolled card follow. The fixed playback button is clicked; a scripted backend
 stands in for the player (no sound): once issuing no "finished" at all for
 the skipped clip, once issuing it late.
 """
@@ -31,7 +31,7 @@ def qt_app():
 
 
 class LongRig(Rig):
-    """Nine-second recordings, so each card has its transport bar."""
+    """Nine-second recordings for five-second seeks and end-of-clip jumps."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -42,14 +42,10 @@ class LongRig(Rig):
         self.window._reload_timeline()
         pump(self.qt, 10)
 
-    def play(self, name):
-        self.window.timeline.bubble(name).play_button.click()
-        pump(self.qt)
-
     def plus_five(self, pump_after=True):
-        bubble = self.window.timeline.bubble(self.controller.owner)
-        assert bubble.forward_button.isVisible(), "the card's +5 s is not offered"
-        QTest.mouseClick(bubble.forward_button, QtCore.Qt.LeftButton)
+        button = self.window.playback_forward_button
+        assert button.isVisible(), "the playback panel's +5 s is not offered"
+        QTest.mouseClick(button, QtCore.Qt.LeftButton)
         if pump_after:
             pump(self.qt, 20)
 
@@ -103,8 +99,7 @@ def test_pressing_twice_advances_once(rig):
     rig.play("t0")
     rig.backend.advance(6000)
     rig.plus_five(pump_after=False)
-    bubble = rig.window.timeline.bubble("t0")
-    QTest.mouseClick(bubble.forward_button, QtCore.Qt.LeftButton)   # before the advance runs
+    QTest.mouseClick(rig.window.playback_forward_button, QtCore.Qt.LeftButton)   # before the advance runs
     pump(rig.qt, 20)
     assert rig.loads() == [rig.path("t0"), rig.path("t3")], "advanced twice"
 

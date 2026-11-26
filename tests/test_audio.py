@@ -82,6 +82,20 @@ def test_block_reports_clipping():
     assert block.clipped and block.clipped_samples == 100
 
 
+def test_clipping_tally_counts_both_polarities_and_quiet_samples_until_reset():
+    source = CallbackAudioSource(SR)
+    source.start()
+    meter = LevelMeter()
+    source.push(np.array([0.998, -0.998, 0.999, -0.999, 1.0, -1.0]))
+    first = meter.update(source.read())
+    assert (first.clip_count, first.sample_count, first.clipped) == (4, 6, True)
+    source.push(np.zeros(10))
+    quiet = meter.update(source.read())
+    assert (quiet.clip_count, quiet.sample_count, quiet.clipped) == (4, 16, False)
+    meter.reset()
+    assert (meter.last.clip_count, meter.last.sample_count) == (0, 0)
+
+
 def test_block_timing_is_monotonic():
     source = CallbackAudioSource(SR)
     source.start()

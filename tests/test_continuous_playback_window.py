@@ -78,6 +78,11 @@ class Rig:
     def path(self, name):
         return str(self.tmp / f"{name}.wav")
 
+    def play(self, name):
+        self.window.timeline.select(name)
+        self.window.selected_play_button.click()
+        pump(self.qt)
+
     def finish(self):
         """The clip plays to its own end, then queued work runs."""
         self.backend.advance(10_000)
@@ -104,6 +109,7 @@ def test_nothing_plays_without_a_deliberate_target(rig):
     w = rig.window
     assert w.selected_hint.text() == "Select a transmission to play."
     assert not w.selected_play_button.isEnabled()
+    assert not w.playback_controls.isVisible()
     assert not w.playback_stop_button.isEnabled()
     w._play_selected()                                   # Play with nothing chosen
     pump(rig.qt, 20)
@@ -135,7 +141,7 @@ def test_a_missing_original_cannot_be_targeted(rig):
     w.timeline.select("t2-missing")
     assert not w.selected_play_button.isEnabled()
     w._play_selected()
-    assert not w.timeline.bubble("t2-missing").play_button.isEnabled()
+    assert not w.playback_controls.isVisible()
     pump(rig.qt)
     assert rig.loads() == []
 
@@ -144,7 +150,7 @@ def test_a_missing_original_cannot_be_targeted(rig):
 
 def test_play_continues_upwards_through_the_session_and_ends_at_the_newest(rig):
     w = rig.window
-    w.timeline.bubble("t0").play_button.click()          # inline Play: target + play
+    rig.play("t0")
     pump(rig.qt)
     assert rig.loads() == [rig.path("t0")]
     assert "continues with newer" in w.playback_line.text()
@@ -161,7 +167,7 @@ def test_play_continues_upwards_through_the_session_and_ends_at_the_newest(rig):
 
 def test_stop_playback_ends_it_and_late_events_restart_nothing(rig):
     w = rig.window
-    w.timeline.bubble("t0").play_button.click()
+    rig.play("t0")
     pump(rig.qt)
     assert w.playback_stop_button.isEnabled()
     w.playback_stop_button.click()
@@ -175,7 +181,7 @@ def test_stop_playback_ends_it_and_late_events_restart_nothing(rig):
 
 def test_pause_and_resume_keep_the_sequence(rig):
     w = rig.window
-    w.timeline.bubble("t0").play_button.click()
+    rig.play("t0")
     pump(rig.qt)
     w.playback_pause_button.click()
     pump(rig.qt)
@@ -191,7 +197,7 @@ def test_short_clips_continue_and_stop_is_offered_throughout(rig):
     for name in ("t0", "t3", "t4"):
         rig.backend.durations[rig.path(name)] = 300
     w = rig.window
-    w.timeline.bubble("t0").play_button.click()
+    rig.play("t0")
     pump(rig.qt)
     assert w.playback_stop_button.isEnabled()
     rig.backend.advance(300)
@@ -200,9 +206,67 @@ def test_short_clips_continue_and_stop_is_offered_throughout(rig):
     assert w.playback_stop_button.isEnabled()
 
 
+def test_pause_between_very_short_recordings_keeps_the_fixed_transport(rig):
+    w = rig.window
+    rig.backend.durations[rig.path("t0")] = 150
+    rig.play("t0")
+    assert w.playback_position_label.text() == "0.00 / 0.15 s"
+    assert w.playback_seek.singleStep() == 15
+    stop_at = w.playback_stop_button.mapToGlobal(w.playback_stop_button.rect().center())
+    rig.backend.advance(150)                            # ended; next clip is queued in Qt
+    assert rig.controller.owner is None and w.sequence.active
+    assert w.playback_controls.isVisible() and w.playback_pause_button.isEnabled()
+    w.playback_pause_button.click()
+    pump(rig.qt, 20)
+    assert w.sequence.paused_between_clips and w.playback_pause_button.text() == "Resume"
+    assert rig.loads() == [rig.path("t0")]
+    w.playback_pause_button.click()
+    pump(rig.qt, 20)
+    assert rig.controller.owner == "t3" and w.timeline.selected_id == "t3"
+    assert w.playback_stop_button.mapToGlobal(w.playback_stop_button.rect().center()) == stop_at
+    w.playback_stop_button.click()
+    assert not w.sequence.active
+
+
+def test_shared_transport_waits_for_a_selected_recording_to_finish_processing(rig):
+    tx = rig.rows["t0"]
+    tx.state = ProcessingState.TRANSCRIBING
+    rig.store.save_transmission(tx)
+    w = rig.window
+    w.timeline.update(tx)
+    w.timeline.select(tx.id)
+    assert not w.playback_controls.isVisible()
+    w._play_selected()
+    assert rig.loads() == []
+    tx.state = ProcessingState.COMPLETE
+    rig.store.save_transmission(tx)
+    w.timeline.update(tx)
+    assert w.playback_controls.isVisible() and w.selected_play_button.isEnabled()
+
+
+def test_inline_edit_finishes_only_its_clip_and_can_replay_without_advancing(rig):
+    w = rig.window
+    rig.play("t0")
+    bubble = w.timeline.bubble("t0")
+    bubble.edit_button.click()
+    assert w.timeline.editing_id == "t0"
+    assert not w.sequence.active and rig.controller.state_for("t0") == "playing"
+    rig.finish()
+    assert rig.controller.owner is None and rig.loads() == [rig.path("t0")]
+    assert w.timeline.editing_id == "t0" and w.timeline.selected_id == "t0"
+    w.selected_play_button.click()
+    assert rig.controller.owner == "t0" and not w.sequence.active
+    rig.finish()
+    assert rig.loads() == [rig.path("t0"), rig.path("t0")]
+    bubble.cancel_edit_button.click()
+    w.selected_play_button.click()
+    rig.finish()
+    assert w.timeline.selected_id == "t3" and w.sequence.active
+
+
 def test_another_manual_play_replaces_the_sequence(rig):
     w = rig.window
-    w.timeline.bubble("t0").play_button.click()
+    rig.play("t0")
     pump(rig.qt)
     rig.controller.play("other-clip", rig.path("t4"))   # e.g. a single-clip preview
     pump(rig.qt, 20)
@@ -213,7 +277,7 @@ def test_another_manual_play_replaces_the_sequence(rig):
 
 def test_switching_session_stops_and_never_resumes(rig):
     w = rig.window
-    w.timeline.bubble("t0").play_button.click()
+    rig.play("t0")
     pump(rig.qt)
     tabs = w.session_tabs
     other = next(i for i in range(tabs.count()) if tabs.tabData(i) == rig.b.id)
@@ -229,7 +293,7 @@ def test_while_the_session_is_monitored_it_waits_and_follows_new_recordings(rig)
     rig.app.capture = object()                           # monitoring into A
     rig.app._capture_conversation_id = rig.a.id
     try:
-        w.timeline.bubble("t4").play_button.click()
+        rig.play("t4")
         pump(rig.qt)
         rig.finish()
         assert w.sequence.waiting
@@ -255,7 +319,7 @@ def test_stop_while_waiting(rig):
     rig.app.capture = object()
     rig.app._capture_conversation_id = rig.a.id
     try:
-        w.timeline.bubble("t4").play_button.click()
+        rig.play("t4")
         pump(rig.qt)
         rig.finish()
         assert w.sequence.waiting
@@ -275,7 +339,7 @@ def test_stop_while_waiting(rig):
 
 def test_browsing_does_not_interrupt_the_sequence(rig):
     w = rig.window
-    w.timeline.bubble("t0").play_button.click()
+    rig.play("t0")
     pump(rig.qt)
     w.timeline.select("t4")
     w.timeline.select("t0")
@@ -290,7 +354,7 @@ def test_an_external_player_never_cascades(qt_app, config, store, tmp_path):
     the player: nothing may follow it."""
     made = Rig(qt_app, config, store, tmp_path, controllable=False)
     try:
-        made.window.timeline.bubble("t0").play_button.click()
+        made.play("t0")
         pump(qt_app)
         made.finish()
         assert made.loads() == [made.path("t0")]
@@ -352,7 +416,7 @@ def test_a_long_run_of_missing_originals_is_crossed(rig):
     assert _time.monotonic() - started < 2.0, "the scan stalled the window"
     assert w._next_original_after("after-the-gap") is None      # the real end
     # And through the window: t4 finishes, the gap is crossed.
-    w.timeline.bubble("t4").play_button.click()
+    rig.play("t4")
     pump(rig.qt)
     rig.finish()
     assert rig.loads()[-1] == rig.path("after-the-gap")

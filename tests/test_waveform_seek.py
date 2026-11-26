@@ -44,7 +44,7 @@ def _seeks(rig):
 
 
 def test_clicking_seeks_and_keeps_playing(rig):
-    rig.window.timeline.bubble("t0").play_button.click()
+    rig.play("t0")
     pump(rig.qt)
     wave = rig.window.waveform
     assert wave.current_tx_id == "t0"
@@ -56,7 +56,7 @@ def test_clicking_seeks_and_keeps_playing(rig):
 
 def test_clicking_while_paused_stays_paused(rig):
     w = rig.window
-    w.timeline.bubble("t0").play_button.click()
+    rig.play("t0")
     pump(rig.qt)
     w.playback_pause_button.click()
     pump(rig.qt)
@@ -77,7 +77,7 @@ def test_nothing_happens_when_the_drawn_recording_is_not_playing(rig):
 
 def test_dragging_is_clamped_and_lets_go_when_the_next_clip_starts(rig):
     w = rig.window
-    w.timeline.bubble("t0").play_button.click()
+    rig.play("t0")
     pump(rig.qt)
     wave = w.waveform
     QTest.mousePress(wave, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, _x(rig, 0.2))
@@ -104,7 +104,7 @@ def test_dragging_is_clamped_and_lets_go_when_the_next_clip_starts(rig):
 
 def test_left_and_right_move_five_seconds(rig):
     w = rig.window
-    w.timeline.bubble("t0").play_button.click()
+    rig.play("t0")
     pump(rig.qt)
     w.waveform.setFocus()
     QTest.keyClick(w.waveform, QtCore.Qt.Key_Right)
@@ -115,3 +115,32 @@ def test_left_and_right_move_five_seconds(rig):
     pump(rig.qt)
     assert rig.backend.position() == 0
     assert rig.controller.state_for("t0") == "playing"
+
+
+def test_shared_slider_scrubs_paused_audio_from_keyboard_and_mouse(rig):
+    w = rig.window
+    rig.play("t0")
+    w.playback_pause_button.click()
+    slider = w.playback_seek
+    assert slider.isVisible() and slider.isEnabled()
+    point = QtCore.QPoint(slider.width() // 2, slider.height() // 2)
+    QTest.mouseClick(slider, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, point)
+    halfway = rig.backend.position()
+    assert abs(halfway - 4000) < 200
+    QTest.keyClick(slider, QtCore.Qt.Key_Right)
+    assert rig.backend.position() == halfway + 1000
+    assert rig.controller.state_for("t0") == "paused"
+
+
+def test_shared_slider_does_not_scrub_the_next_short_recording_during_a_drag(rig):
+    w = rig.window
+    rig.play("t0")
+    slider = w.playback_seek
+    point = QtCore.QPoint(slider.width() // 4, slider.height() // 2)
+    QTest.mousePress(slider, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, point)
+    rig.finish()
+    assert rig.controller.owner == "t3"
+    seeks = list(_seeks(rig))
+    QTest.mouseMove(slider, point + QtCore.QPoint(15, 0))
+    QTest.mouseRelease(slider, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, point)
+    assert _seeks(rig) == seeks

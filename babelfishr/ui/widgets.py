@@ -96,7 +96,7 @@ class SpectrumWidget(QtWidgets.QWidget):
     The gain information the bar meter carried is kept beside it: a slim
     level column on the right (RMS fill, peak-hold tick and the same -40 /
     -20 / -12 / -6 dBFS marks on a -60..0 scale), the clipping lamp at its
-    top, a "CLIP n" count, and the peak/RMS readout in dBFS.
+    top, a current clipping warning, and the peak/RMS readout in dBFS.
 
     It clears itself to flat when told (Stop, a change of input, a lost
     device) and also when readings stop arriving, so a stalled input can
@@ -129,7 +129,8 @@ class SpectrumWidget(QtWidgets.QWidget):
         self.setToolTip(
             "Live input spectrum: frequency across, level up (dBFS). The "
             "column on the right is the overall level - aim for speech peaks "
-            "around -12 dBFS; red means the input clipped.")
+            "around -12 dBFS. The red lamp marks current input clipping. "
+            "The clipped sample count below totals peaks since monitoring started.")
 
     def sizeHint(self) -> QtCore.QSize:  # noqa: N802
         return QtCore.QSize(240, 64)
@@ -299,11 +300,11 @@ class SpectrumWidget(QtWidgets.QWidget):
             box = QtCore.QRectF(plot.left(), plot.top(), plot.width() - 2,
                                 metrics.height())
             painter.drawText(box, QtCore.Qt.AlignRight | QtCore.Qt.AlignTop, text)
-            if self._clip_count:
+            if self._clipped:
                 painter.setPen(QtGui.QColor(t["error"]))
                 box.translate(0, metrics.height())
                 painter.drawText(box, QtCore.Qt.AlignRight | QtCore.Qt.AlignTop,
-                                 f"CLIP {self._clip_count}")
+                                 "Clipping now")
 
         # Level column: -60..0 dBFS bottom to top, the old bar meter's job.
         col = QtCore.QRectF(rect.right() - column - 1, rect.top() + 2,

@@ -15,8 +15,8 @@ _spec = importlib.util.spec_from_file_location(
     "playback_helpers", pathlib.Path(__file__).with_name("test_alpha5_playback.py"))
 _helpers = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_helpers)
-make_scripted_backend, make_view, click, pump, tx = (
-    _helpers.make_scripted_backend, _helpers.make_view, _helpers.click,
+make_scripted_backend, make_view, menu_play, pump, tx = (
+    _helpers.make_scripted_backend, _helpers.make_view, _helpers.menu_play,
     _helpers.pump, _helpers.tx)
 qt_app = _helpers.qt_app
 wavs = _helpers.wavs
@@ -30,9 +30,9 @@ def paused_at_700(qt_app, wavs, tmp_path):
     a = view.add(tx("a", 9.0, wavs["long"]))
     b = view.add(tx("b", 9.0, wavs["short"]))
     pump(qt_app)
-    click(qt_app, a.play_button)
+    menu_play(qt_app, a)
     backend.advance(700)
-    click(qt_app, a.pause_button)
+    menu_play(qt_app, a)
     pump(qt_app)
     assert controller.state_for("a") == PAUSED and backend.position() == 700
     return backend, view, controller, a, b
@@ -53,7 +53,7 @@ def test_a_resume_the_backend_rejects_returns_false_and_shows_the_error(qt_app, 
     assert controller.last_error["a"] == "resume rejected"
     pump(qt_app)
     assert "Could not play: resume rejected" in a.status_label.text()
-    assert a.play_button.isEnabled() and a.playback_bar.isHidden()
+    assert a.play_action.isEnabled() and a.play_action.text() == "Play original recording"
     # Nothing of B's was touched by A's failure.
     assert "b" not in controller.last_error and b.status_label.text() != a.status_label.text()
 

@@ -220,7 +220,9 @@ def compute_envelope(path: str, buckets: int = DEFAULT_BUCKETS,
 # -- formatting -----------------------------------------------------------
 
 def format_duration(seconds: float) -> str:
-    """MM:SS (H:MM:SS from an hour), rounded to the nearest second."""
+    """A clip-relative duration, with hundredths for a subsecond recording."""
+    if 0 < seconds < 1:
+        return f"{seconds:.2f} s"
     total = int(round(max(0.0, seconds)))
     h, rem = divmod(total, 3600)
     m, s = divmod(rem, 60)
@@ -395,6 +397,117 @@ class _Loader:
                 return                       # the widget is gone
 
 
+class PlaybackSeekSlider(QtWidgets.QSlider):
+    """A real keyboard-accessible slider; a drag stays with the file it began on."""
+
+    seekRequested = QtCore.Signal(str, str, int)
+
+    def __init__(self, parent=None):
+        super().__init__(QtCore.Qt.Horizontal, parent)
+        self.setObjectName("playbackSeek")
+        self.setAccessibleName("Playback position slider")
+        self.setToolTip("Drag or use the Left and Right arrow keys to seek.")
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.setFixedHeight(25)
+        self.setMinimumWidth(64)
+        self.setSingleStep(1000)
+        self.setPageStep(5000)
+        self.setMouseTracking(True)
+        self._target = None
+        self._pressed_target = None
+        self.valueChanged.connect(self._seek)
+
+    def display(self, owner, path, position, duration, controllable) -> None:
+        target = (owner, path) if owner and path and controllable and duration > 0 else None
+        if target != self._target and self.isSliderDown():
+            self._pressed_target = None
+        self._target = target
+        self.setEnabled(self._target is not None)
+        # A new owner during a drag may move the displayed handle. The
+        # still-held mouse can never scrub that new recording.
+        with QtCore.QSignalBlocker(self):
+            self.setRange(0, max(0, int(duration)))
+            self.setSingleStep(max(1, int(duration) // 10) if 0 < duration < 1000 else 1000)
+            self.setValue(int(position))
+
+    def _seek(self, value: int) -> None:
+        if self._target and (not self.isSliderDown() or self._pressed_target == self._target):
+            self.seekRequested.emit(*self._target, value)
+
+    def _move_to(self, event) -> None:
+        opt = QtWidgets.QStyleOptionSlider()
+        self.initStyleOption(opt)
+        style = self.style()
+        handle = style.subControlRect(QtWidgets.QStyle.CC_Slider, opt,
+                                      QtWidgets.QStyle.SC_SliderHandle, self)
+        groove = style.subControlRect(QtWidgets.QStyle.CC_Slider, opt,
+                                      QtWidgets.QStyle.SC_SliderGroove, self)
+        start = groove.left() + handle.width() // 2
+        span = max(1, groove.width() - handle.width())
+        value = style.sliderValueFromPosition(
+            self.minimum(), self.maximum(), round(event.position().x()) - start,
+            span, opt.upsideDown)
+        self.setValue(value)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == QtCore.Qt.LeftButton and self._target:
+            self._pressed_target = self._target
+            self.setSliderDown(True)
+            self._move_to(event)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self.isSliderDown():
+            if self._pressed_target == self._target:
+                self._move_to(event)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == QtCore.Qt.LeftButton and self.isSliderDown():
+            if self._pressed_target == self._target:
+                self._move_to(event)
+            self.setSliderDown(False)
+            self._pressed_target = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        super().enterEvent(event)
+        self.update()
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        super().leaveEvent(event)
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+        if self.isEnabled() and (self.underMouse() or self.hasFocus() or self.isSliderDown()):
+            opt = QtWidgets.QStyleOptionSlider()
+            self.initStyleOption(opt)
+            handle = self.style().subControlRect(QtWidgets.QStyle.CC_Slider, opt,
+                                                 QtWidgets.QStyle.SC_SliderHandle, self)
+            painter = QtGui.QPainter(self)
+            painter.setBrush(self.palette().highlight())
+            painter.setPen(QtCore.Qt.NoPen)
+            _seek_grips(painter, handle.center().x(), 0, self.height() - 1)
+            painter.end()
+
+
+def _seek_grips(painter, x: int, top: int, bottom: int) -> None:
+    """Opposed tabs above and below a seekable playhead."""
+    painter.drawPolygon(QtGui.QPolygon([QtCore.QPoint(x - 4, top),
+                                        QtCore.QPoint(x + 4, top),
+                                        QtCore.QPoint(x, top + 5)]))
+    painter.drawPolygon(QtGui.QPolygon([QtCore.QPoint(x - 4, bottom),
+                                        QtCore.QPoint(x + 4, bottom),
+                                        QtCore.QPoint(x, bottom - 5)]))
+
+
 class RecordingWaveform(QtWidgets.QWidget):
     """Waveform of the selected transmission's own clip (read-only).
 
@@ -412,6 +525,7 @@ class RecordingWaveform(QtWidgets.QWidget):
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
         self.setObjectName("recordingWaveform")
+        self.setMouseTracking(True)
         self.setAccessibleName("Recording waveform")
         self.setFixedHeight(self.HEIGHT)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
@@ -527,6 +641,14 @@ class RecordingWaveform(QtWidgets.QWidget):
             return False
         return bool(self._controller.seek_to(
             self.current_tx_id, self.current_path, int(round(fraction * dur))))
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        super().enterEvent(event)
+        self.update()
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        super().leaveEvent(event)
+        self.update()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == QtCore.Qt.LeftButton and self._owns_playback():
@@ -705,7 +827,8 @@ class RecordingWaveform(QtWidgets.QWidget):
     def _update_accessibility(self) -> None:
         if self.state == STATE_READY and self.envelope is not None:
             text = (f"{os.path.basename(self.current_path or '')}, duration "
-                    f"{format_duration(self.envelope.duration_s)}. Read-only.")
+                    f"{format_duration(self.envelope.duration_s)}. During playback, "
+                    "drag or use Left and Right to seek.")
         else:
             name = os.path.basename(self.current_path or "")
             text = f"{name}: {self.message}" if name else self.message
@@ -857,3 +980,7 @@ class RecordingWaveform(QtWidgets.QWidget):
         p.drawRect(box.adjusted(0, 0, -1, -1))
         p.setPen(QtGui.QColor(c["text"]))
         p.drawText(box, QtCore.Qt.AlignCenter, label)
+        if self._owns_playback() and (self.underMouse() or self.hasFocus() or self._drag):
+            p.setBrush(accent)
+            p.setPen(QtCore.Qt.NoPen)
+            _seek_grips(p, x, area.top(), area.bottom())

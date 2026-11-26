@@ -728,7 +728,7 @@ def test_the_confirmation_note_says_only_what_happened():
     assert "not translated" in _speech_check_note(tx)
     tx.source_language, tx.translation = "es", "Thanks."
     assert "and translated" in _speech_check_note(tx)
-    assert "Edit transcript and translation marks it reviewed" in _speech_check_note(tx)
+    assert "Approve it or use Edit to save any corrections" in _speech_check_note(tx)
     from babelfishr.models import ErrorInfo
     tx.state = ProcessingState.FAILED
     tx.error = ErrorInfo(stage="transcription", message="engine unavailable")

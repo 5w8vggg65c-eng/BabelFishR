@@ -36,9 +36,10 @@ from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 
+from .audio.envelope import RollingEnvelope
 from .audio.meter import LevelMeter, LevelReading
 from .audio.safety import SafetyRecorder
-from .audio.source import AudioBlock, AudioSource
+from .audio.source import AudioBlock, AudioSource, ReplayAudioSource
 from .audio.spectrum import SpectrumAnalyzer
 from .audio.wavefile import write_wav
 from .config import Config
@@ -768,7 +769,7 @@ class ProcessingPipeline:
         tx.auto_processed = False
         tx.skip_reason = ""
         _clear_processing_stopped(tx)
-        self.store.save_transmission(tx)
+        self.store.save_transmission(tx, new_recognition=True)
         self.events.publish("updated", tx)
         try:
             self.submit(tx_id)
@@ -843,26 +844,13 @@ class ProcessingPipeline:
                 "automatic": not source_language, "by": "operator"})
             tx.skip_reason = ""
             tx.auto_processed = False
-            # New words, not yet checked: an earlier review was of the old ones.
-            tx.reviewed = False
-            if tx.transcript_correction or tx.translation_correction:
-                # An earlier correction would otherwise keep overriding the
-                # new words on screen. It is kept, not discarded.
-                earlier = list(tx.signal_metadata.get("superseded_corrections") or [])
-                earlier.append({
-                    "transcript": tx.transcript_correction,
-                    "translation": tx.translation_correction,
-                    "corrected_at": tx.corrected_at.isoformat() if tx.corrected_at else None})
-                tx.signal_metadata = dict(tx.signal_metadata, superseded_corrections=earlier)
-                tx.transcript_correction = ""
-                tx.translation_correction = ""
         tx.clear_error()
         tx.state = ProcessingState.CAPTURED
         if is_processing_stopped(tx):
             # Saved-not-processed after a Stop: Retry is the manual route.
             _clear_processing_stopped(tx)
             tx.skip_reason = ""
-        self.store.save_transmission(tx)
+        self.store.save_transmission(tx, new_recognition=True)
         self._publish("updated", tx)
         return True
 
@@ -1271,6 +1259,10 @@ class CaptureService:
         #: PortAudio callback only queues blocks - and computed only when a
         #: reading is published. Fixed memory: one ring, no history.
         self.spectrum = SpectrumAnalyzer()
+        # Replays show their recorded waveform. For a live input compress
+        # the actual blocks arriving here, including quiet audio between calls.
+        self._waveform = (None if isinstance(source, ReplayAudioSource)
+                          else RollingEnvelope(source.sample_rate))
 
     #: How long stop() waits for the audio thread before reporting that it
     #: is still running. A bound on the caller's wait, not on the thread.
@@ -1531,9 +1523,15 @@ class CaptureService:
     def _handle_block(self, block: AudioBlock) -> None:
         reading = self.meter.update(block)
         self.spectrum.feed(block.samples, block.sample_rate)
+        if self._waveform is not None:
+            if self._waveform.sample_rate != block.sample_rate:
+                self._waveform = RollingEnvelope(block.sample_rate)
+            self._waveform.feed(block.samples)
         self._block_count += 1
         if self._block_count % self._level_divisor == 0:
             reading.spectrum = self.spectrum.frame()
+            if self._waveform is not None:
+                reading.waveform = self._waveform.frame()
             self.events.publish("level", reading, run=self.session.id)
         self.safety.feed(block)
 

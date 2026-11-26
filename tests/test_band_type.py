@@ -1,9 +1,4 @@
-"""All type on the teal status band is light orange, in every state.
-
-The band's two backgrounds (dark and light appearance) are unchanged. The
-mode button (with its arrow), the source line and the state text all render
-in one light orange; states are told apart by their words and glyphs.
-"""
+"""White status-band type and independently coloured capture/processing badges."""
 
 from __future__ import annotations
 
@@ -32,22 +27,18 @@ def _contrast(a: str, b: str) -> float:
     return (hi + 0.05) / (lo + 0.05)
 
 
-def test_the_band_backgrounds_are_unchanged_and_the_orange_is_legible():
+def test_white_type_is_legible_on_the_band_and_each_badge():
     from babelfishr.ui import theme
 
     assert theme.CONSOLE["band"] == "#287882" and theme.DAYLIGHT["band"] == "#1F6F78"
     for tokens in (theme.CONSOLE, theme.DAYLIGHT):
-        colour = tokens["band_text"].lstrip("#")
-        r, g, b = (int(colour[i:i + 2], 16) for i in (0, 2, 4))
-        assert r == 255 and r - b >= 0x80 and g > b, "not a visible orange"
-        assert _contrast(tokens["band_text"], tokens["band"]) >= 2.8
-        # Legibility comes from the tight dark halo at every glyph edge.
-        assert _contrast(tokens["band_text"], theme.BAND_HALO) >= 7.0
+        assert tokens["on_band"] == "#FFFFFF"
+        for fill in (tokens["band"], *theme.BADGE_FILL.values()):
+            assert _contrast(tokens["on_band"], fill) >= 4.5
 
 
 @pytest.mark.parametrize("dark", [True, False], ids=["dark", "light"])
-def test_every_state_renders_orange_type_on_the_band(qt_app, config, store,
-                                                     monkeypatch, dark):
+def test_state_changes_recolour_only_the_badge(qt_app, config, store, monkeypatch, dark):
     from PySide6 import QtGui
 
     from babelfishr.app import BabelFishRApp
@@ -55,16 +46,22 @@ def test_every_state_renders_orange_type_on_the_band(qt_app, config, store,
     from babelfishr.ui.main_window import MainWindow
 
     monkeypatch.setattr(theme, "is_dark", lambda widget=None: dark)
-    expected = QtGui.QColor((theme.CONSOLE if dark else theme.DAYLIGHT)["band_text"])
+    expected = QtGui.QColor("white")
     app = BabelFishRApp(config=config, store=store)
     window = MainWindow(app)
     window._apply_theme()
     window.show()
+    window._timer.stop()
     try:
-        for state in (PipelineState.IDLE, PipelineState.LISTENING,
-                      PipelineState.RECEIVING, PipelineState.TRANSCRIBING,
-                      PipelineState.TRANSLATING, PipelineState.ERROR):
-            window._set_state(state)
+        for state, colour in [(PipelineState.IDLE, "green"),
+                              (PipelineState.LISTENING, "red"),
+                              (PipelineState.RECEIVING, "red"),
+                              (PipelineState.TRANSCRIBING, "blue"),
+                              (PipelineState.TRANSLATING, "blue")]:
+            # State reconciliation is exercised by the live capture tests.
+            # Render each possible reconciled state on the actual widget.
+            window._state = state
+            window._refresh_state_badge()
             qt_app.processEvents()
             for widget in (window.mode_button, window.source_label, window.state_badge):
                 widget.ensurePolished()
@@ -72,10 +69,10 @@ def test_every_state_renders_orange_type_on_the_band(qt_app, config, store,
                         else QtGui.QPalette.WindowText)
                 got = widget.palette().color(role)
                 assert got.name() == expected.name(), (state, widget.objectName(), got.name())
+            fill = window.state_badge.palette().color(QtGui.QPalette.Window)
+            channels = {"red": fill.red(), "green": fill.green(), "blue": fill.blue()}
+            assert max(channels, key=channels.get) == colour
         assert "▾" in window.mode_button.text()       # the arrow is part of its text
-        # Outside the band nothing turned orange.
-        assert window.counts_label.palette().color(QtGui.QPalette.WindowText).name() \
-            != expected.name()
     finally:
         window.close()
         app.close()

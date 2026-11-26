@@ -164,7 +164,6 @@ def test_all_four_pairs(qt_app, wav, tmp_path, audio, text, expected):
                   state=ProcessingState.COMPLETE if text else ProcessingState.FAILED)
     status = bubble.pairing_label.text().split(" · ")[0]
     assert status == expected
-    assert bubble.play_button.isEnabled() is audio
     assert bubble.play_action.isEnabled() is audio
     assert bubble.transcribe_action.isEnabled() is audio
     # Retry processing (same settings) is offered only where processing
@@ -248,7 +247,7 @@ def test_external_removal_and_restoration_show_on_selection_and_refresh(qt_app, 
         os.rename(wav, moved)                               # removed outside the app
         window.timeline.select(tx.id)                       # looking at it re-checks
         assert bubble.pairing_label.text() == "Audio missing"
-        assert not bubble.play_button.isEnabled()
+        assert not bubble.play_action.isEnabled()
         assert not window.selected_play_button.isEnabled()
         assert "missing" in window.selected_hint.text()
         assert bubble.notes_label.text() == "Note: kept note"
@@ -257,7 +256,7 @@ def test_external_removal_and_restoration_show_on_selection_and_refresh(qt_app, 
         window._refresh_current_view()                      # View > Refresh
         bubble = window.timeline.bubble(tx.id)
         assert bubble.pairing_label.text() == CHECK
-        assert bubble.play_button.isEnabled()
+        assert bubble.play_action.isEnabled()
         # Recorded values are untouched by any of this.
         assert store.get_transmission(tx.id).audio_path == wav
     finally:

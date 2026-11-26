@@ -1,19 +1,6 @@
-"""Playback notifications reach the bubbles they concern, and history is
-inserted where it belongs (F7, first pass).
-
-Before: every bubble listened to the controller itself AND the view redrew
-every bubble on every change, so one change redrew a thread of N bubbles
-twice; every position tick reached all N bubbles; and each record of history
-was inserted at the top, removed and re-inserted at the bottom. Here the
-controller names the recordings a change concerns, the view redraws only
-their bubbles (inside the anchoring), position reports go to the owner's
-bubble alone, and history goes straight into its final place.
-
-Real Qt widgets (offscreen), real QTest clicks, the scripted playback backend
-from test_alpha5_playback (records every call, reports state like a player).
-Work is counted by wrapping the bubble's render and position slots at class
-level - callbacks as well as renders - so an all-bubble dispatch hidden behind
-an early return would still be counted. No sound device; not a Mac test.
+"""Playback change notifications redraw only the affected message menus.
+Progress goes to the shared transport without a callback per transcript.
+The standalone timeline also preserves viewport anchors and history order.
 """
 
 from __future__ import annotations
@@ -25,7 +12,6 @@ import pathlib
 import pytest
 from PySide6 import QtCore
 
-from babelfishr.models import ProcessingState, Transmission
 from babelfishr.ui import timeline as tl
 from babelfishr.ui.playback import PAUSED, PLAYING, STOPPED, PlaybackController
 
@@ -33,8 +19,8 @@ _spec = importlib.util.spec_from_file_location(
     "playback_helpers", pathlib.Path(__file__).with_name("test_alpha5_playback.py"))
 _helpers = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_helpers)
-make_scripted_backend, make_view, click, pump, tx = (
-    _helpers.make_scripted_backend, _helpers.make_view, _helpers.click,
+make_scripted_backend, make_view, menu_play, pump, tx = (
+    _helpers.make_scripted_backend, _helpers.make_view, _helpers.menu_play,
     _helpers.pump, _helpers.tx)
 qt_app = _helpers.qt_app
 wavs = _helpers.wavs
@@ -50,23 +36,28 @@ def settle(qt_app, rounds: int = 10) -> None:
 
 @pytest.fixture
 def work(monkeypatch):
-    """Per-bubble counts of render and position callbacks."""
+    """Count card redraws and the single progress feed for the transport."""
     renders, positions = {}, {}
     real_render = tl.TransmissionBubble._render_playback
-    real_position = tl.TransmissionBubble._on_playback_position
 
     def render(self):
         renders[self.tx.id] = renders.get(self.tx.id, 0) + 1
         return real_render(self)
 
-    def position(self, *args):
-        positions[self.tx.id] = positions.get(self.tx.id, 0) + 1
-        return real_position(self, *args)
+    def position(owner, _time, _duration):
+        positions[owner] = positions.get(owner, 0) + 1
 
     monkeypatch.setattr(tl.TransmissionBubble, "_render_playback", render)
-    monkeypatch.setattr(tl.TransmissionBubble, "_on_playback_position", position)
 
     class Work:
+        def watch(self, controller):
+            # A standalone timeline has no transport. Any pre-existing
+            # subscription here would send progress through the transcript UI.
+            signal = QtCore.SIGNAL("positionChanged(QString,int,int)")
+            assert controller.receivers(signal) == 0
+            controller.positionChanged.connect(position)
+            assert controller.receivers(signal) == 1
+
         def reset(self):
             renders.clear()
             positions.clear()
@@ -106,55 +97,50 @@ def controls_agree(view, controller, backend, owner, state):
     assert controller.owner == owner
     assert backend.state() == state
     for tx_id, bubble in view._bubbles.items():
-        mine = tx_id == owner
-        assert controller.state_for(tx_id) == (state if mine else STOPPED)
-        if mine and state in (PLAYING, PAUSED):
-            assert bubble.playback_bar.isVisible() and bubble.play_button.isHidden()
-            assert bubble.pause_button.text().startswith("⏸" if state == PLAYING else "▶")
-        else:
-            assert bubble.playback_bar.isHidden()
-            # Play is offered exactly when the original is on disk.
-            from babelfishr.ui.timeline import original_present
-            assert bubble.play_button.isVisible()
-            assert bubble.play_button.isEnabled() == original_present(bubble.tx)
+        current = state if tx_id == owner else STOPPED
+        assert controller.state_for(tx_id) == current
+        assert bubble.play_action.text() == ("Pause" if current == PLAYING else "Play original recording")
+        assert bubble.play_action.isEnabled() == tl.original_present(bubble.tx)
 
 
 # ---- routing ------------------------------------------------------------------------
 
 def test_play_pause_resume_stop_touch_only_the_owner(qt_app, wavs, work):
     backend, view, controller = thread(qt_app, wavs, 40)
+    work.watch(controller)
     a = view._bubbles["m0020"]
     work.reset()
-    click(qt_app, a.play_button)
+    menu_play(qt_app, a)
     controls_agree(view, controller, backend, "m0020", PLAYING)
     work.only("m0020")
     # Loading reports the duration, which the controller passes on as one
     # position report - to the owner alone.
     assert work.positions == {"m0020": 1}
     backend.advance(700)
-    assert work.positions == {"m0020": 2} and a.position_label.text().startswith("0:00")
+    assert work.positions == {"m0020": 2} and controller.position_for("m0020") == (700, 9000)
     work.reset()
-    click(qt_app, a.pause_button)
+    menu_play(qt_app, a)
     controls_agree(view, controller, backend, "m0020", PAUSED)
     work.only("m0020")
     work.reset()
-    click(qt_app, a.pause_button)                              # resume
+    menu_play(qt_app, a)                              # resume
     controls_agree(view, controller, backend, "m0020", PLAYING)
     assert controller.position_for("m0020") == (700, 9000)
     work.only("m0020")
     work.reset()
-    click(qt_app, a.stop_button)
+    controller.stop()
     controls_agree(view, controller, backend, None, STOPPED)
     work.only("m0020")
 
 
 def test_a_takeover_redraws_the_previous_and_the_new_owner_only(qt_app, wavs, work):
     backend, view, controller = thread(qt_app, wavs, 40)
+    work.watch(controller)
     a, b = view._bubbles["m0010"], view._bubbles["m0030"]
-    click(qt_app, a.play_button)
+    menu_play(qt_app, a)
     backend.advance(500)
     work.reset()
-    click(qt_app, b.play_button)
+    menu_play(qt_app, b)
     controls_agree(view, controller, backend, "m0030", PLAYING)
     assert backend.position() == 0
     work.only("m0010", "m0030")
@@ -166,13 +152,14 @@ def test_a_takeover_redraws_the_previous_and_the_new_owner_only(qt_app, wavs, wo
 
 def test_bs_missing_file_touches_b_only_and_a_retry_clears_bs_error(qt_app, wavs, work, tmp_path):
     backend, view, controller = thread(qt_app, wavs, 40)
+    work.watch(controller)
     missing = tmp_path / "missing-b.wav"
     view.update(tx("m0030", 9.0, str(missing), started_at=T0 + dt.timedelta(seconds=30)))
     a, b = view._bubbles["m0010"], view._bubbles["m0030"]
-    click(qt_app, a.play_button)
+    menu_play(qt_app, a)
     backend.advance(700)
     work.reset()
-    assert not b.play_button.isEnabled()          # its original is missing
+    assert not b.play_action.isEnabled()          # its original is missing
     controller.play("m0030", str(missing))        # a stale route is still refused
     controls_agree(view, controller, backend, "m0010", PLAYING)
     assert controller.position_for("m0010") == (700, 9000)
@@ -183,7 +170,7 @@ def test_bs_missing_file_touches_b_only_and_a_retry_clears_bs_error(qt_app, wavs
     shutil.copy(wavs["long"], missing)
     b.refresh_pairing()                           # seen on the next look
     work.reset()
-    click(qt_app, b.play_button)
+    menu_play(qt_app, b)
     controls_agree(view, controller, backend, "m0030", PLAYING)
     assert "Could not play" not in b.status_label.text()
     assert "m0030" not in controller.last_error
@@ -192,16 +179,17 @@ def test_bs_missing_file_touches_b_only_and_a_retry_clears_bs_error(qt_app, wavs
 
 def test_completion_duration_and_position_reach_the_owner_only(qt_app, wavs, work):
     backend, view, controller = thread(qt_app, wavs, 40)
+    work.watch(controller)
     a = view._bubbles["m0005"]
-    click(qt_app, a.play_button)
+    menu_play(qt_app, a)
     work.reset()
     backend.durations[wavs["long"]] = 9000
     backend.durationChanged.emit(12000)                      # a late duration report
-    assert work.positions == {"m0005": 1} and "0:12" in a.position_label.text()
+    assert work.positions == {"m0005": 1} and controller.position_for("m0005") == (0, 12000)
     for _ in range(5):
         backend.advance(1000)
     assert work.positions == {"m0005": 6}
-    assert a.position_label.text().startswith("0:05")
+    assert controller.position_for("m0005") == (5000, 12000)
     assert work.renders == {}
     work.reset()
     backend.advance(20000)                                    # runs to the end
@@ -212,15 +200,16 @@ def test_completion_duration_and_position_reach_the_owner_only(qt_app, wavs, wor
 def test_the_work_does_not_grow_with_the_thread(qt_app, wavs, work):
     def workload(n):
         backend, view, controller = thread(qt_app, wavs, n)
+        work.watch(controller)
         a, b = view._bubbles["m0001"], view._bubbles["m0002"]
         work.reset()
-        click(qt_app, a.play_button)
+        menu_play(qt_app, a)
         backend.advance(300)
-        click(qt_app, a.pause_button)
-        click(qt_app, a.pause_button)
-        click(qt_app, b.play_button)                          # takeover
+        menu_play(qt_app, a)
+        menu_play(qt_app, a)
+        menu_play(qt_app, b)                          # takeover
         backend.advance(300)
-        click(qt_app, b.stop_button)
+        controller.stop()
         totals = (sum(work.renders.values()), sum(work.positions.values()), set(work.renders))
         view.close()
         settle(qt_app)
@@ -236,7 +225,7 @@ def test_the_work_does_not_grow_with_the_thread(qt_app, wavs, work):
 
 def test_cleared_or_removed_bubbles_receive_nothing(qt_app, wavs, work):
     backend, view, controller = thread(qt_app, wavs, 12)
-    gone = view._bubbles["m0003"]
+    work.watch(controller)
     view.remove("m0003")
     view.set_transmissions([tx("n1", 9.0, wavs["long"]), tx("n2", 9.0, wavs["long"])])
     settle(qt_app)
@@ -245,9 +234,9 @@ def test_cleared_or_removed_bubbles_receive_nothing(qt_app, wavs, work):
     controller.positionChanged.emit("m0005", 100, 9000)
     controller.positionChanged.emit("n1", 100, 9000)
     assert work.renders == {"n1": 1}
-    assert work.positions == {"n1": 1}
+    assert work.positions == {"m0005": 1, "n1": 1}  # emissions did not redraw the removed cards
     # Real traffic after a switch of threads still lands in the right place.
-    click(qt_app, view._bubbles["n2"].play_button)
+    menu_play(qt_app, view._bubbles["n2"])
     controls_agree(view, controller, backend, "n2", PLAYING)
     view.close()
     settle(qt_app)
@@ -259,29 +248,32 @@ def test_a_standalone_bubble_still_follows_its_controller(qt_app, wavs, work):
     controller = PlaybackController(backend)
     alone = tl.TransmissionBubble(tx("solo", 9.0, wavs["long"]), controller)
     other = tl.TransmissionBubble(tx("other", 9.0, wavs["long"]), controller)
+    work.watch(controller)
     alone.show()
     other.show()
     pump(qt_app)
     work.reset()
-    click(qt_app, alone.play_button)
+    menu_play(qt_app, alone)
     assert controller.owner == "solo" and controller.state_for("solo") == PLAYING
-    assert alone.playback_bar.isVisible() and other.playback_bar.isHidden()
+    assert alone.play_action.text() == "Pause" and other.play_action.text() == "Play original recording"
     assert work.renders == {"solo": 1}, work.renders
     backend.advance(400)
-    # The duration report and the tick: each standalone bubble listens for
-    # itself, so both hear both - the cost of standing alone.
-    assert work.positions == {"solo": 2, "other": 2}
-    assert alone.position_label.text().startswith("0:00") and other.position_label.text() == ""
-    click(qt_app, alone.stop_button)
-    assert controller.owner is None and alone.playback_bar.isHidden()
+    assert work.positions == {"solo": 2}
+    assert controller.position_for("solo") == (400, 9000)
+    assert controller.position_for("other") == (0, 0)
+    controller.stop()
+    assert controller.owner is None and alone.play_action.text() == "Play original recording"
+    alone.close()
+    other.close()
 
 
 def test_a_transcript_update_during_playback_keeps_position_and_controls(qt_app, wavs, work):
     backend, view, controller = thread(qt_app, wavs, 12)
+    work.watch(controller)
     a = view._bubbles["m0004"]
-    click(qt_app, a.play_button)
+    menu_play(qt_app, a)
     backend.advance(2500)
-    label_before = a.position_label.text()
+    calls_before = list(backend.calls)
     updated = tx("m0004", 9.0, wavs["long"], started_at=T0 + dt.timedelta(seconds=4),
                  transcript="a much longer transcript arriving mid-playback " * 5,
                  translation="and its translation " * 5)
@@ -289,8 +281,8 @@ def test_a_transcript_update_during_playback_keeps_position_and_controls(qt_app,
     pump(qt_app)
     controls_agree(view, controller, backend, "m0004", PLAYING)
     assert backend.position() == 2500 and controller.position_for("m0004") == (2500, 9000)
-    assert a.position_label.text() == label_before
-    assert "much longer" in a.transcript_label.text() if hasattr(a, "transcript_label") else True
+    assert backend.calls == calls_before
+    assert "much longer" in a.original_label.text()
 
 
 # ---- history insertion -----------------------------------------------------------------
@@ -345,29 +337,30 @@ def test_reading_position_holds_through_insertion_growth_and_playback_above(qt_a
                    transcript="and much more was said " * 12))
     settle(qt_app)
     assert abs(viewport_y(view, anchor) - before) <= 1
-    # Playback controls expand on a bubble above ... and collapse again.
-    click(qt_app, view._bubbles[above].play_button)
+    # Transport state for a message above cannot move the reading position.
+    menu_play(qt_app, view._bubbles[above])
     settle(qt_app)
-    assert view._bubbles[above].playback_bar.isVisible()
-    assert abs(viewport_y(view, anchor) - before) <= 1, "expanding controls above moved the text"
-    click(qt_app, view._bubbles[above].stop_button)
+    assert view._bubbles[above].play_action.text() == "Pause"
+    assert abs(viewport_y(view, anchor) - before) <= 1, "starting playback above moved the text"
+    controller.stop()
     settle(qt_app)
-    assert view._bubbles[above].playback_bar.isHidden()
-    assert abs(viewport_y(view, anchor) - before) <= 1, "collapsing controls above moved the text"
+    assert view._bubbles[above].play_action.text() == "Play original recording"
+    assert abs(viewport_y(view, anchor) - before) <= 1, "stopping playback above moved the text"
     assert view._bubbles[anchor_id] is anchor
 
 
-def test_a_takeover_collapses_the_previous_owner_before_the_backend_reports_its_stop(qt_app, wavs,
+def test_takeover_retires_the_previous_menu_before_the_backend_reports_its_stop(qt_app, wavs,
                                                                                     work):
     """QtMultimedia reports state changes asynchronously; the scripted
     backend reports them at once. With a backend that says nothing until
-    later, the previous owner's controls must still collapse the moment
+    later, the previous owner's menu must reflect the change the moment
     ownership moves - the change names the previous owner itself, rather
     than relying on the backend's stop report to do it."""
     backend, view, controller = thread(qt_app, wavs, 12)
+    work.watch(controller)
     a, b = view._bubbles["m0003"], view._bubbles["m0007"]
-    click(qt_app, a.play_button)
-    assert a.playback_bar.isVisible()
+    menu_play(qt_app, a)
+    assert a.play_action.text() == "Pause"
     real_stop = backend.stop
 
     def silent_stop():
@@ -377,10 +370,10 @@ def test_a_takeover_collapses_the_previous_owner_before_the_backend_reports_its_
 
     backend.stop = silent_stop
     work.reset()
-    click(qt_app, b.play_button)
+    menu_play(qt_app, b)
     assert controller.owner == "m0007" and controller.state_for("m0003") == STOPPED
-    assert a.playback_bar.isHidden() and a.play_button.isVisible(), "A's controls stayed open"
-    assert b.playback_bar.isVisible()
+    assert a.play_action.text() == "Play original recording", "A still claims to be playing"
+    assert b.play_action.text() == "Pause"
     work.only("m0003", "m0007")
     backend.stop = real_stop
     # (What a stop report arriving *after* the takeover would do to the new

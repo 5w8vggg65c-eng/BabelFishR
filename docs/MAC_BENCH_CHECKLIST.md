@@ -12,8 +12,7 @@ into an ordinary box inside BabelFishR, never a command.
 Three things you will see a lot:
 
 - **The menu row** is a row of four words — **File  View  Tools  Help** —
-  drawn *inside the BabelFishR window*, directly under the window's own title
-  bar and above everything else in the window. Every command in this list that
+  drawn *inside the BabelFishR window*, below the teal status band. Every command in this list that
   says "View ▸ …" or "Tools ▸ …" is reached by clicking one of those four words
   and then the item in the small menu that drops down. (Earlier builds put
   these menus in the Mac's strip at the very top of the screen. You reported
@@ -21,16 +20,13 @@ Three things you will see a lot:
   offered none of these commands that way. They now live in the window. The
   Mac's top strip still shows a **BabelFishR** menu with **Quit**; that part is
   the system's and is unchanged.)
-- **The badge row** is the row of small coloured labels under the menu row
-  and the toolbar: the **Operating mode** button, the readiness
-  chip (**Ready**, **Partly ready**, **Not ready** or **Checking**) and the
-  activity indicator (**Idle**, **Armed · Listening**, **Audio active (est.)**,
-  **Transcribing**, **Translating**). "Audio active" is estimated from the
-  input level, not reported by the receiver (see docs/LIVE_CAPTURE.md).
-- **The ⋯ button** is the small three-dots button at the right-hand end of each
-  message bubble. Every action on a message — play, edit, retry, transcribe
-  anyway, export — is in the menu that opens from it. There is no right-click
-  menu on a bubble.
+- **The teal status band** shows the operating mode, source and activity.
+  The status bubble reads **Idle**, **Armed · Listening**, **Audio active
+  (est.)**, **Transcribing** or **Translating**. Audio activity is estimated
+  from the input level. The readiness chip is under **Local Engines**.
+- **The ⋯ button** opens a message's actions, including reprocessing and
+  export. Select a completed message to use **Audio Playback**. **Edit** is
+  directly beneath the message.
 
 Work through the steps in order. Each one says what to do, then what "good"
 looks like. If something does not match, note the step number and what you saw
@@ -86,7 +82,7 @@ is the menu check, now in section F below.
 
 ## B. The readiness chip says "Ready"
 
-6. Look at the **badge row**. For a few seconds after launch the readiness chip
+6. Look under **Local Engines** in the sidebar. For a few seconds after launch the readiness chip
    reads **… Checking**.
    *Good:* it then changes to **✓ Ready**. (Older builds said "Field ready".)
    If it reads **◑ Partly ready** or **⚠ Not ready**, click the chip: a window
@@ -94,11 +90,11 @@ is the menu check, now in section F below.
 
 ## C. The Record Only warning goes away when you leave Record Only
 
-7. In the badge row, click the button that reads **Operating mode: …**. Choose
+7. In the teal band, click the current operating mode. Choose
    **Record Only** from the menu.
    *Good:* a yellow warning line appears near the top of the window saying that
    in Record Only, transmissions are recorded but not transcribed.
-8. Click **Operating mode: …** again and choose **Field Offline**.
+8. Click the operating mode again and choose **Field Offline**.
    *Good:* the Record Only warning disappears. If the machine has a different
    problem at the same time (for example an audio input that stopped
    responding), that other warning stays — only the Record Only one goes.
@@ -199,34 +195,25 @@ where the indicator *ends up*.
     had selected is selected again, and the messages are all present with
     their dates.
 
-## I. Playback on a message bubble (new)
+## I. Playback of a selected message
 
-Every bubble that has a recording now has a small **▶ Play** button on its
-bottom row, to the left of the other buttons.
-
-23. Find a bubble whose recording is **shorter than five seconds** (the grey
-    header line shows the length, e.g. `2.3s`). Click its **▶ Play**.
-    *Good:* the recording plays; while it plays the button reads
-    **Playing…** and is greyed out; no extra controls appear; when it ends the
-    button reads **▶ Play** again and works again.
-24. Find a bubble whose recording is **longer than five seconds** (e.g.
-    `7.8s`). Click its **▶ Play**.
-    *Good:* a row of controls opens across the bottom of *that bubble only*:
-    **⏪ 5 s**, **⏸ Pause**, **⏹ Stop**, **⏩ 5 s**, and a time such as
-    `0:03 / 0:07`.
-25. Click **⏸ Pause**. *Good:* sound stops, the time stops counting, the
-    button now reads **▶ Play**. Click **▶ Play** in that row. *Good:* sound
-    continues from where it paused, not from the start.
-26. Click **⏩ 5 s** and **⏪ 5 s**. *Good:* the time jumps forward and back
-    by about five seconds and never goes past the end or before the start.
-27. Click **⏹ Stop**. *Good:* sound stops, the control row disappears, and the
-    bubble shows the small **▶ Play** again.
-28. Click **▶ Play** on the long recording again and let it run to the end.
-    *Good:* when it finishes, the control row disappears by itself and **▶
-    Play** is back.
-29. Start playing one long recording, then click **▶ Play** on a different
-    bubble. *Good:* the first bubble's controls disappear and the second
-    bubble's open; only one recording plays at a time.
+23. Find several completed messages **shorter than five seconds**, select
+    the oldest and click **Play selected** in **Audio Playback**. Keep the
+    pointer over **Pause**. As the next short clip starts, click **Pause**.
+    The control stays in place, playback pauses and **Resume** appears.
+24. Select a completed recording **longer than five seconds** and click
+    **Play selected**. The same bar shows the time and seek slider.
+25. Click **Pause**, wait, and click **Resume**. Sound and the time counter
+    resume at the paused position.
+26. Near the middle of a long recording, click **+5 s** and **−5 s**. The
+    time moves about five seconds in each direction. Rewinding from the
+    first few seconds returns to the start.
+27. Click **Stop** in **Audio Playback**. Sound and automatic advancement
+    stop. The completed selection can be played again from the same bar.
+28. In a stopped Session, play the newest completed message to the end.
+    Playback finishes and **Play selected** becomes available again.
+29. Start a long recording, then select a different completed message and
+    click **Play selected**. Only the new recording should be audible.
 30. While a long recording is playing, click a different Session tab.
     *Good:* the sound stops.
 
@@ -308,7 +295,7 @@ least one of them edited and one removed from view. Do not use a Session
 holding anything you want to keep.
 
 L2-1. **View → Show Times In → UTC**. *Good:* the TIME heading reads **TIME
-    (UTC)**; message headers, hover text and the SELECTED AUDIO range end in
+    (UTC)**; message headers, hover text and the selected range in **Audio Playback** end in
     **UTC**. Exports are unchanged. Quit and reopen: still UTC. Switch back to
     **Local**.
 L2-2. Click **Session options** at the bottom. *Good:* a roomy window opens
@@ -347,40 +334,34 @@ L2-9. Drag **Session options** narrow (about phone width) and short. *Good:*
     visible.
 L2-10. Look at a few message cards. *Good:* no yellow paragraphs, no
     CLIPPED, no confidence or "continuous audio" chips. Each card has one
-    status next to **Play original**: **Audio + transcript ✓**, or **Audio
+    audio/transcript status such as **Audio + transcript ✓**, or **Audio
     missing** / **Transcript missing** / **Transcript pending** / **…
     cleared**, plus at most one short reason (**Audio unintelligible**,
     **Transcription error**, **Translation error**). Hover it for detail.
     Move one WAV of a throwaway message out of the Recordings folder in
-    Finder, click the message: *Good:* **Audio missing**, Play original
-    greyed. Put it back and choose **View → Refresh**: the check returns.
-L2-11. The fixed **AUDIO PLAYBACK** bar, with nothing selected, says
-    **Select a transmission to play.** and **Play selected** is greyed.
-    Click a message: *Good:* nothing plays. Press **Play original** on an
-    older message (or select it and **Play selected**). *Good:* it plays,
-    then each newer message of the same Session in turn, the playing card
-    highlighted. With the playing message selected, Play reads **Now
-    playing** and is greyed: the bar's single **Pause/Resume** pauses, and
-    selecting another message makes **Play selected** start that one.
-    **■ Stop playback** stops the Session's playback (Stop monitoring is
-    separate).
-L2-12. While continuous playback runs, scroll far down the list. *Good:* at
-    each new clip the waveform switches to the recording being heard (its
-    own playhead moving), the playing card is highlighted and brought back
-    into view. Clicking another message only selects it (Play selected);
-    the waveform stays on what is heard until Stop. In **Bookmarked** or
-    **Needs review**, a playing clip outside that filter is shown while it
-    plays (the bar says "not in this view") and goes away afterwards; the
-    filter stays selected.
+    Finder and select the message with playback stopped. **Audio missing**
+    appears and the bar offers no playback controls. Put the WAV back and
+    choose **View → Refresh** to restore its pairing indicator.
+L2-11. With playback stopped, clear the selection. The **Audio Playback**
+    section asks you to select a transmission and its transport is hidden.
+    Select an older completed message that has a WAV. The controls appear
+    and sound begins only after **Play selected**. Allow the recording to
+    finish. The teal selection follows each newer playable message upward
+    in the same Session. After the newest recording, playback finishes, or
+    waits for the next transmission if that Session is being monitored.
+L2-12. With monitoring stopped and continuous playback running, scroll
+    down the list. When the next clip starts, its selected card comes into
+    view and the recording waveform and playhead follow it. Clicking a
+    different card alone leaves the current audio playing. In **Bookmarked**
+    or **Review**, a playing card outside that filter appears temporarily
+    and disappears afterward. The filter stays selected.
 L2-13. First launch on a fresh profile (a new user account, or with
     BabelFishR's data folder moved aside temporarily - never deleting real
     data): *Good:* **Set up BabelFishR** is the first and only window; the
     console appears only after it is closed; nothing downloads until
     **Prepare now**; the mode is **Online / Setup** afterwards (also after
     preparing) unless **Record only for now** was chosen. A returning
-    profile opens straight to the console in its saved mode. Browsing other messages meanwhile does not
-    interrupt it. It stops after the newest message unless that Session is
-    being monitored, in which case it waits for the next one until Stop.
+    profile opens straight to the console in its saved mode.
 
 ## M. Stopping and quitting while a transcription is still running (new)
 
@@ -433,13 +414,11 @@ tests cover it on Linux only.
 
 Not in run 21 or any later build yet; needs a future candidate.
 
-50. With two messages longer than five seconds, press **▶ Play** on the
-    older one and, while it plays, press **▶ Play** on the newer one.
-    *Good:* the older one's controls collapse and the newer one's expand;
-    one recording plays at a time. Press **⏸** to pause, wait a moment,
-    then press **▶ Play** on the same message. *Good:* it continues from
-    where it paused, not from the start. Press **■ Stop**. *Good:* the
-    controls collapse and the sound stops.
+50. With two messages longer than five seconds, select the older one and
+    click **Play selected**. While it plays, select the newer one and click
+    **Play selected** again. The old sound ends and the bar follows the new
+    recording. Click **Pause**, wait and click **Resume**. Sound continues
+    at the saved time. Click **Stop** and confirm it stays stopped.
     (The case of a message whose recording file has gone missing cannot be
     arranged by clicking alone; it is covered by automated tests only.)
 
@@ -472,7 +451,7 @@ history.
     word, press Return. *Good:* the same older message is found, and the
     bottom line gives the same count as before. *Bad:* the message is
     missing, or the count changed without you removing anything.
-53. On any message, click **⋯ → Add or edit note…** (or **Edit transcript and translation…**) and type
+53. On any message, click **⋯ → Add or edit note…** (or click **Edit** beneath the transcript) and save
     a word that appears nowhere else - for example `marigold`. Choose
     **View → Search…** and search for it. *Good:* that message is the one
     match. Now edit the note again and remove the word; search again.
@@ -486,16 +465,12 @@ history.
 
 Not in run 21 or any later build yet; needs a future candidate.
 
-55. With a long thread (twenty or more messages), scroll so that you are
-    reading a message in the middle of the list. Press **▶ Play** on a
-    message *above* the one you are reading (scroll up to it, press, then
-    scroll back). *Good:* the message you were reading is still exactly
-    where it was; the playing message's controls opened without pushing
-    your text down. Press **■ Stop** on it. *Good:* your text still does not
-    move. *Bad:* the list jumping when the controls open or close.
-56. While a long recording plays, watch the time counter on *its* message
-    only. *Good:* it counts up on that message; no other message shows a
-    counter or changes.
+55. Select a completed message in the middle of a long thread and use
+    **Play selected**. As each clip ends, the teal selection moves to
+    the newer message now audible. The fixed **Pause** and **Stop** controls
+    stay within reach as the thread scrolls.
+56. Watch the time counter in **Audio Playback** during a long recording.
+    It advances on that recording, then restarts for the next one.
 
 ## S. SDR receiver through SDR++ (new; needs the RTL-SDR and a new candidate)
 
@@ -638,36 +613,37 @@ step 62 needs a known digital channel or a digital radio you do not yet have.
 
 ## T. Status band, microphone start level, Static, playback scrubbing, menus (new)
 
-65. Look at the teal band at the top in both the dark and the light
-    appearance. *Good:* the row stays teal from edge to edge; the
-    **Online / Setup** button and its arrow, the **Source** label and the
-    state text on the right are all orange, with a thin dark outline
-    around the letters, and stay readable while idle, monitoring and stopped.
-66. With the Mac's built-in microphone (or System default, when it is the
-    built-in microphone) as the source, look under the input spectrum.
-    *Good:* **Start recording at** with a value in dBFS, and **Level now**
-    moving with the room. Choose a USB interface or a replay file instead.
-    *Good:* the row disappears and their own settings are unchanged.
-67. Back on the microphone, start monitoring. Set **Start recording at**
-    just above the quiet room's **Level now**, wait 30 s in silence, then
-    press **Stop**. *Good:* no new card, no queued row and no new recording.
-    Speak a short sentence at a normal level. *Good:* one card with the
-    whole sentence, including its first and last syllables.
-68. Change **Start recording at** while monitoring, quit and reopen.
-    *Good:* the change applied at once and the value is still there.
-    Press **Auto** next to it (shown only while a level is set), also once
-    while monitoring. *Good:* the level goes back to the detector's own
-    setting at once, **Auto** disappears, and it stays that way after
-    reopening.
+65. Check the teal band in both light and dark appearance. The mode, source
+    and status lettering stays white. Watch the status bubble turn green
+    for **Idle**, red for **Armed · Listening** and **Audio active (est.)**,
+    and blue for **Transcribing** and **Translating**. The rest of the band
+    stays teal.
+66. Select the Mac's built-in microphone and press **Start monitoring**.
+    Speak, then go quiet. The live waveform follows the input in the
+    recording-waveform area. **Audio Playback** shows **Start recording at**
+    in dBFS and the moving **Level now**. Stop monitoring, then replay a
+    WAV. The live trigger is hidden while idle and during file replay.
+    A connected USB audio input has its own trigger during live monitoring.
+67. Start monitoring the microphone again. Set **Start recording at** just
+    above the quiet room's **Level now**. During 30 seconds of quiet, no
+    new message or recording should appear. Speak a sentence before
+    pressing **Stop monitoring** and listen for its first and last syllables
+    in the resulting recording.
+68. Change the microphone trigger during monitoring. Quit, reopen and
+    start monitoring that microphone again. The saved value should return.
+    Click **Auto**. The detector resumes its configured setting immediately
+    and the **Auto** button disappears. Check that it stays reset on the
+    next launch and monitoring run.
 69. Hold the microphone near a hissing source (an untuned radio's static,
     or a fan close to the microphone) until a card is made. *Good:* that
     card says **Static**. A cough, a door or a clap says **Audio
     unintelligible**; a spoken word is transcribed.
-70. Play a card longer than 10 s, and drag the line across the waveform.
-    *Good:* it keeps playing from where you let go. Pause and drag again.
-    *Good:* it stays paused at the new place. Click the waveform and press
-    the right and left arrow keys. *Good:* 5 s forward and back. **+5 s**
-    and continuous playback to the next card work as before.
+70. With monitoring stopped, select a completed recording longer than ten
+    seconds and click **Play selected**. Hover over the playback slider.
+    A grip should extend above and below its track. Drag while playing
+    and again while paused. Each seek lands at the chosen time and keeps
+    the current play or pause state. Click the recording waveform and press
+    Right and Left to seek five seconds forward and back.
 71. On a card whose words came out wrong or missing, open **⋯ ▸ Transcribe
     as speech…** and choose **Automatic** or a language. *Good:* one new
     attempt on that card only; other cards keep automatic language
@@ -686,6 +662,23 @@ step 62 needs a known digital channel or a digital radio you do not yet have.
     after the Session, with **Hide Session**, **Delete** and **Cancel**;
     pressing Return or Esc cancels. **Retry file cleanup…** appears under
     the Session buttons only if a past deletion could not remove a file.
+74. On a message marked **Check** whose words are correct, click **Approved**
+    directly underneath. **Check** changes to **Approved** and the words stay
+    intact after Refresh. On a different recorded message with a newer one
+    after it, click **Edit**, play the audio and type a correction in the
+    message. At the end of its recording the draft and selection stay on
+    that message. **Save** keeps the correction. **Cancel** discards a
+    subsequent unsaved change.
+75. With capture and queued work finished, expand the sidebar and look at
+    **Local Engines**. It shows the speech and translation providers and
+    the selected Whisper model. Choose another installed size, for example
+    **Medium**, and reopen the app. The selected size persists. Unavailable
+    sizes are visibly marked. During monitoring or queued work, the choice
+    is disabled.
+76. Use the sidebar arrow to collapse and reopen the left panel during
+    playback. The shared controls stay accessible and audio continues.
+    During a loud input, hover over **clipped samples**. The explanation
+    distinguishes saturated audio samples from the number of messages.
 
 ---
 

@@ -154,6 +154,14 @@ class FasterWhisperEngine(TranscriptionEngine):
             return False
         return True
 
+    def runtime_settings(self) -> Tuple[str, str]:
+        """Backend and precision passed to CTranslate2 when these weights load."""
+        device = "cpu" if self.device == "auto" else self.device
+        precision = self.compute_type
+        if precision == "default":
+            precision = "float16" if device == "cuda" else "int8"
+        return device, precision
+
     def model_directory(self) -> Optional[pathlib.Path]:
         """The local directory this engine would load, if one is configured."""
         if self.model_path:
@@ -244,16 +252,7 @@ class FasterWhisperEngine(TranscriptionEngine):
         except Exception as exc:  # noqa: BLE001
             raise EngineUnavailable(self.unavailable_reason()) from exc
 
-        device = self.device
-        compute_type = self.compute_type
-        if device == "auto":
-            # CTranslate2 has no Metal backend: on Apple silicon the CPU path
-            # with int8 is the fast one, and it is what we default to.
-            device = "cpu"
-            if compute_type == "default":
-                compute_type = "int8"
-        elif compute_type == "default":
-            compute_type = "float16" if device == "cuda" else "int8"
+        device, compute_type = self.runtime_settings()
 
         # Always load from the resolved directory when one exists, in both
         # Online/Setup and Field Offline: loading must never depend on a shared

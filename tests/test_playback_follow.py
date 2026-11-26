@@ -97,7 +97,7 @@ def test_the_waveform_follows_each_clip_with_its_own_playhead(rig):
     pump(rig.qt)
     assert w.waveform.marker_visible and w.waveform.marker_ms == 250, \
         "the playhead belongs to the clip being heard"
-    assert w.timeline.selected_id == "t0", "the operator's target is not moved"
+    assert w.timeline.selected_id == "t3", "the teal selection follows the recording"
     assert w.timeline.now_playing == "t3"
     assert w.timeline.bubble("t3").property("nowPlaying") is True
     assert w.timeline.bubble("t0").property("nowPlaying") is False
@@ -105,7 +105,7 @@ def test_the_waveform_follows_each_clip_with_its_own_playhead(rig):
 
 def test_each_new_clip_is_brought_into_view_after_scrolling_away(rig):
     w = rig.window
-    w.timeline.bubble("t0").play_button.click()
+    rig.play("t0")
     pump(rig.qt, 10)
     scroll_to_bottom(rig)                                 # the operator reads old traffic
     assert not rig.visible("t3")
@@ -124,7 +124,7 @@ def test_a_clip_outside_the_filter_is_shown_while_it_plays_and_the_filter_stays(
     w.filter_bookmarked.click()
     pump(rig.qt)
     assert w.timeline.order() == ["t0"]
-    w.timeline.bubble("t0").play_button.click()
+    rig.play("t0")
     pump(rig.qt)
     rig.finish()                                          # t3: not bookmarked
     assert rig.controller.owner == "t3"
@@ -140,9 +140,27 @@ def test_a_clip_outside_the_filter_is_shown_while_it_plays_and_the_filter_stays(
     assert w.filter_bookmarked.isChecked()
 
 
+def test_editing_a_playing_clip_outside_the_filter_keeps_the_editor_open(rig):
+    w = rig.window
+    rig.app.bookmark("t0", True)
+    w.filter_bookmarked.click()
+    rig.play("t0")
+    rig.finish()
+    bubble = w.timeline.bubble("t3")
+    bubble.edit_button.click()
+    bubble.original_label.setPlainText("draft stays here")
+    rig.finish()
+    assert rig.controller.owner is None and w.timeline.editing_id == "t3"
+    assert w.timeline.bubble("t3") is bubble
+    assert bubble.original_label.toPlainText() == "draft stays here"
+    bubble.cancel_edit_button.click()
+    pump(rig.qt)
+    assert w.timeline.order() == ["t0"]
+
+
 def test_changing_the_filter_mid_clip_keeps_playing_and_shows_the_clip(rig):
     w = rig.window
-    w.timeline.bubble("t3").play_button.click()
+    rig.play("t3")
     pump(rig.qt)
     w.filter_review.click()                               # nothing needs review
     pump(rig.qt)
@@ -156,7 +174,7 @@ def test_changing_the_filter_mid_clip_keeps_playing_and_shows_the_clip(rig):
 
 def test_choosing_another_message_while_playing_only_targets_it(rig):
     w = rig.window
-    w.timeline.bubble("t0").play_button.click()
+    rig.play("t0")
     pump(rig.qt)
     w.timeline.select("old05")
     pump(rig.qt)
@@ -171,7 +189,7 @@ def test_choosing_another_message_while_playing_only_targets_it(rig):
 
 def test_stop_makes_a_pending_scroll_stale(rig):
     w = rig.window
-    w.timeline.bubble("t0").play_button.click()
+    rig.play("t0")
     pump(rig.qt, 10)
     scroll_to_bottom(rig)
     before = w.timeline.verticalScrollBar().value()
@@ -186,7 +204,7 @@ def test_stop_makes_a_pending_scroll_stale(rig):
 
 def test_a_session_change_ends_following(rig):
     w = rig.window
-    w.timeline.bubble("t0").play_button.click()
+    rig.play("t0")
     pump(rig.qt)
     tabs = w.session_tabs
     tabs.setCurrentIndex(next(i for i in range(tabs.count())

@@ -593,22 +593,38 @@ class Store:
             self._conn.commit()
 
     # ---- transmissions -------------------------------------------------
-    def save_transmission(self, tx: Transmission) -> Transmission:
-        payload = _to_row(tx)
-        columns = ", ".join(payload)
-        placeholders = ", ".join("?" for _ in payload)
-        updates = ", ".join(f"{k}=excluded.{k}" for k in payload if k != "id")
+    def save_transmission(self, tx: Transmission, *, new_recognition: bool = False) -> Transmission:
         with self._lock:
             if self._is_tombstoned(tx.id):
                 # The operator deleted this message; a late result from a
                 # worker that still held it must not recreate the row.
                 log.info("refusing to save deleted transmission %s", tx.id)
                 return tx
-            if self._stale_against_store(tx):
+            if self._stale_against_store(tx, merge_review=True):
                 # Loaded before Clear Session History changed the row: saving
                 # it would bring back cleared text or a removed recording.
                 log.info("refusing a stale save of %s (history cleared)", tx.id)
                 return tx
+            if new_recognition and (tx.reviewed or tx.has_correction):
+                metadata = dict(tx.signal_metadata or {})
+                if tx.has_correction:
+                    earlier = list(metadata.get("superseded_corrections") or [])
+                    correction = {"transcript": tx.transcript_correction,
+                                  "translation": tx.translation_correction,
+                                  "corrected_at": iso(tx.corrected_at)}
+                    if metadata.get("operator_cleared_fields"):
+                        correction["cleared_fields"] = metadata.pop("operator_cleared_fields")
+                    earlier.append(correction)
+                    metadata["superseded_corrections"] = earlier
+                metadata.pop("operator_approved", None)
+                metadata["operator_review_revision"] = metadata.get("operator_review_revision", 0) + 1
+                tx.signal_metadata = metadata
+                tx.reviewed = False
+                tx.transcript_correction = tx.translation_correction = ""
+            payload = _to_row(tx)
+            columns = ", ".join(payload)
+            placeholders = ", ".join("?" for _ in payload)
+            updates = ", ".join(f"{k}=excluded.{k}" for k in payload if k != "id")
             self._conn.execute(
                 f"INSERT INTO transmissions ({columns}) VALUES ({placeholders}) "
                 f"ON CONFLICT(id) DO UPDATE SET {updates}",
@@ -620,6 +636,40 @@ class Store:
             self._conn.commit()
             self._writes += 1
         return tx
+
+    def review_transmission(self, tx_id: str, *, approve: bool = False,
+                            transcript: Optional[str] = None,
+                            translation: Optional[str] = None,
+                            notes: Optional[str] = None) -> Optional[Transmission]:
+        """Apply an operator action to the latest row under the writer lock."""
+        with self._lock:
+            tx = self.get_transmission(tx_id)
+            if tx is None or (approve and not tx.can_approve):
+                return None
+            if notes is not None:
+                tx.notes = notes
+            if approve or transcript is not None or translation is not None:
+                metadata = dict(tx.signal_metadata or {})
+                cleared = set(metadata.get("operator_cleared_fields", ()))
+                for field, value in (("transcript", transcript), ("translation", translation)):
+                    if value is not None:
+                        setattr(tx, field + "_correction", value)
+                        if value == "" and getattr(tx, field):
+                            cleared.add(field)
+                        else:
+                            cleared.discard(field)
+                if cleared:
+                    metadata["operator_cleared_fields"] = sorted(cleared)
+                else:
+                    metadata.pop("operator_cleared_fields", None)
+                metadata["operator_review_revision"] = metadata.get("operator_review_revision", 0) + 1
+                if approve:
+                    metadata["operator_approved"] = True
+                tx.signal_metadata = metadata
+                tx.reviewed = True
+            if not approve:
+                tx.corrected_at = utcnow()
+            return self.save_transmission(tx)
 
     def _index_fts(self, tx: Transmission) -> None:
         if not self.fts_enabled:
@@ -1023,29 +1073,31 @@ class Store:
                      "(SELECT id FROM sessions WHERE conversation_id = ?) ")
             params.append(conversation_id)
         params += [threshold, threshold, limit]
-        rows = self._conn.execute(
-            f"""SELECT t.* FROM transmissions t
-               WHERE t.hidden = 0 {scope}AND (
-                  (t.reviewed = 0 AND (
-                     t.state = 'failed'
-                  OR (t.transcript_confidence IS NOT NULL
-                      AND t.transcript_confidence < ?)
-                  OR (t.language_confidence IS NOT NULL
-                      AND t.language_confidence < ?)))
-                  -- A speech-check flag clears only once the operator has
-                  -- saved the words (Transmission.needs_review), not on a
-                  -- note or a Retry as speech.
-                  -- Saved, not processed: monitoring was stopped first.
-                  OR json_extract(t.signal_metadata, '$.processing_stopped') IS NOT NULL
-                  OR ((json_extract(t.signal_metadata, '$.speech_check.verdict')
-                       IN ('likely_noise', 'uncertain')
-                       OR json_extract(t.signal_metadata,
-                                       '$.translation_unresolved') IS NOT NULL)
-                      AND NOT (t.reviewed = 1
-                               AND (COALESCE(t.transcript_correction, '') != ''
-                                    OR COALESCE(t.translation_correction, '') != ''))))
-               ORDER BY t.started_at DESC LIMIT ?""",
-            tuple(params)).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                f"""SELECT t.* FROM transmissions t
+                   WHERE t.hidden = 0 {scope}AND (
+                      t.state = 'failed'
+                      OR (t.reviewed = 0 AND (
+                         (t.transcript_confidence IS NOT NULL
+                          AND t.transcript_confidence < ?)
+                      OR (t.language_confidence IS NOT NULL
+                          AND t.language_confidence < ?)))
+                      -- Saved, not processed: monitoring was stopped first.
+                      OR json_extract(t.signal_metadata, '$.processing_stopped') IS NOT NULL
+                      OR ((json_extract(t.signal_metadata, '$.speech_check.verdict')
+                           IN ('likely_noise', 'uncertain')
+                           OR json_extract(t.signal_metadata,
+                                           '$.translation_unresolved') IS NOT NULL)
+                          AND NOT (t.reviewed = 1
+                                   AND (COALESCE(json_extract(t.signal_metadata,
+                                              '$.operator_approved'), 0) = 1
+                                        OR COALESCE(t.transcript_correction, '') != ''
+                                        OR COALESCE(json_array_length(t.signal_metadata,
+                                                   '$.operator_cleared_fields'), 0) > 0
+                                        OR COALESCE(t.translation_correction, '') != ''))))
+                   ORDER BY t.started_at DESC LIMIT ?""",
+                tuple(params)).fetchall()
         return [_from_row(r) for r in rows]
 
     def delete_transmission(self, tx_id: str, delete_audio: bool = False) -> None:
@@ -1331,14 +1383,37 @@ class Store:
         return result
 
     # ---- Clear Session History ---------------------------------------------
-    def _stale_against_store(self, tx: Transmission) -> bool:
+    def _stale_against_store(self, tx: Transmission, merge_review: bool = False) -> bool:
         row = self._conn.execute(
-            "SELECT history_generation FROM transmissions WHERE id = ?",
+            "SELECT history_generation, json_extract(signal_metadata, '$.operator_review_revision') "
+            "FROM transmissions WHERE id = ?",
             (tx.id,)).fetchone()
-        return row is not None and int(row[0] or 0) > int(tx.history_generation or 0)
+        if row is None:
+            return False
+        if int(row[0] or 0) > int(tx.history_generation or 0):
+            return True
+        if int(row[1] or 0) > (tx.signal_metadata or {}).get("operator_review_revision", 0):
+            if not merge_review:
+                return True  # An old queued UI event must not undo the review.
+            # A worker's snapshot can predate an edit or approval. Keep its
+            # new processing result and the newer operator decision together.
+            latest = self.get_transmission(tx.id)
+            tx.reviewed = latest.reviewed
+            tx.transcript_correction = latest.transcript_correction
+            tx.translation_correction = latest.translation_correction
+            tx.corrected_at = latest.corrected_at
+            metadata = dict(tx.signal_metadata or {})
+            for name in ("operator_review_revision", "operator_approved",
+                         "operator_cleared_fields", "superseded_corrections"):
+                if name in latest.signal_metadata:
+                    metadata[name] = latest.signal_metadata[name]
+                else:
+                    metadata.pop(name, None)
+            tx.signal_metadata = metadata
+        return False
 
     def is_stale(self, tx: Transmission) -> bool:
-        """This copy of a message predates a Clear Session History of it."""
+        """This copy predates a history clear or a newer operator review."""
         with self._lock:
             return self._stale_against_store(tx)
 
@@ -1924,6 +1999,9 @@ def _clear_text(tx: Transmission) -> bool:
     tx.transcript_confidence = None
     metadata = dict(tx.signal_metadata or {})
     metadata.pop("superseded_corrections", None)
+    metadata.pop("operator_approved", None)
+    metadata.pop("operator_cleared_fields", None)
+    tx.reviewed = False
     metadata["history_cleared"] = _cleared_marks(tx, "text")
     tx.signal_metadata = metadata
     return True

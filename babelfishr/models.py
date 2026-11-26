@@ -687,15 +687,30 @@ class Transmission:
     @property
     def display_transcript(self) -> str:
         """What the UI shows as the original-language text."""
+        if "transcript" in (self.signal_metadata or {}).get("operator_cleared_fields", ()):
+            return ""
         return self.transcript_correction or self.transcript
 
     @property
     def display_translation(self) -> str:
+        if "translation" in (self.signal_metadata or {}).get("operator_cleared_fields", ()):
+            return ""
         return self.translation_correction or self.translation
 
     @property
     def has_correction(self) -> bool:
-        return bool(self.transcript_correction or self.translation_correction)
+        return bool(self.transcript_correction or self.translation_correction
+                    or (self.signal_metadata or {}).get("operator_cleared_fields"))
+
+    @property
+    def operator_checked(self) -> bool:
+        """A saved correction or explicit approval of this recognition.
+
+        Older releases also set reviewed when saving a note. A note alone
+        cannot certify a transcript or clear its speech-check flag.
+        """
+        return self.reviewed and bool(self.has_correction or
+                                      (self.signal_metadata or {}).get("operator_approved"))
 
     @property
     def guess_withheld(self) -> bool:
@@ -706,7 +721,7 @@ class Transmission:
         the same way without rewriting them. A manual correction supplies
         the words. Requesting another decode still requires voice evidence
         for a stock sign-off."""
-        if self.transcript_correction or not (self.transcript or "").strip():
+        if self.transcript_correction or not (self.display_transcript or "").strip():
             return False
         metadata = self.signal_metadata or {}
         check = metadata.get("speech_check") or {}
@@ -763,7 +778,7 @@ class Transmission:
     def withheld_ending(self) -> str:
         """The unsupported stock sign-off withheld from the end of an
         otherwise real transcript, or "". The raw text keeps it."""
-        if self.guess_withheld:
+        if self.guess_withheld or not (self.display_transcript or "").strip():
             return ""
         split = self._ending_split()
         return split[1] if split else ""
@@ -773,7 +788,7 @@ class Transmission:
         """The original-language text to present as traffic: "" for a
         withheld guess, and without an unsupported sign-off at its end (the
         raw candidate stays in ``transcript``)."""
-        if self.guess_withheld:
+        if self.guess_withheld or not (self.display_transcript or "").strip():
             return ""
         split = None if self.transcript_correction else self._ending_split()
         if split:
@@ -933,32 +948,27 @@ class Transmission:
         """Low confidence, or a failure the operator should look at."""
         if self.state is ProcessingState.FAILED:
             return True
-        # A speech-check flag clears only when the operator has saved the
-        # transcript/translation (Edit transcript and translation). Not by
-        # Retry as speech, which only lifts the translation hold, and not by
-        # a note: an older version marked a message reviewed when only a
-        # note was saved, and a note does not check the recognised words.
         metadata = self.signal_metadata or {}
-        check = metadata.get("speech_check") or {}
-        if (check.get("verdict") in ("likely_noise", "uncertain")
-                and not (self.reviewed and self.has_correction)):
-            return True
-        if self.guess_withheld:
-            return True
-        # Saved, not processed: monitoring was stopped first (pipeline
-        # PROCESSING_STOPPED). It waits for Transcribe anyway / Retry.
         if metadata.get("processing_stopped"):
             return True
-        # Translation not attempted, language unresolved (pipeline
-        # TRANSLATION_UNRESOLVED): same rule - saved words clear it.
-        if (metadata.get("translation_unresolved")
-                and not (self.reviewed and self.has_correction)):
+        if self.operator_checked:
+            return False
+        check = metadata.get("speech_check") or {}
+        if (check.get("verdict") in ("likely_noise", "uncertain")
+                or self.guess_withheld or metadata.get("translation_unresolved")):
             return True
         if self.reviewed:
             return False
         thresholds = [v for v in (self.transcript_confidence,
                                   self.language_confidence) if v is not None]
         return any(v < 0.6 for v in thresholds)
+
+    @property
+    def can_approve(self) -> bool:
+        """Only a finished result can be acknowledged as checked."""
+        return (self.state in (ProcessingState.COMPLETE, ProcessingState.SKIPPED)
+                and not (self.signal_metadata or {}).get("processing_stopped")
+                and self.needs_review)
 
     def finish(self, ended_at: Optional[_dt.datetime] = None) -> None:
         self.ended_at = ended_at or utcnow()
