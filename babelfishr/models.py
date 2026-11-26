@@ -258,6 +258,12 @@ class Conversation:
     reordering never moves a colour onto a different Session.
     """
 
+    save_path: str = ""
+    """The folder the operator chose for this Session's recordings and
+    portable transcripts, or "" for the standard destination. BabelFishR
+    writes only inside ``<save_path>/BabelFishR`` (see babelfishr.savepath).
+    """
+
     def to_dict(self) -> Dict[str, Any]:
         d = dataclasses.asdict(self)
         d["created_at"] = iso(self.created_at)
@@ -463,6 +469,12 @@ class Session:
     conversation_id: str = ""
     """The named thread this run belongs to. Backfilled to General for every
     run recorded before named threads existed."""
+
+    save_path: str = ""
+    """The Session's chosen folder as it was when this run started ("" for
+    the standard destination). Pinned per run: changing the Session's
+    destination later never moves where this run's recordings and portable
+    transcripts go."""
 
     @property
     def is_open(self) -> bool:

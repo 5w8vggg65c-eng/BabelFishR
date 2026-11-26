@@ -94,7 +94,7 @@ is the menu check, now in section F below.
    **Record Only** from the menu.
    *Good:* a yellow warning line appears near the top of the window saying that
    in Record Only, transmissions are recorded but not transcribed.
-8. Click the operating mode again and choose **Field Offline**.
+8. Click the operating mode again and choose **Offline Field Use**.
    *Good:* the Record Only warning disappears. If the machine has a different
    problem at the same time (for example an audio input that stopped
    responding), that other warning stays — only the Record Only one goes.
@@ -656,13 +656,13 @@ step 62 needs a known digital channel or a digital radio you do not yet have.
     sentence saying there is nothing removed. Remove a throwaway message
     (⋯ ▸ Remove from view), click **Removed**, then **Restore** on it.
     *Good:* it goes back to **All**.
-73. On a throwaway Session, use **Session actions ▾** (or right-click its
-    tab): **Hide Session** hides it at once, and **View ▸ Show hidden
+73. On a throwaway Session, right-click its tab (or select it and press
+    Shift+F10): **Hide Session** hides it at once, and **View ▸ Show hidden
     Sessions** brings it back. **Delete Session…** asks one question named
     after the Session, with **Hide Session**, **Delete** and **Cancel**;
     pressing Return or Esc cancels. **Retry file cleanup…** appears under
     the Session buttons only if a past deletion could not remove a file.
-74. On a message marked **Check** whose words are correct, click **Approved**
+74. On a message marked **Check** whose words are correct, click **Approve?**
     directly underneath. **Check** changes to **Approved** and the words stay
     intact after Refresh. On a different recorded message with a newer one
     after it, click **Edit**, play the audio and type a correction in the
@@ -679,6 +679,52 @@ step 62 needs a known digital channel or a digital radio you do not yet have.
     playback. The shared controls stay accessible and audio continues.
     During a loud input, hover over **clipped samples**. The explanation
     distinguishes saturated audio samples from the number of messages.
+
+## U. Offline Field Use mark, languages, Space, live view, Turbo, waveform scale, Save path (new)
+
+77. Choose **Offline Field Use** in the band. *Good:* right beside it,
+    **Checking…** at once, then a red **✕** or a green **✓**. Click it (or
+    focus it and press Space): the full readiness report opens. A ✓ needs
+    the selected input connected, macOS microphone access granted (the first
+    watch asks), the selected Whisper model and the selected translation
+    route all verified on this Mac. Change the input, the model or the
+    language: *Good:* it says **Checking…** again before any new tick.
+78. Under **Local Engines**: **Language** (Detect automatically / Specified)
+    and directly below it **Source**. Choose Specified ▸ Spanish with only a
+    German→English pack installed. *Good:* ✕ naming es→en. English into
+    English *Good:* passes without any pack. Quit and reopen: the choice is
+    kept. There is no separate "English > English" line and no "No profile
+    selected" line; **Calibrate** and **Remember for profile** are still there.
+79. Select a finished message and press Space (not in a text field).
+    *Good:* it plays, then the following messages in turn; Space pauses and
+    resumes; at the newest message Space stops it, and never sets Bookmark.
+    Type in **Search** and in **Edit**: spaces are typed as usual. **▶ Play
+    selected**, **Pause**, **Stop**, **−5 s** and **+5 s** have the same border.
+80. From a search, the **Removed** filter or another Session, scrolled down,
+    press **Start monitoring**. *Good:* the live thread of the recorded
+    Session, at its newest message at the top.
+81. In Online / Setup: **Local Engines ▸ Install a speech model… ▸ Install
+    Large v3 turbo**, confirm. *Good:* a progress window, then "installed and
+    verified"; Turbo becomes selectable in **Whisper model** without
+    restarting, and the current model stays selected until you choose. In
+    Offline Field Use the button is disabled. (Only on a Mac where a 1.6 GB
+    download is acceptable.)
+82. While monitoring a noisy input, open **Display scale ▾** on the live
+    waveform and raise the display floor to about −30 dBFS. *Good:* the
+    steady band flattens to the centre line and speech peaks remain; the
+    scale under the plot says so. **Reset** returns to −60 dBFS. The level
+    meter, **Start recording at** and the recordings are unchanged.
+83. With a throwaway Session, **Session options ▸ Save path ▸ Choose folder…**
+    a USB stick. *Good:* the path shown is **<stick>/BabelFishR**; new WAVs
+    and per-message transcript files appear there; an edit or approval
+    updates that message's transcript file; exports open there. **Use
+    standard location** goes back; earlier recordings stay where they were
+    and still play. During monitoring the buttons are locked. Quit and
+    reopen: the choice is kept. Eject the stick, then choose Offline Field
+    Use: *Good:* ✕ naming the missing path; **Start monitoring** refuses
+    with the same reason, and no folder appears under /Volumes. Eject it
+    during a watch (throwaway data only): *Good:* a banner says where new
+    recordings went instead, and the ✓ goes away.
 
 ---
 

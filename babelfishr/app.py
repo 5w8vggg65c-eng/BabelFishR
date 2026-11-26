@@ -27,6 +27,8 @@ from .pipeline import (CaptureService, EventBus, PipelineState,
 from .providers import (EngineUnavailable, Glossary, TranscriptionEngine,
                         TranslationEngine, build_transcription_engine,
                         build_translation_engine, is_placeholder)
+from .portable import PortableTranscripts, sidecar_path
+from .savepath import SavePathError, SavePathInfo
 from .storage import Store
 
 log = logging.getLogger(__name__)
@@ -270,6 +272,25 @@ class BabelFishRApp:
         # filed under and which rows the window shows.
         self._conversation_id: str = ""
         self._capture_conversation_id: str = ""
+        #: The save path the starting run is pinned to (see start_session).
+        self._capture_save_path: str = ""
+        #: Portable transcripts for runs with a Session save path, written on
+        #: a background thread of their own (babelfishr.portable).
+        self.portable = PortableTranscripts(
+            self.store, self.events, layout=lambda: self.config.recording.layout)
+        #: Each Session's chosen save folder, kept in memory so readiness -
+        #: which runs on a worker thread, possibly while the window is
+        #: closing the store - never has to read the database for it.
+        self._save_path_cache: Dict[str, str] = {}
+        self._default_conversation_cache = ""
+        try:
+            for conversation_id, (chosen, is_default) in \
+                    self.store.conversation_save_paths().items():
+                self._save_path_cache[conversation_id] = chosen
+                if is_default and not self._default_conversation_cache:
+                    self._default_conversation_cache = conversation_id
+        except Exception:  # noqa: BLE001 - filled in as Sessions are read
+            log.debug("could not read Session save paths", exc_info=True)
 
     # -- setup -----------------------------------------------------------
     def glossary_path(self) -> pathlib.Path:
@@ -841,6 +862,10 @@ class BabelFishRApp:
         problem = self.shutdown_problem()
         if problem:
             raise ProcessingBusy(problem)
+        # The selected Session's own save destination, checked now and
+        # pinned to this run. Unavailable refuses the start with the reason:
+        # never a silent switch to the local folder before a watch begins.
+        save_path = self._preflight_for_start(self.conversation_id)
         self._discard_standalone_pipeline()
 
         if source is None:
@@ -854,6 +879,7 @@ class BabelFishRApp:
         # captured here rather than read later: switching tabs mid-watch must
         # not move traffic that is already arriving.
         self._capture_conversation_id = self.conversation_id
+        self._capture_save_path = save_path
         try:
             return self._open_session(
                 source, device, name, profile_id, target_language,
@@ -880,6 +906,7 @@ class BabelFishRApp:
         """
         session = self.session
         self._capture_conversation_id = ""
+        self._capture_save_path = ""
         self._session_mode = None
         self.session = None
         self.capture = None
@@ -947,9 +974,12 @@ class BabelFishRApp:
             transcription_engine=self.transcription.name if self.transcription else "",
             translation_engine=self.translation.name if self.translation else "",
             conversation_id=self._capture_conversation_id,
+            save_path=self._capture_save_path,
         )
         self.store.save_session(session)
         self.session = session
+        if session.save_path:
+            self.portable.track_run(session.id)
 
         reuse = self.standalone_pipeline
         if reuse is not None and self._can_reuse(reuse, busy=False):
@@ -1161,6 +1191,7 @@ class BabelFishRApp:
                 self._standalone_mode = self._session_mode
         self._session_mode = None
         self._capture_conversation_id = ""
+        self._capture_save_path = ""
         if session is not None:
             # The end is recorded off this thread. The write takes the store
             # lock, which a worker saving a transcript may be holding; an
@@ -1357,14 +1388,206 @@ class BabelFishRApp:
         """Colour one Session's tab. "" restores the default."""
         return self.store.set_conversation_color(conversation_id, color)
 
+    # -- a Session's save path ---------------------------------------------
+    def _chosen_save_path(self, conversation_id: str) -> str:
+        conversation = self.store.get_conversation(conversation_id)
+        chosen = conversation.save_path if conversation is not None else ""
+        self._save_path_cache[conversation_id] = chosen
+        return chosen
+
+    def _standard_dir(self) -> pathlib.Path:
+        return pathlib.Path(self.config.recording.directory).expanduser()
+
+    def save_path_info(self, conversation_id: Optional[str] = None) -> SavePathInfo:
+        """Where this Session's new recordings go, and whether that works.
+
+        *conversation_id* defaults to the Session being viewed. Returns a
+        :class:`~babelfishr.savepath.SavePathInfo`:
+
+        * ``chosen`` - the stored folder ("" = standard destination);
+        * ``owned_dir`` - ``<chosen>/BabelFishR`` (None when standard);
+        * ``effective_dir`` - the folder new recordings go into:
+          ``<chosen>/BabelFishR/recordings`` when available, otherwise the
+          standard folder (where a running watch falls back to - a new watch
+          refuses to start instead);
+        * ``standard_dir`` - ``config.recording.directory``;
+        * ``state`` - "standard", "ok" or "unavailable"; ``reason`` - why
+          (e.g. "not found (drive ejected or folder removed)", "read-only");
+        * ``is_custom``.
+
+        Checking it runs the same preflight as choosing it (a temporary file
+        is written and removed inside the BabelFishR folder); it never
+        creates the chosen folder.
+        """
+        from . import savepath
+
+        conversation_id = conversation_id or self.conversation_id
+        chosen = self._chosen_save_path(conversation_id)
+        standard = self._standard_dir()
+        if not chosen:
+            return SavePathInfo(chosen="", owned_dir=None, effective_dir=standard,
+                                standard_dir=standard, state="standard")
+        reason = savepath.preflight(chosen)
+        if not reason:
+            return SavePathInfo(chosen=chosen, owned_dir=savepath.owned_dir(chosen),
+                                effective_dir=savepath.recordings_dir(chosen),
+                                standard_dir=standard, state="ok")
+        return SavePathInfo(chosen=chosen, owned_dir=savepath.owned_dir(chosen),
+                            effective_dir=standard, standard_dir=standard,
+                            state="unavailable", reason=reason)
+
+    def save_path_locked(self, conversation_id: str) -> bool:
+        """Monitoring is recording into this Session: its destination is
+        fixed until Stop."""
+        return self.capture is not None and self._capture_conversation_id == conversation_id
+
+    def set_save_path(self, conversation_id: str,
+                      folder: Optional[str]) -> SavePathInfo:
+        """Point a Session at *folder*, or back at the standard destination.
+
+        *folder* None or "" restores the standard destination, which is
+        always allowed (except while the Session records). Otherwise the
+        folder must be a complete path to an existing, writable folder: it
+        is preflighted (the BabelFishR folder is created beneath it and a
+        temporary file written and removed there) and stored only if that
+        works. Raises :class:`SavePathError` - and saves nothing - when the
+        folder fails its preflight, when the Session does not exist, or
+        while monitoring is recording into this Session.
+
+        Only new monitoring runs use the new destination. Recordings already
+        made stay where they are and keep playing from there; a run already
+        started keeps the destination it started with.
+        """
+        from . import savepath
+
+        if self.store.get_conversation(conversation_id) is None:
+            raise SavePathError("That Session no longer exists.")
+        if self.save_path_locked(conversation_id):
+            raise SavePathError(
+                "Monitoring is recording into this Session. Its save path "
+                "cannot change until you stop monitoring.")
+        chosen = ""
+        if folder is not None and str(folder).strip():
+            chosen = savepath.normalise(str(folder))
+            if not chosen:
+                raise SavePathError(
+                    f"Save path {folder}: {savepath.NOT_ABSOLUTE}")
+            reason = savepath.preflight(chosen)
+            if reason:
+                raise SavePathError(savepath.describe(chosen, reason))
+        self.store.set_conversation_save_path(conversation_id, chosen)
+        info = self.save_path_info(conversation_id)
+        self.events.publish("save-path", {
+            "state": "changed", "conversation_id": conversation_id,
+            "chosen": chosen, "path": str(info.effective_dir), "reason": "",
+            "message": (f"New recordings for this Session go to "
+                        f"{info.effective_dir}.")})
+        return info
+
+    def default_export_dir(self, conversation_id: Optional[str] = None) -> pathlib.Path:
+        """Where an export of this Session should be offered by default.
+
+        ``<chosen>/BabelFishR/exports`` (created) when the Session has a save
+        path that is available; otherwise the standard default - the
+        Documents folder when there is one, else the home folder.
+        """
+        from . import savepath
+
+        conversation_id = conversation_id or self.conversation_id
+        chosen = self._chosen_save_path(conversation_id)
+        if chosen and not savepath.preflight(chosen):
+            try:
+                return savepath.ensure_subdir(chosen, savepath.EXPORTS_DIRNAME)
+            except OSError:
+                log.warning("could not create the exports folder under %s", chosen)
+        home = pathlib.Path.home()
+        documents = home / "Documents"
+        return documents if documents.is_dir() else home
+
+    def _preflight_for_start(self, conversation_id: str) -> str:
+        """The save path a new run in this Session will use; raises
+        SavePathError with the concrete reason when it is unavailable."""
+        from . import savepath
+
+        chosen = self._chosen_save_path(conversation_id)
+        if chosen:
+            reason = savepath.preflight(chosen)
+            if reason:
+                raise SavePathError(
+                    savepath.describe(chosen, reason) + ". Monitoring did not "
+                    "start. Reconnect the drive, or choose another save path "
+                    "(or the standard location) for this Session.")
+        return chosen
+
+    def portable_transcript_problem(self, tx_id: str) -> str:
+        """Why this message's portable transcript is not saved, or ""."""
+        failure = self.portable.failures.get(tx_id)
+        if failure is None:
+            tx = self.store.get_transmission(tx_id)
+            failure = (tx.signal_metadata or {}).get("portable_transcript") if tx else None
+        if not failure:
+            return ""
+        return (f"The portable transcript could not be saved to "
+                f"{failure.get('path', '')} ({failure.get('reason', '')}).")
+
+    def wait_for_portable_transcripts(self, timeout: Optional[float] = 10.0) -> bool:
+        """Block until every requested portable transcript write has been
+        attempted. For blocking callers and tests."""
+        return self.portable.wait_idle(timeout=timeout)
+
+    def _sidecar_targets(self, rows) -> Dict[str, tuple]:
+        """{tx id: (portable transcript path, chosen)} for rows of runs with
+        a save path, worked out before a deletion takes the rows away."""
+        targets: Dict[str, tuple] = {}
+        sessions: Dict[str, Any] = {}
+        for tx in rows:
+            if tx is None:
+                continue
+            if tx.session_id not in sessions:
+                sessions[tx.session_id] = self.store.get_session(tx.session_id)
+            session = sessions[tx.session_id]
+            if session is None or not session.save_path:
+                continue
+            targets[tx.id] = (sidecar_path(session.save_path, tx, session,
+                                           self.config.recording.layout),
+                              session.save_path)
+        return targets
+
+    def _settle_sidecars(self, targets: Dict[str, tuple]) -> None:
+        """After a deletion or history clear: remove the portable transcript
+        of each message that is gone, rewrite the rest (off this thread)."""
+        for tx_id, (path, chosen) in targets.items():
+            if self.store.get_transmission(tx_id) is None:
+                self.portable.remove(path, chosen)
+            else:
+                self.portable.request(tx_id)
+
     # -- removing messages -------------------------------------------------
     def owned_roots(self) -> List[str]:
         """Directories whose files BabelFishR created and may delete.
 
-        The Recordings folder only. A WAV the operator replayed from their own
-        folder, an export, a backup, a shared copy - none of those are ours.
+        The Recordings folder, and the BabelFishR folder beneath each save
+        path a Session has or a run was started with (``<chosen>/BabelFishR``)
+        - never the chosen folder itself or anything else in it. A WAV the
+        operator replayed from their own folder, an export, a backup, a
+        shared copy - none of those are ours. A BabelFishR folder that has
+        been replaced by a link is not trusted.
         """
-        return [str(pathlib.Path(self.config.recording.directory).expanduser())]
+        from . import savepath
+
+        roots = [str(pathlib.Path(self.config.recording.directory).expanduser())]
+        try:
+            chosen_folders = self.store.save_path_roots()
+        except Exception:  # noqa: BLE001 - the standard root still applies
+            log.debug("could not read save paths", exc_info=True)
+            chosen_folders = []
+        for chosen in chosen_folders:
+            owned = savepath.owned_dir(chosen)
+            if owned.is_symlink():
+                continue
+            if str(owned) not in roots:
+                roots.append(str(owned))
+        return roots
 
     def removal_problem(self, tx_id: str) -> str:
         """Why this message cannot be removed right now, or "" when it can."""
@@ -1395,7 +1618,10 @@ class BabelFishRApp:
         Playback of it is the window's to stop first; processing is refused
         via removal_problem(). Returns the report, or None if already gone.
         """
-        return self.store.delete_transmission_permanently(tx_id, self.owned_roots())
+        targets = self._sidecar_targets([self.store.get_transmission(tx_id)])
+        report = self.store.delete_transmission_permanently(tx_id, self.owned_roots())
+        self._settle_sidecars(targets)
+        return report
 
     def leftover_deletions(self):
         return self.store.leftover_deletions()
@@ -1438,8 +1664,10 @@ class BabelFishRApp:
                                                          self.owned_roots())
 
     def delete_conversation_permanently(self, conversation_id: str):
+        targets = self._sidecar_targets(self.store.conversation_rows(conversation_id))
         report = self.store.delete_conversation_permanently(conversation_id,
                                                             self.owned_roots())
+        self._settle_sidecars(targets)
         if report is not None and self._conversation_id == conversation_id:
             self.select_conversation(self.store.default_conversation().id)
         return report
@@ -1496,8 +1724,10 @@ class BabelFishRApp:
             problem = self.history_clear_problem(conversation_id)
             if problem:
                 raise ProcessingBusy(problem)
+            targets = self._sidecar_targets(self.store.conversation_rows(conversation_id))
             report = self.store.clear_conversation_history(
                 conversation_id, scope, self.owned_roots())
+        self._settle_sidecars(targets)
         if report is not None:
             self.events.publish("history-cleared", report)
         return report
@@ -1602,12 +1832,24 @@ class BabelFishRApp:
         source = getattr(self, "_signal_source", None)
         return source.metadata() if source is not None else None
 
-    def readiness(self, run_smoke_tests: bool = True):
-        """Run Field Check against the current configuration."""
+    def readiness(self, run_smoke_tests: bool = True,
+                  microphone_permission: Optional[str] = None):
+        """Run Field Check against the current configuration.
+        *microphone_permission*: readiness.microphone_authorization(), read
+        by the caller on the GUI thread (Qt's permission API lives there)."""
         from .readiness import field_check
 
+        extra = {}
+        # From memory, not the store: this runs on a worker thread.
+        selected = self._conversation_id or self._default_conversation_cache
+        chosen = self._save_path_cache.get(selected, "")
+        if chosen:
+            # The selected Session's actual destination, not only the
+            # standard Recordings folder.
+            extra["save_path"] = chosen
         return field_check(self.config, run_smoke_tests=run_smoke_tests,
-                           mode=self.mode)
+                           mode=self.mode, microphone_permission=microphone_permission,
+                           **extra)
 
     def correct(self, tx_id: str, transcript: Optional[str] = None,
                 translation: Optional[str] = None,
@@ -1853,6 +2095,11 @@ class BabelFishRApp:
                 end.join(remaining())
         self._reap_session_ends()
         if self._session_ends:
+            return False
+
+        # 5c. Portable transcripts requested so far are attempted (a failed
+        #     one is recorded, not retried here); then the writer stops.
+        if not self.portable.stop(timeout=remaining() if wait else 0.0):
             return False
 
         # 6. Only the final cleanup is left. A caller with routes of its own

@@ -85,6 +85,55 @@ def _ordinal(n: int) -> str:
     return "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
 
 
+class _SpacePlayback(QtCore.QObject):
+    """Space plays and pauses - scoped to playback.
+
+    Watches key events application-wide, for this window only, and takes a
+    plain Space only when the keyboard focus is somewhere playback lives:
+    the message list (not a text field or one of a card's own other
+    buttons), the waveform, or the playback bar - whose Bookmark and Add
+    note buttons included, so focus that drifts onto them when the last
+    clip ends can never turn Space into a bookmark. A press acts once; its
+    release and auto-repeats are swallowed. Text fields (the inline editor,
+    search, spin boxes) and every other control get Space as usual.
+    """
+
+    def __init__(self, window: "MainWindow"):
+        super().__init__(window)
+        self.window = window
+        self._swallowing = False
+
+    def eventFilter(self, obj, event):  # noqa: N802 - Qt's name
+        kind = event.type()
+        if kind not in (QtCore.QEvent.KeyPress, QtCore.QEvent.KeyRelease,
+                        QtCore.QEvent.ShortcutOverride):
+            return False
+        if event.key() != QtCore.Qt.Key_Space:
+            return False
+        if event.modifiers() & ~QtCore.Qt.KeypadModifier:
+            return False
+        if kind == QtCore.QEvent.KeyRelease and self._swallowing:
+            # The press acted, and may have moved focus (a button that became
+            # disabled): its release is swallowed wherever it lands, so it
+            # can never click whatever has focus now.
+            if not event.isAutoRepeat():
+                self._swallowing = False
+            return True
+        focus = QtWidgets.QApplication.focusWidget()
+        if obj is not focus and not (focus is None and obj is self.window):
+            return False                   # once, at the widget that has focus
+        if not self.window.space_is_playback(focus):
+            return False
+        if kind == QtCore.QEvent.ShortcutOverride:
+            event.accept()                 # ours, not a shortcut's
+            return True
+        if kind == QtCore.QEvent.KeyPress:
+            self._swallowing = True
+            if not event.isAutoRepeat():   # held down: acted on once
+                self.window.toggle_playback_from_space()
+        return True
+
+
 class MainWindow(QtWidgets.QMainWindow):
     """Session header, input controls, live meter and the timeline."""
 
@@ -131,10 +180,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._report_engines()
         self._refresh_mode_badge()
         self._refresh_state_badge()
-        self._refresh_readiness(run_smoke_tests=True)
+        self._refresh_install_model_button()
+        self._space_filter = _SpacePlayback(self)
+        QtWidgets.QApplication.instance().installEventFilter(self._space_filter)
         self.app.restore_selected_conversation()
         self._refresh_session_tabs()
         self._reload_timeline()
+        self._refresh_save_path_row()
+        # After the selected Session is restored: its save path is checked.
+        self._refresh_readiness(run_smoke_tests=True)
         # Only a separate product's own entry point registers anything here
         # (babelfishr.extensions); started as BabelFishR this is empty.
         from ..extensions import hooks
@@ -282,12 +336,19 @@ class MainWindow(QtWidgets.QMainWindow):
             "Named Sessions. Monitoring can be started and stopped many "
             "times inside one Session; the thread continues.\n\n"
             "To rename a Session: double-click it, right-click it, "
-            "or select it and press Rename.")
+            "or select it and press Rename.\n\n"
+            "Right-click a Session (or press Shift+F10 or the Menu key) for "
+            "its colour, Clear Session History, Hide and Delete.")
         self.session_tabs.currentChanged.connect(self._on_session_tab)
         self.session_tabs.tabBarDoubleClicked.connect(self._rename_session_tab)
         self.session_tabs.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.session_tabs.customContextMenuRequested.connect(
             self._session_tab_menu)
+        # The same context menu from the keyboard, for the selected Session.
+        for keys in ("Shift+F10", QtCore.Qt.Key_Menu):
+            shortcut = QtGui.QShortcut(QtGui.QKeySequence(keys), self.session_tabs)
+            shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(self._show_session_actions)
         left_layout.addWidget(self.session_tabs)
 
         session_buttons = FlowLayout(spacing=5)
@@ -307,15 +368,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rename_session_button.clicked.connect(
             lambda: self._rename_session_tab(self.session_tabs.currentIndex()))
         session_buttons.addWidget(self.rename_session_button)
-        # Every action on the selected Session in one visible place - the
-        # same menu as right-clicking its tab.
-        self.session_actions_button = QtWidgets.QToolButton()
-        self.session_actions_button.setText("Actions \u25be")
-        self.session_actions_button.setToolTip(
-            "Rename, colour, clear history, hide or delete the selected Session")
-        self.session_actions_button.setAccessibleName("Session actions")
-        self.session_actions_button.clicked.connect(self._show_session_actions)
-        session_buttons.addWidget(self.session_actions_button)
         left_layout.addLayout(session_buttons)
         # Only while a confirmed deletion still has files left on disk.
         self.cleanup_button = QtWidgets.QPushButton("Retry file cleanup\u2026")
@@ -347,17 +399,13 @@ class MainWindow(QtWidgets.QMainWindow):
         input_layout.setContentsMargins(4, 2, 4, 2)
         input_layout.addWidget(self.input_panel)
         left_layout.addWidget(self.input_box)
-        self.language_line = QtWidgets.QLabel("")
-        self.language_line.setObjectName("paneLine")
-        self.language_line.setAccessibleName("Languages")
-        left_layout.addWidget(self.language_line)
-        # The radio profile - or the warning that there is none, so no
-        # channel or frequency is stamped - is always in view, not only in
-        # the Session Options panel.
+        # The radio profile in use, when there is one (the source and target
+        # languages are the editable controls themselves, not a summary).
         self.profile_line = QtWidgets.QLabel("")
         self.profile_line.setObjectName("paneLine")
         self.profile_line.setWordWrap(True)
         self.profile_line.setAccessibleName("Radio profile")
+        self.profile_line.hide()
         left_layout.addWidget(self.profile_line)
         level_row = QtWidgets.QHBoxLayout()
         level_row.setContentsMargins(10, 2, 0, 2)
@@ -398,8 +446,23 @@ class MainWindow(QtWidgets.QMainWindow):
         model_label.setBuddy(self.whisper_model_box)
         model_row.addWidget(model_label)
         model_row.addWidget(self.whisper_model_box, 1)
+        # Install a speech model that is not here yet (Turbo among them) -
+        # Online / Setup only, never while monitoring.
+        self.install_model_button = QtWidgets.QToolButton()
+        self.install_model_button.setText("Install a speech model\u2026")
+        self.install_model_button.setAccessibleName("Install a Whisper speech model")
+        self.install_model_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self.install_model_menu = QtWidgets.QMenu(self.install_model_button)
+        self.install_model_menu.aboutToShow.connect(self._fill_install_model_menu)
+        self.install_model_button.setMenu(self.install_model_menu)
+        self._install_worker = None
         left_layout.addLayout(model_row)
+        install_row = QtWidgets.QHBoxLayout()
+        install_row.addStretch(1)
+        install_row.addWidget(self.install_model_button)
+        left_layout.addLayout(install_row)
         self.whisper_model_box.currentIndexChanged.connect(self._change_whisper_model)
+        self._build_language_controls(left_layout)
         left_layout.addWidget(self.translation_engine_line)
         self.ready_badge = QtWidgets.QLabel()
         self.ready_badge.setObjectName("readinessLink")
@@ -409,6 +472,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ready_badge.mousePressEvent = lambda event: self._show_readiness()
         left_layout.addWidget(self.ready_badge)
         left_layout.addStretch(1)
+        # The narrowest the sidebar may become still fits its contents and
+        # its vertical scroll bar: nothing is clipped at the right edge.
+        self.sidebar.setMinimumWidth(max(
+            250, left.minimumSizeHint().width()
+            + self.sidebar.verticalScrollBar().sizeHint().width() + 2))
 
         # -- right: header, banners --------------------------------------------
         header = QtWidgets.QFrame()
@@ -447,7 +515,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # -- right: the selected recording's waveform ---------------------------
         self.waveform = RecordingWaveform()
-        self.live_waveform = LiveWaveform()
+        self.live_waveform = LiveWaveform(display=self.app.config.display,
+                                          save=self.app.config.save)
         self.waveform_stack = QtWidgets.QStackedWidget()
         self.waveform_stack.addWidget(self.waveform)
         self.waveform_stack.addWidget(self.live_waveform)
@@ -688,29 +757,31 @@ class MainWindow(QtWidgets.QMainWindow):
         controls.setSpacing(3)
         buttons = QtWidgets.QHBoxLayout()
         buttons.setSpacing(6)
-        self.selected_play_button = QtWidgets.QPushButton("Play selected")
-        self.selected_play_button.setObjectName("primaryAction")
+        self.selected_play_button = QtWidgets.QPushButton(self.PLAY_SELECTED)
+        self.selected_play_button.setObjectName("transportButton")
         self.selected_play_button.setAccessibleName("Play selected recording")
         self.selected_play_button.clicked.connect(self._play_selected)
         self.playback_pause_button = QtWidgets.QPushButton("Pause")
-        self.playback_pause_button.setObjectName("textAction")
+        self.playback_pause_button.setObjectName("transportButton")
         self.playback_pause_button.setAccessibleName("Pause or resume playback")
         self.playback_pause_button.clicked.connect(self._pause_playback)
         self.playback_stop_button = QtWidgets.QPushButton("Stop")
-        self.playback_stop_button.setObjectName("textAction")
+        self.playback_stop_button.setObjectName("transportButton")
         self.playback_stop_button.setAccessibleName("Stop playback")
         self.playback_stop_button.clicked.connect(self._stop_playback)
         self.playback_rewind_button = QtWidgets.QPushButton("−5 s")
+        self.playback_rewind_button.setObjectName("transportButton")
         self.playback_rewind_button.setAccessibleName("Rewind five seconds")
         self.playback_rewind_button.clicked.connect(
             lambda: self.timeline.playback.rewind())
         self.playback_forward_button = QtWidgets.QPushButton("+5 s")
+        self.playback_forward_button.setObjectName("transportButton")
         self.playback_forward_button.setAccessibleName("Forward five seconds")
         self.playback_forward_button.clicked.connect(
             lambda: self.sequence.skip_forward(5000))
 
         # Pause and Stop must stay under the pointer across short recordings.
-        for button, longest in ((self.selected_play_button, "Play selected"),
+        for button, longest in ((self.selected_play_button, self.PLAY_SELECTED),
                                 (self.playback_pause_button, "Resume")):
             button.setMinimumWidth(button.fontMetrics().horizontalAdvance(longest) + 36)
         for button in (self.selected_play_button, self.playback_pause_button,
@@ -937,6 +1008,52 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timeline.mark_now_playing(None)
         self._refresh_playback_bar()
 
+    def space_is_playback(self, widget) -> bool:
+        """Does a plain Space at *widget* belong to playback?"""
+        if widget is None:
+            return self.isActiveWindow()
+        if widget.window() is not self:
+            return False
+        if isinstance(widget, (QtWidgets.QLineEdit, QtWidgets.QAbstractSpinBox)):
+            return False
+        if isinstance(widget, (QtWidgets.QTextEdit, QtWidgets.QPlainTextEdit)) \
+                and not widget.isReadOnly():
+            return False                   # typing: the inline editor, notes
+        if isinstance(widget, QtWidgets.QComboBox) and widget.isEditable():
+            return False
+        if widget is self:
+            return True
+        if self.selected_panel is widget or self.selected_panel.isAncestorOf(widget):
+            return True                    # the playback bar, all of it
+        if self.waveform is widget or self.waveform.isAncestorOf(widget):
+            return True
+        if self.timeline is widget or self.timeline.isAncestorOf(widget):
+            if isinstance(widget, QtWidgets.QAbstractButton):
+                # A card's own buttons keep Space (Approve?, its menu);
+                # only its Play button is playback.
+                return bool(widget.property("playbackControl"))
+            return True
+        return False
+
+    def toggle_playback_from_space(self) -> None:
+        """One Space: pause what plays, resume what is paused, stop a wait
+        for the next live recording, or play the selected message (and
+        those after it). Never anything else."""
+        from .playback import PAUSED, PLAYING
+
+        controller = self.timeline.playback
+        owner = controller.owner
+        state = controller.state_for(owner) if owner else ""
+        sequence = self.sequence
+        if owner and state in (PLAYING, PAUSED):
+            self._pause_playback()
+        elif sequence.paused_between_clips:
+            self._pause_playback()
+        elif sequence.waiting or sequence.active:
+            self._stop_playback()
+        else:
+            self._play_selected()
+
     def _pause_playback(self) -> None:
         controller = self.timeline.playback
         if not controller.controllable:
@@ -958,6 +1075,9 @@ class MainWindow(QtWidgets.QMainWindow):
         waiting = bool(sequence is not None and sequence.waiting)
         active = bool(owner and state in (PLAYING, PAUSED)) or waiting \
             or bool(sequence is not None and sequence.active)
+        # Only for a playable, finished selection or while playback is
+        # active; at idle with such a selection Pause and Stop stay in place,
+        # disabled.
         self.playback_controls.setVisible(active or self._playback_selection_ready)
         self.playback_stop_button.setEnabled(active and controller.controllable)
         self.playback_pause_button.setEnabled(active and controller.controllable)
@@ -1047,6 +1167,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.mode_actions[mode.value] = action
         self.mode_button.setMenu(self.mode_menu)
         row.addWidget(self.mode_button)
+        # Offline Field Use's own readiness, right beside the mode: Checking...
+        # while the checks run, then a red cross or a green tick. A button,
+        # so it takes focus and opens the full report on Space or a click.
+        self.offline_status = QtWidgets.QToolButton()
+        self.offline_status.setObjectName("offlineStatus")
+        self.offline_status.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.offline_status.setCursor(QtCore.Qt.PointingHandCursor)
+        self.offline_status.clicked.connect(self._show_readiness)
+        self.offline_status.setVisible(False)
+        row.addWidget(self.offline_status)
         row.addStretch(1)
 
         self.source_label = QtWidgets.QLabel("SOURCE: …")
@@ -1064,6 +1194,269 @@ class MainWindow(QtWidgets.QMainWindow):
         font.setCapitalization(QtGui.QFont.AllUppercase)
         self.state_badge.setFont(font)
         row.addWidget(self.state_badge)
+
+    def _build_language_controls(self, layout) -> None:
+        """Language detection, and directly below it the source language,
+        under Local Engines: what the speech model is told about the
+        language. Saved, restored, and locked while monitoring."""
+        session = self.app.config.session
+        grid = QtWidgets.QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(4)
+        grid.setColumnStretch(1, 1)
+        self.source_mode_box = self._compact_combo(QtWidgets.QComboBox())
+        self.source_mode_box.addItem("Detect automatically", "automatic")
+        self.source_mode_box.addItem("Specified", "specified")
+        self.source_mode_box.setAccessibleName("Language detection")
+        self.source_language_box = self._compact_combo(QtWidgets.QComboBox())
+        for code, name in COMMON_LANGUAGES:
+            self.source_language_box.addItem(f"{name} ({code})", code)
+        self.source_language_box.setAccessibleName("Source language")
+        mode_index = self.source_mode_box.findData(session.source_language_mode)
+        self.source_mode_box.setCurrentIndex(max(0, mode_index))
+        language_index = self.source_language_box.findData(session.source_language)
+        if language_index >= 0:
+            self.source_language_box.setCurrentIndex(language_index)
+        self.source_language_box.setEnabled(
+            self.source_mode_box.currentData() == "specified")
+        self.source_mode_box.currentIndexChanged.connect(self._on_source_mode)
+        self.source_language_box.currentIndexChanged.connect(
+            lambda _i: self._save_source_language())
+        for row, (text, box) in enumerate((("Language", self.source_mode_box),
+                                           ("Source", self.source_language_box))):
+            caption = QtWidgets.QLabel(text)
+            caption.setObjectName("engineLine")
+            caption.setBuddy(box)
+            grid.addWidget(caption, row, 0)
+            grid.addWidget(box, row, 1)
+        layout.addLayout(grid)
+
+    def _save_source_language(self) -> None:
+        """Remember the language choice and recheck what it needs."""
+        session = self.app.config.session
+        mode = self.source_mode_box.currentData()
+        language = self.source_language_box.currentData()
+        if (session.source_language_mode, session.source_language) == (mode, language):
+            return
+        session.source_language_mode, session.source_language = mode, language
+        try:
+            self.app.config.save()
+        except OSError as exc:  # noqa: BLE001 - shown; the running choice stands
+            self.status.showMessage(f"Language choice not saved: {exc}", 8000)
+        self._refresh_context_lines()
+        self._refresh_readiness(run_smoke_tests=False)
+
+    def _on_target_language(self, _index=None) -> None:
+        code = self.target_language_box.currentData()
+        translate = self.app.config.translate
+        if not code or code == translate.target_language:
+            return
+        translate.target_language = code
+        try:
+            self.app.config.save()
+        except OSError as exc:  # noqa: BLE001
+            self.status.showMessage(f"Target language not saved: {exc}", 8000)
+        self._refresh_context_lines()
+        self._refresh_readiness(run_smoke_tests=False)
+
+    # -- installing a speech model (Online / Setup) -------------------------
+    def _install_model_problem(self) -> str:
+        """Why a model cannot be installed now, or "" when it can."""
+        if not self.app.mode.allows_downloads:
+            return (f"{self.app.mode.title} does not download anything. Switch to "
+                    f"Online / Setup to install a speech model.")
+        if self.app.session is not None:
+            return "Stop monitoring first: a model is not installed during a watch."
+        if self._install_worker is not None:
+            return "A speech model is being installed."
+        return ""
+
+    def _refresh_install_model_button(self) -> None:
+        button = getattr(self, "install_model_button", None)
+        if button is None:
+            return
+        problem = self._install_model_problem()
+        button.setEnabled(not problem)
+        button.setToolTip(problem or (
+            "Download and verify a Whisper speech model (multilingual "
+            "transcription; separate from translation language packs). The "
+            "model in use does not change until you choose the new one."))
+
+    def _installable_models(self):
+        """(name, label, state) for each model not installed completely."""
+        from ..preparation import MODEL_SIZES_MB
+        from ..providers.whisper_local import MODEL_SIZES, ModelState, inspect_model_directory
+
+        found = []
+        for name in MODEL_SIZES:
+            try:
+                state, _ = inspect_model_directory(self.app.whisper_model_directory(name))
+            except OSError:
+                state = None
+            if state is ModelState.COMPLETE:
+                continue
+            verb = "Repair" if state is ModelState.INCOMPLETE else "Install"
+            size = MODEL_SIZES_MB.get(name, 0)
+            title = name.replace("-", " ").capitalize()
+            found.append((name, f"{verb} {title} (about {size} MB)", state))
+        return found
+
+    def _fill_install_model_menu(self) -> None:
+        menu = self.install_model_menu
+        menu.clear()
+        models = self._installable_models()
+        if not models:
+            menu.addAction("Every Whisper model is installed").setEnabled(False)
+            return
+        for name, label, _state in models:
+            action = menu.addAction(label)
+            action.triggered.connect(lambda _c=False, n=name: self._install_model(n))
+
+    def _install_model(self, name: str, confirm: bool = True) -> None:
+        from .workers import install_model_job, run_in_background
+
+        problem = self._install_model_problem()
+        if problem:
+            self.status.showMessage(problem, 10000)
+            return
+        from ..preparation import MODEL_SIZES_MB
+
+        title = name.replace("-", " ").capitalize()
+        if confirm and self._choose(
+                f"Install {title}",
+                f"Download the Whisper model {title} (about "
+                f"{MODEL_SIZES_MB.get(name, 0)} MB)?",
+                "It is downloaded into BabelFishR's own folder and checked by "
+                "transcribing a short sample with downloads disabled. The "
+                "model in use now stays selected; choose the new one in "
+                "Whisper model afterwards. An interrupted download can be "
+                "repaired later.",
+                ["Download"]) != "Download":
+            return
+        self.status.showMessage(f"Installing Whisper {title}\u2026", 0)
+        progress = QtWidgets.QProgressDialog(
+            f"Installing Whisper {title}\u2026", "Cancel", 0, 0, self)
+        progress.setWindowTitle("Install speech model")
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        self._install_progress = progress
+
+        def done(outcome, cancelled=False, error=""):
+            self._install_worker = None
+            progress.close()
+            self.whisper_model_box.refresh_choices()
+            self._refresh_install_model_button()
+            if cancelled:
+                text = (f"Installing {title} was cancelled. Anything partly "
+                        f"downloaded shows as Incomplete and can be repaired.")
+            elif error:
+                text = f"{title} was not installed: {error}"
+            else:
+                _step, ok, detail = outcome
+                text = (f"{title} is installed and verified offline. Choose it "
+                        f"in Whisper model to use it." if ok
+                        else f"{title} was not installed: {detail}")
+            self.status.showMessage(text, 15000)
+            QtWidgets.QMessageBox.information(self, "Install speech model", text)
+
+        worker = run_in_background(
+            install_model_job, self.app.config, name,
+            on_finished=lambda result: done(result),
+            on_failed=lambda message: done(None, error=message),
+            on_cancelled=lambda: done(None, cancelled=True),
+            on_message=lambda text: progress.setLabelText(text))
+        self._install_worker = worker
+        progress.canceled.connect(lambda: worker.token.cancel())
+        self._refresh_install_model_button()
+
+    # -- the Session's save path ------------------------------------------
+    def _save_path_locked(self) -> bool:
+        """Locked while this Session is recording (changes after Stop)."""
+        return bool(self.app.save_path_locked(self.app.conversation_id))
+
+    def _refresh_save_path_row(self) -> None:
+        label = getattr(self, "save_path_label", None)
+        if label is None:
+            return
+        info = self.app.save_path_info(self.app.conversation_id)
+        if not info.is_custom:
+            text = f"Standard location: {info.effective_dir}"
+        elif info.available:
+            text = f"{info.owned_dir}  (in {info.chosen})"
+        else:
+            text = f"\u2715 {info.problem()}"
+        label.setText(text)
+        label.setToolTip(
+            "New recordings and portable transcripts of this Session are saved "
+            "here; the shared index and settings stay on this computer, and "
+            "earlier recordings stay where they were saved.")
+        locked = self._save_path_locked()
+        why = "Locked while this Session is recording. Stop to change it." if locked else ""
+        self.save_path_choose.setEnabled(not locked)
+        self.save_path_reset.setEnabled(not locked and info.is_custom)
+        self.save_path_choose.setToolTip(why or "Save this Session's recordings on a "
+                                         "removable drive or any writable folder")
+        self.save_path_reset.setToolTip(why or "Save new recordings in the standard "
+                                        "location again")
+
+    def _choose_save_path(self) -> None:
+        info = self.app.save_path_info(self.app.conversation_id)
+        start = info.chosen if info.is_custom and info.available else str(pathlib.Path.home())
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Choose where this Session saves its recordings", start)
+        if not folder or self._store_gone():
+            return
+        self._apply_save_path(folder)
+
+    def _reset_save_path(self) -> None:
+        self._apply_save_path(None)
+
+    def _apply_save_path(self, folder) -> None:
+        from ..savepath import SavePathError
+
+        try:
+            info = self.app.set_save_path(self.app.conversation_id, folder)
+        except SavePathError as exc:
+            QtWidgets.QMessageBox.warning(self, "Save path not changed", str(exc))
+            self._refresh_save_path_row()
+            return
+        self._refresh_save_path_row()
+        self._clear_warning("save-path")
+        where = info.owned_dir if info.is_custom else info.effective_dir
+        self.status.showMessage(f"New recordings of this Session are saved in {where}.",
+                                10000)
+        self._refresh_readiness(run_smoke_tests=False)
+
+    def _on_save_path_event(self, payload: dict) -> None:
+        state = payload.get("state", "")
+        message = payload.get("message", "")
+        if state == "fallback":
+            # Never a green tick while recordings go somewhere else.
+            self._warn(message, source="save-path")
+            self.status.showMessage(message, 15000)
+            if self.app.mode is OperatingMode.FIELD_OFFLINE:
+                self._set_offline_status("fail", [message])
+            self._refresh_save_path_row()
+            self._refresh_readiness(run_smoke_tests=False)
+        elif state in ("recovered", "restored"):
+            self._clear_warning("save-path")
+            self.status.showMessage(message, 10000)
+            self._refresh_save_path_row()
+            self._refresh_readiness(run_smoke_tests=False)
+        elif state in ("transcript-failed", "transcript-remove-failed"):
+            self._warn(message, source="portable-transcript")
+        elif state == "transcript-saved":
+            self._clear_warning("portable-transcript")
+        elif state == "changed":
+            self._refresh_save_path_row()
+
+    def _export_directory(self) -> pathlib.Path:
+        try:
+            return pathlib.Path(self.app.default_export_dir(self.app.conversation_id))
+        except Exception:  # noqa: BLE001 - a starting folder is a convenience
+            return pathlib.Path.home()
 
     def _compact_combo(self, box: QtWidgets.QComboBox) -> QtWidgets.QComboBox:
         """A combo box whose longest item never sets the form's minimum
@@ -1157,21 +1550,6 @@ class MainWindow(QtWidgets.QMainWindow):
         profile_row.addWidget(self.profile_button)
         form.addRow(label("Radio profile"), profile_row)
 
-        self.source_mode_box = self._compact_combo(QtWidgets.QComboBox())
-        self.source_mode_box.addItem("Detect automatically", "automatic")
-        self.source_mode_box.addItem("Specified", "specified")
-        self.source_mode_box.currentIndexChanged.connect(self._on_source_mode)
-        self.source_language_box = self._compact_combo(QtWidgets.QComboBox())
-        for code, name in COMMON_LANGUAGES:
-            self.source_language_box.addItem(f"{name} ({code})", code)
-        self.source_language_box.setEnabled(False)
-        source = QtWidgets.QVBoxLayout()
-        source.setContentsMargins(0, 0, 0, 0)
-        source.setSpacing(4)
-        source.addWidget(self.source_mode_box)
-        source.addWidget(self.source_language_box)
-        form.addRow(label("Source language"), source)
-
         self.target_language_box = self._compact_combo(QtWidgets.QComboBox())
         for code, name in COMMON_LANGUAGES:
             self.target_language_box.addItem(f"{name} ({code})", code)
@@ -1179,6 +1557,7 @@ class MainWindow(QtWidgets.QMainWindow):
         index = self.target_language_box.findData(target)
         if index >= 0:
             self.target_language_box.setCurrentIndex(index)
+        self.target_language_box.currentIndexChanged.connect(self._on_target_language)
         form.addRow(label("Translate into"), self.target_language_box)
 
         # The quiet that ends a message (detector.hang_time), in seconds.
@@ -1205,6 +1584,34 @@ class MainWindow(QtWidgets.QMainWindow):
         quiet_label.setBuddy(self.quiet_seconds_box)
         self.quiet_seconds_box.valueChanged.connect(self._on_quiet_seconds)
         form.addRow(quiet_label, self.quiet_seconds_box)
+
+        # Where this Session's recordings and portable transcripts go.
+        save_label = label("Save path")
+        self.save_path_label = QtWidgets.QLabel("")
+        self.save_path_label.setObjectName("sectionLabel")
+        self.save_path_label.setWordWrap(True)
+        self.save_path_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.save_path_label.setAccessibleName("Save path in effect")
+        self.save_path_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
+                                           QtWidgets.QSizePolicy.Preferred)
+        self.save_path_choose = QtWidgets.QPushButton("Choose folder\u2026")
+        self.save_path_choose.setAccessibleName("Choose a save folder for this Session")
+        self.save_path_choose.clicked.connect(self._choose_save_path)
+        self.save_path_reset = QtWidgets.QPushButton("Use standard location")
+        self.save_path_reset.setAccessibleName("Save this Session in the standard location")
+        self.save_path_reset.clicked.connect(self._reset_save_path)
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.setContentsMargins(0, 0, 0, 0)
+        buttons.addWidget(self.save_path_choose)
+        buttons.addWidget(self.save_path_reset)
+        buttons.addStretch(1)
+        save_column = QtWidgets.QVBoxLayout()
+        save_column.setContentsMargins(0, 0, 0, 0)
+        save_column.setSpacing(4)
+        save_column.addWidget(self.save_path_label)
+        save_column.addLayout(buttons)
+        save_label.setBuddy(self.save_path_choose)
+        form.addRow(save_label, save_column)
 
         # The operating mode lives in the header, next to readiness, and only
         # there. Two controls for one setting is two things to disagree.
@@ -1285,6 +1692,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         self._report_engines()
         self._refresh_mode_badge()
+        self._refresh_install_model_button()
         self._refresh_readiness(run_smoke_tests=True)
         return True
 
@@ -1484,6 +1892,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_input_selection(self) -> None:
         self.status.showMessage(self.input_panel.status_label.text(), 6000)
+        # The selected input is part of readiness: never keep an old tick.
+        self._refresh_readiness(run_smoke_tests=False)
 
     def _refresh_profiles(self) -> None:
         self.profile_box.blockSignals(True)
@@ -1683,6 +2093,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self.live_waveform.reset()
         self.waveform_stack.setCurrentWidget(self.waveform if replay_path else self.live_waveform)
         self._refresh_context_lines()
+        self._show_live_view()
+
+    def _show_live_view(self) -> None:
+        """After a successful Start: the Session being recorded, its live
+        thread (no search, no filter), scrolled to the newest message at the
+        top - so new transcriptions appear in view. Once only: scrolling
+        afterwards is the operator's."""
+        target = self.app._capture_conversation_id or self.app.conversation_id
+        if target and target != self.app.conversation_id:
+            self.app.select_conversation(target)
+            self._persist_selected_session()
+        for index in range(self.session_tabs.count()):
+            if self.session_tabs.tabData(index) == target:
+                if self.session_tabs.currentIndex() != index:
+                    blocked = self.session_tabs.blockSignals(True)
+                    self.session_tabs.setCurrentIndex(index)
+                    self.session_tabs.blockSignals(blocked)
+                break
+        if self.search_field.text():
+            blocked = self.search_field.blockSignals(True)
+            self.search_field.clear()
+            self.search_field.blockSignals(blocked)
+        removed = getattr(self, "show_removed_action", None)
+        if removed is not None and removed.isChecked():
+            blocked = removed.blockSignals(True)
+            removed.setChecked(False)
+            removed.blockSignals(blocked)
+        self._reload_timeline()
+        self._refresh_capture_tab_label()
+        self.timeline.scroll_to_top()
+        # And again once the rebuilt list has its final size.
+        QtCore.QTimer.singleShot(0, self.timeline.scroll_to_top)
 
     def _resolve_input_problem(self, message: str) -> None:
         """Refuse to start, say exactly why, and offer the real options.
@@ -1731,6 +2173,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_capture_tab_label()
         # Inputs can be changed again, but only once the watch has stopped.
         self.input_panel.set_monitoring(False)
+        permission = (self._readiness.get("Microphone permission")
+                      if self._readiness is not None else None)
+        if permission is not None and "not asked yet" in permission.detail:
+            # macOS asked when this watch opened the microphone: read the
+            # answer now rather than keep reporting "not asked yet".
+            self._refresh_readiness(run_smoke_tests=False)
         self.waveform_stack.setCurrentWidget(self.waveform)
         self.live_waveform.reset()
         self._refresh_context_lines()
@@ -1830,6 +2278,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         self.whisper_model_box.refresh_availability()
+        self._refresh_install_model_button()
+        self._refresh_save_path_row()
         for widget in (self.profile_box, self.profile_button,
                        self.source_mode_box, self.target_language_box,
                        self.quiet_seconds_box,
@@ -1948,6 +2398,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 sequence = getattr(self, "sequence", None)
                 if sequence is not None and sequence.waiting:
                     sequence.notify_new_recording()
+            elif event.kind == "save-path":
+                self._on_save_path_event(event.payload or {})
             elif event.kind == "audio-status":
                 payload = event.payload or {}
                 kind = payload.get("kind", "")
@@ -2312,7 +2764,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Label the operating-mode control and mark the current choice.
 
         The word "mode" is in the button itself, so the toolbar reads
-        "Operating mode: Field Offline" next to a separate readiness chip -
+        "Operating mode: Offline Field Use" next to a separate readiness chip -
         two different things, no longer two identical-looking labels.
         """
         mode = self.app.mode
@@ -2347,6 +2799,13 @@ class MainWindow(QtWidgets.QMainWindow):
         from . import theme
         from .workers import readiness_job, run_in_background
 
+        offline = self.app.mode is OperatingMode.FIELD_OFFLINE
+        if offline:
+            # A tick means the smoke tests ran for this configuration, so in
+            # Offline Field Use every check runs them (on the worker thread).
+            run_smoke_tests = True
+        self._set_offline_status("checking" if offline else "hidden")
+
         # Immediately, before the worker is even launched. The badge used to
         # start blank and only ever said "Checking" if a *finished* report
         # happened to contain a skipped smoke test - so during the seconds the
@@ -2364,18 +2823,34 @@ class MainWindow(QtWidgets.QMainWindow):
             if request is self._readiness_request:
                 self._render_readiness(report)
 
-        def failed(_message):
+        def failed(message):
             if request is self._readiness_request:
                 self.ready_badge.setText("\u26a0 Unknown")
+                if self.app.mode is OperatingMode.FIELD_OFFLINE:
+                    self._set_offline_status(
+                        "fail", [f"The readiness check could not finish: {message}"])
 
+        from ..readiness import microphone_authorization
+
+        # Read here, on the GUI thread, where Qt's permission API answers
+        # (without ever showing the system dialog).
         self._readiness_worker = run_in_background(
             readiness_job, self.app, run_smoke_tests,
+            microphone_permission=microphone_authorization(),
             on_finished=finished, on_failed=failed)
 
     def _render_readiness(self, report) -> None:
         from . import theme
+        from ..readiness import offline_field_problems
 
         self._readiness = report
+        # The destination was just checked: show what it is now.
+        self._refresh_save_path_row()
+        if self.app.mode is OperatingMode.FIELD_OFFLINE:
+            self._set_offline_status("fail" if offline_field_problems(report) else "ok",
+                                     offline_field_problems(report))
+        else:
+            self._set_offline_status("hidden")
         # Wording only. The decision - which branch a report lands in - is the
         # report's, and is unchanged: a skipped or failed check is never
         # rendered as success.
@@ -2414,6 +2889,40 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ready_badge.setAccessibleDescription(detail)
         self.ready_badge.setToolTip(
             f"{detail}\n\nField readiness - click for the full report.")
+
+    OFFLINE_CHECKING = "Checking\u2026"
+
+    def _set_offline_status(self, state: str, problems=()) -> None:
+        """The indicator beside the mode control: "checking", "ok", "fail"
+        or "hidden" (another mode is selected)."""
+        button = getattr(self, "offline_status", None)
+        if button is None:
+            return
+        button.setVisible(state != "hidden")
+        button.setProperty("state", state)
+        if state == "checking":
+            button.setText(self.OFFLINE_CHECKING)
+            name = "Offline Field Use readiness: checking"
+            tip = "Checking whether Offline Field Use is ready on this computer\u2026"
+        elif state == "ok":
+            button.setText("\u2713")
+            name = "Offline Field Use readiness: ready"
+            tip = ("Ready for Offline Field Use: audio, storage, the selected "
+                   "speech model and translation are present and ran locally "
+                   "just now.")
+        elif state == "fail":
+            button.setText("\u2715")
+            name = "Offline Field Use readiness: not ready"
+            tip = "Not ready for Offline Field Use:\n" + "\n".join(
+                f"\u2022 {line}" for line in problems)
+        else:
+            button.setText("")
+            name, tip = "Offline Field Use readiness", ""
+        button.setAccessibleName(name)
+        button.setAccessibleDescription(tip)
+        button.setToolTip(f"{tip}\n\nClick for the full report." if tip else "")
+        button.style().unpolish(button)
+        button.style().polish(button)
 
     def _show_readiness(self) -> None:
         from .readiness_dialog import ReadinessDialog
@@ -2508,7 +3017,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 "exported. The transcript and translation are kept.")
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Export clip", f"{tx.id}.wav", "WAV files (*.wav)")
+            self, "Export clip", str(self._export_directory() / f"{tx.id}.wav"),
+            "WAV files (*.wav)")
         if path and not self._store_gone():
             export_transmission_audio(tx, path)
             self.status.showMessage(f"Exported {path}", 6000)
@@ -2575,6 +3085,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._persist_selected_session()
         self._reload_timeline()
         self._refresh_capture_tab_label()
+        # Another Session may save somewhere else: recheck where.
+        self._refresh_save_path_row()
+        self._refresh_readiness(run_smoke_tests=False)
 
     def _new_session_tab(self) -> None:
         name, ok = QtWidgets.QInputDialog.getText(
@@ -2640,8 +3153,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if index < 0:
             return
         menu = self._build_session_tab_menu(index)
-        menu.exec(self.session_actions_button.mapToGlobal(
-            QtCore.QPoint(0, self.session_actions_button.height())))
+        rect = self.session_tabs.tabRect(index)
+        menu.exec(self.session_tabs.mapToGlobal(rect.bottomLeft()))
 
     def _hide_session_tab(self, index: int) -> None:
         """Hide Session: at once, nothing deleted, undoable."""
@@ -3077,7 +3590,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.selected_range.setText("")
             self.selected_hint.setText("Select a transmission to play.")
             self.selected_bookmark_button.setChecked(False)
-            self.selected_play_button.setText("Play selected")
+            self.selected_play_button.setText(self.PLAY_SELECTED)
             return
         from ..timefmt import span
 
@@ -3095,7 +3608,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.selected_play_button.setText("Paused")
             self.selected_play_button.setEnabled(False)
         else:
-            self.selected_play_button.setText("Play selected")
+            self.selected_play_button.setText(self.PLAY_SELECTED)
             self.selected_play_button.setEnabled(self._playback_selection_ready)
         blocked = self.selected_bookmark_button.blockSignals(True)
         self.selected_bookmark_button.setChecked(bool(tx.bookmarked))
@@ -3115,6 +3628,8 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             hint = ""
         self.selected_hint.setText(hint)
+
+    PLAY_SELECTED = "\u25b6 Play selected"
 
     def _play_selected(self) -> None:
         from .timeline import original_present
@@ -3206,16 +3721,11 @@ class MainWindow(QtWidgets.QMainWindow):
             text, QtCore.Qt.ElideMiddle, room)
         if self.source_label.text() != shown:
             self.source_label.setText(shown)
-        source_language = (self.source_language_box.currentText().split(" (")[0]
-                           if self.source_mode_box.currentData() == "specified"
-                           else "Detect language")
-        target = self.target_language_box.currentText().split(" (")[0]
-        line = f"{source_language} > {target}"
-        if self.language_line.text() != line:
-            self.language_line.setText(line)
-        profile = self.channel_label.text()
+        profile = (self.channel_label.text()
+                   if self.profile_box.currentData() else "")
         if self.profile_line.text() != profile:
             self.profile_line.setText(profile)
+        self.profile_line.setVisible(bool(profile))
         code = self.target_language_box.currentData() or ""
         heading = f"TRANSLATION / {code.upper()}" if code else "TRANSLATION"
         if self.translation_heading.text() != heading:
@@ -3629,7 +4139,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_source_mode(self) -> None:
         specified = self.source_mode_box.currentData() == "specified"
-        self.source_language_box.setEnabled(specified)
+        self.source_language_box.setEnabled(specified and self.app.capture is None)
+        self._save_source_language()
 
     # -- exports ---------------------------------------------------------
     def _export_session(self) -> None:
@@ -3693,7 +4204,8 @@ class MainWindow(QtWidgets.QMainWindow):
         filters = {"md": "Markdown (*.md)", "json": "JSON (*.json)",
                    "csv": "CSV (*.csv)"}
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Export", f"babelfishr_{session.id}.{fmt}", filters[fmt])
+            self, "Export", str(self._export_directory() / f"babelfishr_{session.id}.{fmt}"),
+            filters[fmt])
         if not path or self._store_gone():
             return
         renderer = renderers[fmt]
@@ -3711,6 +4223,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 sequence.cancel()
             # Stop any waveform read; its worker leaves at the next chunk.
             self.waveform.shutdown()
+            # Space is this window's playback key only while it exists.
+            space = getattr(self, "_space_filter", None)
+            application = QtWidgets.QApplication.instance()
+            if space is not None and application is not None:
+                application.removeEventFilter(space)
             super().closeEvent(event)
             return
         # Work is still outstanding, a capture is still finishing, an

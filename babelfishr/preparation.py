@@ -235,6 +235,38 @@ def _prepare_asr(config, paths: AppPaths, model_name: str, say: Reporter,
             f"offline transcription smoke test passed in {elapsed:.1f}s")
 
 
+def install_asr_model(config, model_name: str, *,
+                      report: Optional[Reporter] = None,
+                      mode: Optional[OperatingMode] = None):
+    """Download (or repair) one Whisper speech model and prove it loads and
+    transcribes offline - the speech-model step of prepare_field, alone.
+
+    Nothing else changes: no language packs, and the selected model stays
+    selected (choosing the new one is the operator's step). Refused, before
+    any network access, in a mode that forbids downloads. Returns
+    ``(step, ok, detail)``; a model that is already complete is verified
+    without downloading again.
+    """
+    from .providers.whisper_local import MODEL_SIZES
+
+    if model_name not in MODEL_SIZES:
+        return (ASR_STEP, False, f"unknown Whisper model {model_name!r}")
+    guard_download(mode or OperatingMode(getattr(config, "mode", "online-setup")),
+                   f"installing the Whisper model {model_name}")
+    say = report or (lambda text: None)
+    paths = config.paths().ensure()
+    needed_mb = MODEL_SIZES_MB.get(model_name, 500) + 200
+    free_mb = paths.free_bytes() / 1e6
+    if free_mb < needed_mb:
+        return (ASR_STEP, False,
+                f"{free_mb:.0f} MB free, need about {needed_mb} MB for {model_name}")
+    from .providers.whisper_local import ModelState, inspect_model_directory, model_directory_for
+
+    state, _ = inspect_model_directory(model_directory_for(paths.models, model_name))
+    return _prepare_asr(config, paths, model_name, say,
+                        skip_download=state is ModelState.COMPLETE)
+
+
 def _write_manifest(paths: AppPaths, model_name: str,
                     directory: Optional[pathlib.Path], size_mb: float,
                     version: str) -> None:

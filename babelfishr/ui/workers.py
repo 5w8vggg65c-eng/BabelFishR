@@ -190,8 +190,33 @@ def prepare_field_job(config, asr_model: str,
             "language_pairs": list(language_pairs or [])}
 
 
+def install_model_job(config, model_name: str,
+                      report: Callable[[str], None] = lambda text: None,
+                      token: Optional[CancellationToken] = None):
+    """One Whisper model, downloaded or repaired and verified, off the GUI
+    thread. Cancellation is honoured between steps (a file already being
+    fetched finishes first; a partial model is reported as incomplete)."""
+    from ..preparation import install_asr_model
+
+    token = token or CancellationToken()
+    token.raise_if_cancelled()
+
+    def relay(text: str) -> None:
+        token.raise_if_cancelled()
+        report(text)
+
+    result = install_asr_model(config, model_name, report=relay)
+    token.raise_if_cancelled()
+    return result
+
+
 def readiness_job(app, run_smoke_tests: bool = True,
-                  report: Callable[[str], None] = lambda text: None):
-    """Field Check off the GUI thread; smoke tests load models and take time."""
+                  report: Callable[[str], None] = lambda text: None,
+                  microphone_permission: Optional[str] = None):
+    """Field Check off the GUI thread; smoke tests load models and take time.
+    *microphone_permission* was read on the GUI thread before starting."""
     report("Checking audio, storage and engines...")
-    return app.readiness(run_smoke_tests=run_smoke_tests)
+    if microphone_permission is None:
+        return app.readiness(run_smoke_tests=run_smoke_tests)
+    return app.readiness(run_smoke_tests=run_smoke_tests,
+                         microphone_permission=microphone_permission)

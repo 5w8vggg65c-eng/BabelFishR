@@ -101,9 +101,33 @@ def prepare_model(model_name: str, models_root, local_files_only: bool = False
 
     target = model_directory_for(models_root, model_name)
     target.parent.mkdir(parents=True, exist_ok=True)
-    resolved = download_model(model_name, output_dir=str(target),
+    resolved = download_model(download_source(model_name), output_dir=str(target),
                               local_files_only=local_files_only)
     return pathlib.Path(resolved)
+
+
+#: The Hugging Face repositories behind names that older faster-whisper
+#: releases do not know. 1.1.0 added the "large-v3-turbo" shorthand; 1.0.x
+#: (still allowed by pyproject) would reject it. The local directory and
+#: the configured name stay "large-v3-turbo" either way.
+CANONICAL_REPOSITORIES = {
+    "large-v3-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+}
+
+
+def download_source(model_name: str) -> str:
+    """What to hand faster-whisper's download_model for *model_name*: the
+    name itself when this faster-whisper knows it, else the canonical
+    repository id."""
+    try:
+        from faster_whisper.utils import available_models
+
+        known = set(available_models())
+    except Exception:  # noqa: BLE001 - an older or unusual release
+        known = set()
+    if model_name in known or model_name not in CANONICAL_REPOSITORIES:
+        return model_name
+    return CANONICAL_REPOSITORIES[model_name]
 
 
 class FasterWhisperEngine(TranscriptionEngine):

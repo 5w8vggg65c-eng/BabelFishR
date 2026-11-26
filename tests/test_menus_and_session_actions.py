@@ -89,11 +89,15 @@ def test_the_removed_filter_is_scoped_with_an_empty_state_and_restore(qt_app, co
     window.close()
 
 
-def test_session_actions_button_hide_and_one_delete_question(qt_app, config, store, wav,
-                                                             monkeypatch):
+def test_session_context_menu_by_keyboard_hide_and_one_delete_question(
+        qt_app, config, store, wav, monkeypatch):
+    """No separate Actions dropdown: the Session's own context menu, also
+    from the keyboard (Shift+F10 / Menu key on the Sessions list)."""
     app, window, general, ops, snapshot = two_sessions_window(qt_app, config, store, wav)
     before = snapshot(ops)
-    assert window.session_actions_button.isVisibleTo(window)
+    assert not hasattr(window, "session_actions_button")
+    assert not [b for b in window.findChildren(QtWidgets.QAbstractButton)
+                if b.text().startswith("Actions")]
     shown_menus = []
 
     def read_and_close_popup():
@@ -103,9 +107,17 @@ def test_session_actions_button_hide_and_one_delete_question(qt_app, config, sto
             popup.close()
 
     window.session_tabs.setCurrentIndex(tab_index_for(window, ops))
+    window.activateWindow()
+    window.session_tabs.setFocus()
+    pump(qt_app)
     QtCore.QTimer.singleShot(50, read_and_close_popup)
-    window.session_actions_button.click()
+    QTest.keyClick(window.session_tabs, QtCore.Qt.Key_F10, QtCore.Qt.ShiftModifier)
+    pump(qt_app)
     assert shown_menus and "Hide Session" in shown_menus[0]
+    QtCore.QTimer.singleShot(50, read_and_close_popup)
+    QTest.keyClick(window.session_tabs, QtCore.Qt.Key_Menu)
+    pump(qt_app)
+    assert len(shown_menus) == 2 and shown_menus[1] == shown_menus[0]
     assert "Delete Session…" in shown_menus[0]
     assert "Clear Session History…" in shown_menus[0]
 

@@ -76,8 +76,14 @@ class ReadinessReport:
 
     @property
     def can_record(self) -> bool:
-        """The floor: can we preserve incoming audio at all?"""
-        required = ("Audio backend", "Recording directory writable")
+        """The floor: can we preserve incoming audio at all?
+
+        Also false when the input the operator chose is missing or cannot be
+        told apart from another (monitoring refuses to start on it), or when
+        macOS has affirmatively denied the microphone. An input not chosen
+        yet is a warning, not a failure: preparation comes first."""
+        required = ("Audio backend", "Recording directory writable",
+                    "Selected audio input", "Microphone permission")
         return all(c.status is not CheckStatus.FAIL
                    for c in self.checks if c.name in required)
 
@@ -117,6 +123,16 @@ class ReadinessReport:
         # name and passed without touching a real one.
         return self._unverified("Local translation smoke test",
                                 "Installed translation paths")
+
+    @property
+    def processing_ready(self) -> bool:
+        """What preparation produces: storage and audio backend, and local
+        transcription and translation that ran. Independent of which input
+        is plugged in right now, so Setup judges what it prepared."""
+        floor = ("Audio backend", "Recording directory writable")
+        return (all(c.status is not CheckStatus.FAIL for c in self.checks
+                    if c.name in floor)
+                and self.can_transcribe and self.can_translate)
 
     @property
     def field_ready(self) -> bool:
@@ -208,9 +224,66 @@ class ReadinessReport:
 MIN_FREE_BYTES = 2_000_000_000
 
 
+#: What Offline Field Use needs, each of which must actually PASS for the
+#: green tick beside the mode control: audio and storage, the selected
+#: model present, loaded and run, translation installed and run, and the
+#: mode's own guarantees. Advisory checks (free space, microphone
+#: permission, which is not detectable before recording) stay warnings in
+#: the full report. The selected input may warn (the built-in microphone
+#: on a bench, or a deliberately chosen system default) but not fail.
+OFFLINE_REQUIRED = (
+    "Audio backend", "Audio input devices", "Selected audio input",
+    "Recording directory writable",
+    "Local ASR model present", "Local ASR model loadable",
+    "Local transcription smoke test", "Installed translation paths",
+    "Local translation smoke test", "Cloud processing disabled",
+    "Mock engines disabled")
+#: Must not fail; a warning is acceptable only when the check marks it so
+#: (``data["acceptable"]``): microphone permission off macOS, or a reading
+#: Qt cannot give in this build - never an affirmative "denied" or "not
+#: asked yet" - and a deliberately chosen system-default input.
+OFFLINE_NOT_FAILING = ("Microphone permission",)
+
+
+def offline_field_problems(report: "ReadinessReport") -> List[str]:
+    """Why *report* does not show Offline Field Use ready: one line per
+    required check that is missing, failed, partial, unavailable or not
+    verified (skipped). Empty only when every required check passed."""
+    problems = []
+    if report.mode is not OperatingMode.FIELD_OFFLINE:
+        problems.append(f"Checked for {report.mode.title}, not Offline Field Use")
+    for name in OFFLINE_REQUIRED:
+        check = report.get(name)
+        if check is None:
+            problems.append(f"{name}: not checked")
+        elif check.status is not CheckStatus.PASS and not (
+                check.status is CheckStatus.WARN and check.data.get("acceptable")):
+            word = {CheckStatus.FAIL: "failed", CheckStatus.WARN: "partial",
+                    CheckStatus.SKIP: "not verified"}[check.status]
+            problems.append(f"{name}: {word}" + (f" ({check.detail})" if check.detail else ""))
+    for name in OFFLINE_NOT_FAILING:
+        check = report.get(name)
+        if check is None:
+            problems.append(f"{name}: not checked")
+        elif check.status is CheckStatus.FAIL or (
+                check.status is CheckStatus.WARN and not check.data.get("acceptable")):
+            problems.append(f"{name}: {check.detail}")
+    return problems
+
+
 def field_check(config, *, run_smoke_tests: bool = True,
-                mode: Optional[OperatingMode] = None) -> ReadinessReport:
-    """Verify offline readiness without downloading anything."""
+                mode: Optional[OperatingMode] = None,
+                microphone_permission: Optional[str] = None,
+                save_path: Optional[str] = None) -> ReadinessReport:
+    """Verify offline readiness without downloading anything.
+
+    *save_path*: the selected Session's chosen save folder (Conversation
+    save_path), when it has one. "Recording directory writable" then checks
+    that destination - ``<save_path>/BabelFishR``, with the same preflight
+    as choosing it - instead of only the standard Recordings folder, and
+    fails with the concrete reason ("not found (drive ejected or folder
+    removed)", "read-only", ...). None or "" checks the standard folder.
+    """
     from .audio.devices import backend_available, backend_status, list_input_devices
 
     mode = mode or OperatingMode.FIELD_OFFLINE
@@ -238,11 +311,28 @@ def field_check(config, *, run_smoke_tests: bool = True,
         report.add(Check("Audio input devices", CheckStatus.SKIP,
                          "no audio backend"))
 
-    report.add(_microphone_permission_check())
+    report.add(_microphone_permission_check(microphone_permission))
     report.add(_selected_input_check(config))
 
     # -- storage --------------------------------------------------------
-    if paths.writable():
+    free_target = None
+    if save_path:
+        from . import savepath
+
+        owned = savepath.owned_dir(save_path)
+        reason = savepath.preflight(save_path)
+        if not reason:
+            report.add(Check("Recording directory writable", CheckStatus.PASS,
+                             f"Save path {owned}"))
+            free_target = owned
+        else:
+            report.add(Check(
+                "Recording directory writable", CheckStatus.FAIL,
+                savepath.describe(save_path, reason),
+                remedy=f"Reconnect the drive or make {save_path} writable, or "
+                       f"choose another save path (or the standard location) "
+                       f"for this Session."))
+    elif paths.writable():
         report.add(Check("Recording directory writable", CheckStatus.PASS,
                          str(paths.recordings)))
     else:
@@ -253,6 +343,11 @@ def field_check(config, *, run_smoke_tests: bool = True,
                    f"recordings directory."))
 
     free = paths.free_bytes()
+    if free_target is not None:
+        try:
+            free = shutil.disk_usage(free_target).free
+        except OSError:
+            pass
     free_gb = free / 1e9
     if free >= MIN_FREE_BYTES:
         report.add(Check("Free storage", CheckStatus.PASS, f"{free_gb:.1f} GB"))
@@ -298,6 +393,7 @@ def _selected_input_check(config) -> Check:
         return Check(
             "Selected audio input", CheckStatus.WARN,
             "macOS system default (chosen deliberately)",
+            data={"acceptable": True},
             remedy="For a radio watch, select the interface itself: the system "
                    "default can change without warning.")
     if not config.has_confirmed_input():
@@ -328,33 +424,98 @@ def _selected_input_check(config) -> Check:
                    "another input for it - not the built-in microphone, not "
                    "the system default, and not another interface.")
     device = resolution.device
-    kind = "built-in microphone" if device.is_builtin else "external input"
-    status = CheckStatus.WARN if device.is_builtin else CheckStatus.PASS
+    # The built-in microphone, chosen explicitly and connected, is a
+    # legitimate configured input (a bench test); the note says what it hears.
+    kind = ("built-in microphone, chosen for a bench test" if device.is_builtin
+            else "external input")
     detail = f"{device.name} ({kind}, matched by {resolution.basis})"
     remedy = ""
     if device.is_builtin:
         remedy = ("This is the microphone built into this Mac. It records the "
-                  "room, not a radio. Correct for a bench test only.")
-    return Check("Selected audio input", status, detail, remedy=remedy)
+                  "room, not a radio.")
+    return Check("Selected audio input", CheckStatus.PASS, detail, remedy=remedy)
 
 
-def _microphone_permission_check() -> Check:
-    """Best effort: macOS does not expose a reliable pre-flight API."""
+def microphone_authorization() -> str:
+    """macOS's microphone decision for this app, read without asking:
+    ``"granted"``, ``"denied"``, ``"undetermined"`` (not asked yet),
+    ``"not-applicable"`` (not macOS) or ``"unknown"`` (cannot be read here).
+
+    Uses Qt's permission API (QCoreApplication.checkPermission), which never
+    shows the system dialog. Call it on the GUI thread. Granted is trusted
+    as is. Denied is trusted only from the packaged app, which carries the
+    usage description and Qt's permission backend - without them Qt answers
+    Denied for a working microphone - so a development run reads unknown.
+    """
     if platform.system() != "Darwin":
-        return Check("Microphone permission", CheckStatus.SKIP,
-                     f"not applicable on {platform.system()}")
-    from .audio.devices import list_input_devices
+        return "not-applicable"
+    try:
+        from PySide6 import QtCore
+    except Exception:  # noqa: BLE001 - no Qt: the command line
+        return "unknown"
+    qt_app = QtCore.QCoreApplication.instance()
+    permission_type = getattr(QtCore, "QMicrophonePermission", None)
+    if qt_app is None or permission_type is None:
+        return "unknown"
+    main = getattr(QtCore.QThread, "isMainThread", None)
+    if not (main() if main is not None
+            else QtCore.QThread.currentThread() is qt_app.thread()):
+        return "unknown"
+    try:
+        status = qt_app.checkPermission(permission_type())
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    statuses = QtCore.Qt.PermissionStatus
+    if status == statuses.Granted:
+        return "granted"
+    if status == statuses.Undetermined:
+        return "undetermined"
+    if status == statuses.Denied and _permission_backend_deployed(QtCore):
+        return "denied"
+    return "unknown"
 
-    if not list_input_devices():
+
+def _permission_backend_deployed(QtCore) -> bool:
+    """The packaged app, with Qt's microphone permission plugin beside it."""
+    import sys
+
+    if not getattr(sys, "frozen", False):
+        return False
+    plugins = pathlib.Path(QtCore.QLibraryInfo.path(
+        QtCore.QLibraryInfo.LibraryPath.PluginsPath)) / "permissions"
+    return plugins.is_dir() and any("microphone" in p.name.lower()
+                                    for p in plugins.iterdir())
+
+
+def _microphone_permission_check(authorization: Optional[str] = None) -> Check:
+    """Affirmative evidence where macOS gives it; never a dialog, never a
+    test recording. *authorization* is microphone_authorization() read on
+    the GUI thread by the caller; None reads as unknown."""
+    if platform.system() != "Darwin" or authorization == "not-applicable":
+        return Check("Microphone permission", CheckStatus.SKIP,
+                     f"not applicable on {platform.system()}",
+                     data={"acceptable": True})
+    if authorization == "granted":
+        return Check("Microphone permission", CheckStatus.PASS,
+                     "granted to BabelFishR in macOS")
+    if authorization == "denied":
+        return Check(
+            "Microphone permission", CheckStatus.FAIL,
+            "denied to BabelFishR in macOS: recordings would be silent",
+            remedy="System Settings > Privacy & Security > Microphone: turn on "
+                   "BabelFishR, then quit and reopen it.")
+    if authorization == "undetermined":
         return Check(
             "Microphone permission", CheckStatus.WARN,
-            "cannot be determined; no input devices are visible",
-            remedy="System Settings > Privacy & Security > Microphone, then "
-                   "restart the app or terminal.")
+            "not asked yet: macOS asks the first time monitoring starts",
+            remedy="Start monitoring once and allow BabelFishR to use the "
+                   "microphone.")
     return Check(
         "Microphone permission", CheckStatus.WARN,
-        "not directly detectable; verified only by recording",
-        remedy="Run 'babelfishr test-record' and confirm the clip is not silent.")
+        "cannot be read in this build; verified only by recording",
+        data={"acceptable": True},
+        remedy="If recordings are silent: System Settings > Privacy & Security "
+               "> Microphone.")
 
 
 def _check_transcription(config, report: ReadinessReport,
@@ -436,12 +597,39 @@ def _check_transcription(config, report: ReadinessReport,
 
 def _check_translation(config, report: ReadinessReport,
                        run_smoke_tests: bool) -> None:
+    """The translation the current settings would actually use.
+
+    With a specified source language, that one route - Spanish -> English is
+    not vouched for by a German -> English pack - or, when it is the target
+    language itself and "skip if same language" is on, the genuine
+    pass-through (the transcript is shown as is, no pack involved). In
+    Automatic, every installed route into the target is smoke-tested and
+    the detail names the ones verified, so a pass never implies other
+    languages are covered.
+    """
     from .providers.argos import ArgosTranslateEngine
 
     from .modes import bootstrap_environment
 
-    bootstrap_environment(config)
     target = config.translate.target_language
+    session = getattr(config, "session", None)
+    source = (session.source_language
+              if session is not None and session.source_language_mode == "specified"
+              and session.source_language else None)
+    skip_same = bool(config.translate.skip_if_same_language)
+    if source and source == target and skip_same:
+        report.add(Check(
+            "Installed translation paths", CheckStatus.PASS,
+            f"{source}->{target}: the same language, shown as transcribed "
+            f"(no translation pack needed)",
+            data={"route": "pass-through", "source": source, "target": target}))
+        report.add(Check(
+            "Local translation smoke test", CheckStatus.PASS,
+            f"same-language pass-through ({source}): nothing to translate",
+            data={"route": "pass-through", "verified": []}))
+        return
+
+    bootstrap_environment(config)
     engine = ArgosTranslateEngine(target_language=target,
                                   package_dir=str(config.paths().language_packs))
 
@@ -457,7 +645,7 @@ def _check_translation(config, report: ReadinessReport,
     if not pairs:
         report.add(Check(
             "Installed translation paths", CheckStatus.FAIL, "none installed",
-            remedy=f"babelfishr languages install <source> {target}"))
+            remedy=f"babelfishr languages install {source or '<source>'} {target}"))
         report.add(Check("Local translation smoke test", CheckStatus.SKIP,
                          "no language packages"))
         return
@@ -466,16 +654,30 @@ def _check_translation(config, report: ReadinessReport,
             "Installed translation paths", CheckStatus.FAIL,
             f"{len(pairs)} installed, none into {target!r}: "
             f"{', '.join(f'{a}->{b}' for a, b in pairs)}",
-            remedy=f"babelfishr languages install <source> {target}",
+            remedy=f"babelfishr languages install {source or '<source>'} {target}",
             data={"pairs": pairs}))
         report.add(Check("Local translation smoke test", CheckStatus.SKIP,
                          f"nothing translates into {target}"))
         return
+    if source and (source, target) not in usable:
+        report.add(Check(
+            "Installed translation paths", CheckStatus.FAIL,
+            f"{source}->{target} (the selected source language) is not "
+            f"installed; installed into {target}: "
+            f"{', '.join(f'{a}->{b}' for a, b in usable)}",
+            remedy=f"babelfishr languages install {source} {target}",
+            data={"pairs": pairs, "source": source, "target": target}))
+        report.add(Check("Local translation smoke test", CheckStatus.SKIP,
+                         f"no {source}->{target} route to test"))
+        return
 
+    routes = [(source, target)] if source else usable
     direct = {(a, b) for a, b in engine.direct_pairs()}
     described = ", ".join(
         f"{a}->{b}" + ("" if (a, b) in direct else " (via pivot)")
-        for a, b in usable)
+        for a, b in routes)
+    if not source:
+        described = f"Automatic: {described}"
     report.add(Check(
         "Installed translation paths", CheckStatus.PASS, described,
         data=engine.readiness()))
@@ -485,28 +687,44 @@ def _check_translation(config, report: ReadinessReport,
                          "smoke tests disabled"))
         return
 
-    source = usable[0][0]
-    try:
-        result = engine.smoke_test(source, target)
-    except Exception as exc:  # noqa: BLE001
-        report.add(Check("Local translation smoke test", CheckStatus.FAIL,
-                         str(exc)[:200],
-                         remedy=f"babelfishr languages install {source} {target}"))
+    verified, failed, outputs = [], [], {}
+    for a, b in routes:
+        try:
+            result = engine.smoke_test(a, b)
+        except Exception as exc:  # noqa: BLE001
+            failed.append(f"{a}->{b} ({str(exc)[:120]})")
+            continue
+        if result.text.strip():
+            verified.append(f"{a}->{b}")
+            outputs[f"{a}->{b}"] = result.text
+        else:
+            failed.append(f"{a}->{b} (the engine returned nothing)")
+    data = {"source": source, "target": target, "verified": verified,
+            "failed": failed, "outputs": outputs}
+    if failed:
+        report.add(Check(
+            "Local translation smoke test", CheckStatus.FAIL,
+            f"failed: {'; '.join(failed)}"
+            + (f"; verified: {', '.join(verified)}" if verified else ""),
+            remedy=f"babelfishr languages install {(source or '<source>')} {target}",
+            data=data))
         return
-    if not result.text.strip():
-        report.add(Check("Local translation smoke test", CheckStatus.FAIL,
-                         "the engine returned nothing"))
-        return
-    report.add(Check(
-        "Local translation smoke test", CheckStatus.PASS,
-        f"{source}->{target} produced {result.text[:48]!r}",
-        data={"source": source, "target": target, "output": result.text}))
+    if source:
+        detail = f"{verified[0]} produced {outputs[verified[0]][:48]!r}"
+    else:
+        detail = (f"Automatic: verified {', '.join(verified)}. Speech in any "
+                  f"other language is transcribed but not translated")
+        if skip_same:
+            detail += f"; {target} speech is shown as transcribed"
+    report.add(Check("Local translation smoke test", CheckStatus.PASS, detail,
+                     data=data))
+
 
 def _cloud_disabled_check(mode: OperatingMode) -> Check:
     if mode.allows_cloud:
         return Check("Cloud processing disabled", CheckStatus.WARN,
                      f"{mode.label} permits explicitly selected cloud engines",
-                     remedy="Switch to Field Offline before going into the field.")
+                     remedy="Switch to Offline Field Use before going into the field.")
     return Check("Cloud processing disabled", CheckStatus.PASS,
                  f"{mode.label} cannot construct a cloud provider")
 
@@ -515,7 +733,7 @@ def _mock_disabled_check(mode: OperatingMode) -> Check:
     if mode.allows_mock:
         return Check("Mock engines disabled", CheckStatus.WARN,
                      f"{mode.label} permits placeholder engines",
-                     remedy="Switch to Field Offline so output is never "
+                     remedy="Switch to Offline Field Use so output is never "
                             "placeholder text.")
     return Check("Mock engines disabled", CheckStatus.PASS,
                  f"{mode.label} refuses placeholder engines")

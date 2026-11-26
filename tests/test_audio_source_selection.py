@@ -488,29 +488,36 @@ def test_field_check_reports_the_selected_input(cfg, connected):
     assert "NOT connected" in check.detail
     assert "will not substitute" in check.remedy
 
-    # The built-in mic is usable, and flagged for what it is.
+    # The built-in mic, chosen explicitly for a bench test and connected, is
+    # a legitimate configured input - still described for what it hears.
     connected(builtin_mic(), radio)
     cfg.record_input_selection(builtin_mic(), save=False)
     check = readiness_module._selected_input_check(cfg)
-    assert check.status.name == "WARN"
+    assert check.status.name == "PASS" and "bench test" in check.detail
     assert "records the room" in check.remedy
 
 
-def test_a_missing_input_does_not_by_itself_make_the_app_unready(cfg,
-                                                                 connected):
-    """Preparation legitimately happens before the interface is wired up.
-
-    Readiness is about whether this machine can do the work offline. The hard
-    refusal belongs where monitoring starts, not here - otherwise an operator
-    could never prepare models on a Mac with nothing plugged into it.
-    """
+def test_a_chosen_input_that_is_missing_means_it_cannot_record(cfg, connected):
+    """Monitoring refuses a chosen input that is missing or ambiguous, so
+    readiness cannot say recording works. An input not chosen yet is only a
+    warning - preparation legitimately comes first - and what Setup judges
+    (processing_ready) never depends on what is plugged in."""
     from babelfishr.readiness import Check, CheckStatus, ReadinessReport
 
-    report = ReadinessReport()
-    report.add(Check("Audio backend", CheckStatus.PASS, ""))
-    report.add(Check("Recording directory writable", CheckStatus.PASS, ""))
-    report.add(Check("Selected audio input", CheckStatus.FAIL, "not connected"))
-    assert report.can_record is True
+    def report_with(status, detail):
+        report = ReadinessReport()
+        report.add(Check("Audio backend", CheckStatus.PASS, ""))
+        report.add(Check("Recording directory writable", CheckStatus.PASS, ""))
+        report.add(Check("Selected audio input", status, detail))
+        report.add(Check("Local transcription smoke test", CheckStatus.PASS, ""))
+        report.add(Check("Local translation smoke test", CheckStatus.PASS, ""))
+        return report
+
+    missing = report_with(CheckStatus.FAIL, "not connected")
+    assert missing.can_record is False and missing.field_ready is False
+    assert missing.processing_ready is True
+    unchosen = report_with(CheckStatus.WARN, "none chosen yet")
+    assert unchosen.can_record is True and unchosen.processing_ready is True
 
 
 # ---- P0: two identical interfaces, and the second one is the radio -----

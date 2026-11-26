@@ -46,6 +46,9 @@ STATE_LABELS = {
 
 
 #: The one per-card action for "this is speech" (language or Automatic).
+#: Under a CHECK flag: the question the operator answers. Once approved the
+#: button goes away and the REVIEW column says APPROVED.
+APPROVE = "Approve?"
 SPEECH_ACTION = "Transcribe as speech\u2026"
 
 #: What the bubble says while it is filling itself in.
@@ -596,7 +599,7 @@ class TransmissionBubble(QtWidgets.QFrame):
         review_column.addWidget(self.review_label, 0, QtCore.Qt.AlignRight)
 
         self.approve_button = QtWidgets.QToolButton()
-        self.approve_button.setText("Approved")
+        self.approve_button.setText(APPROVE)
         self.approve_button.setAccessibleName("Mark this transmission approved")
         self.approve_button.setToolTip("Mark this result as checked and keep its words")
         self.approve_button.clicked.connect(lambda: self.approvalRequested.emit(self.tx.id))

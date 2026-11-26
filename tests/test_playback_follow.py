@@ -180,7 +180,7 @@ def test_choosing_another_message_while_playing_only_targets_it(rig):
     pump(rig.qt)
     assert w.waveform.current_tx_id == "t0", "the waveform left the clip being heard"
     assert rig.controller.owner == "t0"
-    assert w.selected_play_button.text() == "Play selected"
+    assert w.selected_play_button.text() == "\u25b6 Play selected"
     w.playback_stop_button.click()
     pump(rig.qt)
     assert w.waveform.current_tx_id == "old05", "after Stop it shows the selection again"

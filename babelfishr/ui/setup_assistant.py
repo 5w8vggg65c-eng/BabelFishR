@@ -28,6 +28,7 @@ MODELS = [
     ("small", "recommended balance", 480),
     ("medium", "slower, more accurate", 1500),
     ("large-v3", "slowest, most accurate", 3100),
+    ("large-v3-turbo", "multilingual, close to large-v3 and much faster", 1600),
 ]
 
 LANGUAGES = [
@@ -276,7 +277,10 @@ class SetupAssistant(QtWidgets.QDialog):
         # three pairs as ready and switched to Field Offline.
         prepared_ok = getattr(result, "ok", True)
 
-        if readiness.field_ready and prepared_ok:
+        # Judged on what preparation produces (processing_ready), not on
+        # whether the chosen interface happens to be plugged in right now.
+        processing = getattr(readiness, "processing_ready", readiness.field_ready)
+        if processing and prepared_ok:
             self.status_label.setText("Ready for offline field use")
             # Persist the model that was actually prepared AND verified, and
             # only now - a failed or cancelled run must leave the previous
@@ -289,7 +293,7 @@ class SetupAssistant(QtWidgets.QDialog):
                 # First launch: stay in Online / Setup. Field Offline is the
                 # operator's choice to make (the mode in the header) when
                 # they go off the network.
-                self._append("You are in Online / Setup. Choose Field Offline "
+                self._append("You are in Online / Setup. Choose Offline Field Use "
                              "from the mode in the window's header when you "
                              "go offline.")
             else:
@@ -297,7 +301,7 @@ class SetupAssistant(QtWidgets.QDialog):
         else:
             # Something did not work. Keep whatever genuinely did.
             self._persist_partial_success(result, payload)
-            if readiness.field_ready:
+            if processing:
                 self._report_incomplete_preparation(result)
             elif readiness.can_record:
                 self.status_label.setText(

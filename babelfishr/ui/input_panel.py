@@ -106,8 +106,10 @@ class InputPanel(QtWidgets.QWidget):
         # follow the system default is to choose that option by name.
         self.profile_check = QtWidgets.QCheckBox("Remember for profile")
         self.profile_check.setToolTip(
-            "Remember this input for the selected radio profile: selecting "
-            "that profile will select this input again.")
+            "Save this audio input for the selected radio profile: choosing "
+            "that profile again (Session Options \u203a Radio profile) selects "
+            "this same input. One input per radio profile; available once a "
+            "profile is selected.")
         self.profile_check.toggled.connect(self._on_profile_link)
         options.addWidget(self.profile_check)
         options.addStretch(1)

@@ -68,10 +68,25 @@ for package in ("faster_whisper", "argostranslate", "ctranslate2"):
     except Exception:  # noqa: BLE001 - optional extras
         pass
 
+# Qt's macOS permission backend (plugins/permissions), explicitly: without
+# it QCoreApplication.checkPermission cannot read the microphone decision,
+# and readiness could only say "unknown". Reading it never shows a dialog.
+binaries = []
+try:
+    from PySide6 import QtCore as _QtCore
+
+    _permissions = pathlib.Path(_QtCore.QLibraryInfo.path(
+        _QtCore.QLibraryInfo.LibraryPath.PluginsPath)) / "permissions"
+    if _permissions.is_dir():
+        binaries += [(str(p), "PySide6/Qt/plugins/permissions")
+                     for p in _permissions.iterdir() if p.is_file()]
+except Exception:  # noqa: BLE001 - reported by readiness as "unknown"
+    pass
+
 analysis = Analysis(
     [str(ROOT / "packaging" / "app_entry.py")],
     pathex=[str(ROOT)],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hidden,
     hookspath=[],

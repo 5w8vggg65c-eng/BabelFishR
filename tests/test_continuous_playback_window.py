@@ -387,7 +387,7 @@ def test_the_bar_is_named_and_offers_one_pause_and_a_startable_new_row(rig):
     assert w.playback_pause_button.text() == "Resume"
     # Another playable row is still startable from the bar.
     w.timeline.select("t3")
-    assert w.selected_play_button.text() == "Play selected"
+    assert w.selected_play_button.text() == "\u25b6 Play selected"
     assert w.selected_play_button.isEnabled()
     w.selected_play_button.click()
     pump(rig.qt)

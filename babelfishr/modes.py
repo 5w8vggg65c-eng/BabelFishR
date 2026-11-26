@@ -39,9 +39,19 @@ class OperatingMode(str, enum.Enum):
     @property
     def label(self) -> str:
         return {
-            OperatingMode.FIELD_OFFLINE: "FIELD OFFLINE",
+            OperatingMode.FIELD_OFFLINE: "OFFLINE FIELD USE",
             OperatingMode.ONLINE_SETUP: "ONLINE / SETUP",
             OperatingMode.RECORD_ONLY: "RECORD ONLY",
+        }[self]
+
+    @property
+    def title(self) -> str:
+        """The name in running text ("Offline Field Use"). The stored value
+        (``field-offline``) never changes, so older settings files load."""
+        return {
+            OperatingMode.FIELD_OFFLINE: "Offline Field Use",
+            OperatingMode.ONLINE_SETUP: "Online / Setup",
+            OperatingMode.RECORD_ONLY: "Record Only",
         }[self]
 
     @property

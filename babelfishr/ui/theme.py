@@ -202,6 +202,16 @@ QMainWindow, #centralRoot {{ background: {t['window']}; }}
 #modeButton:hover, #modeButton:focus {{ border: 1px solid {t['on_band']}; }}
 #modeButton:disabled {{ color: {t['on_band']}; }}
 #modeButton::menu-indicator {{ image: none; width: 0; }}
+/* Offline Field Use readiness beside the mode: a dark pill, so the red
+   cross and green tick read on either teal. */
+#statusBand #offlineStatus {{
+    background: #101010; border-radius: 10px; padding: 1px 9px;
+    border: 1px solid transparent; font-weight: 700;
+}}
+#statusBand #offlineStatus:focus {{ border: 1px solid {t['on_band']}; }}
+#statusBand #offlineStatus[state="checking"] {{ color: #F2F2F2; font-weight: 600; }}
+#statusBand #offlineStatus[state="ok"] {{ color: #4ADE80; font-size: 17px; }}
+#statusBand #offlineStatus[state="fail"] {{ color: #FF6B6B; font-size: 17px; }}
 
 /* --- navigation: the in-window menu bar -------------------------------- */
 QMenuBar {{
@@ -337,6 +347,9 @@ QMenu::item:disabled {{ color: {t['disabled_text']}; }}
 }}
 #secondaryAction:hover, #secondaryAction:focus {{ border: 1px solid {t['accent']}; }}
 #secondaryAction:checked {{ border: 1px solid {t['accent']}; color: {t['accent']}; }}
+#transportButton:focus {{ border: 1px solid {t['accent']}; }}
+#waveformDisplay {{ font-size: 11px; padding: 0 5px; }}
+#waveformDisplay::menu-indicator {{ image: none; width: 0; }}
 #textAction {{ border: none; background: transparent; padding: 7px 16px;
               font-size: 14px; }}
 #textAction:hover, #textAction:focus {{ color: {t['accent']}; }}

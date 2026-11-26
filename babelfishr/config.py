@@ -289,6 +289,14 @@ class DisplayConfig:
     babelfishr.timefmt). Kept apart from ``timezone`` so a Build 39 setting
     reads the same, and switching to Local and back keeps the region."""
 
+    live_waveform_floor_dbfs: float = -60.0
+    """The live input waveform's display floor: sample peaks below it are
+    drawn on the centre line. Rendering only - never the capture gate,
+    the samples, the meter, the WAV or transcription."""
+
+    live_waveform_gain_db: float = 0.0
+    """Display gain added before the floor is applied (rendering only)."""
+
 
 @dataclasses.dataclass
 class SetupState:

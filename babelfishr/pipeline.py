@@ -42,6 +42,7 @@ from .audio.safety import SafetyRecorder
 from .audio.source import AudioBlock, AudioSource, ReplayAudioSource
 from .audio.spectrum import SpectrumAnalyzer
 from .audio.wavefile import write_wav
+from . import savepath
 from .config import Config
 from .detect import DetectedTransmission, RadioActivityDetector
 from .models import (ContentClass, ProcessingState, Provenance, RadioProfile,
@@ -162,6 +163,79 @@ class Recorder:
         except OSError as exc:
             log.error("could not write recording %s: %s", target, exc)
             return None
+
+
+class DestinationRecorder(Recorder):
+    """Writes a run's recordings under its Session's chosen folder.
+
+    The folder is the run's own (Session.save_path, pinned at Start), and
+    files go only into ``<chosen>/BabelFishR/recordings`` with the standard
+    layout. The chosen folder and its parents are never created: a drive
+    ejected mid-watch is not recreated as an empty folder on the internal
+    disk. When a write there fails, the recording goes to the standard
+    (local) Recordings folder instead, the transmission says so in
+    ``signal_metadata["save_path_fallback"]`` (its ``audio_path`` is where
+    it really went), and ``on_change("fallback" | "restored", reason, tx)``
+    is called on each change of state so the application can report it.
+    The next recording tries the chosen folder again.
+    """
+
+    def __init__(self, chosen: str, fallback: Recorder,
+                 on_change: Optional[Callable[[str, str, Transmission], None]] = None):
+        super().__init__(directory=str(savepath.recordings_dir(chosen)),
+                         layout=fallback.layout, bit_depth=fallback.bit_depth,
+                         enabled=fallback.enabled)
+        self.chosen = chosen
+        self.fallback = fallback
+        self.on_change = on_change
+        #: True while recordings are going to the local folder instead.
+        self.falling_back = False
+        self.reason = ""
+
+    def write(self, tx: Transmission, session: Session,
+              audio: np.ndarray, sample_rate: int) -> Optional[str]:
+        if not self.enabled:
+            return None
+        target = self.path_for(tx, session)
+        try:
+            owned = savepath.ensure_owned_dir(self.chosen)
+            # Each level below the owned area, never its parents.
+            savepath.make_within(owned, target.parent)
+            path = write_wav(str(target), audio, sample_rate, self.bit_depth)
+        except OSError as exc:
+            reason = savepath.reason_for(exc)
+            log.error("could not write recording %s on the chosen save path "
+                      "(%s); using the local Recordings folder", target, reason)
+            try:
+                if target.is_file():
+                    target.unlink()        # a partial file is not a recording
+            except OSError:
+                pass
+        else:
+            if self.falling_back:
+                self.falling_back, self.reason = False, ""
+                self._notify("restored", "", tx)
+            return path
+
+        path = self.fallback.write(tx, session, audio, sample_rate)
+        tx.signal_metadata = dict(tx.signal_metadata or {}, save_path_fallback={
+            "chosen": self.chosen,
+            "intended": str(savepath.owned_dir(self.chosen)),
+            "used": str(pathlib.Path(path).parent) if path else "",
+            "reason": reason,
+        })
+        if not self.falling_back or reason != self.reason:
+            self.falling_back, self.reason = True, reason
+            self._notify("fallback", reason, tx)
+        return path
+
+    def _notify(self, state: str, reason: str, tx: Transmission) -> None:
+        if self.on_change is None:
+            return
+        try:
+            self.on_change(state, reason, tx)
+        except Exception:  # noqa: BLE001 - reporting must never cost a recording
+            log.exception("save-path notification failed")
 
 
 #: Below this much voiced audio (local VAD, seconds), the detector heard no
@@ -1220,6 +1294,11 @@ class CaptureService:
         self.recorder = Recorder(
             directory=config.recording.directory, layout=config.recording.layout,
             bit_depth=config.audio.bit_depth, enabled=config.recording.enabled)
+        if getattr(session, "save_path", ""):
+            # The Session's own folder, pinned for this run at Start; the
+            # standard Recordings folder is where it falls back to.
+            self.recorder = DestinationRecorder(
+                session.save_path, self.recorder, on_change=self._save_path_changed)
         safety = config.audio.safety_recording
         self.safety = SafetyRecorder(
             directory=str(pathlib.Path(config.recording.directory) / "safety"),
@@ -1648,6 +1727,35 @@ class CaptureService:
         self.store.save_transmission(tx)
         self.events.publish("updated", tx, run=run)
         return tx
+
+    def _save_path_changed(self, state: str, reason: str, tx: Transmission) -> None:
+        """Report that recordings left, or came back to, the chosen folder.
+
+        Event ``save-path`` with ``state`` "fallback" (recordings are going
+        to ``path``, the local Recordings folder, because ``intended`` failed
+        for ``reason``) or "restored" (the chosen folder works again).
+        """
+        recorder = self.recorder
+        chosen = getattr(recorder, "chosen", "")
+        local = str(pathlib.Path(self.config.recording.directory).expanduser())
+        if state == "fallback":
+            message = (f"The save path {savepath.owned_dir(chosen)} could not be "
+                       f"written ({reason}). New recordings are being saved in "
+                       f"{local} instead.")
+        else:
+            message = (f"The save path {savepath.owned_dir(chosen)} is working "
+                       f"again; new recordings are saved there.")
+        self.events.publish("save-path", {
+            "state": state,
+            "path": local if state == "fallback" else str(recorder.directory),
+            "intended": str(savepath.owned_dir(chosen)),
+            "chosen": chosen,
+            "reason": reason,
+            "message": message,
+            "session_id": self.session.id,
+            "conversation_id": self.session.conversation_id,
+            "transmission": tx.id,
+        })
 
     def _metadata_under(self, tuning):
         """The source's metadata as it stands, but under the tuning a block

@@ -142,7 +142,8 @@ def test_keyboard_reaches_every_control_in_order(qt_app, opened):
         widget = widget.nextInFocusChain()
         if widget is opened.time_zone_box:
             break
-    for control in (opened.utc_zone_box, opened.profile_box, opened.source_mode_box,
+    # (Language detection and source language now live under Local Engines.)
+    for control in (opened.utc_zone_box, opened.profile_box,
                     opened.target_language_box, opened.quiet_seconds_box):
         assert control in seen or control.lineEdit() in seen if isinstance(
             control, QtWidgets.QComboBox) and control.isEditable() else control in seen

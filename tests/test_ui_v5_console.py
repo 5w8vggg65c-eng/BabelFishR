@@ -325,13 +325,22 @@ def test_clicking_a_transcript_selects_its_row(qt_app, console):
     assert window.timeline.selected_id == made[0].id
 
 
-def test_the_radio_profile_line_is_visible_with_session_options_closed(console):
+def test_the_radio_profile_line_shows_a_chosen_profile_only(console):
+    """With a profile chosen, it is in view with Session Options closed;
+    without one there is no explanatory line (the profile control says it)."""
+    from babelfishr.models import RadioProfile
+
     window, _, _ = console
     window._refresh_context_lines()
     assert not window.setup_box.isVisible()
+    assert not window.profile_line.isVisible() and window.profile_line.text() == ""
+    profile = window.app.save_profile(RadioProfile(name="UV-5R", channel_name="GMRS 16"))
+    window._refresh_profiles()
+    window.profile_box.setCurrentIndex(window.profile_box.findData(profile.id))
+    window._refresh_context_lines()
     assert window.profile_line.isVisible()
     assert window.profile_line.text() == window.channel_label.text()
-    assert window.profile_line.text(), "the profile (or its absence) is stated"
+    assert "UV-5R" in window.profile_line.text()
 
 
 def test_pressing_the_current_filter_keeps_playback_and_selection(qt_app, console,
@@ -503,7 +512,7 @@ def test_the_waveform_marker_belongs_to_the_original_file_only(qt_app, console,
     backend.advance(500)
     pump(qt_app)
     assert not window.waveform.marker_visible, "the original's playhead followed another file"
-    assert window.selected_play_button.text() == "Play selected"
+    assert window.selected_play_button.text() == "\u25b6 Play selected"
 
     controller.play(made[0].id, made[0].audio_path)
     backend.advance(500)

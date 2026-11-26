@@ -30,7 +30,7 @@ from .models import (ContentClass, Conversation, ErrorInfo, ProcessingState,
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 #: Layout of the search index and its maintenance table (meta key
 #: ``fts_layout``). 1: the index alone, maintained by deleting and rewriting
@@ -209,7 +209,9 @@ def _conversation_from_row(row) -> Conversation:
                         position=int(row["position"] or 0),
                         notes=row["notes"] or "",
                         color=(row["color"] or "") if "color" in keys else "",
-                        hidden=bool(row["hidden"]) if "hidden" in keys else False)
+                        hidden=bool(row["hidden"]) if "hidden" in keys else False,
+                        save_path=((row["save_path"] or "")
+                                   if "save_path" in keys else ""))
 
 
 _JSON_FIELDS = ("transcript_segments", "tags", "analysis_attempts")
@@ -241,6 +243,10 @@ _ADDED_COLUMNS = (
     ("conversations", "hidden", "INTEGER DEFAULT 0"),
     # Schema 7: Clear Session History's per-row generation (stale writers).
     ("transmissions", "history_generation", "INTEGER DEFAULT 0"),
+    # Schema 8: a named Session's own save destination, and the destination
+    # each monitoring run was started with ("" = the standard Recordings).
+    ("conversations", "save_path", "TEXT DEFAULT ''"),
+    ("sessions", "save_path", "TEXT DEFAULT ''"),
 )
 _BOOL_FIELDS = ("clipped", "bookmarked", "reviewed", "auto_processed", "hidden")
 
@@ -548,8 +554,8 @@ class Store:
                        audio_device, audio_device_id, sample_rate, profile_id,
                        profile_label, source_language_mode, source_language,
                        target_language, transcription_engine, translation_engine,
-                       notes, conversation_id)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       notes, conversation_id, save_path)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(id) DO UPDATE SET
                        name=excluded.name, ended_at=excluded.ended_at,
                        audio_device=excluded.audio_device,
@@ -563,14 +569,15 @@ class Store:
                        transcription_engine=excluded.transcription_engine,
                        translation_engine=excluded.translation_engine,
                        notes=excluded.notes,
-                       conversation_id=excluded.conversation_id""",
+                       conversation_id=excluded.conversation_id,
+                       save_path=excluded.save_path""",
                 (session.id, session.name, iso(session.started_at),
                  iso(session.ended_at), session.audio_device, session.audio_device_id,
                  session.sample_rate, session.profile_id, session.profile_label,
                  session.source_language_mode.value, session.source_language,
                  session.target_language, session.transcription_engine,
                  session.translation_engine, session.notes,
-                 session.conversation_id or None))
+                 session.conversation_id or None, session.save_path or ""))
             self._conn.commit()
         return session
 
@@ -811,16 +818,16 @@ class Store:
         with self._lock:
             self._conn.execute(
                 """INSERT INTO conversations (id, name, created_at, is_default,
-                       position, notes, color, hidden)
-                   VALUES (?,?,?,?,?,?,?,?)
+                       position, notes, color, hidden, save_path)
+                   VALUES (?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(id) DO UPDATE SET
                        name=excluded.name, position=excluded.position,
                        notes=excluded.notes, color=excluded.color,
-                       hidden=excluded.hidden""",
+                       hidden=excluded.hidden, save_path=excluded.save_path""",
                 (conversation.id, conversation.name, iso(conversation.created_at),
                  1 if conversation.is_default else 0, conversation.position,
                  conversation.notes, conversation.color or "",
-                 1 if conversation.hidden else 0))
+                 1 if conversation.hidden else 0, conversation.save_path or ""))
             self._conn.commit()
         return conversation
 
@@ -854,6 +861,69 @@ class Store:
             raise ValueError(f"not a #rrggbb colour: {color!r}")
         conversation.color = value.lower()
         return self.save_conversation(conversation)
+
+    def set_conversation_save_path(self, conversation_id: str,
+                                   save_path: str) -> Optional[Conversation]:
+        """Record a Session's chosen save folder, or "" for the standard one.
+
+        Only the stored choice; validating the folder and refusing a change
+        while the Session records is BabelFishRApp.set_save_path's job.
+        """
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE conversations SET save_path = ? WHERE id = ?",
+                (save_path or "", conversation_id))
+            self._conn.commit()
+            if cursor.rowcount == 0:
+                return None
+        return self.get_conversation(conversation_id)
+
+    def save_path_roots(self) -> List[str]:
+        """Every chosen save folder a Session has now or a run was started
+        with, distinct, in no particular order. Their BabelFishR-owned
+        areas are the extra owned roots for deletion."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT save_path FROM conversations WHERE save_path != '' "
+                "UNION SELECT save_path FROM sessions WHERE save_path != ''"
+            ).fetchall()
+        return sorted({row[0] for row in rows if row[0]})
+
+    def conversation_save_paths(self) -> Dict[str, Tuple[str, bool]]:
+        """{conversation id: (save_path, is_default)} for every Session."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, save_path, is_default FROM conversations").fetchall()
+        return {row[0]: (row[1] or "", bool(row[2])) for row in rows}
+
+    def custom_save_runs(self) -> List[str]:
+        """Ids of the monitoring runs that were started with a save path."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM sessions WHERE save_path != ''").fetchall()
+        return [row[0] for row in rows]
+
+    def set_transmission_flag(self, tx_id: str, key: str,
+                              value: Any = None) -> bool:
+        """Set (or, with None, remove) one top-level ``signal_metadata`` key
+        without rewriting the rest of the row, so a background writer cannot
+        overwrite newer results with an older copy. Returns True if the row
+        exists. A later whole-row save from an older copy may drop the key;
+        the writer that set it sets it again on that save's update."""
+        with self._lock:
+            if value is None:
+                cursor = self._conn.execute(
+                    "UPDATE transmissions SET signal_metadata = json_remove("
+                    "COALESCE(NULLIF(signal_metadata, ''), '{}'), ?) WHERE id = ?",
+                    (f"$.{key}", tx_id))
+            else:
+                cursor = self._conn.execute(
+                    "UPDATE transmissions SET signal_metadata = json_set("
+                    "COALESCE(NULLIF(signal_metadata, ''), '{}'), ?, json(?)) "
+                    "WHERE id = ?",
+                    (f"$.{key}", json.dumps(value), tx_id))
+            self._conn.commit()
+            return cursor.rowcount > 0
 
     # ---- removing a whole Session ------------------------------------------
     def hide_conversation(self, conversation_id: str, hidden: bool = True

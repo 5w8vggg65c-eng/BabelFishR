@@ -196,7 +196,7 @@ def test_the_operating_mode_control_shows_the_mode(qt_app, config, store):
     window = MainWindow(BabelFishRApp(config=config, store=store))
     # A real control now, not a label with a click handler: it says what it
     # is, it says what it is set to, and it opens a menu.
-    assert "FIELD OFFLINE" in window.mode_button.text()
+    assert "OFFLINE FIELD USE" in window.mode_button.text()
     # The v5 status band shows the mode alone, as the approved layout does;
     # readiness no longer sits beside it to be confused with. What the
     # control is stays announced: its accessible name and tooltip.
@@ -206,7 +206,7 @@ def test_the_operating_mode_control_shows_the_mode(qt_app, config, store):
     labels = [a.text() for a in window.mode_button.menu().actions()]
     assert labels == [m.label for m in OperatingMode]
     checked = [a.text() for a in window.mode_button.menu().actions() if a.isChecked()]
-    assert checked == ["FIELD OFFLINE"]
+    assert checked == ["OFFLINE FIELD USE"]
     window.close()
 
 
