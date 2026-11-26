@@ -159,6 +159,17 @@ class InputPanel(QtWidgets.QWidget):
         self.level_now.setObjectName("sectionLabel")
         gate.addWidget(gate_label)
         gate.addWidget(self.gate_box)
+        # Offered only while a fixed level is set for the microphone.
+        self.gate_auto_button = QtWidgets.QToolButton()
+        self.gate_auto_button.setText("Auto")
+        self.gate_auto_button.setAccessibleName(
+            "Reset the microphone start-recording level to the detector setting")
+        self.gate_auto_button.setToolTip(
+            "Stop using a fixed level for the microphone and go back to the "
+            "detector's own setting (normally: follow the room's level). "
+            "Applies at once, also while listening, and is remembered.")
+        self.gate_auto_button.clicked.connect(self._on_gate_auto)
+        gate.addWidget(self.gate_auto_button)
         gate.addWidget(self.level_now)
         gate.addStretch(1)
         layout.addWidget(self.gate_row)
@@ -293,10 +304,18 @@ class InputPanel(QtWidgets.QWidget):
         """Shown for the built-in microphone (or a system default that is
         it, or cannot be told apart); the value is the gate in force."""
         route = getattr(self.app, "microphone_route", lambda: "")()
+        if getattr(self, "_replaying", False) or getattr(self.app, "replaying", bool)():
+            # A replayed file is not the microphone: neither its level nor
+            # the microphone's gate is about it. Back on Stop.
+            route = ""
+        if not route:
+            self.level_now.setText("Level now: \u2013")
         self.gate_row.setVisible(bool(route))
         self.gate_state.setVisible(bool(route))
         if not route:
             return
+        self.gate_auto_button.setVisible(
+            self.app.config.audio.mic_threshold_dbfs is not None)
         value = self.app.mic_gate_dbfs()
         self._loading_gate = True
         try:
@@ -319,6 +338,11 @@ class InputPanel(QtWidgets.QWidget):
             return
         self.app.set_mic_threshold(value)
         self.gate_state.setText("")
+        self.gate_auto_button.setVisible(True)
+
+    def _on_gate_auto(self) -> None:
+        self.app.reset_mic_threshold()
+        self._refresh_gate()
 
     def _on_profile_link(self, checked: bool) -> None:
         if self._loading or not self._profile_id:

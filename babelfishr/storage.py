@@ -905,12 +905,17 @@ class Store:
         if not limit:
             return []
         hidden = "" if include_hidden else "AND t.hidden = 0 "
-        rows = self._conn.execute(
-            "SELECT t.* FROM transmissions t "
-            "JOIN sessions s ON s.id = t.session_id "
-            f"WHERE s.conversation_id = ? {hidden}"
-            "ORDER BY t.started_at DESC, t.rowid DESC LIMIT ?",
-            (conversation_id, limit)).fetchall()
+        # The SELECT and its fetch under the store's lock, like every write:
+        # the connection is shared, so unlocked this read could see another
+        # thread's uncommitted row - one its writer may then roll back.
+        # Converting the fetched rows needs no lock.
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT t.* FROM transmissions t "
+                "JOIN sessions s ON s.id = t.session_id "
+                f"WHERE s.conversation_id = ? {hidden}"
+                "ORDER BY t.started_at DESC, t.rowid DESC LIMIT ?",
+                (conversation_id, limit)).fetchall()
         ordered = rows if newest_first else list(reversed(rows))
         return [_from_row(r) for r in ordered]
 
@@ -1070,12 +1075,15 @@ class Store:
 
     def hidden_transmissions(self, conversation_id: str,
                              limit: int = 500) -> List[Transmission]:
-        rows = self._conn.execute(
-            "SELECT t.* FROM transmissions t "
-            "JOIN sessions s ON s.id = t.session_id "
-            "WHERE s.conversation_id = ? AND t.hidden = 1 "
-            "ORDER BY t.started_at DESC LIMIT ?",
-            (conversation_id, max(0, int(limit)))).fetchall()
+        """The Removed view: one named Session's removed-from-view messages.
+        Read under the store's lock, as conversation_transmissions."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT t.* FROM transmissions t "
+                "JOIN sessions s ON s.id = t.session_id "
+                "WHERE s.conversation_id = ? AND t.hidden = 1 "
+                "ORDER BY t.started_at DESC LIMIT ?",
+                (conversation_id, max(0, int(limit)))).fetchall()
         return [_from_row(r) for r in rows]
 
     def deletion_inventory(self, tx: Transmission,

@@ -655,6 +655,10 @@ step 62 needs a known digital channel or a digital radio you do not yet have.
     whole sentence, including its first and last syllables.
 68. Change **Start recording at** while monitoring, quit and reopen.
     *Good:* the change applied at once and the value is still there.
+    Press **Auto** next to it (shown only while a level is set), also once
+    while monitoring. *Good:* the level goes back to the detector's own
+    setting at once, **Auto** disappears, and it stays that way after
+    reopening.
 69. Hold the microphone near a hissing source (an untuned radio's static,
     or a fan close to the microphone) until a card is made. *Good:* that
     card says **Static**. A cough, a door or a clap says **Audio

@@ -730,6 +730,33 @@ class BabelFishRApp:
                 detector.settings, mode="fixed", threshold_dbfs=value)
         return value
 
+    def reset_mic_threshold(self) -> None:
+        """Auto: drop the microphone's own start-capture level and go back to
+        the detector profile (its mode - following the room, or its fixed
+        threshold), saved; when monitoring the microphone, the running gate
+        returns to that profile now. Other inputs never used the level."""
+        self.config.audio.mic_threshold_dbfs = None
+        try:
+            self.config.save()
+        except OSError:  # noqa: BLE001 - a preference is never worth a crash
+            log.warning("could not save the microphone threshold")
+        capture = self.capture
+        if capture is not None and capture.mic_gate:
+            profile = self.config.detector.to_settings()
+            detector = capture.detector
+            # The exact inverse of set_mic_threshold's swap: one attribute
+            # assignment, so the capture thread sees the old gate or this one.
+            # In automatic mode the room's floor kept being tracked meanwhile.
+            detector.settings = dataclasses.replace(
+                detector.settings, mode=profile.mode,
+                threshold_dbfs=profile.threshold_dbfs)
+            capture.mic_gate = False
+
+    def replaying(self) -> bool:
+        """Is the running capture a recorded file (Replay), not an input?"""
+        capture = self.capture
+        return capture is not None and isinstance(capture.source, ReplayAudioSource)
+
     # -- session ---------------------------------------------------------
     def start_session(self, source: Optional[AudioSource] = None, *,
                       device: Optional[str] = None,
