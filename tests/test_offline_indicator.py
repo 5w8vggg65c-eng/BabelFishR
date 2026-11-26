@@ -297,3 +297,29 @@ def test_while_checking_the_dialog_checks_with_the_same_inputs(qt_app, window,
     dialog.recheck_button.click()                # Re-check: the same inputs again
     assert "microphone_permission" in window.jobs.calls[-1]["kwargs"]
     assert window.jobs.calls[-1]["args"][1] is True
+
+
+def test_a_late_result_after_the_app_closed_reads_nothing(qt_app, config, store, tmp_path,
+                                                          monkeypatch):
+    """The full suite crashed (segfault) when a readiness result reached a
+    window whose application was closing its store on another thread: the
+    Save path row read the shared connection unlocked. Now a late result is
+    ignored once closing has begun, and a read after close raises instead
+    of crashing."""
+    import sqlite3
+
+    from babelfishr.ui.main_window import MainWindow
+
+    config.app_home = str(tmp_path / "home")
+    config.mode = OperatingMode.FIELD_OFFLINE.value
+    jobs = Jobs(monkeypatch)
+    app = BabelFishRApp(config=config, store=store)
+    win = MainWindow(app)
+    pending = len(jobs.calls) - 1
+    app.close()                                    # the store closes
+    assert app.closing
+    jobs.finish(pending, ready_report())           # a late result arrives
+    assert win.offline_status.property("state") != "ok"
+    win._refresh_save_path_row()                   # and a stray redraw
+    with pytest.raises(sqlite3.ProgrammingError):
+        store.get_conversation("anything")         # locked read: raises, no crash

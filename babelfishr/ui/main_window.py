@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import pathlib
+import sqlite3
 from typing import Dict, List, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -1437,13 +1438,21 @@ class MainWindow(QtWidgets.QMainWindow):
         """Locked while this Session is recording (changes after Stop)."""
         return bool(self.app.save_path_locked(self.app.conversation_id))
 
+    def _store_closing(self) -> bool:
+        """Quietly: the database is closing (the window's quit, or the
+        application closed under it) - a late callback must not read it."""
+        return bool(self._store_off_limits or getattr(self.app, "closing", False))
+
     def _refresh_save_path_row(self) -> None:
         label = getattr(self, "save_path_label", None)
-        if label is None:
+        if label is None or self._store_closing():
             return
         # The last check's result (readiness, a choice, a Start): no disk
         # access while drawing the window.
-        info = self.app.save_path_info(self.app.conversation_id, probe=False)
+        try:
+            info = self.app.save_path_info(self.app.conversation_id, probe=False)
+        except sqlite3.Error:
+            return                         # the store closed meanwhile
         if not info.is_custom:
             text = f"Standard location: {info.effective_dir}"
         elif info.state == "unchecked":
@@ -2893,7 +2902,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._readiness = None
 
         def finished(report):
-            if request is self._readiness_request:
+            if request is self._readiness_request and not self._store_closing():
                 self._render_readiness(report)
 
         def failed(message):

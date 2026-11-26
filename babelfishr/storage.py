@@ -810,8 +810,12 @@ class Store:
         return [_conversation_from_row(r) for r in rows]
 
     def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
-        row = self._conn.execute("SELECT * FROM conversations WHERE id = ?",
-                                 (conversation_id,)).fetchone()
+        # Under the store's lock: the GUI thread reads this (the Save path
+        # row) while a cleanup thread may be closing the shared connection;
+        # unlocked, that race crashed the process instead of raising.
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM conversations WHERE id = ?",
+                                     (conversation_id,)).fetchone()
         return _conversation_from_row(row) if row else None
 
     def save_conversation(self, conversation: Conversation) -> Conversation:
