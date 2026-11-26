@@ -12,7 +12,11 @@ from ..readiness import Check, CheckStatus
 class ReadinessDialog(QtWidgets.QDialog):
     """Runs Field Check and shows it as a scannable list with remedies."""
 
-    def __init__(self, app, parent: Optional[QtWidgets.QWidget] = None):
+    def __init__(self, app, parent: Optional[QtWidgets.QWidget] = None,
+                 report=None):
+        """*report*: the readiness report already shown in the window (the
+        one behind the Offline Field Use mark). Shown as is, so the details
+        always agree with the mark; Re-check runs a new one."""
         super().__init__(parent)
         self.app = app
         self.setWindowTitle("Field readiness")
@@ -60,7 +64,10 @@ class ReadinessDialog(QtWidgets.QDialog):
         layout.addWidget(buttons)
 
         self._worker = None
-        self.refresh(False)
+        if report is not None:
+            self._render(report)
+        else:
+            self.refresh(False)
 
     def refresh(self, run_smoke_tests: bool) -> None:
         """Run Field Check on a worker thread.
@@ -69,6 +76,7 @@ class ReadinessDialog(QtWidgets.QDialog):
         fixture, which takes seconds; on the GUI thread that is a frozen
         window.
         """
+        from ..readiness import microphone_authorization
         from .workers import readiness_job, run_in_background
 
         self.recheck_button.setEnabled(False)
@@ -76,8 +84,12 @@ class ReadinessDialog(QtWidgets.QDialog):
         self.subtitle.setText(
             "Loading models and running real smoke tests."
             if run_smoke_tests else "Checking audio, storage and engines.")
+        # The same inputs as the window's own check: macOS's microphone
+        # decision read here on the GUI thread (app.readiness adds the
+        # selected Session's save path).
         self._worker = run_in_background(
             readiness_job, self.app, run_smoke_tests,
+            microphone_permission=microphone_authorization(),
             on_message=self.subtitle.setText,
             on_finished=self._render,
             on_failed=self._failed)
@@ -100,7 +112,21 @@ class ReadinessDialog(QtWidgets.QDialog):
                 item.setForeground(0, QtGui.QBrush(QtGui.QColor("#9a6700")))
             self.tree.addTopLevelItem(item)
 
-        if report.field_ready:
+        from ..modes import OperatingMode
+        from ..readiness import offline_field_problems
+
+        if report.mode is OperatingMode.FIELD_OFFLINE:
+            # The same verdict as the mark beside the mode, word for word.
+            problems = offline_field_problems(report)
+            if problems:
+                self.headline.setText("\u2715 Not ready for Offline Field Use")
+                self.subtitle.setText("\n".join(f"\u2022 {p}" for p in problems))
+            else:
+                self.headline.setText("\u2713 Ready for Offline Field Use")
+                self.subtitle.setText(
+                    "Audio, storage, the selected speech model and the selected "
+                    "translation all passed on this computer.")
+        elif report.field_ready:
             self.headline.setText("Ready for offline field operation")
             self.subtitle.setText(
                 "Recording, local transcription and local translation all work "

@@ -248,3 +248,52 @@ def test_opening_in_offline_field_use_connects_to_nothing(qt_app, config, store,
         assert attempts == [], f"network connections attempted: {attempts}"
     finally:
         window.close()
+
+
+# --- the report it opens says the same as the mark ---------------------------------
+
+def _open_dialog(window, monkeypatch):
+    from babelfishr.ui.readiness_dialog import ReadinessDialog
+
+    opened = []
+    monkeypatch.setattr(ReadinessDialog, "exec", lambda self: opened.append(self) or 0)
+    window.offline_status.click()
+    return opened[-1]
+
+
+def test_a_green_mark_opens_the_same_green_report_without_a_new_check(qt_app, window,
+                                                                       monkeypatch):
+    _select_offline(window)
+    window.jobs.finish(-1, ready_report())
+    assert _state(window)[1] == "ok"
+    before = len(window.jobs.calls)
+    dialog = _open_dialog(window, monkeypatch)
+    assert dialog.headline.text() == "✓ Ready for Offline Field Use"
+    assert len(window.jobs.calls) == before + 1, \
+        "the dialog started its own check (the +1 is the recheck after closing)"
+
+
+def test_a_red_mark_opens_the_same_reasons(qt_app, window, monkeypatch):
+    _select_offline(window)
+    report = ready_report(**{"Local ASR model present": (FAIL, "no model", {})})
+    window.jobs.finish(-1, report)
+    tip = window.offline_status.toolTip()
+    dialog = _open_dialog(window, monkeypatch)
+    assert dialog.headline.text() == "✕ Not ready for Offline Field Use"
+    assert "Local ASR model present: failed (no model)" in dialog.subtitle.text()
+    assert "Local ASR model present: failed (no model)" in tip
+
+
+def test_while_checking_the_dialog_checks_with_the_same_inputs(qt_app, window,
+                                                               monkeypatch):
+    _select_offline(window)                      # still Checking...
+    before = len(window.jobs.calls)
+    dialog = _open_dialog(window, monkeypatch)
+    started = window.jobs.calls[before]
+    assert "microphone_permission" in started["kwargs"], \
+        "the dialog's check did not read macOS's microphone decision"
+    started["finish"](ready_report())
+    assert dialog.headline.text() == "✓ Ready for Offline Field Use"
+    dialog.recheck_button.click()                # Re-check: the same inputs again
+    assert "microphone_permission" in window.jobs.calls[-1]["kwargs"]
+    assert window.jobs.calls[-1]["args"][1] is True

@@ -85,23 +85,75 @@ def _ordinal(n: int) -> str:
     return "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
 
 
+class _KeyboardContextMenu(QtCore.QObject):
+    """A keyboard context-menu request (Menu key, Shift+F10 where the
+    platform turns it into one) on the Sessions list opens the selected
+    Session's menu; a mouse request is left to the normal right-click path."""
+
+    def __init__(self, open_menu, parent):
+        super().__init__(parent)
+        self._open_menu = open_menu
+
+    def eventFilter(self, obj, event):  # noqa: N802 - Qt's name
+        if (event.type() == QtCore.QEvent.ContextMenu
+                and event.reason() == QtGui.QContextMenuEvent.Keyboard):
+            event.accept()
+            self._open_menu()
+            return True
+        return False
+
+
 class _SpacePlayback(QtCore.QObject):
-    """Space plays and pauses - scoped to playback.
+    """Space starts and stops playback - scoped to playback.
 
     Watches key events application-wide, for this window only, and takes a
     plain Space only when the keyboard focus is somewhere playback lives:
     the message list (not a text field or one of a card's own other
-    buttons), the waveform, or the playback bar - whose Bookmark and Add
-    note buttons included, so focus that drifts onto them when the last
-    clip ends can never turn Space into a bookmark. A press acts once; its
-    release and auto-repeats are swallowed. Text fields (the inline editor,
-    search, spin boxes) and every other control get Space as usual.
+    buttons), the waveform, or the playback bar's other parts - its
+    Bookmark and Add note buttons included, so focus that drifts onto them
+    can never turn Space into a bookmark. A press acts once; its release
+    and auto-repeats are swallowed. The transport's own buttons (Play
+    selected, Pause/Resume, Stop, -5/+5 s), text fields (the inline
+    editor, search, spin boxes) and every other control get Space as usual:
+    a deliberately focused button does what its label says.
     """
 
     def __init__(self, window: "MainWindow"):
         super().__init__(window)
         self.window = window
         self._swallowing = False
+        self._watched = None
+        # Never on the whole application: only the widget that has the
+        # keyboard focus in this window (and the window itself, for when
+        # nothing does). Geometry and paint events elsewhere never pass
+        # through Python.
+        window.installEventFilter(self)
+        QtWidgets.QApplication.instance().focusChanged.connect(self._focus_moved)
+        self._focus_moved(None, QtWidgets.QApplication.focusWidget())
+
+    def _focus_moved(self, _old, new) -> None:
+        watched = self._watched
+        if watched is not None:
+            try:
+                watched.removeEventFilter(self)
+            except RuntimeError:           # the widget is gone already
+                pass
+            self._watched = None
+        if new is not None and new is not self.window:
+            try:
+                if new.window() is self.window:
+                    new.installEventFilter(self)
+                    self._watched = new
+            except RuntimeError:
+                pass
+
+    def detach(self) -> None:
+        try:
+            QtWidgets.QApplication.instance().focusChanged.disconnect(self._focus_moved)
+        except (RuntimeError, TypeError):
+            pass
+        self._focus_moved(None, None)
+        self.window.removeEventFilter(self)
 
     def eventFilter(self, obj, event):  # noqa: N802 - Qt's name
         kind = event.type()
@@ -182,7 +234,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_state_badge()
         self._refresh_install_model_button()
         self._space_filter = _SpacePlayback(self)
-        QtWidgets.QApplication.instance().installEventFilter(self._space_filter)
         self.app.restore_selected_conversation()
         self._refresh_session_tabs()
         self._reload_timeline()
@@ -345,10 +396,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session_tabs.customContextMenuRequested.connect(
             self._session_tab_menu)
         # The same context menu from the keyboard, for the selected Session.
+        # Platforms route these keys differently: as a shortcut, or (macOS's
+        # Menu key, some keyboards' Shift+F10) as a keyboard context-menu
+        # event whose position is not over any tab. Both end in
+        # _show_session_actions; right-click stays position-based.
         for keys in ("Shift+F10", QtCore.Qt.Key_Menu):
             shortcut = QtGui.QShortcut(QtGui.QKeySequence(keys), self.session_tabs)
             shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
             shortcut.activated.connect(self._show_session_actions)
+        self._session_keyboard_menu = _KeyboardContextMenu(self._show_session_actions,
+                                                           self.session_tabs)
+        self.session_tabs.installEventFilter(self._session_keyboard_menu)
         left_layout.addWidget(self.session_tabs)
 
         session_buttons = FlowLayout(spacing=5)
@@ -1023,8 +1081,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         if widget is self:
             return True
+        if widget in (self.selected_play_button, self.playback_pause_button,
+                      self.playback_stop_button, self.playback_rewind_button,
+                      self.playback_forward_button):
+            return False                   # a labelled control: its own action
         if self.selected_panel is widget or self.selected_panel.isAncestorOf(widget):
-            return True                    # the playback bar, all of it
+            return True                    # the rest of the playback bar
         if self.waveform is widget or self.waveform.isAncestorOf(widget):
             return True
         if self.timeline is widget or self.timeline.isAncestorOf(widget):
@@ -1036,20 +1098,19 @@ class MainWindow(QtWidgets.QMainWindow):
         return False
 
     def toggle_playback_from_space(self) -> None:
-        """One Space: pause what plays, resume what is paused, stop a wait
-        for the next live recording, or play the selected message (and
-        those after it). Never anything else."""
+        """One Space: STOP whatever plays - the clip and the queue after it,
+        paused, between clips or waiting for the next live recording - so
+        neither a late end report nor a new recording can restart it; or,
+        when nothing plays, play the selected message and those after it.
+        Pause and Resume stay on their own button. Never anything else."""
         from .playback import PAUSED, PLAYING
 
         controller = self.timeline.playback
         owner = controller.owner
         state = controller.state_for(owner) if owner else ""
         sequence = self.sequence
-        if owner and state in (PLAYING, PAUSED):
-            self._pause_playback()
-        elif sequence.paused_between_clips:
-            self._pause_playback()
-        elif sequence.waiting or sequence.active:
+        if (owner and state in (PLAYING, PAUSED)) or sequence.active \
+                or sequence.waiting or sequence.paused_between_clips:
             self._stop_playback()
         else:
             self._play_selected()
@@ -1223,8 +1284,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.source_mode_box.currentIndexChanged.connect(self._on_source_mode)
         self.source_language_box.currentIndexChanged.connect(
             lambda _i: self._save_source_language())
-        for row, (text, box) in enumerate((("Language", self.source_mode_box),
-                                           ("Source", self.source_language_box))):
+        for row, (text, box) in enumerate((("Language detection", self.source_mode_box),
+                                           ("Source language", self.source_language_box))):
             caption = QtWidgets.QLabel(text)
             caption.setObjectName("engineLine")
             caption.setBuddy(box)
@@ -1380,18 +1441,27 @@ class MainWindow(QtWidgets.QMainWindow):
         label = getattr(self, "save_path_label", None)
         if label is None:
             return
-        info = self.app.save_path_info(self.app.conversation_id)
+        # The last check's result (readiness, a choice, a Start): no disk
+        # access while drawing the window.
+        info = self.app.save_path_info(self.app.conversation_id, probe=False)
         if not info.is_custom:
             text = f"Standard location: {info.effective_dir}"
+        elif info.state == "unchecked":
+            text = f"{info.owned_dir}  (in {info.chosen}) \u2013 checking\u2026"
         elif info.available:
             text = f"{info.owned_dir}  (in {info.chosen})"
         else:
             text = f"\u2715 {info.problem()}"
         label.setText(text)
+        safety = self.app.config.audio.safety_recording
+        local = (f"the shared message index and settings ({self.app.config.paths().root})"
+                 + (", and the rolling safety buffer of continuous audio (a "
+                    "short-lived backup, kept on this computer on purpose)"
+                    if getattr(safety, "enabled", False) else ""))
         label.setToolTip(
-            "New recordings and portable transcripts of this Session are saved "
-            "here; the shared index and settings stay on this computer, and "
-            "earlier recordings stay where they were saved.")
+            "New recordings, per-message transcript files and exports of this "
+            f"Session are saved here. On this computer stay {local}. Earlier "
+            "recordings stay where they were saved.")
         locked = self._save_path_locked()
         why = "Locked while this Session is recording. Stop to change it." if locked else ""
         self.save_path_choose.setEnabled(not locked)
@@ -1402,7 +1472,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                         "location again")
 
     def _choose_save_path(self) -> None:
-        info = self.app.save_path_info(self.app.conversation_id)
+        info = self.app.save_path_info(self.app.conversation_id, probe=False)
         start = info.chosen if info.is_custom and info.available else str(pathlib.Path.home())
         folder = QtWidgets.QFileDialog.getExistingDirectory(
             self, "Choose where this Session saves its recordings", start)
@@ -1615,7 +1685,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # The operating mode lives in the header, next to readiness, and only
         # there. Two controls for one setting is two things to disagree.
-        self.channel_label = QtWidgets.QLabel("No profile selected")
+        self.channel_label = QtWidgets.QLabel("")
+        self.channel_label.hide()
         self.channel_label.setObjectName("sectionLabel")
         self.channel_label.setWordWrap(True)
         self.channel_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
@@ -2816,8 +2887,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ready_badge.setAccessibleDescription("Checking field readiness")
 
         # A previous model's slower smoke test may finish after the newly
-        # selected model has already reported its own readiness.
+        # selected model has already reported its own readiness. The old
+        # report no longer describes the configuration: forget it.
         self._readiness_request = request = object()
+        self._readiness = None
 
         def finished(report):
             if request is self._readiness_request:
@@ -2927,7 +3000,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _show_readiness(self) -> None:
         from .readiness_dialog import ReadinessDialog
 
-        ReadinessDialog(self.app, self).exec()
+        # The report behind the mark; None while a newer check is running
+        # (the dialog then runs the same check itself).
+        ReadinessDialog(self.app, self, report=self._readiness).exec()
         self._refresh_readiness()
 
     # -- transmission actions --------------------------------------------
@@ -3104,8 +3179,8 @@ class MainWindow(QtWidgets.QMainWindow):
         index = self.session_tabs.tabAt(position)
         if index < 0:
             return
-        self._build_session_tab_menu(index).exec(
-            self.session_tabs.mapToGlobal(position))
+        self._exec_session_menu(self._build_session_tab_menu(index),
+                                self.session_tabs.mapToGlobal(position))
 
     def _build_session_tab_menu(self, index: int) -> QtWidgets.QMenu:
         """The right-click menu for one tab. Built apart from being shown,
@@ -3154,7 +3229,30 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         menu = self._build_session_tab_menu(index)
         rect = self.session_tabs.tabRect(index)
-        menu.exec(self.session_tabs.mapToGlobal(rect.bottomLeft()))
+        self._exec_session_menu(menu, self.session_tabs.mapToGlobal(rect.bottomLeft()))
+
+    def _exec_session_menu(self, menu: QtWidgets.QMenu, where: QtCore.QPoint) -> None:
+        """Show a Session's context menu (one place, so every route - mouse,
+        shortcut, keyboard context-menu event - behaves the same). Focus
+        goes back to the Sessions list afterwards."""
+        menu.exec(where)
+        # A closed popup does not always hand activation back (seen on
+        # macOS): without it no key reaches the list, and the next Menu key
+        # or Shift+F10 does nothing. Take it back, unless a dialog the menu
+        # opened (Delete Session..., a colour) is still up.
+        if self.isVisible() and QtWidgets.QApplication.activeModalWidget() is None:
+            self.activateWindow()
+            self.raise_()
+            self.session_tabs.setFocus(QtCore.Qt.PopupFocusReason)
+            # Activation can land a moment later (macOS): focus the list
+            # again once it has, unless the operator moved on meanwhile.
+            QtCore.QTimer.singleShot(0, self._refocus_session_list)
+
+    def _refocus_session_list(self) -> None:
+        if (self.isActiveWindow() and QtWidgets.QApplication.activePopupWidget() is None
+                and QtWidgets.QApplication.activeModalWidget() is None
+                and QtWidgets.QApplication.focusWidget() in (None, self)):
+            self.session_tabs.setFocus(QtCore.Qt.PopupFocusReason)
 
     def _hide_session_tab(self, index: int) -> None:
         """Hide Session: at once, nothing deleted, undoable."""
@@ -4118,13 +4216,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if getattr(self, "input_panel", None) is not None:
             self.input_panel.set_profile(profile_id)
         if profile is None:
-            self.channel_label.setText(
-                "No profile selected - transmissions will have no channel or "
-                "frequency metadata. BabelFishR cannot determine these from audio.")
+            # No explanatory row: the Radio profile control says it.
+            self.channel_label.setText("")
+            self.channel_label.hide()
         else:
             self.channel_label.setText(
                 f"Monitoring {profile.name}  ·  {profile.label()}  "
                 f"(operator-supplied metadata)")
+            self.channel_label.show()
 
     def _new_profile(self) -> None:
         dialog = ProfileDialog(self)
@@ -4225,9 +4324,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.waveform.shutdown()
             # Space is this window's playback key only while it exists.
             space = getattr(self, "_space_filter", None)
-            application = QtWidgets.QApplication.instance()
-            if space is not None and application is not None:
-                application.removeEventFilter(space)
+            if space is not None:
+                space.detach()
             super().closeEvent(event)
             return
         # Work is still outstanding, a capture is still finishing, an

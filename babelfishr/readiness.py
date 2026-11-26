@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import os
 import pathlib
 import platform
 import shutil
@@ -238,11 +239,10 @@ OFFLINE_REQUIRED = (
     "Local transcription smoke test", "Installed translation paths",
     "Local translation smoke test", "Cloud processing disabled",
     "Mock engines disabled")
-#: Must not fail; a warning is acceptable only when the check marks it so
-#: (``data["acceptable"]``): microphone permission off macOS, or a reading
-#: Qt cannot give in this build - never an affirmative "denied" or "not
-#: asked yet" - and a deliberately chosen system-default input.
-OFFLINE_NOT_FAILING = ("Microphone permission",)
+#: Required, failing closed: on macOS only a verified grant passes (denied,
+#: not asked yet and cannot-be-read are all red); off macOS the check must
+#: say explicitly that it does not apply (``data["not_applicable"]``).
+OFFLINE_PERMISSION = "Microphone permission"
 
 
 def offline_field_problems(report: "ReadinessReport") -> List[str]:
@@ -261,13 +261,15 @@ def offline_field_problems(report: "ReadinessReport") -> List[str]:
             word = {CheckStatus.FAIL: "failed", CheckStatus.WARN: "partial",
                     CheckStatus.SKIP: "not verified"}[check.status]
             problems.append(f"{name}: {word}" + (f" ({check.detail})" if check.detail else ""))
-    for name in OFFLINE_NOT_FAILING:
-        check = report.get(name)
-        if check is None:
-            problems.append(f"{name}: not checked")
-        elif check.status is CheckStatus.FAIL or (
-                check.status is CheckStatus.WARN and not check.data.get("acceptable")):
-            problems.append(f"{name}: {check.detail}")
+    permission = report.get(OFFLINE_PERMISSION)
+    if permission is None:
+        problems.append(f"{OFFLINE_PERMISSION}: not checked")
+    elif not (permission.status is CheckStatus.PASS or (
+            permission.status is CheckStatus.SKIP
+            and permission.data.get("not_applicable"))):
+        word = {CheckStatus.FAIL: "failed", CheckStatus.WARN: "not verified",
+                CheckStatus.SKIP: "not verified"}.get(permission.status, "not verified")
+        problems.append(f"{OFFLINE_PERMISSION}: {word} ({permission.detail})")
     return problems
 
 
@@ -288,7 +290,6 @@ def field_check(config, *, run_smoke_tests: bool = True,
 
     mode = mode or OperatingMode.FIELD_OFFLINE
     report = ReadinessReport(mode=mode)
-    paths = config.paths()
 
     # -- audio ----------------------------------------------------------
     if backend_available():
@@ -323,31 +324,39 @@ def field_check(config, *, run_smoke_tests: bool = True,
         reason = savepath.preflight(save_path)
         if not reason:
             report.add(Check("Recording directory writable", CheckStatus.PASS,
-                             f"Save path {owned}"))
+                             f"Save path {owned}",
+                             data={"save_path": save_path, "reason": ""}))
             free_target = owned
         else:
             report.add(Check(
                 "Recording directory writable", CheckStatus.FAIL,
                 savepath.describe(save_path, reason),
+                data={"save_path": save_path, "reason": reason},
                 remedy=f"Reconnect the drive or make {save_path} writable, or "
                        f"choose another save path (or the standard location) "
                        f"for this Session."))
-    elif paths.writable():
-        report.add(Check("Recording directory writable", CheckStatus.PASS,
-                         str(paths.recordings)))
     else:
-        report.add(Check(
-            "Recording directory writable", CheckStatus.FAIL,
-            str(paths.recordings),
-            remedy=f"Grant write access to {paths.recordings} or change the "
-                   f"recordings directory."))
+        # The same standard folder the Recorder writes to (which is not the
+        # managed Recordings folder when recording.directory points
+        # elsewhere), probed the same way as a save path.
+        standard = config.recordings_path()
+        reason = _standard_dir_problem(standard)
+        if not reason:
+            report.add(Check("Recording directory writable", CheckStatus.PASS,
+                             str(standard)))
+            free_target = standard
+        else:
+            report.add(Check(
+                "Recording directory writable", CheckStatus.FAIL,
+                f"{standard}: {reason}",
+                remedy=f"Grant write access to {standard} or change the "
+                       f"recordings directory."))
 
-    free = paths.free_bytes()
-    if free_target is not None:
-        try:
-            free = shutil.disk_usage(free_target).free
-        except OSError:
-            pass
+    # Measured on the actual destination: the Session's drive when it is
+    # available, else the standard folder (or, failing both, its nearest
+    # existing parent).
+    free = _free_bytes(free_target if free_target is not None
+                       else config.recordings_path())
     free_gb = free / 1e9
     if free >= MIN_FREE_BYTES:
         report.add(Check("Free storage", CheckStatus.PASS, f"{free_gb:.1f} GB"))
@@ -378,6 +387,37 @@ def field_check(config, *, run_smoke_tests: bool = True,
     return report
 
 
+def _standard_dir_problem(directory: pathlib.Path) -> str:
+    """"" when the standard recordings folder takes a write, else why.
+
+    Created if missing (as the Recorder would), then probed with a uniquely
+    named temporary file that is synced, renamed and removed.
+    """
+    from . import savepath
+
+    try:
+        if directory.is_symlink() and not directory.is_dir():
+            return "a broken link"
+        if os.path.lexists(directory) and not directory.is_dir():
+            return savepath.NOT_A_FOLDER
+        directory.mkdir(parents=True, exist_ok=True)
+        savepath.probe_dir(directory)
+    except OSError as exc:
+        reason = savepath.reason_for(exc)
+        return "cannot be created or written" if reason == savepath.NOT_FOUND else reason
+    return ""
+
+
+def _free_bytes(target: pathlib.Path) -> int:
+    path = pathlib.Path(target)
+    while not path.exists() and path.parent != path:
+        path = path.parent
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return 0
+
+
 def _selected_input_check(config) -> Check:
     """Is the input the operator chose actually the one that would be used?
 
@@ -386,14 +426,30 @@ def _selected_input_check(config) -> Check:
     before an interface is wired up. The hard refusal lives where it belongs -
     monitoring will not start on a missing or unchosen input.
     """
-    from .audio.devices import resolve_input
+    from .audio.devices import list_input_devices, resolve_input
 
     selection = config.audio.input
     if selection.use_system_default and selection.confirmed:
+        # The operating system's own default, resolved now: a Mac can list
+        # inputs and still have no usable default. (default_input_device()
+        # falls back to the first listed device, which is not the default.)
+        try:
+            devices = list_input_devices()
+        except Exception:  # noqa: BLE001 - no backend: cannot resolve
+            devices = []
+        default = next((d for d in devices if d.is_default
+                        and int(getattr(d, "max_input_channels", 0) or 0) > 0), None)
+        if default is None:
+            return Check(
+                "Selected audio input", CheckStatus.FAIL,
+                "system default input chosen, but the system reports no usable "
+                "default input",
+                remedy="Choose an input in System Settings > Sound > Input, or "
+                       "select the interface itself in the Audio input panel.")
         return Check(
             "Selected audio input", CheckStatus.WARN,
-            "macOS system default (chosen deliberately)",
-            data={"acceptable": True},
+            f"system default (chosen deliberately): now {default.name}",
+            data={"acceptable": True, "device": default.to_dict()},
             remedy="For a radio watch, select the interface itself: the system "
                    "default can change without warning.")
     if not config.has_confirmed_input():
@@ -491,10 +547,10 @@ def _microphone_permission_check(authorization: Optional[str] = None) -> Check:
     """Affirmative evidence where macOS gives it; never a dialog, never a
     test recording. *authorization* is microphone_authorization() read on
     the GUI thread by the caller; None reads as unknown."""
-    if platform.system() != "Darwin" or authorization == "not-applicable":
+    if platform.system() != "Darwin":
         return Check("Microphone permission", CheckStatus.SKIP,
                      f"not applicable on {platform.system()}",
-                     data={"acceptable": True})
+                     data={"not_applicable": True})
     if authorization == "granted":
         return Check("Microphone permission", CheckStatus.PASS,
                      "granted to BabelFishR in macOS")
@@ -510,12 +566,15 @@ def _microphone_permission_check(authorization: Optional[str] = None) -> Check:
             "not asked yet: macOS asks the first time monitoring starts",
             remedy="Start monitoring once and allow BabelFishR to use the "
                    "microphone.")
+    # Fail closed: without an affirmative grant this is not verified, and
+    # Offline Field Use is not shown ready (the cross says why).
     return Check(
         "Microphone permission", CheckStatus.WARN,
-        "cannot be read in this build; verified only by recording",
-        data={"acceptable": True},
-        remedy="If recordings are silent: System Settings > Privacy & Security "
-               "> Microphone.")
+        "not verified: macOS's decision could not be read here",
+        data={"authorization": authorization or "unknown"},
+        remedy="Use the packaged BabelFishR app (it can read the decision), "
+               "and allow it in System Settings > Privacy & Security > "
+               "Microphone.")
 
 
 def _check_transcription(config, report: ReadinessReport,

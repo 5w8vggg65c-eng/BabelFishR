@@ -21,7 +21,56 @@ def write_wav(path: str, samples: np.ndarray, sample_rate: int,
         raise ValueError("bit_depth must be 16, 24 or 32")
     target = pathlib.Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    raw, width = _encode(samples, bit_depth)
+    with wave.open(str(target), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(width)
+        handle.setframerate(int(sample_rate))
+        handle.writeframes(raw)
+    return str(target)
 
+
+def write_wav_atomic(path: str, samples: np.ndarray, sample_rate: int,
+                     bit_depth: int = 16) -> str:
+    """Write a WAV into an *existing* folder, atomically.
+
+    Creates no folder at all: the samples go to a uniquely named temporary
+    file in the target's folder, are flushed to disk, and the file is then
+    moved into place with ``os.replace``. On any failure only that
+    temporary file is removed. Used for a Session's chosen save path, where
+    creating a missing parent could recreate an ejected drive's path on the
+    internal disk. Returns the path.
+    """
+    import os
+    import tempfile
+
+    if bit_depth not in (16, 24, 32):
+        raise ValueError("bit_depth must be 16, 24 or 32")
+    target = pathlib.Path(path)
+    raw, width = _encode(samples, bit_depth)
+    fd, temp = tempfile.mkstemp(prefix=f".{target.stem}.", suffix=".wav.tmp",
+                                dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            with wave.open(stream, "wb") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(width)
+                handle.setframerate(int(sample_rate))
+                handle.writeframes(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, target)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+    return str(target)
+
+
+def _encode(samples: np.ndarray, bit_depth: int) -> Tuple[bytes, int]:
+    """PCM bytes and sample width for mono float samples (-1..1)."""
     data = np.asarray(samples, dtype=np.float64).ravel()
     # Clip rather than wrap: a wrapped sample sounds like a gunshot.
     data = np.clip(data, -1.0, 1.0)
@@ -36,13 +85,7 @@ def write_wav(path: str, samples: np.ndarray, sample_rate: int,
     else:
         raw = (data * 2147483647.0).astype("<i4").tobytes()
         width = 4
-
-    with wave.open(str(target), "wb") as handle:
-        handle.setnchannels(1)
-        handle.setsampwidth(width)
-        handle.setframerate(int(sample_rate))
-        handle.writeframes(raw)
-    return str(target)
+    return raw, width
 
 
 def read_wav(path: str) -> Tuple[np.ndarray, int]:

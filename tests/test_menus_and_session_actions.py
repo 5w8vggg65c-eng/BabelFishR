@@ -100,26 +100,44 @@ def test_session_context_menu_by_keyboard_hide_and_one_delete_question(
                 if b.text().startswith("Actions")]
     shown_menus = []
 
-    def read_and_close_popup():
-        popup = QtWidgets.QApplication.activePopupWidget()
-        if popup is not None:
-            shown_menus.append(_texts(popup))
-            popup.close()
+    def record(menu, where):
+        shown_menus.append((_texts(menu), menu))
 
-    window.session_tabs.setCurrentIndex(tab_index_for(window, ops))
+    # Every route ends in the one place menus are shown; recorded there, so
+    # the real key events are routed for real and nothing races a timer.
+    monkeypatch.setattr(window, "_exec_session_menu", record)
+    ops_index = tab_index_for(window, ops)
+    window.session_tabs.setCurrentIndex(ops_index)
     window.activateWindow()
     window.session_tabs.setFocus()
     pump(qt_app)
-    QtCore.QTimer.singleShot(50, read_and_close_popup)
+    assert QtWidgets.QApplication.focusWidget() is window.session_tabs
+
     QTest.keyClick(window.session_tabs, QtCore.Qt.Key_F10, QtCore.Qt.ShiftModifier)
-    pump(qt_app)
-    assert shown_menus and "Hide Session" in shown_menus[0]
-    QtCore.QTimer.singleShot(50, read_and_close_popup)
     QTest.keyClick(window.session_tabs, QtCore.Qt.Key_Menu)
+    # The route macOS can take: a keyboard context-menu event whose position
+    # is over no tab at all.
+    nowhere = QtCore.QPoint(window.session_tabs.width() - 2, window.session_tabs.height() - 2)
+    keyboard = QtGui.QContextMenuEvent(QtGui.QContextMenuEvent.Keyboard, nowhere,
+                                       window.session_tabs.mapToGlobal(nowhere))
+    QtWidgets.QApplication.sendEvent(window.session_tabs, keyboard)
     pump(qt_app)
-    assert len(shown_menus) == 2 and shown_menus[1] == shown_menus[0]
-    assert "Delete Session…" in shown_menus[0]
-    assert "Clear Session History…" in shown_menus[0]
+    assert len(shown_menus) == 3, [m for m, _ in shown_menus]
+    texts = [m for m, _ in shown_menus]
+    assert texts[0] == texts[1] == texts[2]
+    assert "Hide Session" in texts[0] and "Delete Session\u2026" in texts[0]
+    assert "Clear Session History\u2026" in texts[0]
+    assert QtWidgets.QApplication.focusWidget() is window.session_tabs
+
+    # Right-click still opens the menu of the tab under the pointer.
+    general_index = tab_index_for(window, general)
+    window._session_tab_menu(window.session_tabs.tabRect(general_index).center())
+    assert len(shown_menus) == 4
+    assert not menu_action(window, general_index, "Delete Session").isEnabled()
+    disabled = [a for a in shown_menus[3][1].actions()
+                if a.text().startswith("Delete Session")]
+    assert disabled and not disabled[0].isEnabled(), "not General's own menu"
+    monkeypatch.undo()
 
     # Delete Session...: one question; the real dialog's default is Cancel.
     defaults = []
@@ -205,3 +223,34 @@ def test_cleanup_is_offered_only_while_files_are_left_also_after_restart(
     assert not window.cleanup_button.isVisibleTo(window)
     window.close()
     store.close()
+
+
+def test_two_real_keyboard_menus_in_a_row_return_focus(qt_app, config, store, wav):
+    """Real popups: after the first closes, focus is back on the Sessions
+    list by itself, so the next key opens the menu again."""
+    app, window, general, ops, snapshot = two_sessions_window(qt_app, config, store, wav)
+    window.session_tabs.setCurrentIndex(tab_index_for(window, ops))
+    window.activateWindow()
+    window.session_tabs.setFocus()
+    pump(qt_app)
+    shown = []
+
+    def close_popup():
+        popup = QtWidgets.QApplication.activePopupWidget()
+        if popup is None:
+            QtCore.QTimer.singleShot(10, close_popup)      # not open yet: look again
+            return
+        shown.append(_texts(popup))
+        popup.close()
+
+    QtCore.QTimer.singleShot(0, close_popup)
+    QTest.keyClick(window.session_tabs, QtCore.Qt.Key_F10, QtCore.Qt.ShiftModifier)
+    pump(qt_app)
+    assert len(shown) == 1
+    assert QtWidgets.QApplication.focusWidget() is window.session_tabs, \
+        "focus did not come back to the Sessions list"
+    QtCore.QTimer.singleShot(0, close_popup)
+    QTest.keyClick(QtWidgets.QApplication.focusWidget(), QtCore.Qt.Key_Menu)
+    pump(qt_app)
+    assert len(shown) == 2 and shown[0] == shown[1]
+    window.close()

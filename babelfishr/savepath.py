@@ -67,9 +67,14 @@ class SavePathInfo:
     back to); a new watch refuses to start instead."""
     standard_dir: pathlib.Path = pathlib.Path()
     state: str = "standard"
-    """``"standard"``, ``"ok"`` or ``"unavailable"``."""
+    """``"standard"``, ``"ok"``, ``"unavailable"``, or - only from a
+    non-probing read (``probe=False``) of a custom path that has never been
+    checked in this run of the application - ``"unchecked"``."""
     reason: str = ""
     """Why it is unavailable (e.g. :data:`NOT_FOUND`), or ""."""
+    checked_at: Optional[float] = None
+    """``time.time()`` of the preflight this state comes from (None when
+    standard or unchecked)."""
 
     @property
     def is_custom(self) -> bool:
@@ -91,6 +96,7 @@ class SavePathInfo:
                 "effective_dir": str(self.effective_dir),
                 "standard_dir": str(self.standard_dir),
                 "state": self.state, "reason": self.reason,
+                "checked_at": self.checked_at,
                 "is_custom": self.is_custom}
 
 
@@ -122,8 +128,27 @@ def describe(chosen: str, reason: str) -> str:
     return f"Save path {owned_dir(chosen)}: {reason}"
 
 
+class SavePathProblem(OSError):
+    """A destination that is unusable for a reason of its own (a link, a
+    file in the way). ``reason`` is the operator-facing text."""
+
+    def __init__(self, reason: str, path: str = ""):
+        super().__init__(errno.EPERM, reason, path)
+        self.reason = reason
+
+
+def subdir_is_link(name: str) -> str:
+    return f"the {name} folder inside {OWNED_DIRNAME} is a link to somewhere else"
+
+
+def subdir_not_a_folder(name: str) -> str:
+    return f"a file named {name} is in the way inside {OWNED_DIRNAME}"
+
+
 def reason_for(exc: OSError) -> str:
     """The operator-facing reason for a failed write under a chosen folder."""
+    if isinstance(exc, SavePathProblem):
+        return exc.reason
     if exc.strerror in (OWNED_IS_LINK, OWNED_NOT_A_FOLDER, NOT_A_FOLDER,
                         NOT_FOUND):
         return exc.strerror
@@ -135,7 +160,7 @@ def reason_for(exc: OSError) -> str:
         return FULL
     if exc.errno == errno.ENOTDIR:
         return NOT_A_FOLDER
-    return f"cannot be written ({exc.strerror or type(exc).__name__})"
+    return f"not writable ({exc.strerror or type(exc).__name__})"
 
 
 def ensure_owned_dir(chosen: str) -> pathlib.Path:
@@ -150,13 +175,44 @@ def ensure_owned_dir(chosen: str) -> pathlib.Path:
         raise FileNotFoundError(errno.ENOENT, NOT_FOUND, str(base))
     owned = base / OWNED_DIRNAME
     if owned.is_symlink():
-        raise OSError(errno.EPERM, OWNED_IS_LINK, str(owned))
+        raise SavePathProblem(OWNED_IS_LINK, str(owned))
     try:
         os.mkdir(owned)                    # one level: never parents=True
     except FileExistsError:
+        if owned.is_symlink():
+            raise SavePathProblem(OWNED_IS_LINK, str(owned))
         if not owned.is_dir():
-            raise NotADirectoryError(errno.ENOTDIR, OWNED_NOT_A_FOLDER, str(owned))
+            raise SavePathProblem(OWNED_NOT_A_FOLDER, str(owned))
     return owned
+
+
+def _real_within(path: pathlib.Path, root: pathlib.Path) -> bool:
+    real, base = os.path.realpath(path), os.path.realpath(root)
+    return real == base or real.startswith(base.rstrip(os.sep) + os.sep)
+
+
+def contained(owned: pathlib.Path, target: pathlib.Path) -> bool:
+    """Is *target* safely inside *owned*?
+
+    Lexically inside it; no component from *owned* down to *target*
+    (inclusive) is a symbolic link; and its real path lies within the owned
+    folder's real path. Components that do not exist yet are fine.
+    """
+    owned, target = pathlib.Path(owned), pathlib.Path(target)
+    try:
+        relative = target.relative_to(owned)
+    except ValueError:
+        return False
+    if ".." in relative.parts or owned.is_symlink():
+        return False
+    current = owned
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return False
+        if not os.path.lexists(current):
+            break
+    return _real_within(target, owned)
 
 
 def make_within(owned: pathlib.Path, target: pathlib.Path) -> pathlib.Path:
@@ -164,17 +220,33 @@ def make_within(owned: pathlib.Path, target: pathlib.Path) -> pathlib.Path:
 
     Never ``mkdir(parents=True)``: if the drive disappears after the owned
     area was checked, the first missing level fails with FileNotFoundError
-    instead of recreating the whole path on the internal disk.
+    instead of recreating the whole path on the internal disk. A level that
+    is a link, or a file, is refused (SavePathProblem); so is a target whose
+    real path would leave the owned folder.
     """
+    owned, target = pathlib.Path(owned), pathlib.Path(target)
+    if owned.is_symlink():
+        raise SavePathProblem(OWNED_IS_LINK, str(owned))
     relative = target.relative_to(owned)
+    if ".." in relative.parts:
+        raise SavePathProblem(f"{target} is outside {OWNED_DIRNAME}", str(target))
     current = owned
     for part in relative.parts:
         current = current / part
+        if current.is_symlink():
+            raise SavePathProblem(subdir_is_link(str(current.relative_to(owned))),
+                                  str(current))
         try:
             os.mkdir(current)
         except FileExistsError:
+            if current.is_symlink():
+                raise SavePathProblem(subdir_is_link(str(current.relative_to(owned))),
+                                      str(current))
             if not current.is_dir():
-                raise NotADirectoryError(errno.ENOTDIR, NOT_A_FOLDER, str(current))
+                raise SavePathProblem(subdir_not_a_folder(str(current.relative_to(owned))),
+                                      str(current))
+    if not _real_within(target, owned):
+        raise SavePathProblem(subdir_is_link(str(relative)), str(target))
     return target
 
 
@@ -184,14 +256,43 @@ def ensure_subdir(chosen: str, *parts: str) -> pathlib.Path:
     return make_within(owned, owned.joinpath(*parts))
 
 
+def probe_dir(directory: pathlib.Path) -> None:
+    """Prove *directory* takes a write the way recordings and transcripts
+    are written: a uniquely named temporary file created there, flushed to
+    disk, renamed atomically (to another unique name derived from it) and
+    deleted. Only the file created here is ever removed; there is no fixed
+    file name, so concurrent probes cannot interfere. Raises OSError."""
+    fd, temp = tempfile.mkstemp(prefix=".babelfishr-probe-", suffix=".tmp",
+                                dir=str(directory))
+    current = temp
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(b"BabelFishR write check\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        moved = temp[:-len(".tmp")] + ".ok"
+        os.replace(temp, moved)
+        current = moved
+    finally:
+        try:
+            os.unlink(current)
+        except FileNotFoundError:
+            pass
+
+
+#: The data folders inside the owned area that a preflight also proves.
+DATA_DIRNAMES = (RECORDINGS_DIRNAME, TRANSCRIPTS_DIRNAME)
+
+
 def preflight(chosen: str) -> str:
-    """Can new recordings be written under *chosen* right now?
+    """Can new recordings and transcripts be written under *chosen* now?
 
     Returns "" when they can, otherwise the concrete reason. Checks that the
     folder exists and is a folder, creates the owned area beneath it if
-    needed, then writes a temporary file there, moves it into place
-    atomically and deletes it - the same operations a recording and a
-    portable transcript use.
+    needed (never the folder itself or its parents), and probes the owned
+    area and each data folder that already exists in it (recordings/,
+    transcripts/) with a uniquely named temporary file. A data folder that
+    is a link or a file is a failure. Safe to call from several threads.
     """
     if not chosen:
         return ""
@@ -209,28 +310,26 @@ def preflight(chosen: str) -> str:
         return OWNED_NOT_A_FOLDER
     try:
         owned = ensure_owned_dir(chosen)
-    except OSError as exc:
-        return reason_for(exc)
-    temp = None
-    try:
-        fd, temp = tempfile.mkstemp(prefix=".babelfishr-probe-", dir=str(owned))
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(b"BabelFishR write check\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        final = owned / ".babelfishr-write-check"
-        os.replace(temp, final)
-        temp = str(final)
-        os.unlink(final)
-        temp = None
-    except OSError as exc:
-        return reason_for(exc)
-    finally:
-        if temp is not None:
+        probe_dir(owned)
+        for name in DATA_DIRNAMES:
+            directory = owned / name
+            if directory.is_symlink():
+                return subdir_is_link(name)
+            if not os.path.lexists(directory):
+                continue           # created, one level, when first needed
+            if not directory.is_dir():
+                return subdir_not_a_folder(name)
+            if not _real_within(directory, owned):
+                return subdir_is_link(name)
             try:
-                os.unlink(temp)
-            except OSError:
-                pass
+                probe_dir(directory)
+            except OSError as exc:
+                reason = reason_for(exc)
+                if reason == NOT_FOUND:
+                    return reason
+                return f"the {name} folder inside {OWNED_DIRNAME} is {reason}"
+    except OSError as exc:
+        return reason_for(exc)
     return ""
 
 

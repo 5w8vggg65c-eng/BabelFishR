@@ -283,6 +283,13 @@ class BabelFishRApp:
         #: closing the store - never has to read the database for it.
         self._save_path_cache: Dict[str, str] = {}
         self._default_conversation_cache = ""
+        #: The last preflight result per chosen folder: {chosen: (reason,
+        #: time.time())}. Written by every probing call (readiness, choose,
+        #: start, a probing save_path_info) and by the capture's fallback /
+        #: restored reports; read by save_path_info(probe=False).
+        self._preflight_results: Dict[str, tuple] = {}
+        self._preflight_lock = threading.Lock()
+        self.events.subscribe(self._on_save_path_event)
         try:
             for conversation_id, (chosen, is_default) in \
                     self.store.conversation_save_paths().items():
@@ -291,6 +298,10 @@ class BabelFishRApp:
                     self._default_conversation_cache = conversation_id
         except Exception:  # noqa: BLE001 - filled in as Sessions are read
             log.debug("could not read Session save paths", exc_info=True)
+        # Portable transcripts that could not be saved last time (a drive
+        # unplugged): written now if their drive is back. On the writer
+        # thread; nothing here touches the drive.
+        self.portable.requeue_failed()
 
     # -- setup -----------------------------------------------------------
     def glossary_path(self) -> pathlib.Path:
@@ -1396,9 +1407,48 @@ class BabelFishRApp:
         return chosen
 
     def _standard_dir(self) -> pathlib.Path:
-        return pathlib.Path(self.config.recording.directory).expanduser()
+        return self.config.recordings_path()
 
-    def save_path_info(self, conversation_id: Optional[str] = None) -> SavePathInfo:
+    def _probe_save_path(self, chosen: str) -> str:
+        """Preflight *chosen* now, remember the result, and on success queue
+        its unsaved portable transcripts again (on the writer thread)."""
+        from . import savepath
+
+        reason = savepath.preflight(chosen)
+        self._record_preflight(chosen, reason)
+        return reason
+
+    def _record_preflight(self, chosen: str, reason: str) -> None:
+        import time
+
+        if not chosen:
+            return
+        with self._preflight_lock:
+            self._preflight_results[chosen] = (reason, time.time())
+        if not reason:
+            self.portable.requeue_failed(chosen)
+
+    def _on_save_path_event(self, event) -> None:
+        """The capture's own reports update the last known state too."""
+        if event.kind != "save-path":
+            return
+        payload = event.payload or {}
+        state, chosen = payload.get("state"), payload.get("chosen", "")
+        if not chosen:
+            return
+        if state == "fallback":
+            import time
+
+            with self._preflight_lock:
+                self._preflight_results[chosen] = (payload.get("reason", ""), time.time())
+        elif state == "restored":
+            import time
+
+            with self._preflight_lock:
+                self._preflight_results[chosen] = ("", time.time())
+
+    def save_path_info(self, conversation_id: Optional[str] = None, *,
+                       probe: bool = True) -> SavePathInfo:
         """Where this Session's new recordings go, and whether that works.
 
         *conversation_id* defaults to the Session being viewed. Returns a
@@ -1415,9 +1465,17 @@ class BabelFishRApp:
           (e.g. "not found (drive ejected or folder removed)", "read-only");
         * ``is_custom``.
 
-        Checking it runs the same preflight as choosing it (a temporary file
-        is written and removed inside the BabelFishR folder); it never
-        creates the chosen folder.
+        With ``probe=True`` (the default) this runs the same preflight as
+        choosing it - uniquely named temporary files written, synced and
+        removed in the BabelFishR folder and its data folders - and records
+        the result. That touches the drive: keep it off the window's
+        render path. ``probe=False`` does no I/O on the destination at all
+        (one database read for the Session's choice) and returns the last
+        recorded result - from readiness, set_save_path, start_session, a
+        probing call, or the capture's fallback/restored report - with
+        ``checked_at`` set; a custom path never checked in this run of the
+        application reads ``state="unchecked"``, ``reason=""``, and its
+        intended ``effective_dir`` (``<chosen>/BabelFishR/recordings``).
         """
         from . import savepath
 
@@ -1427,14 +1485,24 @@ class BabelFishRApp:
         if not chosen:
             return SavePathInfo(chosen="", owned_dir=None, effective_dir=standard,
                                 standard_dir=standard, state="standard")
-        reason = savepath.preflight(chosen)
+        if probe:
+            self._probe_save_path(chosen)
+        with self._preflight_lock:
+            known = self._preflight_results.get(chosen)
+        if known is None:
+            return SavePathInfo(chosen=chosen, owned_dir=savepath.owned_dir(chosen),
+                                effective_dir=savepath.recordings_dir(chosen),
+                                standard_dir=standard, state="unchecked")
+        reason, checked_at = known
         if not reason:
             return SavePathInfo(chosen=chosen, owned_dir=savepath.owned_dir(chosen),
                                 effective_dir=savepath.recordings_dir(chosen),
-                                standard_dir=standard, state="ok")
+                                standard_dir=standard, state="ok",
+                                checked_at=checked_at)
         return SavePathInfo(chosen=chosen, owned_dir=savepath.owned_dir(chosen),
                             effective_dir=standard, standard_dir=standard,
-                            state="unavailable", reason=reason)
+                            state="unavailable", reason=reason,
+                            checked_at=checked_at)
 
     def save_path_locked(self, conversation_id: str) -> bool:
         """Monitoring is recording into this Session: its destination is
@@ -1472,11 +1540,11 @@ class BabelFishRApp:
             if not chosen:
                 raise SavePathError(
                     f"Save path {folder}: {savepath.NOT_ABSOLUTE}")
-            reason = savepath.preflight(chosen)
+            reason = self._probe_save_path(chosen)
             if reason:
                 raise SavePathError(savepath.describe(chosen, reason))
         self.store.set_conversation_save_path(conversation_id, chosen)
-        info = self.save_path_info(conversation_id)
+        info = self.save_path_info(conversation_id, probe=False)
         self.events.publish("save-path", {
             "state": "changed", "conversation_id": conversation_id,
             "chosen": chosen, "path": str(info.effective_dir), "reason": "",
@@ -1495,7 +1563,7 @@ class BabelFishRApp:
 
         conversation_id = conversation_id or self.conversation_id
         chosen = self._chosen_save_path(conversation_id)
-        if chosen and not savepath.preflight(chosen):
+        if chosen and not self._probe_save_path(chosen):
             try:
                 return savepath.ensure_subdir(chosen, savepath.EXPORTS_DIRNAME)
             except OSError:
@@ -1511,7 +1579,7 @@ class BabelFishRApp:
 
         chosen = self._chosen_save_path(conversation_id)
         if chosen:
-            reason = savepath.preflight(chosen)
+            reason = self._probe_save_path(chosen)
             if reason:
                 raise SavePathError(
                     savepath.describe(chosen, reason) + ". Monitoring did not "
@@ -1847,9 +1915,17 @@ class BabelFishRApp:
             # The selected Session's actual destination, not only the
             # standard Recordings folder.
             extra["save_path"] = chosen
-        return field_check(self.config, run_smoke_tests=run_smoke_tests,
-                           mode=self.mode, microphone_permission=microphone_permission,
-                           **extra)
+        report = field_check(self.config, run_smoke_tests=run_smoke_tests,
+                             mode=self.mode, microphone_permission=microphone_permission,
+                             **extra)
+        if chosen:
+            # This worker's probe is the latest known state of the path, for
+            # save_path_info(probe=False) and the transcript requeue.
+            check = report.get("Recording directory writable")
+            data = getattr(check, "data", None) or {}
+            if data.get("save_path") == chosen:
+                self._record_preflight(chosen, data.get("reason", ""))
+        return report
 
     def correct(self, tx_id: str, transcript: Optional[str] = None,
                 translation: Optional[str] = None,

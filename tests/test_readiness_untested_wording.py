@@ -74,8 +74,12 @@ def _dialog(qt_app, config, store):  # noqa: F811
 
 def test_the_dialog_says_not_checked_yet_for_an_untested_prepared_computer(
         qt_app, config, store):  # noqa: F811
+    from babelfishr.modes import OperatingMode
+
     dialog = _dialog(qt_app, config, store)
-    dialog._render(report())
+    untested = report()
+    untested.mode = OperatingMode.ONLINE_SETUP     # Offline Field Use: its own verdict
+    dialog._render(untested)
     assert dialog.headline.text() == "Prepared - not checked yet"
     assert "not available" not in dialog.subtitle.text()
     assert "Record Only" not in dialog.subtitle.text()
@@ -84,8 +88,12 @@ def test_the_dialog_says_not_checked_yet_for_an_untested_prepared_computer(
 
 
 def test_the_dialog_names_each_stage_when_partly_ready(qt_app, config, store):  # noqa: F811
+    from babelfishr.modes import OperatingMode
+
     dialog = _dialog(qt_app, config, store)
-    dialog._render(report(asr_present=False))
+    partly = report(asr_present=False)
+    partly.mode = OperatingMode.RECORD_ONLY
+    dialog._render(partly)
     assert dialog.headline.text() == "Partly ready - recording works"
     subtitle = dialog.subtitle.text()
     assert "Transcription: not available yet" in subtitle
@@ -104,3 +112,13 @@ def test_the_badge_detail_names_each_stage(qt_app, config, store):  # noqa: F811
     assert "translation installed, not checked yet" in detail
     assert "not the operating mode" in detail
     window.close()
+
+
+def test_in_offline_field_use_the_dialog_gives_the_marks_verdict(qt_app, config, store):  # noqa: F811
+    """Untested is not a tick: in Offline Field Use the dialog's headline is
+    the same red cross as the mark, naming what was not verified."""
+    dialog = _dialog(qt_app, config, store)
+    dialog._render(report())
+    assert dialog.headline.text() == "\u2715 Not ready for Offline Field Use"
+    assert "not verified" in dialog.subtitle.text()
+    dialog.close()

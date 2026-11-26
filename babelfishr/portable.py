@@ -20,6 +20,14 @@ the row as ``signal_metadata["portable_transcript"] = {"state": "failed",
 "path", "reason", "at"}`` and announced as a ``save-path`` event with state
 ``"transcript-failed"``. The next successful write clears the flag and
 announces ``"transcript-saved"``.
+
+Failed transcripts are not left waiting for the next edit: whenever their
+save path is seen working again - the capture's "restored" report, a
+successful preflight by readiness, choosing the path or starting a watch -
+and once at launch, the recorded failures for that path are queued again
+(bounded, each message at most once, on the writer thread). Every path
+written or removed must be safely inside the owned folder: no link
+anywhere from ``<chosen>/BabelFishR`` down, real path inside its real path.
 """
 
 from __future__ import annotations
@@ -42,6 +50,9 @@ FORMAT = "babelfishr.portable-transcript.v1"
 #: signal_metadata key set on a transmission whose portable transcript could
 #: not be written. Removed again once a write succeeds.
 FAILURE_KEY = "portable_transcript"
+
+#: At most this many recorded failures are queued again per restoration.
+REQUEUE_LIMIT = 2000
 
 
 def sidecar_path(chosen: str, tx: Transmission, session: Session,
@@ -145,6 +156,11 @@ class PortableTranscripts:
         self._runs.add(session_id)
 
     def _on_event(self, event) -> None:
+        if event.kind == "save-path":
+            payload = event.payload or {}
+            if payload.get("state") == "restored" and payload.get("chosen"):
+                self.requeue_failed(payload["chosen"])
+            return
         if event.kind not in ("transmission", "updated"):
             return
         payload = event.payload
@@ -155,6 +171,16 @@ class PortableTranscripts:
     def request(self, tx_id: str) -> None:
         """Write (or rewrite) *tx_id*'s portable transcript soon."""
         self._put(("write", tx_id))
+
+    def requeue_failed(self, chosen: Optional[str] = None) -> None:
+        """Write again, soon, every portable transcript recorded as not
+        saved - for runs started with *chosen*, or all of them. Done on the
+        writer thread: it reads the recorded failures (bounded by
+        :data:`REQUEUE_LIMIT`), checks each save path once, and queues each
+        message at most once. Unavailable paths are left for next time."""
+        if not chosen and not self._runs and not self.failures:
+            return                     # no run ever used a save path
+        self._put(("requeue", chosen or ""))
 
     def remove(self, path: pathlib.Path, chosen: str) -> None:
         """Delete one portable transcript file soon (a deleted message)."""
@@ -212,6 +238,8 @@ class PortableTranscripts:
                 kind, value = item
                 if kind == "write":
                     self._write(value)
+                elif kind == "requeue":
+                    self._requeue(value)
                 else:
                     self._remove(*value)
             except Exception:  # noqa: BLE001 - one bad row must not stop the writer
@@ -220,6 +248,21 @@ class PortableTranscripts:
                 with self._cond:
                     self._busy = False
                     self._cond.notify_all()
+
+    def _requeue(self, chosen: str) -> None:
+        pending = list(self.store.failed_portable_transcripts(
+            chosen or None, limit=REQUEUE_LIMIT))
+        known = {tx_id for tx_id, _ in pending}
+        for tx_id, failure in list(self.failures.items()):
+            path = failure.get("chosen", "")
+            if tx_id not in known and path and (not chosen or path == chosen):
+                pending.append((tx_id, path))
+        usable: Dict[str, bool] = {}
+        for tx_id, path in pending[:REQUEUE_LIMIT]:
+            if path not in usable:
+                usable[path] = not savepath.preflight(path)
+            if usable[path]:
+                self.request(tx_id)
 
     def _write(self, tx_id: str) -> None:
         tx = self.store.get_transmission(tx_id)
@@ -236,11 +279,14 @@ class PortableTranscripts:
                                  conversation.name if conversation else "")
         try:
             owned = savepath.ensure_owned_dir(chosen)
-            savepath.make_within(owned, path.parent)
+            savepath.make_within(owned, path.parent)   # refuses links
+            if not savepath.contained(owned, path):
+                raise savepath.SavePathProblem(
+                    savepath.subdir_is_link(savepath.TRANSCRIPTS_DIRNAME), str(path))
             savepath.write_json_atomic(
                 path, json.dumps(record, indent=2, ensure_ascii=False) + "\n")
         except OSError as exc:
-            self._failed(tx, path, savepath.reason_for(exc))
+            self._failed(tx, path, savepath.reason_for(exc), chosen)
             return
         if tx_id in self.failures or FAILURE_KEY in (tx.signal_metadata or {}):
             self.failures.pop(tx_id, None)
@@ -250,10 +296,11 @@ class PortableTranscripts:
                 "path": str(path), "reason": "",
                 "message": f"The portable transcript was saved to {path}."})
 
-    def _failed(self, tx: Transmission, path: pathlib.Path, reason: str) -> None:
+    def _failed(self, tx: Transmission, path: pathlib.Path, reason: str,
+                chosen: str) -> None:
         log.error("portable transcript %s was not saved: %s", path, reason)
         failure = {"state": "failed", "path": str(path), "reason": reason,
-                   "at": iso(utcnow())}
+                   "chosen": chosen, "at": iso(utcnow())}
         first = tx.id not in self.failures
         self.failures[tx.id] = failure
         try:
@@ -270,11 +317,16 @@ class PortableTranscripts:
 
     def _remove(self, path: str, chosen: str) -> None:
         target = pathlib.Path(path)
-        root = savepath.transcripts_dir(chosen)
+        owned = savepath.owned_dir(chosen)
         try:
-            target.relative_to(root)
+            target.relative_to(savepath.transcripts_dir(chosen))
         except ValueError:
-            return                     # only ever inside the owned area
+            return                     # only ever inside the transcripts area
+        # No link anywhere from the owned folder down, and the real path
+        # inside the owned folder's real path - as storage's ownership rules.
+        if not savepath.contained(owned, target):
+            log.warning("not removing %s: it is not safely inside %s", path, owned)
+            return
         try:
             if target.is_symlink() or not target.is_file():
                 return

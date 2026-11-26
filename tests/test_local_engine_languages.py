@@ -157,3 +157,35 @@ def wav_path(tmp_path):
 
     return build_fixture([{"gap": 0.5}, {"kind": "voice", "duration": 1.0, "level_dbfs": -14},
                           {"gap": 0.5}], sample_rate=16_000).write(str(tmp_path / "one.wav"))
+
+
+def test_the_labels_say_which_control_is_which(qt_app, setup):
+    window, _ = setup
+    left = window.sidebar.widget()
+    buddies = {label.buddy(): label.text() for label in left.findChildren(QtWidgets.QLabel)
+               if label.buddy() is not None}
+    assert buddies[window.source_mode_box] == "Language detection"
+    assert buddies[window.source_language_box] == "Source language"
+
+
+def test_session_options_has_no_no_profile_row_but_shows_a_real_profile(qt_app, setup):
+    from babelfishr.models import RadioProfile
+
+    window, _ = setup
+    window.session_options_dialog.show()
+    pump(qt_app)
+    shown = [w.text() for w in window.session_options_dialog.findChildren(QtWidgets.QLabel)
+             if w.isVisibleTo(window.session_options_dialog)]
+    assert not any("No profile selected" in t or "no channel or frequency" in t
+                   for t in shown)
+    assert not window.channel_label.isVisibleTo(window.session_options_dialog)
+    profile = window.app.save_profile(RadioProfile(name="UV-5R", channel_name="GMRS 16"))
+    window._refresh_profiles()
+    window.profile_box.setCurrentIndex(window.profile_box.findData(profile.id))
+    pump(qt_app)
+    assert window.channel_label.isVisibleTo(window.session_options_dialog)
+    assert "UV-5R" in window.channel_label.text()
+    window.profile_box.setCurrentIndex(0)                 # back to no profile
+    assert not window.channel_label.isVisibleTo(window.session_options_dialog)
+    assert window.calibrate_button.isVisibleTo(window)
+    window.session_options_dialog.hide()

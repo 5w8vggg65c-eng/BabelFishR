@@ -120,12 +120,15 @@ def test_main_window_states_and_banners(qt_app, config, store):
     window.close()
 
 
-def test_main_window_warns_when_no_profile_is_selected(qt_app, config, store):
+def test_no_profile_adds_no_explanatory_row(qt_app, config, store):
+    """Operator request: without a radio profile there is no "No profile
+    selected - ... cannot determine ..." row (the Radio profile control
+    says it); a chosen profile's metadata is still shown."""
     from babelfishr.app import BabelFishRApp
     from babelfishr.ui.main_window import MainWindow
 
     window = MainWindow(BabelFishRApp(config=config, store=store))
-    assert "cannot determine" in window.channel_label.text()
+    assert window.channel_label.text() == "" and window.channel_label.isHidden()
     window.close()
 
 

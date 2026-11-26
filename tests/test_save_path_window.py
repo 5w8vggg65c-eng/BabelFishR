@@ -209,3 +209,28 @@ def test_the_choice_survives_a_relaunch(qt_app, window, drive, monkeypatch, conf
     finally:
         again.close()
         store.close()
+
+
+def test_the_tooltip_says_what_stays_on_this_computer(qt_app, window, drive, monkeypatch):
+    choose(monkeypatch, window, drive)
+    window.app.config.audio.safety_recording.enabled = False
+    window._refresh_save_path_row()
+    assert "shared message index and settings" in window.save_path_label.toolTip()
+    assert "safety buffer" not in window.save_path_label.toolTip()
+    window.app.config.audio.safety_recording.enabled = True
+    window._refresh_save_path_row()
+    assert "rolling safety buffer" in window.save_path_label.toolTip()
+
+
+def test_drawing_the_row_never_probes_the_drive(qt_app, window, drive, monkeypatch):
+    import babelfishr.savepath as savepath
+
+    choose(monkeypatch, window, drive)
+    probes = []
+    real = savepath.probe_dir
+    monkeypatch.setattr(savepath, "probe_dir", lambda *a, **k: probes.append(a) or real(*a, **k))
+    for _ in range(5):
+        window._refresh_save_path_row()
+    window._refresh_context_lines()
+    assert probes == [], "the window probed the drive while drawing"
+    assert str(drive) in window.save_path_label.text()

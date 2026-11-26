@@ -41,7 +41,7 @@ from .audio.meter import LevelMeter, LevelReading
 from .audio.safety import SafetyRecorder
 from .audio.source import AudioBlock, AudioSource, ReplayAudioSource
 from .audio.spectrum import SpectrumAnalyzer
-from .audio.wavefile import write_wav
+from .audio.wavefile import write_wav, write_wav_atomic
 from . import savepath
 from .config import Config
 from .detect import DetectedTransmission, RadioActivityDetector
@@ -199,18 +199,16 @@ class DestinationRecorder(Recorder):
         target = self.path_for(tx, session)
         try:
             owned = savepath.ensure_owned_dir(self.chosen)
-            # Each level below the owned area, never its parents.
+            # Each level below the owned area, never its parents, and never
+            # through a link. The WAV itself creates no folder: a temporary
+            # file in the target folder, moved into place (only that
+            # temporary file is removed on failure).
             savepath.make_within(owned, target.parent)
-            path = write_wav(str(target), audio, sample_rate, self.bit_depth)
+            path = write_wav_atomic(str(target), audio, sample_rate, self.bit_depth)
         except OSError as exc:
             reason = savepath.reason_for(exc)
             log.error("could not write recording %s on the chosen save path "
                       "(%s); using the local Recordings folder", target, reason)
-            try:
-                if target.is_file():
-                    target.unlink()        # a partial file is not a recording
-            except OSError:
-                pass
         else:
             if self.falling_back:
                 self.falling_back, self.reason = False, ""

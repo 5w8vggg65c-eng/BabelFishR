@@ -610,7 +610,13 @@ class Config:
         return AppPaths.resolve(self.app_home)
 
     def recordings_path(self) -> pathlib.Path:
-        return pathlib.Path(self.recording.directory).expanduser()
+        """The standard recordings folder new recordings actually go to:
+        ``recording.directory`` when set (it is, once runtime paths are
+        resolved), else the managed ``AppPaths.recordings``. The one
+        resolver the application, readiness and exports use for it."""
+        if self.recording.directory:
+            return pathlib.Path(self.recording.directory).expanduser()
+        return self.paths().recordings
 
     def glossary_file(self) -> pathlib.Path:
         if self.translate.glossary_path:

@@ -896,6 +896,25 @@ class Store:
                 "SELECT id, save_path, is_default FROM conversations").fetchall()
         return {row[0]: (row[1] or "", bool(row[2])) for row in rows}
 
+    def failed_portable_transcripts(self, chosen: Optional[str] = None,
+                                    limit: int = 1000) -> List[Tuple[str, str]]:
+        """(transmission id, save path) for messages whose portable
+        transcript is recorded as not saved, oldest first, at most *limit*;
+        only those of runs started with *chosen* when it is given."""
+        sql = ("SELECT t.id, s.save_path FROM transmissions t "
+               "JOIN sessions s ON s.id = t.session_id "
+               "WHERE s.save_path != '' AND json_extract(t.signal_metadata, "
+               "'$.portable_transcript.state') = 'failed'")
+        params: List[Any] = []
+        if chosen:
+            sql += " AND s.save_path = ?"
+            params.append(chosen)
+        sql += " ORDER BY t.started_at LIMIT ?"
+        params.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [(row[0], row[1]) for row in rows]
+
     def custom_save_runs(self) -> List[str]:
         """Ids of the monitoring runs that were started with a save path."""
         with self._lock:
