@@ -551,3 +551,230 @@ def test_gui_transfers_make_no_network_call_in_restricted_modes(
         prepare_field_job(window.app.config, TURBO, [("es", "en")])
     assert spies.calls == []
     assert not registry().active()
+
+
+# ---- engine-level downloads (a Whisper engine fetching on first load) --------
+@pytest.fixture
+def held_engine_download(monkeypatch):
+    """The real engine factory and load path; only prepare_model (the
+    provider's download internals) is held on an Event."""
+    import babelfishr.providers.whisper_local as whisper_local
+    from babelfishr.download_progress import DownloadCancelled
+
+    state = types.SimpleNamespace(release=threading.Event(),
+                                  started=threading.Event(),
+                                  honour_cancel=True, saw_cancel=False,
+                                  outcome=None)
+
+    def prepare_model(name, models_root, local_files_only=False,
+                      cancelled=None, **_kw):
+        assert not local_files_only
+        state.started.set()
+        while not state.release.wait(0.01):
+            if cancelled is not None and cancelled():
+                state.saw_cancel = True
+                if state.honour_cancel:
+                    raise DownloadCancelled("cancelled")
+        raise OSError("stand-in network finished without a model")
+
+    monkeypatch.setattr(whisper_local, "prepare_model", prepare_model)
+    monkeypatch.setitem(sys.modules, "faster_whisper",
+                        types.SimpleNamespace(WhisperModel=object))
+    yield state
+    state.release.set()
+
+
+def _start_engine_load(app, state):
+    from babelfishr.providers import build_transcription_engine
+
+    engine = build_transcription_engine(app.config, requested="faster-whisper",
+                                        mode=OperatingMode.ONLINE_SETUP)
+    assert engine.local_files_only is False
+
+    def load():
+        try:
+            engine.preload()
+            state.outcome = "loaded"
+        except BaseException as exc:  # noqa: BLE001
+            state.outcome = f"{type(exc).__name__}: {exc}"
+
+    thread = threading.Thread(target=load, daemon=True)
+    thread.start()
+    assert state.started.wait(5), "the engine never started its download"
+    assert registry().busy, "the engine's download is not accounted for"
+    return thread
+
+
+@pytest.mark.parametrize("mode", RESTRICTED)
+def test_engine_download_holds_the_switch_until_cancelled(app, held_engine_download,
+                                                         mode):
+    thread = _start_engine_load(app, held_engine_download)
+    held_engine_download.honour_cancel = False         # not yet
+    transition = app.request_mode(mode.value, timeout=10)
+    assert transition.pending
+    time.sleep(0.05)
+    assert held_engine_download.saw_cancel, "the owner's cancel did not reach it"
+    assert app.mode is OperatingMode.ONLINE_SETUP
+    assert saved_mode(app) == OperatingMode.ONLINE_SETUP.value
+    held_engine_download.honour_cancel = True
+    assert transition.wait() == ModeTransition.DONE
+    thread.join(5)
+    assert "Cancelled" in held_engine_download.outcome
+    assert app.mode is mode and saved_mode(app) == mode.value
+
+
+def test_engine_download_that_will_not_stop_declines_the_switch(
+        app, held_engine_download):
+    thread = _start_engine_load(app, held_engine_download)
+    held_engine_download.honour_cancel = False
+    with pytest.raises(ModeChangeRefused) as refused:
+        app.set_mode(OperatingMode.FIELD_OFFLINE.value, timeout=0.3)
+    assert "A download is still finishing" in str(refused.value)
+    assert "the Whisper model" in str(refused.value)
+    assert app.mode is OperatingMode.ONLINE_SETUP
+    assert saved_mode(app) == OperatingMode.ONLINE_SETUP.value
+    assert not registry().restricted
+    held_engine_download.release.set()
+    thread.join(5)
+    assert not registry().busy
+
+
+def test_restricted_engine_is_not_wrapped_and_never_downloads(app, monkeypatch):
+    from babelfishr.providers import EngineUnavailable, build_transcription_engine
+
+    spies = NetworkSpies(monkeypatch)
+    monkeypatch.setitem(sys.modules, "faster_whisper",
+                        types.SimpleNamespace(WhisperModel=object))
+    engine = build_transcription_engine(app.config, requested="faster-whisper",
+                                        mode=OperatingMode.ONLINE_SETUP)
+    engine.local_files_only = True                     # as Field Offline builds it
+    with pytest.raises(EngineUnavailable):
+        engine._load()
+    assert spies.calls == []
+
+
+# ---- the Setup Assistant's mode changes --------------------------------------
+def _ready_payload():
+    from babelfishr.preparation import ASR_STEP, PreparationResult
+    from babelfishr.readiness import Check, CheckStatus, ReadinessReport
+
+    result = PreparationResult()
+    result.add(ASR_STEP, True, "small ok")
+    result.add("Language pack es->en", True, "installed")
+    ready = ReadinessReport()
+    for name in ("Audio backend", "Recording directory writable",
+                 "Local transcription smoke test", "Local translation smoke test"):
+        ready.add(Check(name, CheckStatus.PASS, ""))
+    return {"preparation": result, "readiness": ready, "asr_model": "small",
+            "language_pairs": [("es", "en")]}
+
+
+def _assistant(parent_window=None, app=None):
+    from PySide6 import QtWidgets
+
+    from babelfishr.ui.setup_assistant import SetupAssistant
+
+    dialog = SetupAssistant(app or parent_window.app, parent_window)
+    dialog.done_with = None
+    dialog.finished.connect(lambda code: setattr(dialog, "done_with", code))
+    assert dialog.result() != QtWidgets.QDialog.Accepted
+    return dialog
+
+
+def _saved_setup(app):
+    from babelfishr.config import Config
+
+    return Config.load(str(app.config.settings_path())).setup
+
+
+def test_assistant_record_only_through_the_window(qt_app, window):
+    from PySide6 import QtWidgets
+
+    dialog = _assistant(window)
+    dialog._record_only()
+    assert dialog.result() == QtWidgets.QDialog.Accepted
+    assert window.app.mode is OperatingMode.RECORD_ONLY
+    assert saved_mode(window.app) == OperatingMode.RECORD_ONLY.value
+    assert _saved_setup(window.app).record_only_acknowledged
+    assert "RECORD ONLY" in window.mode_button.text()
+
+
+def test_assistant_record_only_waits_for_a_running_download(qt_app, window,
+                                                            held_download):
+    from PySide6 import QtWidgets
+
+    held_download.honour_cancel = False
+    _start_held_install(qt_app, window, held_download)
+    dialog = _assistant(window)
+    dialog._record_only()
+    # Handed to the window, which waits: the dialog closes, nothing is shown
+    # or saved as Record Only yet.
+    assert dialog.result() == QtWidgets.QDialog.Accepted
+    assert window.app.mode is OperatingMode.ONLINE_SETUP
+    assert saved_mode(window.app) == OperatingMode.ONLINE_SETUP.value
+    assert not _saved_setup(window.app).record_only_acknowledged
+    assert "ONLINE" in window.mode_button.text()
+    held_download.release.set()
+    assert pump_until(qt_app, lambda: window.app.mode is OperatingMode.RECORD_ONLY)
+    assert saved_mode(window.app) == OperatingMode.RECORD_ONLY.value
+    assert pump_until(qt_app, lambda: window._install_worker is None)
+    assert not registry().restricted
+
+
+def test_assistant_switches_to_offline_after_preparation(qt_app, window,
+                                                         held_download):
+    held_download.honour_cancel = False
+    _start_held_install(qt_app, window, held_download)
+    dialog = _assistant(window)
+    dialog._finished(_ready_payload())
+    assert dialog.status_label.text() == "Ready for offline field use"
+    assert window.app.config.setup.completed
+    assert window.app.mode is OperatingMode.ONLINE_SETUP, "offline shown early"
+    assert saved_mode(window.app) == OperatingMode.ONLINE_SETUP.value
+    held_download.release.set()
+    assert pump_until(qt_app,
+                      lambda: window.app.mode is OperatingMode.FIELD_OFFLINE)
+    assert saved_mode(window.app) == OperatingMode.FIELD_OFFLINE.value
+    assert "OFFLINE FIELD USE" in window.mode_button.text()
+    assert pump_until(qt_app, lambda: window._install_worker is None)
+
+
+def test_assistant_switches_to_offline_at_once_when_nothing_runs(qt_app, window):
+    dialog = _assistant(window)
+    dialog._finished(_ready_payload())
+    assert window.app.mode is OperatingMode.FIELD_OFFLINE
+    assert saved_mode(window.app) == OperatingMode.FIELD_OFFLINE.value
+
+
+def test_assistant_without_a_window_refuses_record_only_and_stays_open(
+        qt_app, app):
+    from PySide6 import QtWidgets
+
+    held = HeldTransfer(honour_cancel=False)
+    dialog = _assistant(app=app)
+    dialog._record_only()
+    assert dialog.result() != QtWidgets.QDialog.Accepted and dialog.done_with is None
+    text = dialog.log_view.toPlainText()
+    assert "The mode was not changed: A download is still finishing" in text
+    assert "Record Only was not turned on" in text
+    assert app.mode is OperatingMode.ONLINE_SETUP
+    assert saved_mode(app) == OperatingMode.ONLINE_SETUP.value
+    assert not _saved_setup(app).record_only_acknowledged
+    assert not registry().restricted
+    held.finish()
+    dialog._record_only()                              # nothing running now
+    assert dialog.result() == QtWidgets.QDialog.Accepted
+    assert app.mode is OperatingMode.RECORD_ONLY
+
+
+def test_assistant_without_a_window_reports_a_declined_offline_switch(qt_app, app):
+    held = HeldTransfer(honour_cancel=False)
+    dialog = _assistant(app=app)
+    dialog._finished(_ready_payload())
+    text = dialog.log_view.toPlainText()
+    assert "The mode was not changed: A download is still finishing" in text
+    assert "Offline Field Use was not turned on" in text
+    assert app.mode is OperatingMode.ONLINE_SETUP
+    assert saved_mode(app) == OperatingMode.ONLINE_SETUP.value
+    assert not registry().restricted
+    held.finish()
