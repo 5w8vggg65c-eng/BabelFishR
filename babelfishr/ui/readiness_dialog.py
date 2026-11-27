@@ -9,6 +9,11 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from ..readiness import Check, CheckStatus
 
 
+#: How long a check may run before the dialog says it did not finish.
+STALL_LIMIT_S = 240
+QUICK_STALL_LIMIT_S = 45
+
+
 class ReadinessDialog(QtWidgets.QDialog):
     """Runs Field Check and shows it as a scannable list with remedies."""
 
@@ -19,6 +24,9 @@ class ReadinessDialog(QtWidgets.QDialog):
         always agree with the mark; Re-check runs a new one."""
         super().__init__(parent)
         self.app = app
+        from . import theme
+
+        theme.style_window(self)          # the console's look, light or dark
         self.setWindowTitle("Field readiness")
         self.resize(720, 620)
 
@@ -84,32 +92,61 @@ class ReadinessDialog(QtWidgets.QDialog):
         self.subtitle.setText(
             "Loading models and running real smoke tests."
             if run_smoke_tests else "Checking audio, storage and engines.")
+        # Only the newest check may fill the window: an earlier, slower one
+        # (the quick check at opening, then Re-check) is ignored if it ends
+        # later.
+        self._request = request = object()
+
+        def current(handler):
+            return lambda *args: handler(*args) if request is self._request else None
+
+        # Never "Checking..." for good: a check that has not reported by the
+        # limit is shown as not finished, and Re-check is offered again.
+        limit = STALL_LIMIT_S if run_smoke_tests else QUICK_STALL_LIMIT_S
+        self._watchdog = QtCore.QTimer(self)
+        self._watchdog.setSingleShot(True)
+        self._watchdog.timeout.connect(current(lambda: self._failed(
+            f"The check did not finish within {limit} s (stalled). "
+            f"Re-check to try again.")))
+        self._watchdog.start(int(limit * 1000))
         # The same inputs as the window's own check: macOS's microphone
         # decision read here on the GUI thread (app.readiness adds the
         # selected Session's save path).
         self._worker = run_in_background(
             readiness_job, self.app, run_smoke_tests,
             microphone_permission=microphone_authorization(),
-            on_message=self.subtitle.setText,
-            on_finished=self._render,
-            on_failed=self._failed)
+            on_message=current(self.subtitle.setText),
+            on_finished=current(self._render),
+            on_failed=current(self._failed),
+            on_cancelled=current(lambda: self._failed("The check was cancelled.")))
 
     def _failed(self, message: str) -> None:
+        if getattr(self, "_watchdog", None) is not None:
+            self._watchdog.stop()
         self.recheck_button.setEnabled(True)
-        self.headline.setText("Field check could not complete")
+        self.headline.setText("Field check did not finish")
         self.subtitle.setText(message)
 
     def _render(self, report) -> None:
+        if getattr(self, "_watchdog", None) is not None:
+            self._watchdog.stop()
         self.recheck_button.setEnabled(True)
         self.tree.clear()
         for check in report.checks:
             item = QtWidgets.QTreeWidgetItem(
                 [f"{_symbol(check.status)}  {check.name}", check.detail])
             item.setToolTip(1, check.detail)
+            from . import theme
+
             if check.status is CheckStatus.FAIL:
-                item.setForeground(0, QtGui.QBrush(QtGui.QColor("#cf222e")))
+                item.setForeground(0, QtGui.QBrush(QtGui.QColor(
+                    theme.status_color("error", self))))
             elif check.status is CheckStatus.WARN:
-                item.setForeground(0, QtGui.QBrush(QtGui.QColor("#9a6700")))
+                item.setForeground(0, QtGui.QBrush(QtGui.QColor(
+                    theme.status_color("working", self))))
+            elif check.status is CheckStatus.PASS:
+                item.setForeground(0, QtGui.QBrush(QtGui.QColor(
+                    theme.status_color("ok", self))))
             self.tree.addTopLevelItem(item)
 
         from ..modes import OperatingMode

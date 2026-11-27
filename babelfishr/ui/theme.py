@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from typing import Dict
 
-from PySide6 import QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 #: Turquoise, for the selection and the primary action - both appearances.
 ACCENT_DARK = "#34CACD"
@@ -173,6 +173,45 @@ def palette(widget: QtWidgets.QWidget = None) -> QtGui.QPalette:
     return p
 
 
+class _FollowAppearance(QtCore.QObject):
+    """Re-applies the console palette and stylesheet to one window when
+    the system appearance changes (light/dark)."""
+
+    def __init__(self, window):
+        super().__init__(window)
+        self._window = window
+        self._busy = False
+        self.apply()
+
+    def apply(self) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        try:
+            self._window.setPalette(palette(self._window))
+            self._window.setStyleSheet(stylesheet(self._window))
+        finally:
+            self._busy = False
+
+    def eventFilter(self, obj, event):  # noqa: N802 - Qt's name
+        # Defensive: Qt may call this while the window is being destroyed,
+        # after the Python side of this object is already gone.
+        window = getattr(self, "_window", None)
+        if (window is not None and obj is window and not getattr(self, "_busy", True)
+                and event.type() in (QtCore.QEvent.PaletteChange,
+                                     QtCore.QEvent.ApplicationPaletteChange)):
+            self.apply()
+        return False
+
+
+def style_window(window: QtWidgets.QWidget) -> None:
+    """Give a separate window (a dialog with or without a parent) the
+    console's look, and keep it in step with the system appearance."""
+    follower = _FollowAppearance(window)
+    window.installEventFilter(follower)
+    window._appearance = follower
+
+
 def stylesheet(widget: QtWidgets.QWidget = None) -> str:
     """Application stylesheet for the current appearance.
 
@@ -186,6 +225,32 @@ def stylesheet(widget: QtWidgets.QWidget = None) -> str:
     return f"""
 QWidget {{ color: {t['text']}; font-weight: normal; }}
 QMainWindow, #centralRoot {{ background: {t['window']}; }}
+/* The console's own windows (Setup, Field Readiness, Calibrate, progress)
+   use the same surfaces and controls as the console. */
+QDialog {{ background: {t['window']}; }}
+QTreeView, QTreeWidget, QListView, QTableView, QPlainTextEdit, QTextEdit {{
+    background: {t['surface']}; color: {t['text']};
+    border: 1px solid {t['border']};
+    alternate-background-color: {t['surface_raised']};
+    selection-background-color: {t['accent']}; selection-color: {t['on_accent']};
+}}
+QHeaderView::section {{ background: {t['surface_raised']}; color: {t['text_muted']};
+    border: none; border-bottom: 1px solid {t['border']}; padding: 4px 8px; }}
+QCheckBox, QRadioButton {{ spacing: 6px; background: transparent; }}
+QCheckBox::indicator, QRadioButton::indicator {{ width: 13px; height: 13px;
+    border: 1px solid {t['rule_strong']}; background: {t['surface']}; }}
+QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
+    background: {t['accent']}; border: 1px solid {t['accent']}; }}
+QProgressBar {{ border: 1px solid {t['border']}; background: {t['surface']};
+    color: {t['text']}; text-align: center; min-height: 14px; }}
+QProgressBar::chunk {{ background: {t['accent']}; }}
+QScrollBar:vertical {{ background: {t['surface']}; width: 12px; margin: 0; border: none; }}
+QScrollBar:horizontal {{ background: {t['surface']}; height: 12px; margin: 0; border: none; }}
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{
+    background: {t['rule_strong']}; min-height: 24px; min-width: 24px; border-radius: 3px; }}
+QScrollBar::handle:hover {{ background: {t['accent']}; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; border: none; }}
+QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 
 /* --- identity row and teal status band -------------------------------- */
 #titleBar {{ background: {t['window']}; }}
@@ -236,6 +301,12 @@ QMenu::item:disabled {{ color: {t['disabled_text']}; }}
     background: {t['surface_raised']}; padding: 6px 10px; font-size: 14px;
 }}
 #columnHeader QLabel {{ background: transparent; font-size: 13px; }}
+#sectionHeaderRow {{ background: {t['surface_raised']}; }}
+#sectionHeaderRow #sectionHeader {{ background: transparent; }}
+#sectionArrow, #sidebarArrow {{ border: 1px solid transparent; padding: 2px;
+    background: transparent; min-width: 14px; min-height: 14px; }}
+#sectionArrow:hover, #sectionArrow:focus, #sidebarArrow:hover, #sidebarArrow:focus {{
+    border: 1px solid {t['accent']}; }}
 #rule {{ background: {t['border']}; max-height: 1px; min-height: 1px; }}
 #paneLine, #engineLine {{ padding: 1px 10px; }}
 #mutedLine, #sectionLabel {{ color: {t['text_muted']}; }}

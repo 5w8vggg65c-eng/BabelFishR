@@ -7,7 +7,9 @@ nothing is uploaded, and an M-series Mac with 24 GB comfortably runs the
 Model layout
 ------------
 Models are prepared into ``<AppPaths.models>/<model-name>/`` with
-``faster_whisper.utils.download_model(name, output_dir=...)``, and loaded by
+huggingface_hub into the same plain ``output_dir`` layout
+``faster_whisper.utils.download_model(name, output_dir=...)`` produces (but
+with real byte progress, see prepare_model), and loaded by
 passing that directory to ``WhisperModel``.  This matters: passing
 ``download_root`` instead makes faster-whisper treat the path as a *Hugging
 Face cache*, which uses a ``models--org--repo/snapshots/<sha>/`` layout - so a
@@ -24,6 +26,7 @@ vocabulary in as an initial prompt.
 
 from __future__ import annotations
 
+import fnmatch
 import logging
 import threading
 import time
@@ -33,6 +36,9 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from ..download_progress import (CancelCheck, DownloadCancelled,  # noqa: F401
+                                 DownloadProgress, ProgressCallback,
+                                 ProgressTracker, progress_bar_class)
 from ..dsp.resample import resample
 from ..models import TranscriptSegment, signoff_is_noise, stock_signoff
 from .base import (EngineError, EngineUnavailable, PrivacyProfile,
@@ -89,21 +95,130 @@ def inspect_model_directory(directory) -> tuple:
     return (ModelState.COMPLETE, [])
 
 
-def prepare_model(model_name: str, models_root, local_files_only: bool = False
-                  ) -> pathlib.Path:
+#: The files faster-whisper's own download_model fetches, and nothing else.
+ALLOW_PATTERNS = ("config.json", "preprocessor_config.json", "model.bin",
+                  "tokenizer.json", "vocabulary.*")
+
+
+def prepare_model(model_name: str, models_root, local_files_only: bool = False,
+                  progress: Optional[ProgressCallback] = None,
+                  cancelled: Optional[CancelCheck] = None) -> pathlib.Path:
     """Download (or verify) a model into its own directory. Returns the path.
 
-    Uses faster-whisper's supported preparation entry point with an explicit
-    ``output_dir``, so the result is a plain directory we own rather than an
-    entry in a shared cache.
-    """
-    from faster_whisper.utils import download_model
+    Fetches exactly what faster-whisper's ``download_model`` would (same
+    repository, same files, same plain ``output_dir`` layout), but with a
+    progress bar that reports real bytes: *progress* receives a
+    :class:`DownloadProgress` snapshot ("resolving", then "downloading"),
+    throttled to about ten per second plus file boundaries. It is called on
+    the downloading thread. *cancelled* is polled during the transfer and
+    between files; when it returns True, :class:`DownloadCancelled` is
+    raised and the files not yet complete are absent, so the directory
+    inspects as INCOMPLETE (repairable), never COMPLETE.
 
+    The file list and sizes come from the Hub's metadata first; when that
+    is unavailable the total is reported as unknown (``None``) and the
+    download still proceeds through ``snapshot_download``. Files already
+    present at their published size are counted as done, not fetched again.
+    """
     target = model_directory_for(models_root, model_name)
     target.parent.mkdir(parents=True, exist_ok=True)
-    resolved = download_model(download_source(model_name), output_dir=str(target),
-                              local_files_only=local_files_only)
-    return pathlib.Path(resolved)
+    repo_id = _repository_id(download_source(model_name))
+    tracker = ProgressTracker(progress, cancelled)
+    import huggingface_hub
+
+    if local_files_only:
+        resolved = huggingface_hub.snapshot_download(
+            repo_id, local_dir=str(target), allow_patterns=list(ALLOW_PATTERNS),
+            local_files_only=True)
+        return pathlib.Path(resolved)
+
+    target.mkdir(parents=True, exist_ok=True)
+    tracker.update(phase="resolving", file="")
+    tracker.check_cancelled()
+    files = _published_files(huggingface_hub, repo_id)
+    tracker.check_cancelled()
+    bar = progress_bar_class(tracker)
+
+    if files is None:
+        # No metadata: the size is unknown, but the download still runs.
+        tracker.update(phase="downloading", bytes_total=None, files_total=None)
+        resolved = huggingface_hub.snapshot_download(
+            repo_id, local_dir=str(target), allow_patterns=list(ALLOW_PATTERNS),
+            tqdm_class=bar)
+        tracker.check_cancelled()
+        tracker.update(file="")
+        return pathlib.Path(resolved)
+
+    pending, present = [], []
+    for name, size in files:
+        local = target / name
+        if size is not None and local.is_file() and local.stat().st_size == size:
+            present.append(name)
+        else:
+            pending.append((name, size))
+    sizes = [size for _name, size in pending]
+    total = None if any(size is None for size in sizes) else sum(sizes)
+    tracker.update(phase="downloading", bytes_done=0, bytes_total=total,
+                   files_done=len(present), files_total=len(files), file="")
+    for name, _size in pending:
+        tracker.check_cancelled()
+        tracker.update(file=name)
+        huggingface_hub.hf_hub_download(repo_id, filename=name,
+                                        local_dir=str(target), tqdm_class=bar)
+        tracker.check_cancelled()
+        tracker.update(files_done=tracker.snapshot.files_done + 1)
+    tracker.update(file="")
+    return target
+
+
+def _repository_id(source: str) -> str:
+    """The Hub repository behind *source*, as faster-whisper resolves it."""
+    if "/" in source:
+        return source
+    try:
+        from faster_whisper import utils as fw_utils
+
+        known = dict(getattr(fw_utils, "_MODELS", {}) or {})
+    except Exception:  # noqa: BLE001
+        known = {}
+    if source in known:
+        return known[source]
+    if source in CANONICAL_REPOSITORIES:
+        return CANONICAL_REPOSITORIES[source]
+    if source in _SYSTRAN_MODELS:
+        return f"Systran/faster-whisper-{source}"
+    raise ValueError(f"Invalid model size {source!r}, expected one of: "
+                     f"{', '.join(sorted(known) or MODEL_SIZES)}")
+
+
+#: Sizes published under Systran/faster-whisper-<name>, for a faster-whisper
+#: whose name table cannot be read.
+_SYSTRAN_MODELS = ("tiny", "base", "small", "medium", "large-v3")
+
+
+def _published_files(huggingface_hub, repo_id: str):
+    """``[(filename, size or None)]`` for the files to fetch, smallest first
+    and ``model.bin`` last, or ``None`` when the Hub's metadata cannot be read."""
+    try:
+        info = huggingface_hub.HfApi().model_info(repo_id, files_metadata=True)
+        siblings = list(info.siblings or [])
+    except Exception as exc:  # noqa: BLE001 - fall back to an unknown total
+        log.info("no file metadata for %s (%s); size unknown", repo_id, exc)
+        return None
+    files = []
+    for sibling in siblings:
+        name = getattr(sibling, "rfilename", None)
+        if not name or not any(fnmatch.fnmatch(name, pattern)
+                               for pattern in ALLOW_PATTERNS):
+            continue
+        size = getattr(sibling, "size", None)
+        if size is None and getattr(sibling, "lfs", None) is not None:
+            size = getattr(sibling.lfs, "size", None)
+        files.append((name, int(size) if size is not None else None))
+    if not files:
+        return None
+    files.sort(key=lambda item: (item[0] == "model.bin", item[1] or 0, item[0]))
+    return files
 
 
 #: The Hugging Face repositories behind names that older faster-whisper
@@ -210,14 +325,19 @@ class FasterWhisperEngine(TranscriptionEngine):
         """
         return self.model_state()[0] is ModelState.COMPLETE
 
-    def prepare(self, local_files_only: bool = False) -> pathlib.Path:
+    def prepare(self, local_files_only: bool = False,
+                progress: Optional[ProgressCallback] = None,
+                cancelled: Optional[CancelCheck] = None) -> pathlib.Path:
         """Fetch or verify this engine's model. Returns the resolved directory."""
         if self.model_path:
             return pathlib.Path(self.model_path).expanduser()
         if not self.models_root:
             raise EngineUnavailable("no model directory is configured")
+        extra = {key: value for key, value in (("progress", progress),
+                                                ("cancelled", cancelled))
+                 if value is not None}
         return prepare_model(self.model_size, self.models_root,
-                             local_files_only=local_files_only)
+                             local_files_only=local_files_only, **extra)
 
     def available(self) -> bool:
         """Installed AND, when restricted to local files, actually present.

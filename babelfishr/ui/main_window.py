@@ -368,16 +368,38 @@ class MainWindow(QtWidgets.QMainWindow):
 
         right = QtWidgets.QFrame()
         right.setObjectName("rightPane")
-        right_layout = QtWidgets.QVBoxLayout(right)
+        right_outer = QtWidgets.QHBoxLayout(right)
+        right_outer.setContentsMargins(0, 0, 0, 0)
+        right_outer.setSpacing(0)
+        # The sidebar's arrow when it is hidden: at the same left boundary,
+        # top, so the way back is where the way out was.
+        self.sidebar_restore = QtWidgets.QToolButton()
+        self.sidebar_restore.setObjectName("sidebarArrow")
+        self.sidebar_restore.setArrowType(QtCore.Qt.RightArrow)
+        self.sidebar_restore.setAutoRaise(True)
+        self.sidebar_restore.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.sidebar_restore.setAccessibleName("Show sidebar")
+        self.sidebar_restore.setToolTip("Show sidebar")
+        self.sidebar_restore.clicked.connect(lambda: self.sidebar_toggle.setChecked(True))
+        self.sidebar_restore.hide()
+        right_outer.addWidget(self.sidebar_restore, 0, QtCore.Qt.AlignTop)
+        right_content = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right_content)
         right_layout.setContentsMargins(8, 8, 8, 0)
         right_layout.setSpacing(6)
+        right_outer.addWidget(right_content, 1)
         panes.addWidget(right)
         panes.setStretchFactor(0, 0)
         panes.setStretchFactor(1, 1)
         panes.setSizes([320, 900])
 
         # -- left: SESSIONS --------------------------------------------------
-        left_layout.addWidget(self._section_header("SESSIONS"))
+        # Each section's body is its own widget under a header with a
+        # disclosure arrow; collapsing only hides it, so selections and
+        # work in progress stay as they were.
+        sidebar_layout = left_layout
+        self.section_bodies, self.section_toggles = {}, {}
+        left_layout = self._disclosure_section(sidebar_layout, "SESSIONS", "sessions")
         # Named Session threads. The database still records one Session per
         # monitoring run; this groups those runs into the continuous log an
         # operator actually thinks in.
@@ -447,7 +469,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left_layout.addWidget(self._rule())
 
         # -- left: INPUT ------------------------------------------------------
-        left_layout.addWidget(self._section_header("INPUT"))
+        left_layout = self._disclosure_section(sidebar_layout, "INPUT", "input")
         # Deliberately always visible: the operator must be able to see which
         # input is live at every moment of a watch.
         self.input_box = QtWidgets.QFrame()
@@ -490,7 +512,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # -- left: LOCAL ENGINES ---------------------------------------------
         from .local_engines import WhisperModelPicker
 
-        left_layout.addWidget(self._section_header("LOCAL ENGINES"))
+        left_layout = self._disclosure_section(sidebar_layout, "LOCAL ENGINES", "engines")
         self.speech_engine_line = QtWidgets.QLabel("Speech: …")
         self.speech_engine_line.setObjectName("engineLine")
         self.speech_engine_line.setWordWrap(True)
@@ -520,6 +542,12 @@ class MainWindow(QtWidgets.QMainWindow):
         install_row.addStretch(1)
         install_row.addWidget(self.install_model_button)
         left_layout.addLayout(install_row)
+        # Progress of an install, in place: real bytes, its phases, Cancel.
+        from .download_panel import DownloadProgressPanel
+
+        self.install_panel = DownloadProgressPanel()
+        self.install_panel.hide()
+        left_layout.addWidget(self.install_panel)
         self.whisper_model_box.currentIndexChanged.connect(self._change_whisper_model)
         self._build_language_controls(left_layout)
         left_layout.addWidget(self.translation_engine_line)
@@ -530,6 +558,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ready_badge.setAccessibleName("Field readiness")
         self.ready_badge.mousePressEvent = lambda event: self._show_readiness()
         left_layout.addWidget(self.ready_badge)
+        left_layout = sidebar_layout
         left_layout.addStretch(1)
         # The narrowest the sidebar may become still fits its contents and
         # its vertical scroll bar: nothing is clipped at the right edge.
@@ -537,42 +566,21 @@ class MainWindow(QtWidgets.QMainWindow):
             250, left.minimumSizeHint().width()
             + self.sidebar.verticalScrollBar().sizeHint().width() + 2))
 
-        # -- right: header, banners --------------------------------------------
-        header = QtWidgets.QFrame()
-        header.setObjectName("paneHeader")
-        header_row = QtWidgets.QHBoxLayout(header)
-        header_row.setContentsMargins(0, 0, 0, 0)
+        # The sidebar's arrow, arrow only: pinned at the top of the sidebar's
+        # vertical scroll bar (the bar is always shown, so it is always
+        # there), however far the contents are scrolled.
         self.sidebar_toggle = QtWidgets.QToolButton()
-        self.sidebar_toggle.setText("Sidebar")
-        self.sidebar_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self.sidebar_toggle.setObjectName("sidebarArrow")
+        self.sidebar_toggle.setAutoRaise(True)
         self.sidebar_toggle.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.sidebar_toggle.setCheckable(True)
         self.sidebar_toggle.setChecked(True)
         self.sidebar_toggle.toggled.connect(self._set_sidebar_visible)
+        self.sidebar.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOn)
+        self.sidebar.addScrollBarWidget(self.sidebar_toggle, QtCore.Qt.AlignTop)
         self._set_sidebar_visible(True)
-        header_row.addWidget(self.sidebar_toggle)
-        heading = QtWidgets.QLabel("Transcript and translation")
-        heading.setObjectName("paneHeading")
-        header_row.addWidget(heading)
-        header_row.addStretch(1)
-        self.capture_tab_label = QtWidgets.QLabel("")
-        self.capture_tab_label.setObjectName("sectionLabel")
-        header_row.addWidget(self.capture_tab_label)
-        right_layout.addWidget(header)
 
-        self.warning_banner = QtWidgets.QLabel()
-        self.warning_banner.setObjectName("warningBanner")
-        self.warning_banner.setWordWrap(True)
-        self.warning_banner.hide()
-        right_layout.addWidget(self.warning_banner)
-
-        self.privacy_banner = QtWidgets.QLabel()
-        self.privacy_banner.setObjectName("privacyBanner")
-        self.privacy_banner.setWordWrap(True)
-        self.privacy_banner.hide()
-        right_layout.addWidget(self.privacy_banner)
-
-        # -- right: the selected recording's waveform ---------------------------
+        # -- right: the selected recording's waveform, first ---------------------
         self.waveform = RecordingWaveform()
         self.live_waveform = LiveWaveform(display=self.app.config.display,
                                           save=self.app.config.save)
@@ -580,6 +588,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.waveform_stack.addWidget(self.waveform)
         self.waveform_stack.addWidget(self.live_waveform)
         right_layout.addWidget(self.waveform_stack)
+
+        # -- right: the local-processing notice, then any warnings ----------------
+        self.privacy_banner = QtWidgets.QLabel()
+        self.privacy_banner.setObjectName("privacyBanner")
+        self.privacy_banner.setWordWrap(True)
+        self.privacy_banner.hide()
+        right_layout.addWidget(self.privacy_banner)
+
+        self.warning_banner = QtWidgets.QLabel()
+        self.warning_banner.setObjectName("warningBanner")
+        self.warning_banner.setWordWrap(True)
+        self.warning_banner.hide()
+        right_layout.addWidget(self.warning_banner)
 
         # -- right: filters and search ------------------------------------------
         filter_row = QtWidgets.QHBoxLayout()
@@ -599,6 +620,11 @@ class MainWindow(QtWidgets.QMainWindow):
             filter_row.addWidget(button)
         self.filter_all.setChecked(True)
         filter_row.addStretch(1)
+        # "Recording into <Session>" while another Session is shown (it used
+        # to sit in the removed header strip).
+        self.capture_tab_label = QtWidgets.QLabel("")
+        self.capture_tab_label.setObjectName("sectionLabel")
+        filter_row.addWidget(self.capture_tab_label)
         self.search_field = QtWidgets.QLineEdit()
         self.search_field.setObjectName("searchField")
         self.search_field.setPlaceholderText("Search...")
@@ -709,9 +735,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_cleanup_offer()
 
     def _set_sidebar_visible(self, visible: bool) -> None:
+        # Keyboard focus follows the arrow to its counterpart.
+        had_focus = (self.sidebar_toggle.hasFocus() if not visible
+                     else self.sidebar_restore.hasFocus())
         if not visible:
             self._sidebar_width = self.pane_splitter.sizes()[0] or self._sidebar_width
         self.sidebar.setVisible(visible)
+        self.sidebar_restore.setVisible(not visible)
         if visible:
             available = max(self.pane_splitter.width(), self.width())
             self.pane_splitter.setSizes([self._sidebar_width,
@@ -720,6 +750,9 @@ class MainWindow(QtWidgets.QMainWindow):
         action = "Hide sidebar" if visible else "Show sidebar"
         self.sidebar_toggle.setAccessibleName(action)
         self.sidebar_toggle.setToolTip(action)
+        if had_focus:
+            (self.sidebar_restore if not visible else self.sidebar_toggle).setFocus(
+                QtCore.Qt.OtherFocusReason)
 
     def menuBar(self) -> QtWidgets.QMenuBar:  # noqa: N802
         """The in-window navigation bar (see _build_ui), not a bar QMainWindow
@@ -728,6 +761,54 @@ class MainWindow(QtWidgets.QMainWindow):
         return bar if bar is not None else super().menuBar()
 
     # -- v5 construction helpers ---------------------------------------------
+    def _disclosure_section(self, outer: QtWidgets.QVBoxLayout, title: str,
+                            key: str) -> QtWidgets.QVBoxLayout:
+        """A sidebar section: header with its disclosure arrow on the right,
+        and a body widget (returned as its layout) the arrow shows or hides."""
+        header = QtWidgets.QWidget()
+        header.setObjectName("sectionHeaderRow")
+        row = QtWidgets.QHBoxLayout(header)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        row.addWidget(self._section_header(title), 1)
+        toggle = QtWidgets.QToolButton()
+        toggle.setObjectName("sectionArrow")
+        toggle.setAutoRaise(True)
+        toggle.setCheckable(True)
+        toggle.setChecked(True)
+        toggle.setArrowType(QtCore.Qt.DownArrow)
+        toggle.setFocusPolicy(QtCore.Qt.StrongFocus)
+        name = title.title()
+        toggle.setAccessibleName(f"Collapse {name}")
+        toggle.setToolTip(f"Collapse {name}")
+        row.addWidget(toggle, 0, QtCore.Qt.AlignVCenter)
+        outer.addWidget(header)
+        body = QtWidgets.QWidget()
+        body.setObjectName("sectionBody")
+        layout = QtWidgets.QVBoxLayout(body)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        outer.addWidget(body)
+
+        def toggled(opened: bool) -> None:
+            body.setVisible(opened)
+            toggle.setArrowType(QtCore.Qt.DownArrow if opened else QtCore.Qt.RightArrow)
+            verb = "Collapse" if opened else "Expand"
+            toggle.setAccessibleName(f"{verb} {name}")
+            toggle.setToolTip(f"{verb} {name}")
+
+        toggle.toggled.connect(toggled)
+        self.section_bodies[key], self.section_toggles[key] = body, toggle
+        return layout
+
+    def _expand_section(self, key: str) -> None:
+        """Open a sidebar section (and the sidebar) to show something in it."""
+        if not self.sidebar_toggle.isChecked():
+            self.sidebar_toggle.setChecked(True)
+        toggle = getattr(self, "section_toggles", {}).get(key)
+        if toggle is not None and not toggle.isChecked():
+            toggle.setChecked(True)
+
     def _section_header(self, text: str) -> QtWidgets.QLabel:
         label = QtWidgets.QLabel(text)
         label.setObjectName("sectionHeader")
@@ -773,16 +854,13 @@ class MainWindow(QtWidgets.QMainWindow):
         time.setFixedWidth(TIME_COLUMN_WIDTH)
         self.time_heading = time
         row.addWidget(time)
-        # One MESSAGE column: each row shows the transcript at full width,
-        # then the translation under it - no half-width translation column.
-        message = QtWidgets.QHBoxLayout()
-        message.setSpacing(6)
-        self.original_heading = QtWidgets.QLabel("MESSAGE: TRANSCRIPT, THEN")
-        message.addWidget(self.original_heading)
-        self.translation_heading = QtWidgets.QLabel("TRANSLATION")
-        message.addWidget(self.translation_heading)
-        message.addStretch(1)
-        row.addLayout(message, 1)
+        # One column: each row shows the transcript at full width, then the
+        # translation under it.
+        self.original_heading = QtWidgets.QLabel("Transcription")
+        row.addWidget(self.original_heading, 1)
+        # Kept for the code that names the target language; not shown.
+        self.translation_heading = QtWidgets.QLabel("")
+        self.translation_heading.hide()
         review = QtWidgets.QLabel("REVIEW")
         review.setFixedWidth(REVIEW_COLUMN_WIDTH)
         review.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
@@ -1396,18 +1474,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 "repaired later.",
                 ["Download"]) != "Download":
             return
-        self.status.showMessage(f"Installing Whisper {title}\u2026", 0)
-        progress = QtWidgets.QProgressDialog(
-            f"Installing Whisper {title}\u2026", "Cancel", 0, 0, self)
-        progress.setWindowTitle("Install speech model")
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(False)
-        progress.setAutoReset(False)
-        self._install_progress = progress
+        self.status.showMessage(f"Installing Whisper {title}\u2026", 8000)
+        panel = self.install_panel
+        self._expand_section("engines")
+        panel.start(f"Installing Whisper {title}\u2026")
+        previous = getattr(self, "_install_cancel_connection", None)
+        if previous is not None:
+            panel.cancelRequested.disconnect(previous)
+            self._install_cancel_connection = None
 
         def done(outcome, cancelled=False, error=""):
             self._install_worker = None
-            progress.close()
             self.whisper_model_box.refresh_choices()
             self._refresh_install_model_button()
             if cancelled:
@@ -1420,17 +1497,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 text = (f"{title} is installed and verified offline. Choose it "
                         f"in Whisper model to use it." if ok
                         else f"{title} was not installed: {detail}")
+            ok = bool(outcome and outcome[1]) and not cancelled and not error
+            if not ok:
+                text += " Install a speech model\u2026 tries again."
+            panel.finish(text, ok)
             self.status.showMessage(text, 15000)
-            QtWidgets.QMessageBox.information(self, "Install speech model", text)
 
         worker = run_in_background(
             install_model_job, self.app.config, name,
             on_finished=lambda result: done(result),
             on_failed=lambda message: done(None, error=message),
             on_cancelled=lambda: done(None, cancelled=True),
-            on_message=lambda text: progress.setLabelText(text))
+            on_message=panel.set_message,
+            on_progress=panel.set_progress)
         self._install_worker = worker
-        progress.canceled.connect(lambda: worker.token.cancel())
+        self._install_cancel_connection = panel.cancelRequested.connect(
+            lambda: worker.token.cancel())
         self._refresh_install_model_button()
 
     # -- the Session's save path ------------------------------------------
@@ -2232,7 +2314,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if ok:
                 self._start_monitoring()
         elif clicked is choose:
-            self.sidebar_toggle.setChecked(True)
+            self._expand_section("input")
             self.input_box.setVisible(True)
             self.input_panel.refresh_devices()
             self.input_panel.device_box.setFocus()
@@ -2383,40 +2465,34 @@ class MainWindow(QtWidgets.QMainWindow):
             self._stop_monitoring()
         self._start_monitoring(replay_path=path)
 
-    def _calibrate(self) -> None:
-        from ..audio.meter import calibrate
+    CALIBRATION_SECONDS = 5.0
+
+    def _calibration_source_factory(self):
+        """The input that will actually be monitored, unstarted. A threshold
+        measured on a different device is worse than no threshold at all."""
         from ..audio.source import LiveAudioSource
 
-        # Calibrate the input that will actually be monitored. A threshold
-        # measured on a different device is worse than no threshold at all.
+        identity = self.input_panel.selected_identity()
+        config = self.app.config.audio
+        return lambda: LiveAudioSource(identity=identity, sample_rate=config.sample_rate,
+                                       block_size=config.block_size, reconnect=False)
+
+    def _calibrate(self) -> None:
+        from .calibration_dialog import CalibrationDialog
+
         ok, message = self.input_panel.ready_to_monitor()
         if not ok:
             self._resolve_input_problem(message)
             return
-        try:
-            source = LiveAudioSource(
-                identity=self.input_panel.selected_identity(),
-                sample_rate=self.app.config.audio.sample_rate,
-                block_size=self.app.config.audio.block_size,
-                reconnect=False)
-            source.start()
-        except Exception as exc:  # noqa: BLE001
-            QtWidgets.QMessageBox.warning(self, "Calibration", str(exc))
-            return
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-        try:
-            result = calibrate(source, seconds=5.0)
-        finally:
-            source.stop()
-            QtWidgets.QApplication.restoreOverrideCursor()
-
-        box = QtWidgets.QMessageBox(self)
-        box.setWindowTitle("Input calibration")
-        box.setText("<pre>" + result.summary() + "</pre>")
-        box.setStandardButtons(QtWidgets.QMessageBox.Apply | QtWidgets.QMessageBox.Close)
-        box.button(QtWidgets.QMessageBox.Apply).setText("Use suggested threshold")
-        if box.exec() == QtWidgets.QMessageBox.Apply:
-            self._apply_calibration(result.recommended_threshold_dbfs)
+        # Opens at once; the listen runs off this thread (it used to freeze
+        # the window for the whole measurement).
+        dialog = CalibrationDialog(self._calibration_source_factory(),
+                                   seconds=self.CALIBRATION_SECONDS, parent=self)
+        self.calibration_dialog = dialog
+        dialog.start()
+        dialog.exec()
+        if dialog.applied and dialog.result is not None:
+            self._apply_calibration(dialog.result.recommended_threshold_dbfs)
 
     def _apply_calibration(self, threshold_dbfs: float) -> None:
         """The operator chose the suggested threshold: use it and save it, so
@@ -2907,10 +2983,29 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def failed(message):
             if request is self._readiness_request:
-                self.ready_badge.setText("\u26a0 Unknown")
-                if self.app.mode is OperatingMode.FIELD_OFFLINE:
-                    self._set_offline_status(
-                        "fail", [f"The readiness check could not finish: {message}"])
+                self._settle_unfinished_readiness(
+                    f"The readiness check could not finish: {message}")
+
+        def cancelled():
+            if request is self._readiness_request:
+                self._settle_unfinished_readiness("The readiness check was cancelled.")
+
+        # A check that never reports (a smoke test that stalls) must not
+        # leave "Checking" up forever: after the limit it is shown as not
+        # finished, with a retry. Its result still counts if it does arrive.
+        watchdog = QtCore.QTimer(self)
+        watchdog.setSingleShot(True)
+        limit = self.READINESS_LIMIT_S if run_smoke_tests else self.READINESS_QUICK_LIMIT_S
+
+        def stalled():
+            if request is self._readiness_request and self._readiness is None:
+                self._settle_unfinished_readiness(
+                    f"The readiness check did not finish within {limit} s "
+                    f"(stalled). Click to check again.")
+
+        watchdog.timeout.connect(stalled)
+        watchdog.start(int(limit * 1000))
+        self._readiness_watchdog = watchdog
 
         from ..readiness import microphone_authorization
 
@@ -2919,13 +3014,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self._readiness_worker = run_in_background(
             readiness_job, self.app, run_smoke_tests,
             microphone_permission=microphone_authorization(),
-            on_finished=finished, on_failed=failed)
+            on_finished=finished, on_failed=failed, on_cancelled=cancelled)
+
+    #: How long a readiness check may run before it is shown as stalled:
+    #: with smoke tests (a Whisper model loads and transcribes) and without.
+    READINESS_LIMIT_S = 240
+    READINESS_QUICK_LIMIT_S = 45
+
+    def _settle_unfinished_readiness(self, reason: str) -> None:
+        """A check that failed, was cancelled or stalled: say so - never
+        "Checking" - and let a click start another one."""
+        from . import theme
+
+        watchdog = getattr(self, "_readiness_watchdog", None)
+        if watchdog is not None:
+            watchdog.stop()
+        self.ready_badge.setText("\u26a0 Check did not finish")
+        self.ready_badge.setStyleSheet(f"color: {theme.status_color('error', self)};")
+        self.ready_badge.setAccessibleDescription(reason)
+        self.ready_badge.setToolTip(f"{reason}\n\nClick for the full report and to check again.")
+        if self.app.mode is OperatingMode.FIELD_OFFLINE:
+            self._set_offline_status("fail", [reason])
 
     def _render_readiness(self, report) -> None:
         from . import theme
         from ..readiness import offline_field_problems
 
         self._readiness = report
+        watchdog = getattr(self, "_readiness_watchdog", None)
+        if watchdog is not None:
+            watchdog.stop()
         # The destination was just checked: show what it is now.
         self._refresh_save_path_row()
         if self.app.mode is OperatingMode.FIELD_OFFLINE:
@@ -2943,12 +3061,14 @@ class MainWindow(QtWidgets.QMainWindow):
             detail = ("Ready: recording, local transcription and local "
                       "translation all work on this computer.")
         elif report.field_ready_unknown:
-            # Prepared, but the smoke tests have not run in this process yet.
-            # Alpha 3 showed "Record only" here, on a machine with a working
-            # Whisper model and working Argos routes, and it stayed wrong
-            # until the operator restarted. "Not tested" is not "unavailable".
-            text, tone = "\u2026 Checking", "working"
-            detail = "Checking field readiness."
+            # Prepared, but the smoke tests did not run in this check (a
+            # quick check after a model, input or language change). This is
+            # a finished result: it used to read "Checking" - for good, since
+            # nothing else was coming. "Not tested" is not "unavailable".
+            text, tone = "\u25d1 Installed, not tested", "working"
+            detail = ("Installed: the speech model and language packs are "
+                      "present but were not test-run in this check. Click to "
+                      "run the full check.")
         elif report.can_record:
             # "Partly ready", not "Record only". The badge describes what is
             # installed and working; Record Only is an operating mode the

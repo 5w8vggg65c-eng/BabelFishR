@@ -44,6 +44,11 @@ class SetupAssistant(QtWidgets.QDialog):
     def __init__(self, app, parent: Optional[QtWidgets.QWidget] = None,
                  first_run: bool = False):
         super().__init__(parent)
+        from . import theme
+
+        # The console's look, also at first launch when there is no console
+        # window yet to inherit it from.
+        theme.style_window(self)
         self.app = app
         #: The very first launch: preparing does not change the mode - the
         #: operator starts in Online / Setup unless they choose otherwise.
@@ -72,7 +77,15 @@ class SetupAssistant(QtWidgets.QDialog):
             + PERMISSION_TEXT))
 
         self.stack = QtWidgets.QStackedWidget()
-        self.stack.addWidget(self._build_choices())
+        # The choices scroll rather than being squeezed (rows overlapped in
+        # a short window) or pushing the window past the screen.
+        choices = QtWidgets.QScrollArea()
+        choices.setWidgetResizable(True)
+        choices.setFrameShape(QtWidgets.QFrame.NoFrame)
+        choices.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        choices.setWidget(self._build_choices())
+        self.choices_scroll = choices
+        self.stack.addWidget(choices)
         self.stack.addWidget(self._build_progress())
         layout.addWidget(self.stack, 1)
 
@@ -120,6 +133,14 @@ class SetupAssistant(QtWidgets.QDialog):
         model_box = QtWidgets.QGroupBox("Speech model")
         model_layout = QtWidgets.QVBoxLayout(model_box)
         self.model_box = QtWidgets.QComboBox()
+        # Its longest entry must not set the window's width; the full text
+        # is in the popup and the tooltip.
+        self.model_box.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.model_box.setMinimumContentsLength(16)
+        self.model_box.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                                     QtWidgets.QSizePolicy.Fixed)
+        self.model_box.currentTextChanged.connect(self.model_box.setToolTip)
         for name, note, size in MODELS:
             label = f"{name} - about {size} MB" + (f", {note}" if note else "")
             self.model_box.addItem(label, name)
@@ -133,6 +154,9 @@ class SetupAssistant(QtWidgets.QDialog):
         model_layout.addWidget(self.model_box)
         self.size_label = QtWidgets.QLabel()
         self.size_label.setObjectName("sectionLabel")
+        self.size_label.setWordWrap(True)          # a long model folder path
+        self.size_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
+                                      QtWidgets.QSizePolicy.Preferred)
         model_layout.addWidget(self.size_label)
         layout.addWidget(model_box)
 
@@ -145,7 +169,8 @@ class SetupAssistant(QtWidgets.QDialog):
             check.setChecked(code in ("es", "de", "fr"))
             check.stateChanged.connect(self._update_advanced)
             self.language_checks[code] = check
-            language_layout.addWidget(check, index // 3, index % 3)
+            # Two columns: three were wider than a MacBook-size window.
+            language_layout.addWidget(check, index // 2, index % 2)
         layout.addWidget(language_box)
 
         layout.addWidget(_paragraph(
@@ -195,14 +220,28 @@ class SetupAssistant(QtWidgets.QDialog):
         font = self.status_label.font()
         font.setBold(True)
         self.status_label.setFont(font)
+        # Long model paths wrap inside the window. A one-line label made
+        # this window (and its progress bar) wider than the screen.
+        self.status_label.setWordWrap(True)
+        self.status_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
+                                        QtWidgets.QSizePolicy.Preferred)
         layout.addWidget(self.status_label)
 
         self.progress = QtWidgets.QProgressBar()
-        self.progress.setRange(0, 0)  # indeterminate: sizes are not knowable
+        self.progress.setRange(0, 0)  # the whole preparation: busy until done
+        self.progress.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
+                                    QtWidgets.QSizePolicy.Fixed)
         layout.addWidget(self.progress)
+        # The speech model's own download: real bytes and phases, in place.
+        from .download_panel import DownloadProgressPanel
+
+        self.download_panel = DownloadProgressPanel(cancellable=False)
+        self.download_panel.hide()
+        layout.addWidget(self.download_panel)
 
         self.log_view = QtWidgets.QPlainTextEdit()
         self.log_view.setReadOnly(True)
+        self.log_view.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
         layout.addWidget(self.log_view, 1)
         return page
 
@@ -242,8 +281,10 @@ class SetupAssistant(QtWidgets.QDialog):
 
         # Off the GUI thread: a 500 MB download on the UI thread looks like a
         # crash, and a force-quit mid-download leaves a broken model.
+        self.download_panel.start(f"Speech model {model}")
         self._worker = run_in_background(
             prepare_field_job, self.app.config, model, pairs,
+            on_progress=self.download_panel.set_progress,
             on_message=self._append,
             on_finished=self._finished,
             on_failed=self._failed,
@@ -259,6 +300,13 @@ class SetupAssistant(QtWidgets.QDialog):
         self.progress.setValue(1)
         self._worker = None
         result = payload["preparation"]
+        # The speech model is "installed" only if its step succeeded.
+        asr = next(((ok, detail) for name, ok, detail in getattr(result, "steps", [])
+                    if name.startswith("Local ASR model")), None)
+        if asr is not None:
+            self.download_panel.finish(
+                "Speech model installed and verified offline." if asr[0]
+                else f"Speech model not installed: {asr[1]}", asr[0])
         readiness = payload["readiness"]
         self._readiness = readiness
 
@@ -395,6 +443,7 @@ class SetupAssistant(QtWidgets.QDialog):
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
         self._worker = None
+        self.download_panel.finish(f"Not installed: {message}", False)
         self.status_label.setText("Preparation failed")
         self._append("")
         self._append(f"ERROR: {message}")
@@ -413,6 +462,8 @@ class SetupAssistant(QtWidgets.QDialog):
         self._worker = None
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
+        self.download_panel.finish("Cancelled: anything partly downloaded shows as "
+                                   "Incomplete and is repaired next time.", False)
         self.status_label.setText("Preparation cancelled")
         self._append(
             "Cancelled. A partly downloaded model is detected as incomplete "

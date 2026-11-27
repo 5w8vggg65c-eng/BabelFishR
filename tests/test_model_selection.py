@@ -105,7 +105,8 @@ def test_readiness_checks_the_selected_model_not_the_default(app, monkeypatch,
     prepared, checked = {}, {}
 
     def fake_prepare(config, *, asr_model=None, language_pairs=None,
-                     report=None, skip_download=False, mode=None):
+                     report=None, skip_download=False, mode=None,
+                     progress=None, cancelled=None):
         prepared["model"] = asr_model
         prepared["config_model"] = config.asr.model
         result = PreparationResult()

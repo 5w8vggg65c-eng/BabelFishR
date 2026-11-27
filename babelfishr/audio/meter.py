@@ -125,11 +125,21 @@ class CalibrationResult:
         return dataclasses.asdict(self)
 
 
+class CalibrationCancelled(RuntimeError):
+    """The operator cancelled a calibration; nothing was measured."""
+
+
 def calibrate(source: AudioSource, seconds: float = 5.0,
-              frame_ms: float = 20.0) -> CalibrationResult:
+              frame_ms: float = 20.0, on_block=None,
+              cancelled=None) -> CalibrationResult:
     """Measure an idle channel and recommend a detection threshold.
 
     Run this with the radio on, squelch open or closed, but nobody talking.
+
+    *on_block(block, collected_seconds)* is called for each block actually
+    received (for a live view and progress measured on real audio, not on a
+    clock); *cancelled()* returning True stops the listen with
+    :class:`CalibrationCancelled`.
     """
     frames: List[float] = []
     clip_count = 0
@@ -138,12 +148,16 @@ def calibrate(source: AudioSource, seconds: float = 5.0,
     started = time.monotonic()
 
     while collected < seconds:
+        if cancelled is not None and cancelled():
+            raise CalibrationCancelled()
         block = source.read(timeout=1.0)
         if block is None:
             if source.finished or (time.monotonic() - started) > seconds * 3 + 2:
                 break
             continue
         collected += block.duration
+        if on_block is not None:
+            on_block(block, collected)
         clip_count += block.clipped_samples
         peak = max(peak, block.peak)
         size = max(1, int(block.sample_rate * frame_ms / 1000.0))

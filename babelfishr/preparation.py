@@ -14,6 +14,8 @@ import shutil
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
+from .download_progress import (CancelCheck, DownloadCancelled,
+                                DownloadProgress, ProgressCallback)
 from .modes import AppPaths, OperatingMode, OfflineViolation, guard_download
 
 log = logging.getLogger(__name__)
@@ -97,11 +99,15 @@ def prepare_field(config, *, asr_model: Optional[str] = None,
                   language_pairs: Optional[List[Tuple[str, str]]] = None,
                   report: Optional[Reporter] = None,
                   skip_download: bool = False,
-                  mode: Optional[OperatingMode] = None) -> PreparationResult:
+                  mode: Optional[OperatingMode] = None,
+                  progress: Optional[ProgressCallback] = None,
+                  cancelled: Optional[CancelCheck] = None) -> PreparationResult:
     """Download and verify everything needed for offline operation.
 
     Refuses to run in a mode that forbids downloads, unless the caller is only
-    verifying what is already present (``skip_download``).
+    verifying what is already present (``skip_download``). *progress* and
+    *cancelled* apply to the speech model (see _prepare_asr); a cancelled
+    download raises DownloadCancelled.
     """
     if not skip_download:
         guard_download(mode or OperatingMode(getattr(config, "mode",
@@ -142,7 +148,8 @@ def prepare_field(config, *, asr_model: Optional[str] = None,
                str(paths.recordings))
 
     # -- ASR model -------------------------------------------------------
-    result.add(*_prepare_asr(config, paths, model_name, say, skip_download))
+    result.add(*_prepare_asr(config, paths, model_name, say, skip_download,
+                             **_progress_arguments(progress, cancelled)))
 
     # -- translation packages -------------------------------------------
     # A failure to fetch the package index is about the catalogue, not about
@@ -171,9 +178,49 @@ def prepare_field(config, *, asr_model: Optional[str] = None,
     return result
 
 
+def _progress_arguments(progress, cancelled) -> Dict[str, object]:
+    """Only the progress arguments a caller actually gave, so stand-ins with
+    the older signature keep working."""
+    return {key: value for key, value in (("progress", progress),
+                                          ("cancelled", cancelled))
+            if value is not None}
+
+
+class _PhaseReporter:
+    """Remembers the last download snapshot so the later phases
+    ("verifying", "done") carry its byte and file counts."""
+
+    def __init__(self, progress: Optional[ProgressCallback]):
+        self._progress = progress
+        self.last = DownloadProgress()
+
+    def __call__(self, snapshot: DownloadProgress) -> None:
+        self.last = snapshot
+        if self._progress is not None:
+            self._progress(snapshot)
+
+    def phase(self, phase: str) -> None:
+        self(dataclasses.replace(self.last, phase=phase, file=""))
+
+
 def _prepare_asr(config, paths: AppPaths, model_name: str, say: Reporter,
-                 skip_download: bool):
-    """Fetch the model into our own directory, then prove it transcribes."""
+                 skip_download: bool,
+                 progress: Optional[ProgressCallback] = None,
+                 cancelled: Optional[CancelCheck] = None):
+    """Fetch the model into our own directory, then prove it transcribes.
+
+    *progress* receives DownloadProgress snapshots: "resolving" and
+    "downloading" from the download, "verifying" before the offline load
+    and smoke test, and "done" only once that succeeded. *cancelled* is
+    polled during the download (DownloadCancelled is raised, and the partial
+    model stays INCOMPLETE) and once more before verification.
+    """
+    phases = _PhaseReporter(progress)
+
+    def check_cancelled() -> None:
+        if cancelled is not None and cancelled():
+            raise DownloadCancelled("model preparation cancelled")
+
     try:
         from faster_whisper import WhisperModel  # noqa: F401
     except Exception:
@@ -193,9 +240,11 @@ def _prepare_asr(config, paths: AppPaths, model_name: str, say: Reporter,
             return (ASR_STEP, False,
                     f"{state.value} at {directory} (missing: "
                     f"{', '.join(missing)}) and downloads were skipped")
+        # Nothing to fetch: the transfer is trivially complete.
+        phases.last = DownloadProgress(phase="downloading", bytes_total=0)
     else:
         if state is ModelState.INCOMPLETE:
-            # Repair rather than delete: download_model re-fetches only what is
+            # Repair rather than delete: prepare_model re-fetches only what is
             # missing, so an interrupted download costs the gap, not the whole
             # model, and a complete model is never destroyed by a re-run.
             say(f"Model at {directory} is incomplete (missing: "
@@ -203,7 +252,12 @@ def _prepare_asr(config, paths: AppPaths, model_name: str, say: Reporter,
         say(f"Preparing Whisper model {model_name!r} into {directory} "
             f"(this is the step that needs the network)...")
         try:
-            resolved = prepare_model(model_name, paths.models)
+            resolved = prepare_model(model_name, paths.models,
+                                     **_progress_arguments(
+                                         phases if progress is not None else None,
+                                         cancelled))
+        except DownloadCancelled:
+            raise
         except Exception as exc:  # noqa: BLE001
             return (ASR_STEP, False, f"could not prepare: {exc}")
         state, missing = inspect_model_directory(resolved)
@@ -214,7 +268,9 @@ def _prepare_asr(config, paths: AppPaths, model_name: str, say: Reporter,
 
     # Re-open exactly as the field would: from the resolved directory, local
     # files only, no network.
+    check_cancelled()
     say("Verifying the model loads with downloads disabled...")
+    phases.phase("verifying")
     offline = FasterWhisperEngine(model=model_name,
                                   models_root=str(paths.models),
                                   local_files_only=True)
@@ -230,6 +286,7 @@ def _prepare_asr(config, paths: AppPaths, model_name: str, say: Reporter,
     size_mb = (sum(f.stat().st_size for f in directory.rglob('*') if f.is_file())
                / 1e6) if directory and directory.exists() else 0
     _write_manifest(paths, model_name, directory, size_mb, result.engine_version)
+    phases.phase("done")
     return (ASR_STEP, True,
             f"{model_name} at {directory} ({size_mb:.0f} MB), "
             f"offline transcription smoke test passed in {elapsed:.1f}s")
@@ -237,7 +294,9 @@ def _prepare_asr(config, paths: AppPaths, model_name: str, say: Reporter,
 
 def install_asr_model(config, model_name: str, *,
                       report: Optional[Reporter] = None,
-                      mode: Optional[OperatingMode] = None):
+                      mode: Optional[OperatingMode] = None,
+                      progress: Optional[ProgressCallback] = None,
+                      cancelled: Optional[CancelCheck] = None):
     """Download (or repair) one Whisper speech model and prove it loads and
     transcribes offline - the speech-model step of prepare_field, alone.
 
@@ -245,7 +304,7 @@ def install_asr_model(config, model_name: str, *,
     selected (choosing the new one is the operator's step). Refused, before
     any network access, in a mode that forbids downloads. Returns
     ``(step, ok, detail)``; a model that is already complete is verified
-    without downloading again.
+    without downloading again. *progress*/*cancelled* as for _prepare_asr.
     """
     from .providers.whisper_local import MODEL_SIZES
 
@@ -264,7 +323,8 @@ def install_asr_model(config, model_name: str, *,
 
     state, _ = inspect_model_directory(model_directory_for(paths.models, model_name))
     return _prepare_asr(config, paths, model_name, say,
-                        skip_download=state is ModelState.COMPLETE)
+                        skip_download=state is ModelState.COMPLETE,
+                        **_progress_arguments(progress, cancelled))
 
 
 def _write_manifest(paths: AppPaths, model_name: str,

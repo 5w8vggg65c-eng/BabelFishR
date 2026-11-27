@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import sys
+import threading
 import urllib.parse
 from typing import Any, Dict, List, Optional
 
@@ -310,14 +312,31 @@ def _looks_builtin(name: str) -> bool:
     return any(hint in lowered for hint in BUILTIN_NAME_HINTS)
 
 
-def _sounddevice():
-    try:
-        import sounddevice  # type: ignore
+_SOUNDDEVICE_LOCK = threading.Lock()
+_SOUNDDEVICE_FAILED: list = []        # [reason] once the import has failed
 
-        return sounddevice
-    except Exception as exc:  # noqa: BLE001 - any import failure means "no backend"
-        log.debug("sounddevice unavailable: %s", exc)
-        return None
+
+def _sounddevice():
+    """The sounddevice module, or None. A module already imported is used
+    as is. A failed import is remembered and not retried, under a lock: a
+    failing import (no PortAudio library) searches for the library with a
+    subprocess every time, and retried on every status call - from the GUI
+    thread and from readiness workers at once - that crashed the process
+    (Linux test run). A newly installed PortAudio is seen after a restart."""
+    module = sys.modules.get("sounddevice")
+    if module is not None:
+        return module
+    with _SOUNDDEVICE_LOCK:
+        if _SOUNDDEVICE_FAILED:
+            return None
+        try:
+            import sounddevice  # type: ignore
+
+            return sounddevice
+        except Exception as exc:  # noqa: BLE001 - any import failure means "no backend"
+            log.debug("sounddevice unavailable: %s", exc)
+            _SOUNDDEVICE_FAILED.append(str(exc))
+            return None
 
 
 def backend_available() -> bool:

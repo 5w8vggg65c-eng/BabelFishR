@@ -53,7 +53,7 @@ def fake_preparation(monkeypatch):
 
     calls = {"downloads": [], "fail": None, "warm": []}
 
-    def prepare_model(name, models_root):
+    def prepare_model(name, models_root, **_progress):
         from babelfishr.providers.whisper_local import model_directory_for
 
         calls["downloads"].append(name)
@@ -133,7 +133,7 @@ def test_install_from_local_engines_refreshes_without_restart(
     index = window.whisper_model_box.findData(TURBO)
     assert window.whisper_model_box.model().item(index).isEnabled()
     assert "Installed" in window.whisper_model_box.itemText(index)
-    assert "installed and verified" in shown[-1]
+    assert "installed and verified" in window.install_panel.status.text()
     assert not any("Large v3 turbo" in label for label in _menu_labels(window))
     window.whisper_model_box.setCurrentIndex(index)  # selectable now, no restart
     assert window.app.config.asr.model == TURBO
@@ -162,7 +162,7 @@ def test_a_failed_download_is_reported_and_stays_unselectable(qt_app, window,
     fake_preparation["fail"] = "connection reset"
     window._install_model(TURBO)
     _wait_installed(qt_app, window)
-    assert "was not installed" in shown[-1] and "connection reset" in shown[-1]
+    assert "was not installed" in window.install_panel.status.text() and "connection reset" in window.install_panel.status.text()
     index = window.whisper_model_box.findData(TURBO)
     assert not window.whisper_model_box.model().item(index).isEnabled()
     assert window.install_model_button.isEnabled(), "a retry is not possible"
@@ -232,23 +232,43 @@ def test_turbo_resolves_on_old_and_new_faster_whisper(monkeypatch, known, expect
 
 
 def test_the_local_folder_is_named_turbo_whatever_the_source(monkeypatch, tmp_path):
+    """On a faster-whisper that does not know "large-v3-turbo" the canonical
+    repository is fetched, into a folder still named after the model. The
+    Hub is stood in for: no network."""
     import sys
     import types
+
+    import huggingface_hub
 
     import babelfishr.providers.whisper_local as whisper_local
 
     asked = []
 
-    def download_model(source, output_dir, local_files_only=False):
-        asked.append((source, output_dir))
-        return output_dir
+    class Api:
+        def model_info(self, repo_id, files_metadata=False):
+            asked.append(("info", repo_id))
+            return types.SimpleNamespace(siblings=[
+                types.SimpleNamespace(rfilename=name, size=4, lfs=None)
+                for name in ("config.json", "model.bin", "tokenizer.json",
+                             "README.md")])
 
-    utils = types.SimpleNamespace(available_models=lambda: ["large-v3"],
-                                  download_model=download_model)
+    def hf_hub_download(repo_id, filename, local_dir, tqdm_class=None, **_):
+        asked.append((repo_id, filename, local_dir))
+        (whisper_local.pathlib.Path(local_dir) / filename).write_bytes(b"abcd")
+        return str(whisper_local.pathlib.Path(local_dir) / filename)
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", Api)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", hf_hub_download)
+    utils = types.SimpleNamespace(available_models=lambda: ["large-v3"])
     monkeypatch.setitem(sys.modules, "faster_whisper",
                         types.SimpleNamespace(utils=utils, WhisperModel=object))
     monkeypatch.setitem(sys.modules, "faster_whisper.utils", utils)
     resolved = whisper_local.prepare_model(TURBO, tmp_path / "models")
-    assert asked == [("mobiuslabsgmbh/faster-whisper-large-v3-turbo",
-                      str(tmp_path / "models" / TURBO))]
+    repo = "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
+    folder = str(tmp_path / "models" / TURBO)
+    assert asked[0] == ("info", repo)
+    # The same files faster-whisper fetches (README.md is not one), weights last.
+    assert asked[1:] == [(repo, "config.json", folder),
+                         (repo, "tokenizer.json", folder),
+                         (repo, "model.bin", folder)]
     assert resolved.name == TURBO

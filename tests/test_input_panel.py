@@ -342,11 +342,16 @@ def test_calibration_uses_the_selected_input_not_a_stale_widget(qt_app, app,
             raise RuntimeError("stop here; the identity is what matters")
 
     monkeypatch.setattr("babelfishr.audio.source.LiveAudioSource", FakeSource)
-    monkeypatch.setattr(QtWidgets.QMessageBox, "warning",
-                        staticmethod(lambda *a, **k: None))
+    from babelfishr.ui.calibration_dialog import CalibrationDialog
+
+    # The dialog opens the input on its worker; wait for it, not for a person.
+    monkeypatch.setattr(CalibrationDialog, "exec",
+                        lambda self: (self._thread.join(5),
+                                      QtWidgets.QApplication.processEvents(), 0)[2])
     window._calibrate()
 
     assert opened["identity"].uid == radio.uid
+    assert "could not be measured" in window.calibration_dialog.status.text()
 
 
 # ---- P0: the window when two interfaces cannot be told apart -----------

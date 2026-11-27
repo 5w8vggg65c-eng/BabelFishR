@@ -5,10 +5,12 @@ transcription smoke test takes longer still.  None of that may run on the GUI
 thread: a frozen window during a 500 MB download looks like a crash, and an
 operator who force-quits mid-download is left with an incomplete model.
 
-Every worker here reports progress through signals and is cancellable at step
-boundaries. Cancellation is deliberately cooperative - a download is abandoned
-between steps rather than mid-write, so a partially written model is detected
-as INCOMPLETE and repaired rather than being mistaken for a good one.
+Every worker here reports progress through signals (model downloads also
+emit real byte progress on ``signals.progress``) and is cancellable.
+Cancellation is cooperative: a model download is abandoned between chunks,
+but each file is written to a temporary name and only moved into place once
+complete, so a partially downloaded model is detected as INCOMPLETE and
+repaired rather than being mistaken for a good one.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from typing import Any, Callable, List, Optional, Tuple
 
 from PySide6 import QtCore
 
+from ..download_progress import DownloadCancelled
 from ..preparation import working_config
 
 log = logging.getLogger(__name__)
@@ -37,6 +40,9 @@ class WorkerSignals(QtCore.QObject):
     finished = QtCore.Signal(object)         # result payload
     failed = QtCore.Signal(str)
     cancelled = QtCore.Signal()
+    #: A DownloadProgress snapshot (immutable, so safe across threads),
+    #: emitted from the worker thread while a model downloads and verifies.
+    progress = QtCore.Signal(object)
 
 
 class CancellationToken:
@@ -64,8 +70,10 @@ class Cancelled(RuntimeError):
 class FunctionWorker(QtCore.QRunnable):
     """Runs a callable on a thread pool, reporting through signals.
 
-    The callable receives ``report`` (a message callback) and ``token`` (a
-    :class:`CancellationToken`) as keyword arguments when it accepts them.
+    The callable receives ``report`` (a message callback), ``token`` (a
+    :class:`CancellationToken`) and ``progress`` (a DownloadProgress
+    callback that emits ``signals.progress``) as keyword arguments when it
+    accepts them.
     """
 
     def __init__(self, function: Callable[..., Any], *args, **kwargs):
@@ -92,6 +100,9 @@ class FunctionWorker(QtCore.QRunnable):
         except RuntimeError as exc:  # pragma: no cover - teardown race
             log.debug("dropping a background result: %s", exc)
 
+    def _emit_progress(self, snapshot) -> None:
+        self._emit(self.signals.progress, snapshot)
+
     @QtCore.Slot()
     def run(self) -> None:  # pragma: no cover - exercised via the thread pool
         self._emit(self.signals.started)
@@ -104,8 +115,10 @@ class FunctionWorker(QtCore.QRunnable):
                 kwargs["report"] = self.signals.message.emit
             if "token" in parameters:
                 kwargs["token"] = self.token
+            if "progress" in parameters and "progress" not in kwargs:
+                kwargs["progress"] = self._emit_progress
             result = self._function(*self._args, **kwargs)
-        except Cancelled:
+        except (Cancelled, DownloadCancelled):
             self._emit(self.signals.cancelled)
             return
         except Exception as exc:  # noqa: BLE001 - a worker must never crash the UI
@@ -129,9 +142,13 @@ def run_in_background(function: Callable[..., Any], *args,
                       on_failed: Optional[Callable[[str], None]] = None,
                       on_message: Optional[Callable[[str], None]] = None,
                       on_cancelled: Optional[Callable[[], None]] = None,
+                      on_progress: Optional[Callable[[Any], None]] = None,
                       pool: Optional[QtCore.QThreadPool] = None,
                       **kwargs) -> FunctionWorker:
-    """Start *function* off the GUI thread and wire up its callbacks."""
+    """Start *function* off the GUI thread and wire up its callbacks.
+
+    *on_progress* receives each DownloadProgress snapshot on the GUI thread
+    (a queued connection to ``signals.progress``)."""
     worker = FunctionWorker(function, *args, **kwargs)
     if on_finished is not None:
         worker.signals.finished.connect(on_finished)
@@ -141,6 +158,8 @@ def run_in_background(function: Callable[..., Any], *args,
         worker.signals.message.connect(on_message)
     if on_cancelled is not None:
         worker.signals.cancelled.connect(on_cancelled)
+    if on_progress is not None:
+        worker.signals.progress.connect(on_progress)
 
     _ACTIVE.add(worker)
     for signal in (worker.signals.finished, worker.signals.failed,
@@ -160,8 +179,12 @@ def active_worker_count() -> int:
 def prepare_field_job(config, asr_model: str,
                       language_pairs: List[Tuple[str, str]],
                       report: Callable[[str], None] = lambda text: None,
-                      token: Optional[CancellationToken] = None) -> dict:
-    """Download and verify field assets. Runs entirely off the GUI thread."""
+                      token: Optional[CancellationToken] = None,
+                      progress: Optional[Callable[[Any], None]] = None) -> dict:
+    """Download and verify field assets. Runs entirely off the GUI thread.
+
+    *progress* receives DownloadProgress snapshots for the speech model; the
+    token's cancellation stops the download mid-file."""
     from ..preparation import prepare_field, working_config
 
     token = token or CancellationToken()
@@ -174,8 +197,13 @@ def prepare_field_job(config, asr_model: str,
     # One config for both steps, so preparation and verification can never
     # disagree about which model they are talking about.
     working = working_config(config, asr_model)
-    result = prepare_field(working, asr_model=asr_model,
-                           language_pairs=language_pairs, report=relay)
+    extra = {"progress": progress} if progress is not None else {}
+    try:
+        result = prepare_field(working, asr_model=asr_model,
+                               language_pairs=language_pairs, report=relay,
+                               cancelled=lambda: token.cancelled, **extra)
+    except DownloadCancelled as exc:
+        raise Cancelled() from exc
     token.raise_if_cancelled()
 
     report(f"Running Field Check on {working.asr.model!r} with downloads "
@@ -192,10 +220,12 @@ def prepare_field_job(config, asr_model: str,
 
 def install_model_job(config, model_name: str,
                       report: Callable[[str], None] = lambda text: None,
-                      token: Optional[CancellationToken] = None):
+                      token: Optional[CancellationToken] = None,
+                      progress: Optional[Callable[[Any], None]] = None):
     """One Whisper model, downloaded or repaired and verified, off the GUI
-    thread. Cancellation is honoured between steps (a file already being
-    fetched finishes first; a partial model is reported as incomplete)."""
+    thread. *progress* receives DownloadProgress snapshots. Cancellation is
+    honoured during the transfer (mid-file) and between steps; a partial
+    model is reported as incomplete."""
     from ..preparation import install_asr_model
 
     token = token or CancellationToken()
@@ -205,7 +235,12 @@ def install_model_job(config, model_name: str,
         token.raise_if_cancelled()
         report(text)
 
-    result = install_asr_model(config, model_name, report=relay)
+    extra = {"progress": progress} if progress is not None else {}
+    try:
+        result = install_asr_model(config, model_name, report=relay,
+                                   cancelled=lambda: token.cancelled, **extra)
+    except DownloadCancelled as exc:
+        raise Cancelled() from exc
     token.raise_if_cancelled()
     return result
 

@@ -504,8 +504,11 @@ def test_readiness_wording_does_not_alter_readiness_decisions(qt_app, config,
 
     cases = [
         (_ready_report(), "Ready", dict(field_ready=True)),
-        (_untested_report(), "Checking", dict(field_ready=False,
-                                              field_ready_unknown=True)),
+        # A finished check whose smoke tests did not run: a settled result.
+        # It used to read "Checking" - for good, since nothing else was
+        # coming (the director's baseline reproduction on dee017b).
+        (_untested_report(), "Installed, not tested", dict(field_ready=False,
+                                                           field_ready_unknown=True)),
         (_partly_ready_report(), "Partly ready", dict(field_ready=False,
                                                       can_record=True)),
     ]
@@ -518,6 +521,8 @@ def test_readiness_wording_does_not_alter_readiness_decisions(qt_app, config,
         window._render_readiness(report)
         assert expected in window.ready_badge.text(), (
             report.to_dict(), window.ready_badge.text())
+        assert "Checking" not in window.ready_badge.text(), \
+            "a completed report is displayed as still checking"
         for key, value in facts.items():
             assert getattr(report, key) is value
         assert report.to_dict() == before, "rendering changed the report"
@@ -525,6 +530,21 @@ def test_readiness_wording_does_not_alter_readiness_decisions(qt_app, config,
     # A skipped smoke test is never "Ready".
     window._render_readiness(_untested_report())
     assert window.ready_badge.text().split()[-1] != "Ready"
+
+    # The Offline Field Use verdict is untouched by the wording: in that
+    # mode the mark is exactly what offline_field_problems says.
+    from babelfishr.modes import OperatingMode
+    from babelfishr.readiness import offline_field_problems
+
+    window.app.config.mode = OperatingMode.FIELD_OFFLINE.value
+    for report, _expected, _facts in cases:
+        report.mode = OperatingMode.FIELD_OFFLINE
+        window._render_readiness(report)
+        state = window.offline_status.property("state")
+        assert state == ("fail" if offline_field_problems(report) else "ok")
+    window._render_readiness(_untested_report())
+    assert window.offline_status.property("state") == "fail", \
+        "an untested computer was shown ready for Offline Field Use"
     window.close()
 
 
