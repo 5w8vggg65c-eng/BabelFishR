@@ -23,14 +23,14 @@ import unicodedata
 from typing import (Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set,
                     Tuple)
 
-from .models import (ContentClass, Conversation, ErrorInfo, ProcessingState,
+from .models import (CaptureGap, ContentClass, Conversation, ErrorInfo, ProcessingState,
                      RadioProfile, Session, SourceLanguageMode,
                      Transmission, TranscriptSegment, iso, parse_iso,
                      utcnow)
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 #: Layout of the search index and its maintenance table (meta key
 #: ``fts_layout``). 1: the index alone, maintained by deleting and rewriting
@@ -166,6 +166,24 @@ CREATE TABLE IF NOT EXISTS deleted_transmissions (
     session_id     TEXT,
     leftover_files TEXT DEFAULT '[]'
 );
+
+-- Schema 9: audio a monitoring run's input received but could not keep (the
+-- capture buffer overflowed and its oldest audio was discarded). One row per
+-- gap; start_frame is the position in the run's stream (NULL when the frames
+-- were counted but could not be placed). Written by the capture thread as
+-- each gap is found, so the record survives a crash or a restart.
+CREATE TABLE IF NOT EXISTS capture_gaps (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    start_frame INTEGER,
+    frames      INTEGER NOT NULL,
+    sample_rate INTEGER NOT NULL DEFAULT 0,
+    started_at  TEXT,
+    blocks      INTEGER DEFAULT 0,
+    reason      TEXT DEFAULT 'buffer-overflow',
+    recorded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_gap_session ON capture_gaps (session_id);
 
 CREATE INDEX IF NOT EXISTS ix_tx_session ON transmissions (session_id);
 CREATE INDEX IF NOT EXISTS ix_tx_started ON transmissions (started_at);
@@ -584,13 +602,53 @@ class Store:
     def get_session(self, session_id: str) -> Optional[Session]:
         row = self._conn.execute("SELECT * FROM sessions WHERE id = ?",
                                  (session_id,)).fetchone()
-        return Session.from_dict(dict(row)) if row else None
+        if not row:
+            return None
+        return self._with_gaps([Session.from_dict(dict(row))])[0]
 
     def list_sessions(self, limit: int = 100) -> List[Session]:
         rows = self._conn.execute(
             "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ?",
             (limit,)).fetchall()
-        return [Session.from_dict(dict(r)) for r in rows]
+        return self._with_gaps([Session.from_dict(dict(r)) for r in rows])
+
+    # ---- capture gaps --------------------------------------------------
+    def add_capture_gap(self, gap: CaptureGap) -> CaptureGap:
+        """Record audio a run's input lost. Called from the capture thread,
+        never from the device callback."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO capture_gaps (session_id, start_frame, frames, "
+                "sample_rate, started_at, blocks, reason, recorded_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (gap.session_id, gap.start_frame, int(gap.frames),
+                 int(gap.sample_rate), iso(gap.started_at), int(gap.blocks),
+                 gap.reason, iso(gap.recorded_at)))
+            self._conn.commit()
+        return gap
+
+    def capture_gaps(self, session_id: str) -> List[CaptureGap]:
+        """Every gap recorded for one monitoring run, in stream order (gaps
+        that could not be placed last)."""
+        rows = self._conn.execute(
+            "SELECT * FROM capture_gaps WHERE session_id = ? "
+            "ORDER BY start_frame IS NULL, start_frame, id",
+            (session_id,)).fetchall()
+        return [CaptureGap.from_dict(dict(r)) for r in rows]
+
+    def _with_gaps(self, sessions: List[Session]) -> List[Session]:
+        if not sessions:
+            return sessions
+        by_id = {s.id: s for s in sessions}
+        marks = ",".join("?" for _ in by_id)
+        rows = self._conn.execute(
+            f"SELECT * FROM capture_gaps WHERE session_id IN ({marks}) "
+            f"ORDER BY start_frame IS NULL, start_frame, id",
+            tuple(by_id)).fetchall()
+        for row in rows:
+            by_id[row["session_id"]].capture_gaps.append(
+                CaptureGap.from_dict(dict(row)).to_dict())
+        return sessions
 
     def close_session(self, session_id: str,
                       ended_at: Optional[_dt.datetime] = None) -> None:
@@ -1016,6 +1074,8 @@ class Store:
                 if one is not None:
                     report.messages.append(one)
             with self._lock:
+                self._conn.execute("DELETE FROM capture_gaps WHERE session_id = ?",
+                                   (session_id,))
                 self._conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
                 self._conn.commit()
             report.session_ids.append(session_id)

@@ -476,6 +476,21 @@ class Session:
     destination later never moves where this run's recordings and portable
     transcripts go."""
 
+    capture_gaps: List[Dict[str, Any]] = dataclasses.field(default_factory=list)
+    """Audio the input lost during this run (capture buffer overflow), one
+    :meth:`CaptureGap.to_dict` per gap, in stream order. Read-only here:
+    filled by the store from its capture_gaps table, never written by
+    save_session, so a stale Session object cannot erase the record."""
+
+    @property
+    def dropped_frames(self) -> int:
+        return sum(int(g.get("frames") or 0) for g in self.capture_gaps)
+
+    @property
+    def dropped_seconds(self) -> float:
+        return round(sum(float(g.get("duration") or 0.0)
+                         for g in self.capture_gaps), 6)
+
     @property
     def is_open(self) -> bool:
         return self.ended_at is None
@@ -491,17 +506,77 @@ class Session:
         d["ended_at"] = iso(self.ended_at)
         d["source_language_mode"] = self.source_language_mode.value
         d["duration"] = self.duration
+        d["dropped_frames"] = self.dropped_frames
+        d["dropped_seconds"] = self.dropped_seconds
         return d
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Session":
         d = dict(d)
         d.pop("duration", None)
+        d.pop("dropped_frames", None)
+        d.pop("dropped_seconds", None)
+        d["capture_gaps"] = list(d.get("capture_gaps") or [])
         d["started_at"] = parse_iso(d.get("started_at")) or utcnow()
         d["ended_at"] = parse_iso(d.get("ended_at"))
         _coerce_enum(d, "source_language_mode", SourceLanguageMode)
         known = {f.name for f in dataclasses.fields(cls)}
         return cls(**{k: v for k, v in d.items() if k in known})
+
+
+@dataclasses.dataclass
+class CaptureGap:
+    """A stretch of audio the input received but could not keep.
+
+    The live input's buffer overflowed (the capture thread fell behind) and
+    the oldest buffered audio was discarded to keep the device callback from
+    stalling. ``start_frame`` is the position in the run's stream, in frames
+    at ``sample_rate`` counted from the start of capture, where the missing
+    audio began; ``None`` when the frames were counted at the drop but could
+    not be placed (still unread when the run ended)."""
+
+    session_id: str = ""
+    frames: int = 0
+    sample_rate: int = 0
+    start_frame: Optional[int] = None
+    started_at: Optional[_dt.datetime] = None
+    """Wall-clock time of the first missing frame (stream start + offset)."""
+    blocks: int = 0
+    reason: str = "buffer-overflow"
+    recorded_at: _dt.datetime = dataclasses.field(default_factory=utcnow)
+
+    @property
+    def duration(self) -> float:
+        return self.frames / float(self.sample_rate) if self.sample_rate else 0.0
+
+    @property
+    def stream_offset(self) -> Optional[float]:
+        """Seconds from the start of capture to the first missing frame."""
+        if self.start_frame is None or not self.sample_rate:
+            return None
+        return self.start_frame / float(self.sample_rate)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"session_id": self.session_id, "frames": int(self.frames),
+                "sample_rate": int(self.sample_rate),
+                "duration": round(self.duration, 6),
+                "start_frame": self.start_frame,
+                "stream_offset": (None if self.stream_offset is None
+                                  else round(self.stream_offset, 6)),
+                "started_at": iso(self.started_at), "blocks": int(self.blocks),
+                "reason": self.reason, "recorded_at": iso(self.recorded_at)}
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "CaptureGap":
+        start = d.get("start_frame")
+        return cls(session_id=d.get("session_id") or "",
+                   frames=int(d.get("frames") or 0),
+                   sample_rate=int(d.get("sample_rate") or 0),
+                   start_frame=None if start is None else int(start),
+                   started_at=parse_iso(d.get("started_at")),
+                   blocks=int(d.get("blocks") or 0),
+                   reason=d.get("reason") or "buffer-overflow",
+                   recorded_at=parse_iso(d.get("recorded_at")) or utcnow())
 
 
 def _enum_value(value: Any, default: Any) -> str:

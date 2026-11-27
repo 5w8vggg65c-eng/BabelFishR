@@ -20,7 +20,7 @@ from typing import Callable, Iterator, List, Optional
 import numpy as np
 
 from ..dsp.filters import dbfs, rms
-from ..models import utcnow
+from ..models import CaptureGap, utcnow
 from .devices import (AmbiguousInputDevice, AudioBackendUnavailable,
                       AudioDevice, DeviceIdentity, InputDeviceMissing,
                       find_device, resolve_input)
@@ -40,6 +40,11 @@ class AudioBlock:
     timestamp: _dt.datetime
     offset: float
     """Seconds since the source started."""
+
+    start_frame: Optional[int] = None
+    """Index of the first sample in the source's stream, counted from the
+    start of capture, for a source that numbers its frames (live input).
+    A jump between consecutive blocks is audio that was lost in between."""
 
     @property
     def duration(self) -> float:
@@ -246,8 +251,23 @@ class LiveAudioSource(AudioSource):
         #: before Stop.
         self._intake_lock = threading.Lock()
         self._intake_open = False
+        #: Overflow accounting, counted in the device callback at the moment
+        #: a block is discarded: plain integer increments under the lock the
+        #: callback already holds for its enqueue - no I/O, no logging, no
+        #: allocation. Reset at start(); they describe the current run.
         self.dropped_blocks = 0
+        self.dropped_frames = 0
         self.overflow_count = 0
+        #: PortAudio status flags seen in the callback; reported (logged,
+        #: on_status) by the reading thread, never from the callback.
+        self._status_count = 0
+        self._status_reported = 0
+        self._last_status = None
+        # Consumer side (the thread that calls read()): where the stream is
+        # expected to continue, and the gaps found but not yet taken.
+        self._next_frame = 0
+        self._located_frames = 0
+        self._gaps: List[CaptureGap] = []
 
     # -- lifecycle -------------------------------------------------------
     def start(self) -> None:
@@ -269,6 +289,14 @@ class LiveAudioSource(AudioSource):
         self._start_time = utcnow()
         self._samples_seen = 0
         with self._intake_lock:
+            self.dropped_blocks = 0
+            self.dropped_frames = 0
+            self.overflow_count = 0
+            self._status_count = self._status_reported = 0
+            self._last_status = None
+            self._next_frame = 0
+            self._located_frames = 0
+            self._gaps = []
             self._intake_open = True
         self._open_stream()
         self._running = True
@@ -324,34 +352,49 @@ class LiveAudioSource(AudioSource):
         self._stream.start()
         self._notify("connected", f"capturing from {self.device.name}")
 
-    def _callback(self, indata, frames, time_info, status) -> None:  # pragma: no cover
-        """PortAudio realtime thread: do the minimum and never block."""
+    def _callback(self, indata, frames, time_info, status) -> None:
+        """PortAudio realtime thread: do the minimum and never block.
+
+        No file or store I/O, no logging, no status callback here: a status
+        flag is only counted (read() reports it), and an overflow is only
+        counted (read() locates the gap, the capture thread records it)."""
         if status:
             if getattr(status, "input_overflow", False):
                 self.overflow_count += 1
-            self._notify("stream-status", str(status))
+            self._last_status = status
+            self._status_count += 1
         data = np.asarray(indata, dtype=np.float64)
         mono = data.mean(axis=1) if data.ndim > 1 else data
-        offset = self._samples_seen / float(self.sample_rate)
+        start = self._samples_seen
+        offset = start / float(self.sample_rate)
         self._samples_seen += mono.size
         block = AudioBlock(
             samples=mono.copy(), sample_rate=self.sample_rate,
             timestamp=(self._start_time or utcnow()) + _dt.timedelta(seconds=offset),
-            offset=offset,
+            offset=offset, start_frame=start,
         )
         with self._intake_lock:
             if not self._intake_open:
                 return                 # after Stop: not part of this run
             try:
                 self._queue.put_nowait(block)
+                return
             except queue.Full:
-                # Better to lose the oldest block than to stall the audio callback.
+                pass
+            # Better to lose the oldest block than to stall the audio
+            # callback - but every frame of it is counted, here, at the drop.
+            try:
+                oldest = self._queue.get_nowait()
+            except queue.Empty:        # the reader emptied it meanwhile
+                oldest = None
+            if oldest is not None:
                 self.dropped_blocks += 1
-                try:
-                    self._queue.get_nowait()
-                    self._queue.put_nowait(block)
-                except queue.Empty:  # pragma: no cover - race, harmless
-                    pass
+                self.dropped_frames += oldest.samples.size
+            try:
+                self._queue.put_nowait(block)
+            except queue.Full:         # pragma: no cover - only this thread puts
+                self.dropped_blocks += 1
+                self.dropped_frames += block.samples.size
 
     def close_intake(self) -> None:
         with self._intake_lock:
@@ -407,10 +450,63 @@ class LiveAudioSource(AudioSource):
         return self._running
 
     def read(self, timeout: float = 1.0) -> Optional[AudioBlock]:
+        self._report_status()
         try:
-            return self._queue.get(timeout=timeout)
+            block = self._queue.get(timeout=timeout)
         except queue.Empty:
             return None
+        self._locate_gap(block)
+        return block
+
+    def _report_status(self) -> None:
+        """Stream status flags the callback counted, reported here, off the
+        realtime thread (it must neither log nor call out)."""
+        count = self._status_count
+        if count != self._status_reported:
+            self._status_reported = count
+            status = self._last_status
+            if status is not None:
+                self._notify("stream-status", str(status))
+
+    def _locate_gap(self, block: AudioBlock) -> None:
+        """Consumer side: a block that does not start where the previous one
+        ended follows audio the callback discarded. Exact, because every
+        delivered block is numbered and each one is either read or dropped."""
+        start = block.start_frame
+        if start is None:
+            return
+        if start > self._next_frame:
+            missing = start - self._next_frame
+            offset = self._next_frame / float(self.sample_rate)
+            self._gaps.append(CaptureGap(
+                frames=missing, sample_rate=self.sample_rate,
+                start_frame=self._next_frame,
+                started_at=((self._start_time or utcnow())
+                            + _dt.timedelta(seconds=offset)),
+                # Frames are exact; the block count is derived from the
+                # stream's fixed callback size (dropped_blocks is the
+                # callback's exact running total).
+                blocks=max(1, round(missing / float(self.block_size or missing)))))
+            self._located_frames += missing
+        self._next_frame = max(self._next_frame, start + block.samples.size)
+
+    def take_capture_gaps(self, final: bool = False) -> List[CaptureGap]:
+        """Gaps found since the last call, in stream order. Called by the
+        capture thread, which records them.
+
+        ``final`` at the end of a run: frames the callback counted as dropped
+        that no read could place (their successor was never read) are
+        returned as one unplaced gap, so the total always equals what was
+        actually discarded."""
+        gaps, self._gaps = self._gaps, []
+        if final:
+            self._report_status()
+            unplaced = self.dropped_frames - self._located_frames
+            if unplaced > 0:
+                gaps.append(CaptureGap(frames=unplaced,
+                                       sample_rate=self.sample_rate))
+                self._located_frames += unplaced
+        return gaps
 
     def _notify(self, kind: str, message: str) -> None:
         log.debug("audio %s: %s", kind, message)

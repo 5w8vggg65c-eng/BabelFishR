@@ -45,8 +45,9 @@ from .audio.wavefile import write_wav, write_wav_atomic
 from . import savepath
 from .config import Config
 from .detect import DetectedTransmission, RadioActivityDetector
-from .models import (ContentClass, ProcessingState, Provenance, RadioProfile,
-                     Session, SourceLanguageMode, Transmission, utcnow)
+from .models import (CaptureGap, ContentClass, ProcessingState, Provenance,
+                     RadioProfile, Session, SourceLanguageMode, Transmission,
+                     iso, utcnow)
 from .providers import (EngineError, EngineUnavailable, Glossary,
                         TranscriptionEngine, TranslationEngine)
 from .storage import Store
@@ -1340,6 +1341,22 @@ class CaptureService:
         # the actual blocks arriving here, including quiet audio between calls.
         self._waveform = (None if isinstance(source, ReplayAudioSource)
                           else RollingEnvelope(source.sample_rate))
+        # Capture-buffer overflow accounting (finding: drops were silent).
+        # The source counts and locates the loss; this thread records it in
+        # the store, attaches it to the transmission open across it, and
+        # tells the operator - at most once per overflow_warning_interval.
+        #: Every gap recorded for this run, in the order found.
+        self.capture_gaps: List[CaptureGap] = []
+        self._open_gaps: List[CaptureGap] = []
+        self._unwarned_frames = 0
+        self._unwarned_gaps = 0
+        self._last_overflow_warning: Optional[float] = None
+        #: Monotonic clock for the warning's rate limit (tests replace it).
+        self.clock: Callable[[], float] = _time.monotonic
+
+    #: Minimum seconds between two capture-overflow warnings; what drops in
+    #: between is accumulated into the next one.
+    overflow_warning_interval = 10.0
 
     #: How long stop() waits for the audio thread before reporting that it
     #: is still running. A bound on the caller's wait, not on the thread.
@@ -1522,6 +1539,9 @@ class CaptureService:
                 return
             self._finished = True
         self._drain_source()
+        # Drops just before the end are recorded too: what the drain placed,
+        # and anything counted at the drop that nothing after it revealed.
+        self._account_gaps(final=True)
         # A Stop request (the audio cutoff) keeps all of an open burst; the
         # end of a file keeps the ordinary end-of-stream rules.
         for detected in self.detector.flush(cutoff=self._stop_requested):
@@ -1570,6 +1590,7 @@ class CaptureService:
                     break
                 continue
             if isinstance(block, AudioBlock):
+                self._account_gaps()
                 self._handle_block(block)
             else:
                 self._boundary(block)
@@ -1593,9 +1614,79 @@ class CaptureService:
             if item is None:
                 return
             if isinstance(item, AudioBlock):
+                self._account_gaps()
                 self._handle_block(item)
             else:
                 self._boundary(item)
+
+    # -- capture-buffer overflow -------------------------------------------
+    def _account_gaps(self, final: bool = False) -> None:
+        """Record what the input lost before the block about to be handled.
+
+        Runs on the capture thread (or the stopper, at the finish) - never
+        in the device callback. Each gap is written to the store at once, so
+        the accounting survives a crash or restart; one found while a
+        transmission is open belongs to that transmission's audio."""
+        take = getattr(self.source, "take_capture_gaps", None)
+        if take is None:
+            return
+        try:
+            gaps = take(final=final)
+        except Exception:  # noqa: BLE001 - accounting must not stop capture
+            log.exception("reading the input's overflow accounting failed")
+            return
+        for gap in gaps:
+            gap.session_id = self.session.id
+            try:
+                self.store.add_capture_gap(gap)
+            except Exception:  # noqa: BLE001 - kept in memory, warned below
+                log.exception("recording a capture gap failed")
+            self.capture_gaps.append(gap)
+            if self.detector.open:
+                self._open_gaps.append(gap)
+            self._unwarned_frames += gap.frames
+            self._unwarned_gaps += 1
+            log.warning("capture buffer overflow: %d frames (%.3f s) lost at "
+                        "frame %s of run %s", gap.frames, gap.duration,
+                        gap.start_frame, self.session.id)
+        self._warn_overflow(force=final)
+
+    @property
+    def dropped_frames(self) -> int:
+        return sum(g.frames for g in self.capture_gaps)
+
+    @property
+    def dropped_seconds(self) -> float:
+        return sum(g.duration for g in self.capture_gaps)
+
+    def _warn_overflow(self, force: bool = False) -> None:
+        """One operator warning for what was lost since the last one, at most
+        once per interval; ``force`` (the end of the run) reports whatever is
+        still unreported so nothing lost is left unsaid."""
+        if not self._unwarned_frames:
+            return
+        now = self.clock()
+        last = self._last_overflow_warning
+        if not force and last is not None and now - last < self.overflow_warning_interval:
+            return
+        self._last_overflow_warning = now
+        rate = self.source.sample_rate or 1
+        lost = self._unwarned_frames / float(rate)
+        gaps = self._unwarned_gaps
+        message = (f"Audio input buffer overflowed: {lost:.3f} s of audio "
+                   f"({self._unwarned_frames} frames, {gaps} gap"
+                   f"{'' if gaps == 1 else 's'}) was lost because processing "
+                   f"fell behind. This run has lost {self.dropped_seconds:.3f} s "
+                   f"in total; the gaps are recorded with the session.")
+        payload = {"kind": "capture-overflow", "message": message,
+                   "session_id": self.session.id,
+                   "dropped_frames": self._unwarned_frames,
+                   "dropped_seconds": round(lost, 6), "gaps": gaps,
+                   "total_dropped_frames": self.dropped_frames,
+                   "total_dropped_seconds": round(self.dropped_seconds, 6)}
+        self._unwarned_frames = 0
+        self._unwarned_gaps = 0
+        self.events.publish("audio-status", payload)
 
     def _handle_block(self, block: AudioBlock) -> None:
         reading = self.meter.update(block)
@@ -1619,6 +1710,8 @@ class CaptureService:
         self._block_tuning = getattr(block, "tuning", None)
         for detected in self.detector.push(block):
             self._capture(detected, tuning=self._block_tuning)
+        if not self.detector.open:
+            self._open_gaps.clear()    # closed without a recording to carry them
         if self.detector.open and not was_open:
             self._set_state(PipelineState.RECEIVING)
         elif was_open and not self.detector.open:
@@ -1684,6 +1777,15 @@ class CaptureService:
             tx.signal_metadata = dict(tx.signal_metadata or {}, segment={
                 "continued": bool(detected.continued),
                 "continues_previous": bool(detected.continues_previous)})
+
+        if self._open_gaps:
+            # Audio was lost while this transmission was being received:
+            # what survives is kept, in order, and the missing part is said.
+            gaps, self._open_gaps = self._open_gaps, []
+            tx.signal_metadata = dict(tx.signal_metadata or {}, capture_gaps=[
+                {"start_frame": g.start_frame, "frames": g.frames,
+                 "duration": round(g.duration, 6), "sample_rate": g.sample_rate,
+                 "started_at": iso(g.started_at)} for g in gaps])
 
         # --- persistence, before any classification-driven decision ---------
         tx.audio_path = self.recorder.write(tx, self.session, detected.audio,
