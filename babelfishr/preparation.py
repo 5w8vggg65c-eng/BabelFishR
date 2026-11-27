@@ -230,32 +230,45 @@ def _prepare_asr(config, paths: AppPaths, model_name: str, say: Reporter,
     from .providers.whisper_local import FasterWhisperEngine
 
     from .providers.whisper_local import (ModelState, inspect_model_directory,
-                                          model_directory_for, prepare_model)
+                                          model_directory_for, prepare_model,
+                                          verify_model)
 
     directory = model_directory_for(paths.models, model_name)
     state, missing = inspect_model_directory(directory)
+    reporter = phases if progress is not None else None
 
     if skip_download:
         if state is not ModelState.COMPLETE:
             return (ASR_STEP, False,
                     f"{state.value} at {directory} (missing: "
                     f"{', '.join(missing)}) and downloads were skipped")
-        # Nothing to fetch: the transfer is trivially complete.
-        phases.last = DownloadProgress(phase="downloading", bytes_total=0)
+        # Nothing to fetch, but nothing is taken on trust either: every file
+        # is hashed against the pinned checksums, locally, with no network.
+        say(f"Checking {model_name!r} against its published checksums "
+            f"(no network)...")
+        try:
+            verify_model(model_name, paths.models,
+                         **_progress_arguments(reporter, cancelled))
+        except DownloadCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return (ASR_STEP, False, f"not verified: {exc}")
+        # The transfer is trivially complete.
+        phases.last = dataclasses.replace(phases.last, phase="downloading",
+                                          bytes_done=0, bytes_total=0)
     else:
         if state is ModelState.INCOMPLETE:
             # Repair rather than delete: prepare_model re-fetches only what is
-            # missing, so an interrupted download costs the gap, not the whole
-            # model, and a complete model is never destroyed by a re-run.
+            # missing or fails its checksum, so an interrupted download costs
+            # the gap, not the whole model, and a model whose files all match
+            # is never fetched again.
             say(f"Model at {directory} is incomplete (missing: "
                 f"{', '.join(missing)}); repairing...")
         say(f"Preparing Whisper model {model_name!r} into {directory} "
             f"(this is the step that needs the network)...")
         try:
             resolved = prepare_model(model_name, paths.models,
-                                     **_progress_arguments(
-                                         phases if progress is not None else None,
-                                         cancelled))
+                                     **_progress_arguments(reporter, cancelled))
         except DownloadCancelled:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -285,10 +298,16 @@ def _prepare_asr(config, paths: AppPaths, model_name: str, say: Reporter,
     directory = offline.model_directory()
     size_mb = (sum(f.stat().st_size for f in directory.rglob('*') if f.is_file())
                / 1e6) if directory and directory.exists() else 0
+    from .model_integrity import Integrity, integrity_state
+
+    integrity, integrity_detail = integrity_state(directory, model_name)
+    if integrity is not Integrity.VERIFIED:   # changed under us: fail closed
+        return (ASR_STEP, False, f"not verified: {integrity_detail}")
     _write_manifest(paths, model_name, directory, size_mb, result.engine_version)
     phases.phase("done")
     return (ASR_STEP, True,
             f"{model_name} at {directory} ({size_mb:.0f} MB), "
+            f"{integrity_detail}, "
             f"offline transcription smoke test passed in {elapsed:.1f}s")
 
 
@@ -303,8 +322,10 @@ def install_asr_model(config, model_name: str, *,
     Nothing else changes: no language packs, and the selected model stays
     selected (choosing the new one is the operator's step). Refused, before
     any network access, in a mode that forbids downloads. Returns
-    ``(step, ok, detail)``; a model that is already complete is verified
-    without downloading again. *progress*/*cancelled* as for _prepare_asr.
+    ``(step, ok, detail)``; a model that is already complete is hashed
+    against its pinned checksums without downloading again (a legacy install
+    becomes verified this way), and files that fail are fetched again.
+    *progress*/*cancelled* as for _prepare_asr.
     """
     from .providers.whisper_local import MODEL_SIZES
 
@@ -319,11 +340,10 @@ def install_asr_model(config, model_name: str, *,
     if free_mb < needed_mb:
         return (ASR_STEP, False,
                 f"{free_mb:.0f} MB free, need about {needed_mb} MB for {model_name}")
-    from .providers.whisper_local import ModelState, inspect_model_directory, model_directory_for
-
-    state, _ = inspect_model_directory(model_directory_for(paths.models, model_name))
-    return _prepare_asr(config, paths, model_name, say,
-                        skip_download=state is ModelState.COMPLETE,
+    # Always through prepare_model: a complete model is hashed against its
+    # pin with no network request, and only files that are missing or fail
+    # their checksum are fetched (from the pinned commit).
+    return _prepare_asr(config, paths, model_name, say, skip_download=False,
                         **_progress_arguments(progress, cancelled))
 
 

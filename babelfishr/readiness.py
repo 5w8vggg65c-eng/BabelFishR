@@ -618,9 +618,36 @@ def _check_transcription(config, report: ReadinessReport,
 
     directory = engine.model_directory()
     size = _directory_size(directory) if directory else 0
+    # Integrity from the install record only (no hashing here): "verified"
+    # only when the record matches the pin and the files as they are now.
+    # A custom folder has no pinned identity, so it is never "verified".
+    from .model_integrity import Integrity, integrity_state
+
+    if getattr(config.asr, "model_path", None):
+        integrity, integrity_detail = (Integrity.UNPINNED,
+                                       "custom folder, checksums not verified")
+    else:
+        integrity, integrity_detail = integrity_state(directory, config.asr.model)
+    if integrity is Integrity.MISMATCH:
+        report.add(Check(
+            "Local ASR model present", CheckStatus.FAIL,
+            f"{config.asr.model} at {directory}: {integrity_detail}",
+            remedy=f"babelfishr prepare-field --asr-model {config.asr.model}",
+            data={"path": str(directory), "bytes": size,
+                  "integrity": integrity.value}))
+        report.add(Check("Local ASR model loadable", CheckStatus.SKIP,
+                         "the model failed its checksums"))
+        report.add(Check("Local transcription smoke test", CheckStatus.SKIP,
+                         "the model failed its checksums"))
+        return
+    wording = (integrity_detail if integrity is Integrity.VERIFIED
+               else "checksums not verified")
     report.add(Check("Local ASR model present", CheckStatus.PASS,
-                     f"{config.asr.model} at {directory} ({size / 1e6:.0f} MB)",
-                     data={"path": str(directory), "bytes": size}))
+                     f"{config.asr.model} at {directory} ({size / 1e6:.0f} MB), "
+                     f"{wording}",
+                     data={"path": str(directory), "bytes": size,
+                           "integrity": integrity.value,
+                           "integrity_detail": integrity_detail}))
 
     if not run_smoke_tests:
         report.add(Check("Local ASR model loadable", CheckStatus.SKIP,

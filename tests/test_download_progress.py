@@ -56,14 +56,16 @@ class FakeHub:
         self.chunks = []           # every chunk size delivered
         self.calls = []
         self.on_chunk = None       # hook(filename, bytes so far)
+        self.revisions = []        # the revision every request named
 
     # -- metadata -----------------------------------------------------------
     def api(self):
         hub = self
 
         class Api:
-            def model_info(self, repo_id, files_metadata=False):
+            def model_info(self, repo_id, revision=None, files_metadata=False):
                 hub.calls.append(("model_info", repo_id, files_metadata))
+                hub.revisions.append(revision)
                 if not hub.metadata:
                     raise OSError("metadata unavailable")
                 return types.SimpleNamespace(siblings=[
@@ -104,8 +106,9 @@ class FakeHub:
         return str(destination)
 
     def hf_hub_download(self, repo_id, filename, local_dir=None,
-                        tqdm_class=None, **kwargs):
+                        tqdm_class=None, revision=None, **kwargs):
         self.calls.append(("hf_hub_download", repo_id, filename))
+        self.revisions.append(revision)
         size = len(self.files[filename])
         bar = tqdm_class(total=size, initial=0, desc=filename, unit="B",
                          unit_scale=True)
@@ -113,12 +116,14 @@ class FakeHub:
             return self._send(filename, local_dir, bar)
 
     def snapshot_download(self, repo_id, local_dir=None, allow_patterns=None,
-                          tqdm_class=None, local_files_only=False, **kwargs):
+                          tqdm_class=None, local_files_only=False, revision=None,
+                          **kwargs):
         """As huggingface_hub 2.x: one transfer bar and one reconstruction
         bar for the whole snapshot, both of the given class."""
         import fnmatch
 
         self.calls.append(("snapshot_download", repo_id, local_files_only))
+        self.revisions.append(revision)
         if local_files_only:
             return local_dir
         # As huggingface_hub 2.4.0 builds them: both measured in bytes.
@@ -141,6 +146,15 @@ class FakeHub:
         monkeypatch.setattr(huggingface_hub, "snapshot_download",
                             self.snapshot_download)
         return self
+
+
+@pytest.fixture(autouse=True)
+def pinned(monkeypatch):
+    """The model pinned to exactly the fake Hub's files (README.md is not
+    one of the model's files)."""
+    from pinning import pin
+
+    return pin(monkeypatch, MODEL, {name: FILES[name] for name in WANTED}, repo=REPO)
 
 
 @pytest.fixture
@@ -243,6 +257,10 @@ def test_known_total_reports_real_bytes_monotonically(config, tmp_path, hub,
     assert [c[2] for c in hub.calls if c[0] == "hf_hub_download"] == [
         "config.json", "tokenizer.json", "model.bin"]
     assert inspect_model_directory(model_dir(config))[0] is ModelState.COMPLETE
+    # every request named the pinned commit, never a branch
+    from pinning import REVISION
+
+    assert hub.revisions and set(hub.revisions) == {REVISION}
 
 
 def test_callbacks_are_throttled_but_file_boundaries_always_arrive():
@@ -366,19 +384,23 @@ def test_an_already_complete_model_is_not_downloaded_again(config, tmp_path, hub
     hub.calls.clear()
     hub.chunks.clear()
     events.clear()
-    # install_asr_model only verifies a complete model ...
+    # install_asr_model only verifies a complete model (each file hashed
+    # against its pinned checksum, then the offline smoke test) ...
     step, ok, detail = install(config, tmp_path, events)
     assert ok, detail
     assert hub.calls == [] and hub.chunks == []
-    assert [s.phase for s in snapshots(events)] == ["verifying", "done"]
+    phases = [s.phase for s in snapshots(events)]
+    assert phases[-1] == "done" and set(phases[:-1]) == {"verifying"}
+    assert {s.file for s in snapshots(events) if s.file} == set(WANTED)
     assert snapshots(events)[-1].fraction == 1.0
-    # ... and a full preparation run checks the file list but fetches nothing.
+    # ... and so does a full preparation run: with every checksum matching
+    # it makes no request at all (it used to ask for the file list).
     events.clear()
     config.mode = OperatingMode.ONLINE_SETUP.value
     result = prepare_field(config, asr_model=MODEL, language_pairs=[],
                            progress=events.append)
     assert result.asr_ok, result.summary()
-    assert [c[0] for c in hub.calls] == ["model_info"] and hub.chunks == []
+    assert hub.calls == [] and hub.chunks == []
     last = snapshots(events)[-1]
     assert last.phase == "done" and last.files_done == 3
     assert last.bytes_done == 0 and last.bytes_total == 0 and last.fraction == 1.0

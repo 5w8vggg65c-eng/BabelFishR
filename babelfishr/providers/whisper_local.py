@@ -26,7 +26,6 @@ vocabulary in as an initial prompt.
 
 from __future__ import annotations
 
-import fnmatch
 import logging
 import threading
 import time
@@ -40,6 +39,7 @@ from ..download_progress import (CancelCheck, DownloadCancelled,  # noqa: F401
                                  DownloadProgress, ProgressCallback,
                                  ProgressTracker, progress_bar_class)
 from ..dsp.resample import resample
+from ..model_integrity import IntegrityError, UnpinnedModel  # noqa: F401
 from ..models import TranscriptSegment, signoff_is_noise, stock_signoff
 from .base import (EngineError, EngineUnavailable, PrivacyProfile,
                    TranscriptionEngine, TranscriptionResult)
@@ -95,7 +95,8 @@ def inspect_model_directory(directory) -> tuple:
     return (ModelState.COMPLETE, [])
 
 
-#: The files faster-whisper's own download_model fetches, and nothing else.
+#: The files faster-whisper's own download_model fetches, and nothing else
+#: (the refresh script pins exactly the files of a revision matching these).
 ALLOW_PATTERNS = ("config.json", "preprocessor_config.json", "model.bin",
                   "tokenizer.json", "vocabulary.*")
 
@@ -105,70 +106,180 @@ def prepare_model(model_name: str, models_root, local_files_only: bool = False,
                   cancelled: Optional[CancelCheck] = None) -> pathlib.Path:
     """Download (or verify) a model into its own directory. Returns the path.
 
-    Fetches exactly what faster-whisper's ``download_model`` would (same
-    repository, same files, same plain ``output_dir`` layout), but with a
-    progress bar that reports real bytes: *progress* receives a
-    :class:`DownloadProgress` snapshot ("resolving", then "downloading"),
-    throttled to about ten per second plus file boundaries. It is called on
-    the downloading thread. *cancelled* is polled during the transfer and
-    between files; when it returns True, :class:`DownloadCancelled` is
-    raised and the files not yet complete are absent, so the directory
+    Fetches the files faster-whisper's ``download_model`` would (same
+    repository, plain ``output_dir`` layout), but from the model's *pinned*
+    commit (model_pins / model_integrity.pin_for) - every request, on every
+    path, names that commit, so a repair cannot mix revisions - and each file
+    is checked by sha256 against the pin:
+
+    * files already present are hashed first (phase "verifying"); a match is
+      reused, a mismatch is deleted and fetched again (with
+      *local_files_only*, nothing is fetched: IntegrityError instead);
+    * every fetched file is hashed after its transfer; a mismatch deletes it
+      and raises IntegrityError (fail closed, the model is not installed);
+    * success writes the install record (model_integrity.RECORD_NAME), the
+      only thing that lets the model be reported as verified.
+
+    A model with no usable pin raises UnpinnedModel before any network
+    access. When every file is already present and matches, no network
+    request is made at all.
+
+    *progress* receives :class:`DownloadProgress` snapshots ("verifying" while
+    hashing, "resolving", "downloading" with real transferred bytes - hashed
+    bytes are never counted), throttled to about ten per second plus file
+    boundaries, on the calling thread. *cancelled* is polled during the
+    transfer, while hashing and between files; when it returns True,
+    :class:`DownloadCancelled` is raised and the files not yet complete are
+    absent (partial transfers stay in huggingface_hub's ``.incomplete``
+    scratch files, never at the model's own paths), so the directory
     inspects as INCOMPLETE (repairable), never COMPLETE.
 
-    The file list and sizes come from the Hub's metadata first; when that
+    File sizes come from the Hub's metadata for the pinned commit; when that
     is unavailable the total is reported as unknown (``None``) and the
-    download still proceeds through ``snapshot_download``. Files already
-    present at their published size are counted as done, not fetched again.
+    download still proceeds through ``snapshot_download`` (at the same
+    commit, and hashed the same way).
     """
+    from .. import model_integrity as integrity
+
     target = model_directory_for(models_root, model_name)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    repo_id = _repository_id(download_source(model_name))
     tracker = ProgressTracker(progress, cancelled)
-    import huggingface_hub
+    pin = integrity.pin_for(model_name)          # fail closed, before any network
+    names = pin.names
+
+    def hashing(name: str) -> None:
+        tracker.update(phase="verifying", file=name)
 
     if local_files_only:
-        resolved = huggingface_hub.snapshot_download(
-            repo_id, local_dir=str(target), allow_patterns=list(ALLOW_PATTERNS),
-            local_files_only=True)
-        return pathlib.Path(resolved)
+        if not target.is_dir():
+            raise IntegrityError(f"no model at {target}")
+        outcome = integrity.verify_directory(target, pin, cancelled=tracker.check_cancelled,
+                                             on_file=hashing)
+        problems = {name: state for name, state in outcome.items() if state != "ok"}
+        if problems:
+            if any(state == "mismatch" for state in problems.values()):
+                integrity.write_record(target, pin, integrity.Integrity.MISMATCH, problems)
+            raise IntegrityError(
+                f"the {model_name} model at {target} does not match its pinned "
+                f"checksums ({_describe(problems)}); repair it with a network connection")
+        integrity.write_record(target, pin, integrity.Integrity.VERIFIED)
+        tracker.update(phase="verifying", file="", bytes_done=0, bytes_total=0,
+                       files_done=len(names), files_total=len(names))
+        return target
 
     target.mkdir(parents=True, exist_ok=True)
+    present = [name for name in names if (target / name).exists()]
+    outcome = integrity.verify_directory(target, pin, present,
+                                         cancelled=tracker.check_cancelled,
+                                         on_file=hashing) if present else {}
+    reused = [name for name in names if outcome.get(name) == "ok"]
+    pending = [name for name in names if name not in reused]
+    if not pending:
+        integrity.write_record(target, pin, integrity.Integrity.VERIFIED)
+        tracker.update(phase="verifying", file="", bytes_done=0, bytes_total=0,
+                       files_done=len(names), files_total=len(names))
+        return target
+    # Anything not proven good goes, with huggingface_hub's own note that it
+    # is up to date - otherwise that note alone would let it be kept.
+    integrity.remove_record(target)
+    for name in pending:
+        if outcome.get(name) == "mismatch":
+            log.warning("%s/%s does not match its pinned sha256; fetching it again",
+                        target, name)
+        _forget_local_file(target, name)
+
+    import huggingface_hub
+
     tracker.update(phase="resolving", file="")
     tracker.check_cancelled()
-    files = _published_files(huggingface_hub, repo_id)
+    sizes = _published_sizes(huggingface_hub, pin)
     tracker.check_cancelled()
     bar = progress_bar_class(tracker)
 
-    if files is None:
-        # No metadata: the size is unknown, but the download still runs.
-        tracker.update(phase="downloading", bytes_total=None, files_total=None)
-        resolved = huggingface_hub.snapshot_download(
-            repo_id, local_dir=str(target), allow_patterns=list(ALLOW_PATTERNS),
-            tqdm_class=bar)
-        tracker.check_cancelled()
-        tracker.update(file="")
-        return pathlib.Path(resolved)
+    def check_fetched(name: str) -> None:
+        tracker.update(phase="verifying", file=name)
+        state = integrity.check_file(target, pin.file(name), tracker.check_cancelled)
+        if state != "ok":
+            _forget_local_file(target, name)
+            raise IntegrityError(
+                f"{name} fetched for the {model_name} model ({pin.repo} at "
+                f"{pin.revision[:12]}) is {'missing' if state == 'missing' else 'not the published file (sha256 mismatch)'}; "
+                f"it was deleted and the model is not installed")
 
-    pending, present = [], []
-    for name, size in files:
-        local = target / name
-        if size is not None and local.is_file() and local.stat().st_size == size:
-            present.append(name)
-        else:
-            pending.append((name, size))
-    sizes = [size for _name, size in pending]
-    total = None if any(size is None for size in sizes) else sum(sizes)
-    tracker.update(phase="downloading", bytes_done=0, bytes_total=total,
-                   files_done=len(present), files_total=len(files), file="")
-    for name, _size in pending:
+    if sizes is None:
+        # No metadata: the size is unknown, but the download still runs -
+        # at the pinned commit, and only the files still needed.
+        tracker.update(phase="downloading", bytes_total=None, files_total=None)
+        huggingface_hub.snapshot_download(
+            pin.repo, revision=pin.revision, local_dir=str(target),
+            allow_patterns=list(pending), tqdm_class=bar)
         tracker.check_cancelled()
-        tracker.update(file=name)
-        huggingface_hub.hf_hub_download(repo_id, filename=name,
-                                        local_dir=str(target), tqdm_class=bar)
-        tracker.check_cancelled()
-        tracker.update(files_done=tracker.snapshot.files_done + 1)
-    tracker.update(file="")
+        for name in pending:
+            check_fetched(name)
+    else:
+        wanted = [sizes.get(name) for name in pending]
+        total = None if any(size is None for size in wanted) else sum(wanted)
+        tracker.update(phase="downloading", bytes_done=0, bytes_total=total,
+                       files_done=len(reused), files_total=len(names), file="")
+        for name in pending:
+            tracker.check_cancelled()
+            tracker.update(phase="downloading", file=name)
+            huggingface_hub.hf_hub_download(pin.repo, filename=name,
+                                            revision=pin.revision,
+                                            local_dir=str(target), tqdm_class=bar)
+            tracker.check_cancelled()
+            check_fetched(name)
+            tracker.update(phase="downloading", file="",
+                           files_done=tracker.snapshot.files_done + 1)
+    integrity.write_record(target, pin, integrity.Integrity.VERIFIED)
+    tracker.update(phase="verifying", file="")
     return target
+
+
+def verify_model(model_name: str, models_root,
+                 progress: Optional[ProgressCallback] = None,
+                 cancelled: Optional[CancelCheck] = None) -> pathlib.Path:
+    """Hash an installed model against its pin with no network at all and
+    record the outcome. Raises IntegrityError (or UnpinnedModel) unless every
+    pinned file matches."""
+    return prepare_model(model_name, models_root, local_files_only=True,
+                         progress=progress, cancelled=cancelled)
+
+
+def _describe(problems) -> str:
+    return ", ".join(f"{name} {state}" for name, state in sorted(problems.items()))
+
+
+def _forget_local_file(target: pathlib.Path, name: str) -> None:
+    """Remove *name* and huggingface_hub's local-dir note about it."""
+    note = target / ".cache" / "huggingface" / "download" / f"{name}.metadata"
+    for path in (target / name, note):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _published_sizes(huggingface_hub, pin):
+    """``{filename: size or None}`` for the pinned files at the pinned
+    commit, or ``None`` when the Hub's metadata cannot be read."""
+    try:
+        info = huggingface_hub.HfApi().model_info(pin.repo, revision=pin.revision,
+                                                  files_metadata=True)
+        siblings = list(info.siblings or [])
+    except Exception as exc:  # noqa: BLE001 - fall back to an unknown total
+        log.info("no file metadata for %s@%s (%s); size unknown", pin.repo,
+                 pin.revision, exc)
+        return None
+    sizes = {}
+    for sibling in siblings:
+        name = getattr(sibling, "rfilename", None)
+        if name not in pin.names:
+            continue
+        size = getattr(sibling, "size", None)
+        if size is None and getattr(sibling, "lfs", None) is not None:
+            size = getattr(sibling.lfs, "size", None)
+        sizes[name] = int(size) if size is not None else None
+    return {name: sizes.get(name) for name in pin.names}
 
 
 def _repository_id(source: str) -> str:
@@ -194,31 +305,6 @@ def _repository_id(source: str) -> str:
 #: Sizes published under Systran/faster-whisper-<name>, for a faster-whisper
 #: whose name table cannot be read.
 _SYSTRAN_MODELS = ("tiny", "base", "small", "medium", "large-v3")
-
-
-def _published_files(huggingface_hub, repo_id: str):
-    """``[(filename, size or None)]`` for the files to fetch, smallest first
-    and ``model.bin`` last, or ``None`` when the Hub's metadata cannot be read."""
-    try:
-        info = huggingface_hub.HfApi().model_info(repo_id, files_metadata=True)
-        siblings = list(info.siblings or [])
-    except Exception as exc:  # noqa: BLE001 - fall back to an unknown total
-        log.info("no file metadata for %s (%s); size unknown", repo_id, exc)
-        return None
-    files = []
-    for sibling in siblings:
-        name = getattr(sibling, "rfilename", None)
-        if not name or not any(fnmatch.fnmatch(name, pattern)
-                               for pattern in ALLOW_PATTERNS):
-            continue
-        size = getattr(sibling, "size", None)
-        if size is None and getattr(sibling, "lfs", None) is not None:
-            size = getattr(sibling.lfs, "size", None)
-        files.append((name, int(size) if size is not None else None))
-    if not files:
-        return None
-    files.sort(key=lambda item: (item[0] == "model.bin", item[1] or 0, item[0]))
-    return files
 
 
 #: The Hugging Face repositories behind names that older faster-whisper
