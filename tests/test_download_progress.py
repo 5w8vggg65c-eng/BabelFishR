@@ -121,9 +121,11 @@ class FakeHub:
         self.calls.append(("snapshot_download", repo_id, local_files_only))
         if local_files_only:
             return local_dir
-        transfer = tqdm_class(desc="Downloading bytes", total=0, initial=0)
+        # As huggingface_hub 2.4.0 builds them: both measured in bytes.
+        transfer = tqdm_class(desc="Downloading bytes", total=0, initial=0,
+                              unit="B", unit_scale=True)
         reconstruct = tqdm_class(desc="Reconstructing (incomplete total...)",
-                                 total=0, initial=0)
+                                 total=0, initial=0, unit="B", unit_scale=True)
         pathlib.Path(local_dir).mkdir(parents=True, exist_ok=True)
         for name in self.files:
             if any(fnmatch.fnmatch(name, p) for p in allow_patterns):

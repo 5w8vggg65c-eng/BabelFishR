@@ -117,56 +117,25 @@ class ProgressTracker:
         self._progress(self._state)
 
 
-class _ProgressBar:
-    """The subset of tqdm huggingface_hub uses, forwarding real byte counts.
+def _tqdm_base():
+    """tqdm's own class (huggingface_hub depends on tqdm), or a stand-in
+    offering the same calls when it is not importable."""
+    try:
+        from tqdm.std import tqdm  # type: ignore
 
-    Deliberately not a tqdm subclass: huggingface_hub then passes only plain
-    tqdm keyword arguments and never draws anything. ``update_transfer`` is
-    defined so both the plain HTTP path and the Xet path report written
-    bytes through ``update()`` exactly once (network-transfer bytes, which
-    can differ because of deduplication, are ignored).
-    """
+        return tqdm
+    except Exception:  # noqa: BLE001
+        return _TqdmStandIn
 
-    _tracker: ProgressTracker = None  # type: ignore[assignment]
 
-    def __init__(self, *args, **kwargs):
-        self.total = kwargs.get("total")
-        self.n = kwargs.get("initial", 0) or 0
-        self.desc = kwargs.get("desc", "") or ""
-        # snapshot_download makes a separate network-transfer bar; counting
-        # it as well would double every byte.
-        self._ignored = self.desc == "Downloading bytes"
+class _TqdmStandIn:
+    """The tqdm calls huggingface_hub makes, as no-ops (only without tqdm)."""
 
-    def update(self, n=1):
-        if n is None:
-            return
-        self.n += n
-        if not self._ignored:
-            self._tracker.add_bytes(int(n))
-        else:
-            self._tracker.check_cancelled()
+    def __init__(self, iterable=None, *args, total=None, initial=0, **kwargs):
+        self.iterable, self.total, self.n, self.disable = iterable, total, initial or 0, True
 
-    def update_transfer(self, n=1):
-        self._tracker.check_cancelled()
-
-    def set_postfix_str(self, *args, **kwargs):
-        pass
-
-    def set_transfer_postfix_str(self, *args, **kwargs):
-        pass
-
-    def set_description(self, *args, **kwargs):
-        pass
-
-    def refresh(self, *args, **kwargs):
-        pass
-
-    def reset(self, total=None):
-        self.n = 0
-        self.total = total
-
-    def close(self):
-        pass
+    def __iter__(self):
+        return iter(self.iterable or ())
 
     def __enter__(self):
         return self
@@ -174,8 +143,104 @@ class _ProgressBar:
     def __exit__(self, *exc):
         return False
 
-    def __iter__(self):
-        return iter(())
+    def __getattr__(self, name):          # set_*, refresh, reset, clear, display...
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return lambda *args, **kwargs: None
+
+    @classmethod
+    def get_lock(cls):
+        import threading
+
+        lock = getattr(cls, "_stand_in_lock", None)
+        if lock is None:
+            lock = cls._stand_in_lock = threading.RLock()
+        return lock
+
+    @classmethod
+    def set_lock(cls, lock):
+        cls._stand_in_lock = lock
+
+
+class _ProgressBar(_tqdm_base()):
+    """A real tqdm (subclass), always disabled - it never draws - so it
+    honours every call huggingface_hub makes on its tqdm_class, on every
+    path: per-file downloads, the snapshot_download fallback
+    (set_description_str, set_postfix_str with format_dict["rate"],
+    refresh, a reassigned total), hf_thread_map's file counter (as a
+    context manager and with tqdm's thread lock), reset and close.
+
+    Only counting is ours: the real bytes written, from bars measured in
+    bytes, go to the tracker once. snapshot_download's separate network
+    bar ("Downloading bytes") and the count of finished files (unit "it")
+    are not bytes of the model and are not counted. Every update checks
+    for cancellation.
+
+    An earlier version implemented only a hand-picked subset; on the
+    unknown-total path snapshot_download called set_description_str and
+    the download failed with AttributeError (found on a Mac against the
+    real huggingface_hub client).
+    """
+
+    _tracker: ProgressTracker = None  # type: ignore[assignment]
+
+    def __init__(self, *args, **kwargs):
+        desc = kwargs.get("desc", "") or ""
+        unit = kwargs.get("unit", "it")
+        kwargs.pop("name", None)              # huggingface_hub's own keyword
+        kwargs["disable"] = True              # never draw anything
+        super().__init__(*args, **kwargs)
+        self.desc, self.unit = desc, unit
+        self.n = kwargs.get("initial", 0) or 0
+        self.total = kwargs.get("total")
+        self._counts_bytes = unit == "B" and desc != "Downloading bytes"
+
+    def update(self, n=1):
+        n = n or 0
+        self.n += n
+        if self._counts_bytes and n:
+            self._tracker.add_bytes(int(n))
+        else:
+            self._tracker.check_cancelled()
+
+    def update_transfer(self, n=1):
+        self._tracker.check_cancelled()
+
+    def set_transfer_postfix_str(self, *args, **kwargs):
+        pass
+
+    @property
+    def format_dict(self):
+        # A disabled tqdm has no timing state; a rate is not measured here.
+        return {"n": self.n, "total": self.total, "elapsed": 0, "rate": None,
+                "unit": getattr(self, "unit", "it"), "desc": getattr(self, "desc", "")}
+
+    def set_description(self, desc=None, refresh=True):
+        self.desc = desc or ""
+
+    def set_description_str(self, desc=None, refresh=True):
+        self.desc = desc or ""
+
+    def set_postfix(self, *args, **kwargs):
+        pass
+
+    def set_postfix_str(self, s="", refresh=True):
+        pass
+
+    def refresh(self, *args, **kwargs):
+        pass
+
+    def reset(self, total=None):
+        self.n = 0
+        if total is not None:
+            self.total = total
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
 
 
 def progress_bar_class(tracker: ProgressTracker) -> type:
