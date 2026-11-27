@@ -1,0 +1,12 @@
+# Input for packaging/requirements-macos-arm64.txt (the hash-pinned lock that
+# packaging/build_macos.sh installs). See packaging/SUPPLY_CHAIN.md for the
+# exact command that turns this into the lock and how to refresh it.
+#
+# The project itself, with every extra the build installs. It is not written
+# to the lock (a local directory has no hash); build_macos.sh installs it
+# separately with --no-deps, so it cannot pull anything unpinned.
+-e .[gui,audio,asr,translate,dev,packaging]
+# build_macos.sh installs the project with --no-build-isolation, so the
+# build backend declared in pyproject.toml has to come from the lock too.
+setuptools>=68
+wheel

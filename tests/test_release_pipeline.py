@@ -142,13 +142,15 @@ def test_every_packaging_script_is_valid_shell(script):
 def test_the_workflow_uses_maintained_action_versions():
     """Deprecated Node runtimes produce a warning annotation on every run.
 
-    Pinned by major version deliberately: a floating ref would let a third
-    party change what runs in the release pipeline.
+    Each action is pinned to a full commit SHA, with the release tag it
+    resolves to in a trailing comment; the major version is read from that
+    comment. (tests/test_release_workflow.py checks the SHA pinning itself.)
     """
     import re
 
     body = _workflow()
-    used = dict(re.findall(r"uses:\s*(actions/[a-z-]+)@v(\d+)", body))
+    used = dict(re.findall(
+        r"uses:\s*(actions/[a-z-]+)@(?:[0-9a-f]{40}\s+#\s*)?v(\d+)", body))
     minimums = {"actions/checkout": 5, "actions/setup-python": 6,
                 "actions/upload-artifact": 5}
     for action, minimum in minimums.items():
