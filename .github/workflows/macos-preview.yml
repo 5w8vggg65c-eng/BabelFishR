@@ -1,6 +1,10 @@
 name: macOS operator preview
 
 # Request one installer by including [build macOS preview] in the tip commit.
+#
+# Read-only throughout: this workflow never publishes. Actions are pinned to
+# full commit SHAs and build_macos.sh installs only the hash-pinned lock; see
+# packaging/SUPPLY_CHAIN.md.
 on:
   push:
     branches:
@@ -15,16 +19,21 @@ jobs:
     name: Test and package the Apple Silicon preview
     runs-on: macos-26
     timeout-minutes: 40
+    permissions:
+      contents: read
+    outputs:
+      dmg_sha256: ${{ steps.build.outputs.dmg_sha256 }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
 
       - name: Build, verify and sign the preview
+        id: build
         env:
           BABELFISHR_SKIP_TESTS: "0"
           BABELFISHR_MAKE_DMG: "1"
@@ -38,9 +47,12 @@ jobs:
           cd dist
           shasum -a 256 -c BabelFishR-macOS-arm64.dmg.sha256
           cat BabelFishR-macOS-arm64.dmg.sha256
+          SHA="$(shasum -a 256 BabelFishR-macOS-arm64.dmg | awk '{print $1}')"
+          [[ "$SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad sha256 '$SHA'"; exit 1; }
+          echo "dmg_sha256=$SHA" >> "$GITHUB_OUTPUT"
 
       - name: Upload the installer and its checksum
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: BabelFishR-macOS-arm64-dmg
           path: |
@@ -52,7 +64,7 @@ jobs:
 
       - name: Upload build and test reports
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: BabelFishR-macOS-reports
           path: build-reports/

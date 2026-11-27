@@ -6,6 +6,16 @@ name: macOS release (Apple Silicon)
 #
 # Triggered by hand (workflow_dispatch) or by pushing a v* tag. A tag also
 # publishes a GitHub prerelease.
+#
+# Two jobs, so the token that can write releases never meets the build:
+#   build   - read-only token. Installs the hash-pinned lock, runs the whole
+#             suite, builds, signs and packages, uploads the DMG and exposes
+#             its sha256 as a job output.
+#   publish - the only job with contents: write. It does not check out or
+#             build anything: it downloads the artifact, re-checks the DMG
+#             against the sha256 the build job reported, then publishes.
+# Every action is pinned to a full commit SHA (the tag is in the comment);
+# packaging/SUPPLY_CHAIN.md says how they and the Python lock were obtained.
 
 on:
   workflow_dispatch:
@@ -26,8 +36,8 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write
+# Nothing is granted by default; each job asks for exactly what it needs.
+permissions: {}
 
 concurrency:
   group: macos-release-${{ github.ref }}
@@ -40,6 +50,12 @@ jobs:
     # A healthy run takes six minutes. Anything approaching this is wedged, and
     # holding a runner for two hours to discover that helps nobody.
     timeout-minutes: 40
+    permissions:
+      contents: read
+    outputs:
+      # The DMG's sha256 as the build job computed it. The publish job
+      # re-hashes what it downloaded and refuses to publish on a mismatch.
+      dmg_sha256: ${{ steps.dmg.outputs.sha }}
 
     steps:
       # ------------------------------------------------------------------
@@ -49,13 +65,15 @@ jobs:
       # why it was slow, or it would not launch at all.
       # ------------------------------------------------------------------
       - name: Verify this is an Apple Silicon runner
+        env:
+          RUNNER_LABEL: ${{ inputs.runner_label || 'macos-26' }}
         run: |
           set -euo pipefail
           ARCH="$(uname -m)"
           echo "uname -m      : $ARCH"
           echo "uname -a      : $(uname -a)"
           echo "sw_vers       : $(sw_vers -productName) $(sw_vers -productVersion)"
-          echo "runner label  : ${{ inputs.runner_label || 'macos-26' }}"
+          echo "runner label  : $RUNNER_LABEL"
           {
             echo "### Runner architecture"
             echo ""
@@ -71,10 +89,13 @@ jobs:
           fi
 
       - name: Check out the source
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # The build never pushes; no token is left in .git/config.
+          persist-credentials: false
 
       - name: Install Python 3.12
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
 
@@ -154,7 +175,12 @@ jobs:
           DMG="dist/BabelFishR-macOS-arm64.dmg"
           [[ -f "$DMG" ]] || { echo "::error::$DMG was not produced"; exit 1; }
           [[ -f "$DMG.sha256" ]] || { echo "::error::$DMG.sha256 missing"; exit 1; }
-          SHA="$(awk '{print $1}' "$DMG.sha256")"
+          # Hash the image itself rather than trusting the .sha256 file, and
+          # require the two to agree: this value crosses the job boundary.
+          SHA="$(shasum -a 256 "$DMG" | awk '{print $1}')"
+          [[ "$SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad sha256 '$SHA'"; exit 1; }
+          [[ "$(awk '{print $1}' "$DMG.sha256")" == "$SHA" ]] || {
+            echo "::error::$DMG.sha256 does not match the image"; exit 1; }
           SIZE="$(du -h "$DMG" | awk '{print $1}')"
           echo "dmg=$DMG"   >> "$GITHUB_OUTPUT"
           echo "sha=$SHA"   >> "$GITHUB_OUTPUT"
@@ -177,7 +203,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the disk image
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: BabelFishR-macOS-arm64-dmg
           path: |
@@ -188,7 +214,7 @@ jobs:
 
       - name: Upload the test, build, verification and signing reports
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: BabelFishR-macOS-reports
           path: build-reports/
@@ -219,20 +245,69 @@ jobs:
           sed -n '/CoreAudio probe/,/result  *:/p' \
             build-reports/independence-report.txt 2>/dev/null || echo "(none)"
 
-      # ------------------------------------------------------------------
-      # Publishing. A tag push publishes automatically; a manual run publishes
-      # only when explicitly asked to, so probing the pipeline never creates a
-      # release by accident. Everything below the 0.x line is a prerelease.
-      # ------------------------------------------------------------------
+  # ------------------------------------------------------------------
+  # Publishing. A tag push publishes automatically; a manual run publishes
+  # only when explicitly asked to, so probing the pipeline never creates a
+  # release by accident. Everything below the 0.x line is a prerelease.
+  # ------------------------------------------------------------------
+  #
+  # This is the only job that can write to the repository. It runs no code
+  # from the checkout - there is no checkout - and publishes only an image
+  # whose sha256 matches the one the build job computed.
+  publish:
+    name: Publish the prerelease
+    needs: build
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' &&
+       inputs.publish_prerelease == 'true' && inputs.release_tag != '')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download the disk image
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: BabelFishR-macOS-arm64-dmg
+          path: dist
+
+      - name: Download the signing report the release notes are written from
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: BabelFishR-macOS-reports
+          path: build-reports
+
+      - name: Verify the image is the one the build job tested
+        env:
+          EXPECTED_SHA256: ${{ needs.build.outputs.dmg_sha256 }}
+        run: |
+          set -euo pipefail
+          DMG="dist/BabelFishR-macOS-arm64.dmg"
+          [[ -f "$DMG" ]] || { echo "::error::$DMG was not downloaded"; exit 1; }
+          [[ "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "::error::the build job reported no usable sha256: '$EXPECTED_SHA256'"; exit 1; }
+          ACTUAL="$(sha256sum "$DMG" | awk '{print $1}')"
+          FILE_SHA="$(awk '{print $1}' "$DMG.sha256")"
+          echo "build job : $EXPECTED_SHA256"
+          echo "downloaded: $ACTUAL"
+          echo "sha256 file: $FILE_SHA"
+          if [[ "$ACTUAL" != "$EXPECTED_SHA256" || "$FILE_SHA" != "$EXPECTED_SHA256" ]]; then
+            echo "::error::the downloaded image is not the one the build job tested; refusing to publish"
+            exit 1
+          fi
+          (cd dist && sha256sum -c BabelFishR-macOS-arm64.dmg.sha256)
+          [[ -f build-reports/signing-status.txt ]] || {
+            echo "::error::build-reports/signing-status.txt was not downloaded"; exit 1; }
+
       - name: Publish the prerelease
-        if: >-
-          startsWith(github.ref, 'refs/tags/v') ||
-          (github.event_name == 'workflow_dispatch' &&
-           inputs.publish_prerelease == 'true' && inputs.release_tag != '')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # There is no checkout, so gh is told which repository to act on.
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.release_tag }}
-          SHA256: ${{ steps.dmg.outputs.sha }}
+          SHA256: ${{ needs.build.outputs.dmg_sha256 }}
         run: |
           set -euo pipefail
           NOTARIZED="$(grep -E '^notarized *:' build-reports/signing-status.txt \

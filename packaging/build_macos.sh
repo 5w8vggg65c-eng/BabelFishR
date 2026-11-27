@@ -45,11 +45,24 @@ python3 -m venv "$VENV"
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
 
-phase "Installing runtime, GUI, engine, dev and packaging dependencies"
-python -m pip install --upgrade pip wheel
-# 'dev' carries pytest; 'packaging' carries pyinstaller. Both are required
-# below, so both are installed here rather than assumed.
-python -m pip install -e ".[gui,audio,asr,translate,dev,packaging]"
+phase "Installing runtime, GUI, engine, dev and packaging dependencies from the lock"
+# Every third-party distribution comes from the hash-pinned lock, read-only:
+# --require-hashes refuses any file whose sha256 is not in the lock,
+# --no-deps stops pip resolving (and fetching) anything the lock does not
+# name, and --only-binary refuses to run an sdist's build code. The lock is
+# generated for macOS arm64 / CPython 3.12; packaging/SUPPLY_CHAIN.md says how
+# it was produced and how to refresh it. pip itself is the one bundled with
+# the Python that made the venv - it is not upgraded from the network.
+LOCK="packaging/requirements-macos-arm64.txt"
+[[ -f "$LOCK" ]] || { echo "build failed: $LOCK is missing" >&2; exit 1; }
+python -m pip install --require-hashes --no-deps --only-binary :all: -r "$LOCK"
+# Then the project itself, from this checkout. 'dev' carries pytest and
+# 'packaging' carries pyinstaller; both come from the lock above. --no-index
+# and --no-deps mean this step cannot download anything, and
+# --no-build-isolation builds it with the locked setuptools and wheel.
+python -m pip install --no-deps --no-index --no-build-isolation -e ".[gui,audio,asr,translate,dev,packaging]"
+# --no-deps trusts the lock to be complete; this proves it is.
+python -m pip check
 
 phase "Verifying the build toolchain is actually present"
 python -c "import pytest, PyInstaller, PySide6; print('pytest', pytest.__version__)"
