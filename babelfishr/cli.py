@@ -691,9 +691,14 @@ def cmd_export(args) -> int:
         session_id = sessions[0].id
 
     if args.format == "bundle":
-        path = export_module.export_session(
-            store, session_id, args.output or f"babelfishr_{session_id}",
-            include_audio=not args.no_audio, archive=args.zip)
+        try:
+            path = export_module.export_session(
+                store, session_id, args.output or f"babelfishr_{session_id}",
+                include_audio=not args.no_audio, archive=args.zip)
+        except OSError as exc:
+            print(f"Export failed, nothing was written: {exc}", file=sys.stderr)
+            return 1
+        # The path actually written: an occupied name gets "name (2)".
         print(f"Exported bundle to {path}")
         return 0
 
