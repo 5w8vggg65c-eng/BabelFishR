@@ -1426,6 +1426,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return "Stop monitoring first: a model is not installed during a watch."
         if self._install_worker is not None:
             return "A speech model is being installed."
+        transfers = getattr(self.app, "transfers", None)
+        if transfers is not None and transfers.restricted:
+            return ("A network-restricted mode has been requested, so nothing "
+                    "is downloaded.")
         return ""
 
     def _refresh_install_model_button(self) -> None:
@@ -1858,21 +1862,92 @@ class MainWindow(QtWidgets.QMainWindow):
         all still consistent with each other. The combo box is put back to
         match, because a control showing a mode the application is not in is
         the same lie the badge used to tell.
+
+        A network-restricted mode is not shown (or saved) while a download is
+        still running: the app stops new transfers at once, cancels running
+        ones, and this window polls - never blocking the event loop - until
+        they have ended (the mode then changes) or the bounded wait runs out
+        (the switch is declined, and says so). Returns True only when the
+        mode changed now.
         """
         from ..app import ModeChangeRefused
 
         try:
-            self.app.set_mode(value)
+            transition = self.app.request_mode(value)
         except ModeChangeRefused as exc:
             QtWidgets.QMessageBox.information(
                 self, "The processing mode was not changed", str(exc))
             self._sync_mode_box()
             return False
+        self._settle_watched_transition()
+        if transition.pending:
+            self._watched_mode_transition = transition
+            self._show_mode_transition_waiting(transition)
+            timer = self._mode_transition_timer()
+            if not timer.isActive():
+                timer.start()
+            return False
+        self._mode_changed()
+        return True
+
+    def _mode_changed(self) -> None:
         self._report_engines()
         self._refresh_mode_badge()
         self._refresh_install_model_button()
         self._refresh_readiness(run_smoke_tests=True)
-        return True
+
+    def _mode_transition_timer(self) -> QtCore.QTimer:
+        timer = getattr(self, "_mode_settle_timer", None)
+        if timer is None:
+            timer = QtCore.QTimer(self)
+            timer.setInterval(100)
+            timer.timeout.connect(self._poll_mode_transition)
+            self._mode_settle_timer = timer
+        return timer
+
+    def _show_mode_transition_waiting(self, transition) -> None:
+        active = self.app.transfers.describe_active()
+        text = (f"Turning on {transition.target.title} once the download "
+                f"{('(' + active + ') ') if active else ''}has stopped. "
+                f"Nothing new is downloaded meanwhile; the mode is still "
+                f"{self.app.mode.title}.")
+        self.status.showMessage(text, 0)
+        self.mode_button.setToolTip(text)
+        self._sync_mode_box()
+        self._refresh_install_model_button()
+
+    def _settle_watched_transition(self) -> None:
+        """Report an earlier request a newer choice replaced."""
+        watched = getattr(self, "_watched_mode_transition", None)
+        if watched is not None and not watched.pending:
+            self._watched_mode_transition = None
+            if watched.message:
+                self.status.showMessage(watched.message, 10000)
+
+    def _poll_mode_transition(self) -> None:
+        from ..app import ModeTransition
+
+        transition = getattr(self, "_watched_mode_transition", None)
+        if transition is None:
+            self._mode_transition_timer().stop()
+            return
+        state = transition.poll()
+        if state == ModeTransition.PENDING:
+            return
+        self._mode_transition_timer().stop()
+        self._watched_mode_transition = None
+        if state == ModeTransition.DONE:
+            self.status.showMessage(f"{transition.target.title} is on.", 8000)
+            self._mode_changed()
+            return
+        self._refresh_mode_badge()
+        self._refresh_install_model_button()
+        if state == ModeTransition.DECLINED:
+            self.status.showMessage(transition.message, 15000)
+            QtWidgets.QMessageBox.information(
+                self, "The processing mode was not changed", transition.message)
+        elif transition.message:
+            self.status.showMessage(transition.message, 10000)
 
     def _sync_mode_box(self) -> None:
         """Make the control agree with the mode the application is actually in."""

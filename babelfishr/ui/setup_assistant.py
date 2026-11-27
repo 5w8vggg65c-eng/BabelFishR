@@ -347,7 +347,7 @@ class SetupAssistant(theme.ConsoleDialog):
                              "from the mode in the window's header when you "
                              "go offline.")
             else:
-                self.app.set_mode(OperatingMode.FIELD_OFFLINE.value)
+                self._switch_mode(OperatingMode.FIELD_OFFLINE.value)
         else:
             # Something did not work. Keep whatever genuinely did.
             self._persist_partial_success(result, payload)
@@ -485,9 +485,35 @@ class SetupAssistant(theme.ConsoleDialog):
 
     def _record_only(self) -> None:
         """A deliberate, remembered choice - not a silent fallback."""
-        self.app.set_mode(OperatingMode.RECORD_ONLY.value)
-        self.app.config.record_setup(record_only=True)
+        if self._switch_mode(OperatingMode.RECORD_ONLY.value):
+            self.app.config.record_setup(record_only=True)
+        elif getattr(self.app, "mode_transition", None) is None:
+            return      # refused: the reason is shown, the dialog stays
+        # Otherwise it takes effect once a running download has stopped; the
+        # console reports that (or why it did not happen).
         self.accept()
+
+    def _switch_mode(self, value: str) -> bool:
+        """Change the mode without blocking this window.
+
+        A network-restricted mode waits for any download still running (see
+        BabelFishRApp.request_mode). Through the console window, which polls
+        and reports the outcome; with no console (first launch) nothing may
+        wait, so a running download declines the switch at once, and the
+        reason is shown here. Returns True when the mode changed now.
+        """
+        from ..app import ModeChangeRefused
+
+        apply = getattr(self.parent(), "_apply_mode", None)
+        if callable(apply):
+            return bool(apply(value))
+        try:
+            self.app.set_mode(value, timeout=0.0)
+        except ModeChangeRefused as exc:
+            self._append("")
+            self._append(f"The mode was not changed: {exc}")
+            return False
+        return True
 
     @property
     def readiness(self):

@@ -17,6 +17,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from .download_progress import (CancelCheck, DownloadCancelled,
                                 DownloadProgress, ProgressCallback)
 from .modes import AppPaths, OperatingMode, OfflineViolation, guard_download
+from .transfers import registered as _registered_transfer
 
 log = logging.getLogger(__name__)
 
@@ -95,6 +96,7 @@ class PreparationResult:
                           for n, o, d in self.steps]}
 
 
+@_registered_transfer("setup", lambda *a, **k: "field preparation")
 def prepare_field(config, *, asr_model: Optional[str] = None,
                   language_pairs: Optional[List[Tuple[str, str]]] = None,
                   report: Optional[Reporter] = None,
@@ -292,6 +294,8 @@ def _prepare_asr(config, paths: AppPaths, model_name: str, say: Reporter,
             f"offline transcription smoke test passed in {elapsed:.1f}s")
 
 
+@_registered_transfer("model", lambda config, model_name, **k:
+                      f"the Whisper model {model_name}")
 def install_asr_model(config, model_name: str, *,
                       report: Optional[Reporter] = None,
                       mode: Optional[OperatingMode] = None,
@@ -406,17 +410,24 @@ def installed_routes(config=None) -> List[Tuple[str, str, str]]:
     return ArgosTranslateEngine().routes()
 
 
-def available_languages() -> List[Tuple[str, str]]:
+@_registered_transfer("catalogue", lambda *a, **k: "the language catalogue")
+def available_languages(mode: Optional[OperatingMode] = None
+                        ) -> List[Tuple[str, str]]:
     """Packages published upstream. Needs the network.
 
     Goes through the bounded refresh, so a failure here raises once with the
-    real cause rather than recursing inside argostranslate.
+    real cause rather than recursing inside argostranslate. With *mode*, it
+    is refused before any network access when that mode forbids downloads.
     """
+    if mode is not None:
+        guard_download(mode, "listing the language catalogue")
     from .providers.argos import available_packages
 
     return sorted((p.from_code, p.to_code) for p in available_packages())
 
 
+@_registered_transfer("language", lambda source, target, *a, **k:
+                      f"the {source}->{target} language pack")
 def install_language(source: str, target: str, mode: OperatingMode) -> bool:
     """Install a language pack. Refused outside preparation mode."""
     guard_download(mode, f"installing the {source}->{target} language pack")

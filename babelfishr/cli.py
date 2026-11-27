@@ -443,6 +443,20 @@ def cmd_languages(args) -> int:
 
     config = Config.load(args.config)
     action = args.action or "list"
+    # The configured policy (or --mode) is applied before anything that
+    # could reach the network: installing and the remote catalogue.
+    mode = OperatingMode(getattr(args, "mode", None) or config.mode)
+    needs_network = (action == "install"
+                     or (action == "list" and args.available))
+    if needs_network and not mode.allows_downloads:
+        what = ("installing a language pack" if action == "install"
+                else "listing the language packs available to download")
+        print(f"error: {mode.title} does not use the network, and {what} "
+              f"would need it. Nothing was downloaded. Switch to Online / "
+              f"Setup first ('babelfishr mode --set online-setup') or pass "
+              f"--mode online-setup. Installed packs: 'babelfishr languages "
+              f"list'.", file=sys.stderr)
+        return 2
 
     if action == "list":
         installed = installed_languages(config)
@@ -467,16 +481,17 @@ def cmd_languages(args) -> int:
         if args.available:
             print("\nAvailable to install (needs the network):")
             try:
-                for source, dest in available_languages():
+                for source, dest in available_languages(mode):
                     print(f"  {source} -> {dest}")
             except Exception as exc:  # noqa: BLE001
                 print(f"  could not fetch the index: {exc}", file=sys.stderr)
         return 0
 
     if action == "install":
-        mode = OperatingMode(config.mode)
-        if not mode.allows_downloads:
-            mode = OperatingMode.ONLINE_SETUP  # installing is an online action
+        if not (args.source and args.target):
+            print("usage: babelfishr languages install SOURCE TARGET",
+                  file=sys.stderr)
+            return 2
         try:
             ok = install_language(args.source, args.target, mode)
         except Exception as exc:  # noqa: BLE001
@@ -881,6 +896,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("target", nargs="?", help="target language code")
     p.add_argument("--available", action="store_true",
                    help="also list packs available to download")
+    p.add_argument("--mode", choices=[m.value for m in __import__(
+        "babelfishr.modes", fromlist=["OperatingMode"]).OperatingMode],
+                   help="operating mode to apply (default: the saved mode); "
+                        "installing and --available need online-setup")
     p.set_defaults(func=cmd_languages)
 
     p = sub.add_parser("mode", help="show or set the operating mode")
