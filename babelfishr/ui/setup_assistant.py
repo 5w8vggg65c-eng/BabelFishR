@@ -16,6 +16,8 @@ from typing import List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from . import theme
+
 from ..modes import OperatingMode
 from .input_panel import PERMISSION_TEXT
 from .workers import prepare_field_job, run_in_background
@@ -38,7 +40,7 @@ LANGUAGES = [
 ]
 
 
-class SetupAssistant(QtWidgets.QDialog):
+class SetupAssistant(theme.ConsoleDialog):
     """Choose assets, prepare them here, and verify offline readiness."""
 
     def __init__(self, app, parent: Optional[QtWidgets.QWidget] = None,

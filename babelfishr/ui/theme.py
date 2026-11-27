@@ -173,43 +173,45 @@ def palette(widget: QtWidgets.QWidget = None) -> QtGui.QPalette:
     return p
 
 
-class _FollowAppearance(QtCore.QObject):
-    """Re-applies the console palette and stylesheet to one window when
-    the system appearance changes (light/dark)."""
+def _apply_look(window: QtWidgets.QWidget) -> None:
+    if getattr(window, "_applying_look", False):
+        return
+    window._applying_look = True
+    try:
+        window.setPalette(palette(window))
+        window.setStyleSheet(stylesheet(window))
+    finally:
+        window._applying_look = False
 
-    def __init__(self, window):
-        super().__init__(window)
-        self._window = window
-        self._busy = False
-        self.apply()
 
-    def apply(self) -> None:
-        if self._busy:
-            return
-        self._busy = True
-        try:
-            self._window.setPalette(palette(self._window))
-            self._window.setStyleSheet(stylesheet(self._window))
-        finally:
-            self._busy = False
+class ConsoleDialog(QtWidgets.QDialog):
+    """Base for the console's own windows (Setup, Field Readiness,
+    Calibrate): the console's palette and stylesheet, re-applied in the
+    window's own event() when the system appearance changes. (A Qt
+    subclass: PySide dispatches C++ virtuals only to overrides on classes
+    derived from the Qt class, not on a plain-Python mixin.)
 
-    def eventFilter(self, obj, event):  # noqa: N802 - Qt's name
-        # Defensive: Qt may call this while the window is being destroyed,
-        # after the Python side of this object is already gone.
-        window = getattr(self, "_window", None)
-        if (window is not None and obj is window and not getattr(self, "_busy", True)
-                and event.type() in (QtCore.QEvent.PaletteChange,
-                                     QtCore.QEvent.ApplicationPaletteChange)):
-            self.apply()
-        return False
+    Deliberately not a separate event-filter object: one held by its
+    window formed a reference cycle, and the garbage collector then ran
+    that filter's Python eventFilter while destroying the window, on an
+    object it had already cleared (seen dozens of times per collection on
+    Linux; a crash candidate for the macOS segfault while collecting)."""
+
+    def event(self, event) -> bool:  # noqa: A003 - Qt's name
+        # event(), not changeEvent(): with its own (console) palette set, a
+        # window gets no changeEvent when the system goes from dark to light
+        # - only ApplicationPaletteChange, through event().
+        if (event.type() in (QtCore.QEvent.PaletteChange,
+                             QtCore.QEvent.ApplicationPaletteChange)
+                and not getattr(self, "_applying_look", False)):
+            _apply_look(self)
+        return QtWidgets.QDialog.event(self, event)
 
 
 def style_window(window: QtWidgets.QWidget) -> None:
-    """Give a separate window (a dialog with or without a parent) the
-    console's look, and keep it in step with the system appearance."""
-    follower = _FollowAppearance(window)
-    window.installEventFilter(follower)
-    window._appearance = follower
+    """Give one of the console's windows its look now. It follows later
+    appearance changes when its class derives from :class:`ConsoleDialog`."""
+    _apply_look(window)
 
 
 def stylesheet(widget: QtWidgets.QWidget = None) -> str:

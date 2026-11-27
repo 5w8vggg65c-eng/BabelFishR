@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import sys
 import threading
 import urllib.parse
 from typing import Any, Dict, List, Optional
@@ -317,15 +316,13 @@ _SOUNDDEVICE_FAILED: list = []        # [reason] once the import has failed
 
 
 def _sounddevice():
-    """The sounddevice module, or None. A module already imported is used
-    as is. A failed import is remembered and not retried, under a lock: a
+    """The sounddevice module, or None. A plain import (it waits for an
+    import another thread has started, and returns a finished module). A
+    failed import is remembered and not retried, under a lock: a
     failing import (no PortAudio library) searches for the library with a
     subprocess every time, and retried on every status call - from the GUI
     thread and from readiness workers at once - that crashed the process
     (Linux test run). A newly installed PortAudio is seen after a restart."""
-    module = sys.modules.get("sounddevice")
-    if module is not None:
-        return module
     with _SOUNDDEVICE_LOCK:
         if _SOUNDDEVICE_FAILED:
             return None

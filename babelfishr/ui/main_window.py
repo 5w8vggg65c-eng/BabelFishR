@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import pathlib
 import sqlite3
+import weakref
 from typing import Dict, List, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -93,13 +94,16 @@ class _KeyboardContextMenu(QtCore.QObject):
 
     def __init__(self, open_menu, parent):
         super().__init__(parent)
-        self._open_menu = open_menu
+        # Weakly: no cycle with the window (see theme.ConsoleDialog).
+        self._open_menu = weakref.WeakMethod(open_menu)
 
     def eventFilter(self, obj, event):  # noqa: N802 - Qt's name
-        if (event.type() == QtCore.QEvent.ContextMenu
+        ref = getattr(self, "_open_menu", None)
+        open_menu = ref() if ref is not None else None
+        if (open_menu is not None and event.type() == QtCore.QEvent.ContextMenu
                 and event.reason() == QtGui.QContextMenuEvent.Keyboard):
             event.accept()
-            self._open_menu()
+            open_menu()
             return True
         return False
 
@@ -121,7 +125,9 @@ class _SpacePlayback(QtCore.QObject):
 
     def __init__(self, window: "MainWindow"):
         super().__init__(window)
-        self.window = window
+        # Weakly: no cycle with the window, so it is never torn down by the
+        # garbage collector with this filter half-cleared.
+        self._window_ref = weakref.ref(window)
         self._swallowing = False
         self._watched = None
         # Never on the whole application: only the widget that has the
@@ -132,6 +138,11 @@ class _SpacePlayback(QtCore.QObject):
         QtWidgets.QApplication.instance().focusChanged.connect(self._focus_moved)
         self._focus_moved(None, QtWidgets.QApplication.focusWidget())
 
+    @property
+    def window(self):
+        ref = getattr(self, "_window_ref", None)
+        return ref() if ref is not None else None
+
     def _focus_moved(self, _old, new) -> None:
         watched = self._watched
         if watched is not None:
@@ -140,6 +151,8 @@ class _SpacePlayback(QtCore.QObject):
             except RuntimeError:           # the widget is gone already
                 pass
             self._watched = None
+        if self.window is None:
+            return
         if new is not None and new is not self.window:
             try:
                 if new.window() is self.window:
@@ -154,9 +167,12 @@ class _SpacePlayback(QtCore.QObject):
         except (RuntimeError, TypeError):
             pass
         self._focus_moved(None, None)
-        self.window.removeEventFilter(self)
+        if self.window is not None:
+            self.window.removeEventFilter(self)
 
     def eventFilter(self, obj, event):  # noqa: N802 - Qt's name
+        if self.window is None:
+            return False
         kind = event.type()
         if kind not in (QtCore.QEvent.KeyPress, QtCore.QEvent.KeyRelease,
                         QtCore.QEvent.ShortcutOverride):
@@ -2993,19 +3009,16 @@ class MainWindow(QtWidgets.QMainWindow):
         # A check that never reports (a smoke test that stalls) must not
         # leave "Checking" up forever: after the limit it is shown as not
         # finished, with a retry. Its result still counts if it does arrive.
-        watchdog = QtCore.QTimer(self)
-        watchdog.setSingleShot(True)
+        # One timer per window, restarted for each check (a new parented
+        # timer per check accumulated on the window).
         limit = self.READINESS_LIMIT_S if run_smoke_tests else self.READINESS_QUICK_LIMIT_S
-
-        def stalled():
-            if request is self._readiness_request and self._readiness is None:
-                self._settle_unfinished_readiness(
-                    f"The readiness check did not finish within {limit} s "
-                    f"(stalled). Click to check again.")
-
-        watchdog.timeout.connect(stalled)
+        watchdog = getattr(self, "_readiness_watchdog", None)
+        if watchdog is None:
+            watchdog = self._readiness_watchdog = QtCore.QTimer(self)
+            watchdog.setSingleShot(True)
+            watchdog.timeout.connect(self._readiness_stalled)
+        self._readiness_limit = limit
         watchdog.start(int(limit * 1000))
-        self._readiness_watchdog = watchdog
 
         from ..readiness import microphone_authorization
 
@@ -3020,6 +3033,12 @@ class MainWindow(QtWidgets.QMainWindow):
     #: with smoke tests (a Whisper model loads and transcribes) and without.
     READINESS_LIMIT_S = 240
     READINESS_QUICK_LIMIT_S = 45
+
+    def _readiness_stalled(self) -> None:
+        if self._readiness is None:
+            self._settle_unfinished_readiness(
+                f"The readiness check did not finish within "
+                f"{self._readiness_limit} s (stalled). Click to check again.")
 
     def _settle_unfinished_readiness(self, reason: str) -> None:
         """A check that failed, was cancelled or stalled: say so - never

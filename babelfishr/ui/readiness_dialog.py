@@ -6,6 +6,8 @@ from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from . import theme
+
 from ..readiness import Check, CheckStatus
 
 
@@ -14,7 +16,7 @@ STALL_LIMIT_S = 240
 QUICK_STALL_LIMIT_S = 45
 
 
-class ReadinessDialog(QtWidgets.QDialog):
+class ReadinessDialog(theme.ConsoleDialog):
     """Runs Field Check and shows it as a scannable list with remedies."""
 
     def __init__(self, app, parent: Optional[QtWidgets.QWidget] = None,

@@ -234,3 +234,27 @@ def qt_app():
     from PySide6 import QtWidgets
 
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+
+def test_the_file_count_bar_never_adds_bytes_and_an_unknown_total_stays_unknown():
+    """The SDK's own "Fetching 3 files" bar (hf_thread_map: unit unset,
+    total=3) counts finished files, not bytes: it must not add one "byte"
+    per file (262,163 for 262,160 received), and it must not turn an
+    unknown total into a known one."""
+    from babelfishr.download_progress import ProgressTracker, progress_bar_class
+
+    seen = []
+    tracker = ProgressTracker(seen.append, interval=0)
+    tracker.update(phase="downloading")
+    bar_class = progress_bar_class(tracker)
+    reconstruct = bar_class(desc="Reconstructing (incomplete total...)", total=0,
+                            initial=0, unit="B", unit_scale=True)
+    network = bar_class(desc="Downloading bytes", total=0, initial=0, unit="B")
+    with bar_class(total=3, desc="Fetching 3 files") as files:
+        for size in (1024, 4096, 257040):
+            reconstruct.update(size)
+            network.update(size)
+            files.update(1)
+    assert tracker.snapshot.bytes_done == TOTAL
+    assert tracker.snapshot.bytes_total is None and tracker.snapshot.fraction is None
+    assert all(p.bytes_total is None for p in seen)

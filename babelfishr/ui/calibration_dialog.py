@@ -39,7 +39,7 @@ class _Reading:
         self.waveform = frame
 
 
-class CalibrationDialog(QtWidgets.QDialog):
+class CalibrationDialog(theme.ConsoleDialog):
     """*source_factory()* returns the selected input's (unstarted) source."""
 
     def __init__(self, source_factory: Callable[[], object], seconds: float = 5.0,
