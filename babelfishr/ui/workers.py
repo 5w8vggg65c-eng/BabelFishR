@@ -176,6 +176,34 @@ def active_worker_count() -> int:
 
 
 # ---- the concrete jobs -------------------------------------------------
+def _transfer_job(kind: str, describe: Callable[..., str]):
+    """Register the whole job with the transfer owner (babelfishr.transfers)
+    from its first line until it has returned or raised, with its token's
+    cancel as the way to stop it. A switch to a network-restricted mode
+    waits for exactly this to end. The wrapped signature is unchanged."""
+    import functools
+    import inspect
+
+    def wrap(function):
+        signature = inspect.signature(function)
+
+        @functools.wraps(function)
+        def run(*args, **kwargs):
+            from ..transfers import registry
+
+            bound = signature.bind_partial(*args, **kwargs)
+            token = bound.arguments.get("token")
+            if token is None:
+                token = CancellationToken()
+                kwargs["token"] = token
+            with registry().begin(kind, describe(*args, **kwargs),
+                                  cancel=token.cancel):
+                return function(*args, **kwargs)
+        return run
+    return wrap
+
+
+@_transfer_job("setup", lambda *a, **k: "field preparation")
 def prepare_field_job(config, asr_model: str,
                       language_pairs: List[Tuple[str, str]],
                       report: Callable[[str], None] = lambda text: None,
@@ -218,6 +246,8 @@ def prepare_field_job(config, asr_model: str,
             "language_pairs": list(language_pairs or [])}
 
 
+@_transfer_job("model", lambda config, model_name, *a, **k:
+               f"the Whisper model {model_name}")
 def install_model_job(config, model_name: str,
                       report: Callable[[str], None] = lambda text: None,
                       token: Optional[CancellationToken] = None,

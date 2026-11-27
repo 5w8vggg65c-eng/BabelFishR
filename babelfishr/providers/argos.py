@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from .base import (EngineError, EngineUnavailable, PrivacyProfile,
                    TranslationEngine, TranslationResult)
 from .glossary import translate_around_terms
+from ..transfers import registered as _registered
 
 log = logging.getLogger(__name__)
 
@@ -337,6 +338,7 @@ def _index_failure_message(original: Optional[BaseException],
     return "\n".join(lines)
 
 
+@_registered("catalogue", lambda *a, **k: "the language catalogue")
 def available_packages():
     """Upstream packages, after a bounded index refresh.
 
@@ -511,6 +513,8 @@ class ArgosTranslateEngine(TranslationEngine):
             self._checked_pairs[key] = key in set(self.installed_pairs())
         return self._checked_pairs[key]
 
+    @_registered("language", lambda self, source, target, *a, **k:
+                 f"the {source}->{target} language pack")
     def install_pair(self, source: str, target: str) -> bool:
         """Download and install a language pair. Returns True on success."""
         try:

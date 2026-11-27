@@ -11,6 +11,7 @@ import dataclasses
 import logging
 import pathlib
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 from .audio.devices import (AmbiguousInputDevice, AudioDevice, DeviceIdentity,
@@ -58,6 +59,89 @@ class ModeChangeRefused(RuntimeError):
 
 class ProcessingBusy(RuntimeError):
     """An operation was refused because saved-recording work is in flight."""
+
+
+#: How long a switch to a network-restricted mode waits for transfers that
+#: were already running to stop before it is declined.
+MODE_SETTLE_TIMEOUT = 30.0
+
+
+def transfer_still_running_message(target, active: str = "") -> str:
+    what = f" ({active})" if active else ""
+    return (f"A download is still finishing{what}; {target.title} was not "
+            f"turned on. The mode is unchanged. Cancel the download or wait "
+            f"for it to end, then choose {target.title} again.")
+
+
+class ModeTransition:
+    """A requested mode change, from the request until it took effect or was
+    declined.
+
+    A switch to a network-restricted mode holds the transfer gate closed from
+    the request on (no new transfer may begin), asks the running ones to
+    cancel, and commits - shows and persists the mode - only once every one
+    has settled. ``poll()`` never blocks (the GUI calls it from a timer);
+    ``wait()`` blocks up to the deadline (the CLI and library path).
+    """
+
+    PENDING = "pending"
+    DONE = "done"
+    DECLINED = "declined"
+    ABANDONED = "abandoned"
+
+    def __init__(self, app: "BabelFishRApp", target, persist: bool,
+                 timeout: float, restriction=None, state: str = PENDING,
+                 message: str = ""):
+        self._app = app
+        self.target = target
+        self.persist = persist
+        self.deadline = time.monotonic() + max(0.0, timeout)
+        self._restriction = restriction
+        self.state = state
+        self.message = message
+        if state != self.PENDING and restriction is not None:
+            restriction.release()
+
+    @property
+    def pending(self) -> bool:
+        return self.state == self.PENDING
+
+    def poll(self) -> str:
+        if self.state != self.PENDING:
+            return self.state
+        transfers = self._app.transfers
+        if not transfers.busy:
+            # The gate is closed, so nothing can register between this check
+            # and the commit: the new mode is never shown over a transfer.
+            try:
+                self._app._commit_mode(self.target, self.persist)
+            except ModeChangeRefused as exc:
+                self._finish(self.DECLINED, str(exc))
+            else:
+                self._finish(self.DONE, "")
+        elif time.monotonic() >= self.deadline:
+            self._finish(self.DECLINED, transfer_still_running_message(
+                self.target, transfers.describe_active()))
+        return self.state
+
+    def wait(self) -> str:
+        while self.state == self.PENDING:
+            self._app.transfers.wait_settled(
+                max(0.0, self.deadline - time.monotonic()))
+            self.poll()
+        return self.state
+
+    def abandon(self, message: str) -> None:
+        if self.state == self.PENDING:
+            self._finish(self.ABANDONED, message)
+
+    def _finish(self, state: str, message: str) -> None:
+        self.state = state
+        self.message = message
+        if self._restriction is not None:
+            self._restriction.release()
+        if self._app._mode_transition is self:
+            self._app._mode_transition = None
 
 
 @dataclasses.dataclass
@@ -213,6 +297,13 @@ class BabelFishRApp:
                                     recordings_dir=self.config.recording.directory)
         self.events = EventBus()
         self.glossary = self._load_glossary()
+        # Every network transfer in the process registers here; a switch to
+        # a restricted mode waits on it (see ModeTransition).
+        from .transfers import registry as _transfer_registry
+
+        self.transfers = _transfer_registry()
+        self.mode_settle_timeout = MODE_SETTLE_TIMEOUT
+        self._mode_transition: Optional[ModeTransition] = None
 
         self.transcription: Optional[TranscriptionEngine] = None
         self.translation: Optional[TranslationEngine] = None
@@ -498,7 +589,8 @@ class BabelFishRApp:
         self.transcription = None
         self.translation = None
 
-    def set_mode(self, mode, persist: bool = True) -> None:
+    def set_mode(self, mode, persist: bool = True,
+                 timeout: Optional[float] = None) -> None:
         """Switch operating mode, persisting it so it survives a restart.
 
         An in-memory-only switch meant an operator who selected Field Offline
@@ -511,17 +603,70 @@ class BabelFishRApp:
         retired *before* ``config.mode`` moves, so there is no instant at
         which a cloud-capable processor is reachable while the mode says
         Field Offline.
+
+        A network-restricted target also waits (up to *timeout*, default
+        ``mode_settle_timeout``) for running transfers to stop; if they do
+        not, ModeChangeRefused is raised and nothing changed.
+        """
+        transition = self.request_mode(mode, persist=persist, timeout=timeout)
+        if transition.wait() != ModeTransition.DONE:
+            raise ModeChangeRefused(transition.message)
+
+    @property
+    def mode_transition(self) -> Optional[ModeTransition]:
+        """The restricted-mode switch still waiting for transfers, if any."""
+        return self._mode_transition
+
+    def request_mode(self, mode, persist: bool = True,
+                     timeout: Optional[float] = None) -> ModeTransition:
+        """Start a mode change without blocking; see ModeTransition.
+
+        The returned transition is already DONE when nothing had to settle.
+        A newer request supersedes a pending one; asking for the mode that is
+        already in force abandons it.
         """
         from .modes import OperatingMode
 
         target = OperatingMode(mode)
+        timeout = self.mode_settle_timeout if timeout is None else timeout
+        pending = self._mode_transition
         if target is self.mode:
-            return
+            if pending is not None:
+                pending.abandon(
+                    f"{pending.target.title} was not turned on: "
+                    f"{target.title} was chosen again before it took effect.")
+            return ModeTransition(self, target, persist, 0.0,
+                                  state=ModeTransition.DONE)
 
         problem = self.mode_change_problem()
         if problem:
             raise ModeChangeRefused(problem)
 
+        if target.allows_downloads:
+            if pending is not None:
+                pending.abandon(f"{pending.target.title} was not turned on: "
+                                f"{target.title} was chosen instead.")
+            self._commit_mode(target, persist)
+            return ModeTransition(self, target, persist, 0.0,
+                                  state=ModeTransition.DONE)
+
+        # Close the gate before letting go of an older request's, so it is
+        # never open in between, and stop what is running.
+        restriction = self.transfers.restrict(
+            f"{target.title} was requested")
+        if pending is not None:
+            pending.abandon(f"{pending.target.title} was not turned on: "
+                            f"{target.title} was chosen instead.")
+        transition = ModeTransition(self, target, persist, timeout,
+                                    restriction=restriction)
+        self._mode_transition = transition
+        transition.poll()
+        return transition
+
+    def _commit_mode(self, target, persist: bool) -> None:
+        problem = self.mode_change_problem()
+        if problem:
+            raise ModeChangeRefused(problem)
         self._retire_processing()
         self.config.mode = target.value
         if persist:
@@ -2007,6 +2152,11 @@ class BabelFishRApp:
             return True
         if self._close_in_progress:
             return False
+        pending = getattr(self, "_mode_transition", None)
+        if pending is not None:
+            # Quitting ends the request; the transfer gate must not stay shut.
+            pending.abandon(f"{pending.target.title} was not turned on: "
+                            f"the application is closing.")
         self._close_in_progress = True
         try:
             return self._close(wait, timeout, start_cleanup)
