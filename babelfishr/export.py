@@ -3,6 +3,11 @@
 A session bundle is self-contained on purpose: audio, metadata, original
 transcript and translation travel together, with relative paths, so it stays
 readable after being copied to another machine.
+
+Every export - bundle, standalone Markdown/JSON/CSV file, CLI stdout - goes
+through :func:`portable_projection`, so none carries this machine's folders.
+A bundle names audio by its bundle-relative ``audio/<file>``; a standalone
+file, which has no audio folder, by the recording's plain file name.
 """
 
 from __future__ import annotations
@@ -128,11 +133,62 @@ def _operator_folders(store: Store, sessions: Iterable[Optional[Session]],
         for value in (tx.audio_path, tx.processed_audio_path):
             if value:
                 add(pathlib.Path(value).parent)
+        # Folders named in diagnostics (a fallback save path, an analysis
+        # run's input and artifacts), so free text mentioning them is
+        # redacted too.
+        for value in _paths_in(tx.signal_metadata):
+            add(value)
+            add(pathlib.Path(value).parent)
+        for attempt in tx.analysis_attempts or ():
+            for value in ([attempt.input_path]
+                          + [a.path for a in attempt.artifacts or ()]
+                          + list(_paths_in(attempt.metadata))
+                          + list(_paths_in(attempt.options))
+                          + list(_paths_in(attempt.command))):
+                if value:
+                    add(pathlib.Path(value).parent)
+    for session in sessions:
+        if session is not None:
+            for value in _paths_in(session.capture_gaps):
+                add(value)
+                add(pathlib.Path(value).parent)
     try:
         add(pathlib.Path.home())
     except Exception:  # noqa: BLE001 - no home folder: nothing to hide
         pass
+    try:
+        add(tempfile.gettempdir())
+    except Exception:  # noqa: BLE001 - no temporary folder: nothing to hide
+        pass
     return sorted(roots, key=len, reverse=True)
+
+
+def _is_absolute_path(text: str) -> bool:
+    """A whole string that is an absolute path on POSIX or Windows."""
+    text = text.strip()
+    if not text or "\n" in text:
+        return False
+    return (pathlib.PurePosixPath(text).is_absolute()
+            or pathlib.PureWindowsPath(text).is_absolute()
+            or text.startswith("\\\\"))
+
+
+def _file_name(path) -> str:
+    """The plain file name of a POSIX or Windows path, without any folder."""
+    return re.split(r"[\\/]", str(path).rstrip("/\\"))[-1] if path else ""
+
+
+def _paths_in(value):
+    """Every string in a JSON-like tree that is wholly an absolute path."""
+    if isinstance(value, str):
+        if _is_absolute_path(value):
+            yield value.strip()
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _paths_in(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _paths_in(item)
 
 
 def _redactor(roots: Sequence[str]):
@@ -151,6 +207,173 @@ def _redact_tree(value, redact):
     if isinstance(value, dict):
         return {k: _redact_tree(v, redact) for k, v in value.items()}
     return value
+
+
+def _scrub_tree(value, redact):
+    """Diagnostic metadata made portable: a value that is wholly an
+    absolute path says only LOCAL_FOLDER; other text is redacted."""
+    if isinstance(value, str):
+        return LOCAL_FOLDER if _is_absolute_path(value) else redact(value)
+    if isinstance(value, (list, tuple)):
+        return [_scrub_tree(v, redact) for v in value]
+    if isinstance(value, dict):
+        return {k: _scrub_tree(v, redact) for k, v in value.items()}
+    return value
+
+
+def _portable_attempt(attempt, redact):
+    """An analysis attempt with file references reduced to plain file
+    names and its diagnostics scrubbed."""
+    return dataclasses.replace(
+        attempt,
+        input_path=_file_name(attempt.input_path),
+        command=[_file_name(c) if isinstance(c, str) and _is_absolute_path(c)
+                 else _scrub_tree(c, redact) for c in attempt.command or []],
+        options=_scrub_tree(attempt.options or {}, redact),
+        metadata=_scrub_tree(attempt.metadata or {}, redact),
+        artifacts=[dataclasses.replace(a, path=_file_name(a.path),
+                                       description=redact(a.description or ""))
+                   for a in attempt.artifacts or []],
+        stdout=redact(attempt.stdout or ""),
+        stderr=redact(attempt.stderr or ""),
+        error=redact(attempt.error or ""))
+
+
+def portable_projection(store: Store, transmissions: Sequence[Transmission],
+                        sessions: Sequence[Optional[Session]],
+                        conversation_id: Optional[str] = None,
+                        audio_refs: Optional[Dict[str, str]] = None):
+    """What every export shows instead of this machine's folders.
+
+    Returns ``(transmissions, sessions, redact)``: copies (the stored rows
+    are not changed) with
+
+    - ``audio_path``: with *audio_refs* (a bundle), the bundle-relative
+      ``audio/<file>`` of a copied recording, or "" when it was not copied;
+      without (a standalone Markdown/JSON/CSV file, which has no audio
+      folder), the plain file name of the original recording, or "" when
+      there is none. A legacy row whose recording is gone keeps its name.
+    - ``processed_audio_path``: always None (a derived working file).
+    - analysis attempts: input, artifact and command file references as
+      plain file names; options, metadata, stdout, stderr and error
+      scrubbed.
+    - ``signal_metadata`` and a Session's ``capture_gaps``: any value that
+      is wholly an absolute path becomes LOCAL_FOLDER, other text redacted.
+    - error messages and notes: operator folders (save paths, recordings
+      folder, recording folders, home, temp) redacted to LOCAL_FOLDER.
+    - a Session's ``save_path`` emptied.
+
+    Transcript and translation text is left exactly as stored; *redact* is
+    applied to the rendered output, where it only changes a literal local
+    folder path.
+    """
+    sessions = list(sessions)
+    redact = _redactor(_operator_folders(store, sessions, conversation_id,
+                                         transmissions))
+    portable: List[Transmission] = []
+    for tx in transmissions:
+        if audio_refs is not None:
+            audio = audio_refs.get(tx.id) or ""
+        else:
+            audio = _file_name(tx.audio_path) or None
+        error = tx.error
+        if error is not None:
+            error = dataclasses.replace(error, message=redact(error.message or ""),
+                                        stage=redact(error.stage or ""))
+        portable.append(dataclasses.replace(
+            tx, audio_path=audio, processed_audio_path=None,
+            signal_metadata=_scrub_tree(tx.signal_metadata or {}, redact),
+            analysis_attempts=[_portable_attempt(a, redact)
+                               for a in tx.analysis_attempts or []],
+            error=error, notes=redact(tx.notes or "")))
+    shown: List[Optional[Session]] = []
+    for session in sessions:
+        if session is not None:
+            session = dataclasses.replace(
+                session, save_path="", notes=redact(session.notes or ""),
+                capture_gaps=_scrub_tree(list(session.capture_gaps or []),
+                                         redact))
+        shown.append(session)
+    return portable, shown, redact
+
+
+#: Standalone formats and their file suffixes.
+TEXT_FORMATS = ("md", "json", "csv")
+
+
+def portable_text(fmt: str, store: Store, transmissions: Sequence[Transmission],
+                  session: Optional[Session] = None,
+                  sessions: Sequence[Optional[Session]] = (),
+                  conversation_id: Optional[str] = None) -> str:
+    """A standalone Markdown, JSON or CSV export, with the same portable
+    projection as a bundle (see :func:`portable_projection`): no save
+    folder, recording folder, home folder or path-bearing diagnostics.
+
+    *sessions* are every monitoring run the transmissions came from (their
+    save paths are redacted too); *session* is the one described.
+    """
+    if fmt not in TEXT_FORMATS:
+        raise ValueError(f"unknown export format: {fmt}")
+    runs = [session] + [s for s in sessions if s is not None and s is not session]
+    portable, shown, redact = portable_projection(
+        store, transmissions, runs, conversation_id)
+    described = shown[0]
+    if fmt == "json":
+        payload = _redact_tree(json.loads(to_json(portable, described)), redact)
+        return json.dumps(payload, indent=2, ensure_ascii=False)
+    if fmt == "csv":
+        return redact(to_csv(portable))
+    return redact(to_markdown(portable, described))
+
+
+def write_text_export(text: str, destination: str,
+                      overwrite: bool = False) -> str:
+    """Write a standalone export atomically. Returns the path written.
+
+    The text goes to a private temporary file in the target folder, is
+    flushed to disk, and is then published: with ``overwrite=True`` (the
+    operator confirmed replacing that file) by an atomic replace, otherwise
+    never over an existing file - an occupied name gets ``name (2).md`` and
+    so on, as bundles do. On any failure the previous file is untouched and
+    no temporary file is left; the error is raised.
+    """
+    target = pathlib.Path(destination).absolute()
+    if target.is_dir():
+        raise IsADirectoryError(errno.EISDIR, "is a folder", str(target))
+    temp: Optional[pathlib.Path] = None
+    try:
+        for _ in range(100):
+            candidate = target.parent / (
+                f".babelfishr-export-{os.urandom(6).hex()}.partial")
+            try:
+                # 0o666 less the umask: the mode a plain write would give.
+                fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                             0o666)
+            except FileExistsError:
+                continue
+            temp = candidate
+            break
+        else:
+            raise FileExistsError(f"no free temporary name in {target.parent}")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if overwrite:
+            try:
+                # Keep the confirmed file's permissions.
+                os.chmod(temp, os.stat(target).st_mode & 0o7777)
+            except OSError:
+                pass
+            os.replace(temp, target)
+            return str(target)
+        return str(_publish(temp, target))
+    finally:
+        if temp is not None:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
 
 
 def _unique_sibling(path: pathlib.Path, attempt: int,
@@ -493,8 +716,11 @@ def export_session(store: Store, session_id: str, destination: str,
 
     check()
     plan = _plan_audio(transmissions, include_audio)
-    redact = _redactor(_operator_folders(store, sessions, conversation_id,
-                                         transmissions))
+    # One mapping for every file: included audio has its bundle path,
+    # excluded or missing audio has none.
+    portable, shown, redact = portable_projection(
+        store, transmissions, sessions, conversation_id,
+        audio_refs={tx_id: relative for tx_id, _, relative in plan})
     staging = _staging_dir(final.parent)
     try:
         root = staging / "bundle"
@@ -511,12 +737,7 @@ def export_session(store: Store, session_id: str, destination: str,
             copied[tx_id] = relative
         check()
 
-        # One mapping for every file: included audio has its bundle path,
-        # excluded or missing audio has none.
-        portable = [dataclasses.replace(tx, audio_path=copied.get(tx.id) or "",
-                                        processed_audio_path="")
-                    for tx in transmissions]
-        manifest = json.loads(to_json(transmissions, session))
+        manifest = json.loads(to_json(portable, shown[0]))
         manifest["format"] = "babelfishr.session-bundle.v1"
         manifest["audio_files"] = copied
         for entry in manifest["transmissions"]:
@@ -530,7 +751,7 @@ def export_session(store: Store, session_id: str, destination: str,
 
         texts = {
             "session.json": json.dumps(manifest, indent=2, ensure_ascii=False),
-            "transcript.md": redact(to_markdown(portable, session)),
+            "transcript.md": redact(to_markdown(portable, shown[0])),
             "transmissions.csv": redact(to_csv(portable)),
             "README.txt": redact(_bundle_readme(session, len(transmissions))),
         }

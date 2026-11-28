@@ -719,16 +719,20 @@ def cmd_export(args) -> int:
 
     session = store.get_session(session_id)
     transmissions = store.list_transmissions(session_id=session_id, limit=100_000)
-    if args.format == "json":
-        text = export_module.to_json(transmissions, session)
-    elif args.format == "csv":
-        text = export_module.to_csv(transmissions)
-    else:
-        text = export_module.to_markdown(transmissions, session)
+    # The same portable projection as a bundle, on stdout as in a file: no
+    # save folder, recording folders, home folder or path diagnostics.
+    text = export_module.portable_text(args.format, store, transmissions, session)
 
     if args.output:
-        pathlib.Path(args.output).write_text(text, encoding="utf-8")
-        print(f"Exported {len(transmissions)} transmission(s) to {args.output}")
+        try:
+            path = export_module.write_text_export(text, args.output,
+                                                   overwrite=args.overwrite)
+        except OSError as exc:
+            print(f"Export failed, {args.output} was not changed: {exc}",
+                  file=sys.stderr)
+            return 1
+        # The path actually written: an occupied name gets "name (2)".
+        print(f"Exported {len(transmissions)} transmission(s) to {path}")
     else:
         print(text)
     return 0
@@ -962,7 +966,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("export", help="export a session")
     p.add_argument("--session")
     p.add_argument("--format", choices=("md", "json", "csv", "bundle"), default="md")
-    p.add_argument("--output")
+    p.add_argument("--output",
+                   help="file or folder to write (md/json/csv print to stdout "
+                        "without it); an existing file or folder is never "
+                        "replaced: the export goes to 'name (2)' and the path "
+                        "written is printed")
+    p.add_argument("--overwrite", action="store_true",
+                   help="md/json/csv only: atomically replace an existing "
+                        "--output file instead of writing 'name (2)'")
     p.add_argument("--zip", action="store_true", help="zip the bundle")
     p.add_argument("--no-audio", action="store_true",
                    help="omit audio files from the bundle")
