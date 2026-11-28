@@ -30,7 +30,7 @@ from .models import (CaptureGap, ContentClass, Conversation, ErrorInfo, Processi
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 #: Layout of the search index and its maintenance table (meta key
 #: ``fts_layout``). 1: the index alone, maintained by deleting and rewriting
@@ -172,6 +172,9 @@ CREATE TABLE IF NOT EXISTS deleted_transmissions (
 -- gap; start_frame is the position in the run's stream (NULL when the frames
 -- were counted but could not be placed). Written by the capture thread as
 -- each gap is found, so the record survives a crash or a restart.
+-- Schema 10 (overflows): the driver-reported input overflows a row with
+-- reason 'driver-overflow' counts. Such a row's duration is unknown: frames
+-- is stored as 0 (NOT NULL) and read back as unknown, never as zero loss.
 CREATE TABLE IF NOT EXISTS capture_gaps (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id  TEXT NOT NULL,
@@ -181,7 +184,8 @@ CREATE TABLE IF NOT EXISTS capture_gaps (
     started_at  TEXT,
     blocks      INTEGER DEFAULT 0,
     reason      TEXT DEFAULT 'buffer-overflow',
-    recorded_at TEXT NOT NULL
+    recorded_at TEXT NOT NULL,
+    overflows   INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_gap_session ON capture_gaps (session_id);
 
@@ -265,6 +269,8 @@ _ADDED_COLUMNS = (
     # each monitoring run was started with ("" = the standard Recordings).
     ("conversations", "save_path", "TEXT DEFAULT ''"),
     ("sessions", "save_path", "TEXT DEFAULT ''"),
+    # Schema 10: driver-reported input overflows per capture_gaps record.
+    ("capture_gaps", "overflows", "INTEGER DEFAULT 0"),
 )
 _BOOL_FIELDS = ("clipped", "bookmarked", "reviewed", "auto_processed", "hidden")
 
@@ -619,11 +625,11 @@ class Store:
         with self._lock:
             self._conn.execute(
                 "INSERT INTO capture_gaps (session_id, start_frame, frames, "
-                "sample_rate, started_at, blocks, reason, recorded_at) "
-                "VALUES (?,?,?,?,?,?,?,?)",
-                (gap.session_id, gap.start_frame, int(gap.frames),
+                "sample_rate, started_at, blocks, reason, recorded_at, "
+                "overflows) VALUES (?,?,?,?,?,?,?,?,?)",
+                (gap.session_id, gap.start_frame, int(gap.frames or 0),
                  int(gap.sample_rate), iso(gap.started_at), int(gap.blocks),
-                 gap.reason, iso(gap.recorded_at)))
+                 gap.reason, iso(gap.recorded_at), int(gap.overflows or 0)))
             self._conn.commit()
         return gap
 
@@ -635,6 +641,14 @@ class Store:
             "ORDER BY start_frame IS NULL, start_frame, id",
             (session_id,)).fetchall()
         return [CaptureGap.from_dict(dict(r)) for r in rows]
+
+    def sessions_for_conversation(self, conversation_id: str) -> List[Session]:
+        """Every monitoring run filed under one named thread, newest first,
+        each with its capture gaps."""
+        rows = self._conn.execute(
+            "SELECT * FROM sessions WHERE conversation_id = ? "
+            "ORDER BY started_at DESC", (conversation_id,)).fetchall()
+        return self._with_gaps([Session.from_dict(dict(r)) for r in rows])
 
     def _with_gaps(self, sessions: List[Session]) -> List[Session]:
         if not sessions:

@@ -1350,6 +1350,18 @@ class MainWindow(QtWidgets.QMainWindow):
         font.setCapitalization(QtGui.QFont.AllUppercase)
         self.state_badge.setFont(font)
         row.addWidget(self.state_badge)
+        # Beside the state, for as long as it is true: this run's input lost
+        # audio during capture. Not a status-bar message - those are
+        # replaced by the next one - and back when the Session is reopened,
+        # from what the store recorded (see _refresh_capture_loss).
+        self.capture_loss_badge = QtWidgets.QLabel("")
+        self.capture_loss_badge.setObjectName("captureLossBadge")
+        self.capture_loss_badge.setAccessibleName("Audio lost during capture")
+        self.capture_loss_badge.setFocusPolicy(QtCore.Qt.TabFocus)
+        self.capture_loss_badge.setFont(font)
+        self.capture_loss_badge.hide()
+        self._capture_loss_seen_live = object()     # forces the first refresh
+        row.addWidget(self.capture_loss_badge)
 
     def _build_language_controls(self, layout) -> None:
         """Language detection, and directly below it the source language,
@@ -2670,6 +2682,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
                 for audio_status in hooks("audio_status"):
                     audio_status(self, kind, message)
+                if kind == "capture-overflow":
+                    self._refresh_capture_loss()
                 if kind == "audio-resumed":
                     self._clear_warning("audio-input")
                 elif kind == "receiver-shutdown-failed":
@@ -2690,6 +2704,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.status.showMessage(
                     f"{payload.get('stage', 'processing')} error: "
                     f"{payload.get('message', '')}", 12000)
+        live = self.app.session.id if self.app.session is not None else None
+        if live != self._capture_loss_seen_live:
+            # A run started (its own, fresh account) or ended (back to the
+            # thread's latest run): the indicator follows.
+            self._capture_loss_seen_live = live
+            self._refresh_capture_loss()
         # Once a second while anything is held: which recording is being
         # processed, for how long, and each waiting card's place in line.
         import time as _t
@@ -3778,6 +3798,74 @@ class MainWindow(QtWidgets.QMainWindow):
             include_hidden=self._showing_removed()), keep_playback=True)
         self._refollow_after_rebuild()
         self._sync_filters()
+        self._refresh_capture_loss()
+
+    # -- audio lost during capture ----------------------------------------
+    def _refresh_capture_loss(self) -> None:
+        """The capture-loss indicator and the thread's per-run notes, from
+        what the store recorded (so a reopened Session shows them again).
+
+        The indicator describes the run being captured now; with none, the
+        newest run of the Session in view. A new run starts its own account,
+        so the indicator goes away until that run loses audio itself. The
+        thread's run notes list every run of the Session that lost audio."""
+        badge = getattr(self, "capture_loss_badge", None)
+        if badge is None or getattr(self, "timeline", None) is None or self._store_gone():
+            return
+        from ..models import Session as _Run
+        from ..timefmt import stamp
+
+        try:
+            runs = self.app.store.sessions_for_conversation(self.app.conversation_id)
+            live = self.app.session
+            current: Optional[_Run] = None
+            if live is not None:
+                current = self.app.store.get_session(live.id)
+            elif runs:
+                current = runs[0]
+        except Exception:  # noqa: BLE001 - an indicator never stops the window
+            log.exception("reading the capture-loss record failed")
+            return
+        loss = current.capture_loss if current is not None else None
+        if not loss:
+            badge.clear()
+            badge.setToolTip("")
+            badge.setAccessibleDescription("")
+            badge.hide()
+        else:
+            short = (f"\u26a0 Audio lost {loss.seconds:.2f} s" if loss.gaps
+                     else "\u26a0 Audio lost")
+            if loss.driver_overflows:
+                short += (" + driver overflow" if loss.gaps
+                          else " (driver overflow)")
+            which = ("This monitoring run" if live is not None
+                     else f"The latest monitoring run of this Session (started "
+                          f"{stamp(current.started_at)})")
+            details = []
+            if loss.gaps:
+                details.append(
+                    f"lost {loss.seconds:.3f} s of audio ({loss.frames:,} frames) in "
+                    f"{loss.gaps} gap{'' if loss.gaps == 1 else 's'} because "
+                    f"processing fell behind")
+            if loss.driver_overflows:
+                n = loss.driver_overflows
+                details.append(
+                    f"the input driver reported {n} overflow{'' if n == 1 else 's'} "
+                    f"(audio lost before it reached BabelFishR; duration unknown)")
+            text = (f"{which} {'; '.join(details)}. The rest of the audio is "
+                    f"kept; the gaps are recorded with the run and noted in "
+                    f"the thread and in exports.")
+            badge.setText(short)
+            badge.setToolTip(text)
+            badge.setAccessibleDescription(text)
+            badge.show()
+        notes = []
+        for run in sorted((r for r in runs if r.capture_loss),
+                          key=lambda r: r.started_at):
+            notes.append(f"Monitoring run started {stamp(run.started_at)}"
+                         f"{' (now)' if live is not None and run.id == live.id else ''}"
+                         f": {run.capture_loss.note()}")
+        self.timeline.set_run_notes(notes)
 
     def _showing_removed(self) -> bool:
         action = getattr(self, "show_removed_action", None)
@@ -4560,8 +4648,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path or self._store_gone():
             return
         renderer = renderers[fmt]
-        text = (renderer(transmissions, session) if fmt != "csv"
-                else renderer(transmissions))
+        if fmt == "md":
+            # Every run of the Session, for the capture-loss totals.
+            runs = self.app.store.sessions_for_conversation(conversation_id)
+            text = renderer(transmissions, session, runs=runs)
+        else:
+            text = (renderer(transmissions, session) if fmt != "csv"
+                    else renderer(transmissions))
         pathlib.Path(path).write_text(text, encoding="utf-8")
         self.status.showMessage(f"Exported {path}", 8000)
 

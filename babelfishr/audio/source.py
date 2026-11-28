@@ -20,7 +20,7 @@ from typing import Callable, Iterator, List, Optional
 import numpy as np
 
 from ..dsp.filters import dbfs, rms
-from ..models import CaptureGap, utcnow
+from ..models import GAP_DRIVER_OVERFLOW, CaptureGap, utcnow
 from .devices import (AmbiguousInputDevice, AudioBackendUnavailable,
                       AudioDevice, DeviceIdentity, InputDeviceMissing,
                       find_device, resolve_input)
@@ -268,6 +268,11 @@ class LiveAudioSource(AudioSource):
         self._next_frame = 0
         self._located_frames = 0
         self._gaps: List[CaptureGap] = []
+        #: Driver-reported overflows (overflow_count, counted in the
+        #: callback) already handed to the capture thread as records, and
+        #: when the last such record was made (monotonic).
+        self._overflows_taken = 0
+        self._overflow_taken_at: Optional[float] = None
 
     # -- lifecycle -------------------------------------------------------
     def start(self) -> None:
@@ -297,6 +302,8 @@ class LiveAudioSource(AudioSource):
             self._next_frame = 0
             self._located_frames = 0
             self._gaps = []
+            self._overflows_taken = 0
+            self._overflow_taken_at = None
             self._intake_open = True
         self._open_stream()
         self._running = True
@@ -506,7 +513,34 @@ class LiveAudioSource(AudioSource):
                 gaps.append(CaptureGap(frames=unplaced,
                                        sample_rate=self.sample_rate))
                 self._located_frames += unplaced
+        driver = self._take_driver_overflows(final)
+        if driver is not None:
+            gaps.append(driver)
         return gaps
+
+    #: Driver-reported overflows are coalesced into at most one record per
+    #: this many seconds (a driver overflowing on every callback would
+    #: otherwise write a row per block); the end of the run takes the rest.
+    driver_overflow_record_interval = 1.0
+
+    def _take_driver_overflows(self, final: bool) -> Optional[CaptureGap]:
+        """Input overflows the driver reported (PortAudio ``input_overflow``,
+        counted in the callback) since the last record, as one record of
+        unknown duration and position - the driver says audio was lost, not
+        how much or where, so no duration is made up."""
+        count = self.overflow_count
+        new = count - self._overflows_taken
+        if new <= 0:
+            return None
+        now = time.monotonic()
+        last = self._overflow_taken_at
+        if (not final and last is not None
+                and now - last < self.driver_overflow_record_interval):
+            return None
+        self._overflows_taken = count
+        self._overflow_taken_at = now
+        return CaptureGap(frames=None, sample_rate=self.sample_rate,
+                          reason=GAP_DRIVER_OVERFLOW, overflows=new)
 
     def _notify(self, kind: str, message: str) -> None:
         log.debug("audio %s: %s", kind, message)

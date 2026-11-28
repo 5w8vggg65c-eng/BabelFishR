@@ -45,9 +45,9 @@ from .audio.wavefile import write_wav, write_wav_atomic
 from . import savepath
 from .config import Config
 from .detect import DetectedTransmission, RadioActivityDetector
-from .models import (CaptureGap, ContentClass, ProcessingState, Provenance,
-                     RadioProfile, Session, SourceLanguageMode, Transmission,
-                     iso, utcnow)
+from .models import (GAP_DRIVER_OVERFLOW, CaptureGap, ContentClass,
+                     ProcessingState, Provenance, RadioProfile, Session,
+                     SourceLanguageMode, Transmission, iso, utcnow)
 from .providers import (EngineError, EngineUnavailable, Glossary,
                         TranscriptionEngine, TranslationEngine)
 from .storage import Store
@@ -1350,6 +1350,7 @@ class CaptureService:
         self._open_gaps: List[CaptureGap] = []
         self._unwarned_frames = 0
         self._unwarned_gaps = 0
+        self._unwarned_driver = 0
         self._last_overflow_warning: Optional[float] = None
         #: Monotonic clock for the warning's rate limit (tests replace it).
         self.clock: Callable[[], float] = _time.monotonic
@@ -1642,28 +1643,43 @@ class CaptureService:
             except Exception:  # noqa: BLE001 - kept in memory, warned below
                 log.exception("recording a capture gap failed")
             self.capture_gaps.append(gap)
-            if self.detector.open:
+            if gap.reason == GAP_DRIVER_OVERFLOW:
+                # Duration and position unknown: the run's, not a message's.
+                self._unwarned_driver += int(gap.overflows or 0)
+                log.warning("audio driver reported %d input overflow(s) in "
+                            "run %s (duration unknown)", gap.overflows,
+                            self.session.id)
+                continue
+            if self.detector.open and gap.located:
+                # Only a gap whose place in the stream is known is put on
+                # the transmission being received; an unplaced one (the
+                # end-of-run reckoning) could have fallen anywhere.
                 self._open_gaps.append(gap)
-            self._unwarned_frames += gap.frames
+            self._unwarned_frames += gap.frames or 0
             self._unwarned_gaps += 1
             log.warning("capture buffer overflow: %d frames (%.3f s) lost at "
-                        "frame %s of run %s", gap.frames, gap.duration,
+                        "frame %s of run %s", gap.frames or 0, gap.duration or 0.0,
                         gap.start_frame, self.session.id)
         self._warn_overflow(force=final)
 
     @property
     def dropped_frames(self) -> int:
-        return sum(g.frames for g in self.capture_gaps)
+        return sum(g.frames or 0 for g in self.capture_gaps)
 
     @property
     def dropped_seconds(self) -> float:
-        return sum(g.duration for g in self.capture_gaps)
+        return sum(g.duration or 0.0 for g in self.capture_gaps)
+
+    @property
+    def driver_overflows(self) -> int:
+        return sum(int(g.overflows or 0) for g in self.capture_gaps
+                   if g.reason == GAP_DRIVER_OVERFLOW)
 
     def _warn_overflow(self, force: bool = False) -> None:
         """One operator warning for what was lost since the last one, at most
         once per interval; ``force`` (the end of the run) reports whatever is
         still unreported so nothing lost is left unsaid."""
-        if not self._unwarned_frames:
+        if not self._unwarned_frames and not self._unwarned_driver:
             return
         now = self.clock()
         last = self._last_overflow_warning
@@ -1673,19 +1689,36 @@ class CaptureService:
         rate = self.source.sample_rate or 1
         lost = self._unwarned_frames / float(rate)
         gaps = self._unwarned_gaps
-        message = (f"Audio input buffer overflowed: {lost:.3f} s of audio "
-                   f"({self._unwarned_frames} frames, {gaps} gap"
-                   f"{'' if gaps == 1 else 's'}) was lost because processing "
-                   f"fell behind. This run has lost {self.dropped_seconds:.3f} s "
-                   f"in total; the gaps are recorded with the session.")
+        driver = self._unwarned_driver
+        parts = []
+        if self._unwarned_frames:
+            parts.append(
+                f"Audio input buffer overflowed: {lost:.3f} s of audio "
+                f"({self._unwarned_frames} frames, {gaps} gap"
+                f"{'' if gaps == 1 else 's'}) was lost because processing "
+                f"fell behind.")
+        if driver:
+            parts.append(
+                f"The audio driver reported {driver} input overflow"
+                f"{'' if driver == 1 else 's'}: audio was lost before it reached "
+                f"BabelFishR (duration unknown).")
+        parts.append(f"This run has lost {self.dropped_seconds:.3f} s in total"
+                     + (f" plus {self.driver_overflows} driver-reported overflow"
+                        f"{'' if self.driver_overflows == 1 else 's'}"
+                        if self.driver_overflows else "")
+                     + "; the gaps are recorded with the session.")
+        message = " ".join(parts)
         payload = {"kind": "capture-overflow", "message": message,
                    "session_id": self.session.id,
                    "dropped_frames": self._unwarned_frames,
                    "dropped_seconds": round(lost, 6), "gaps": gaps,
+                   "driver_overflows": driver,
                    "total_dropped_frames": self.dropped_frames,
-                   "total_dropped_seconds": round(self.dropped_seconds, 6)}
+                   "total_dropped_seconds": round(self.dropped_seconds, 6),
+                   "total_driver_overflows": self.driver_overflows}
         self._unwarned_frames = 0
         self._unwarned_gaps = 0
+        self._unwarned_driver = 0
         self.events.publish("audio-status", payload)
 
     def _handle_block(self, block: AudioBlock) -> None:
