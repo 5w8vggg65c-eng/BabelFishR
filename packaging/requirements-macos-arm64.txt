@@ -119,6 +119,7 @@ httpx2==2.16.2 \
 huggingface-hub==2.5.0 \
     --hash=sha256:f8565260f2031f5a62301d01d8d80bf6f889390f3c3f1b1cfe6d7e10b5a02db8
     # via
+    #   babelfishr
     #   faster-whisper
     #   tokenizers
 idna==3.20 \

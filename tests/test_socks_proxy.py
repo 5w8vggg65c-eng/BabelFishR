@@ -144,7 +144,7 @@ def test_the_frozen_self_test_builds_the_client_behind_socks(monkeypatch):
 
 def test_socksio_is_declared_locked_and_bundled():
     pyproject = (ROOT / "pyproject.toml").read_text()
-    asr = re.search(r"^asr = \[(.*)\]$", pyproject, re.M).group(1)
+    asr = re.search(r"^asr = \[(.*?)\]", pyproject, re.M | re.S).group(1)
     assert "socksio" in asr
     lock = (ROOT / "packaging" / "requirements-macos-arm64.txt").read_text()
     entry = re.search(r"^socksio==(\S+) \\\n\s+--hash=sha256:([0-9a-f]{64})", lock, re.M)
