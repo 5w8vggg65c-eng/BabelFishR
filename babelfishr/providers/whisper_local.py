@@ -52,11 +52,43 @@ TARGET_RATE = 16_000
 MODEL_SIZES = ("tiny", "base", "small", "medium", "large-v3", "large-v3-turbo")
 
 #: Assets faster-whisper's own download_model fetches. ``model.bin`` and
-#: ``config.json`` are mandatory; a model also needs one tokenizer asset, which
-#: is ``tokenizer.json`` on newer conversions and ``vocabulary.*`` on older
-#: ones, so either satisfies the check.
+#: ``config.json`` are mandatory, and so is ``tokenizer.json``: CTranslate2
+#: reads ``vocabulary.*``, but faster-whisper's WhisperModel (1.2.1,
+#: transcribe.py) builds its tokenizer from ``tokenizer.json`` and, when that
+#: file is absent, calls ``tokenizers.Tokenizer.from_pretrained(
+#: "openai/whisper-tiny")`` with no local-only flag - a Hugging Face Hub
+#: request, even in Offline Field Use. A folder with only ``vocabulary.*`` is
+#: therefore INCOMPLETE (repairable online: the repair adds tokenizer.json
+#: and keeps the files already there), and WhisperModel is never constructed
+#: on it (:func:`tokenizer_problem`).
 REQUIRED_ASSETS = ("model.bin", "config.json")
+TOKENIZER_FILE = "tokenizer.json"
 TOKENIZER_ASSETS = ("tokenizer.json", "vocabulary.json", "vocabulary.txt")
+
+TOKENIZER_MISSING = ("The speech model's tokenizer (tokenizer.json) is missing; "
+                     "repair the model in Online / Setup")
+
+
+def tokenizer_problem(directory, read: bool = True) -> str:
+    """Why WhisperModel must not be constructed on *directory* for want of a
+    local tokenizer, or "" when ``tokenizer.json`` is there. faster-whisper
+    falls back to the Hub exactly when ``os.path.isfile(tokenizer.json)`` is
+    false, so a regular, non-empty file is what is required; with *read*
+    (the load gate) it must also open, so an unreadable file fails here with
+    a clear message. Its content is the library's to judge: a damaged file
+    fails to load locally, with no network."""
+    path = pathlib.Path(directory) / TOKENIZER_FILE
+    try:
+        if not path.is_file() or path.stat().st_size == 0:
+            return f"{TOKENIZER_MISSING} ({pathlib.Path(directory)})."
+        if read:
+            with open(path, "rb") as handle:
+                handle.read(1)
+    except OSError as exc:
+        return (f"The speech model's tokenizer (tokenizer.json) in "
+                f"{pathlib.Path(directory)} cannot be read ({exc}); repair the "
+                f"model in Online / Setup.")
+    return ""
 
 
 class ModelState(str, enum.Enum):
@@ -85,8 +117,9 @@ def inspect_model_directory(directory) -> tuple:
     if not path.is_dir():
         return (ModelState.MISSING, list(REQUIRED_ASSETS))
     missing = [name for name in REQUIRED_ASSETS if not (path / name).exists()]
-    if not any((path / name).exists() for name in TOKENIZER_ASSETS):
-        missing.append("tokenizer.json or vocabulary.*")
+    if tokenizer_problem(path, read=False):
+        # vocabulary.* alone is not enough: see TOKENIZER_FILE.
+        missing.append(TOKENIZER_FILE)
     if missing:
         # An empty or half-written directory is worse than none: it looks
         # prepared. Report it as incomplete so it can be repaired.
@@ -479,6 +512,11 @@ class FasterWhisperEngine(TranscriptionEngine):
                     "    pip install 'babelfishr[asr]'")
         state, missing = self.model_state()
         directory = self.model_directory()
+        if state is ModelState.INCOMPLETE and missing == [TOKENIZER_FILE]:
+            return (f"{TOKENIZER_MISSING} ({directory}).\n"
+                    f"Repair it with a network connection (the files already "
+                    f"there are kept):\n"
+                    f"    babelfishr prepare-field --asr-model {self.model_size}")
         if state is ModelState.INCOMPLETE:
             return (f"The Whisper model at {directory} is incomplete - an "
                     f"interrupted download. Missing: {', '.join(missing)}.\n"
@@ -531,6 +569,11 @@ class FasterWhisperEngine(TranscriptionEngine):
             # Online/Setup with nothing prepared yet: fetch into our directory
             # rather than letting faster-whisper populate a cache we do not own.
             target = str(self.prepare())
+        # Without a local tokenizer.json, WhisperModel itself would fetch one
+        # from the Hub (see TOKENIZER_FILE): never construct it then.
+        problem = tokenizer_problem(target)
+        if problem:
+            raise EngineUnavailable(problem)
         try:
             self._model = WhisperModel(
                 target, device=device, compute_type=compute_type,

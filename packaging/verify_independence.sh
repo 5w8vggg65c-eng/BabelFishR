@@ -126,6 +126,22 @@ else
 fi
 
 echo
+echo "== a vocabulary-only Whisper model is refused offline, with no network =="
+# Fatal. faster-whisper's WhisperModel fetches a tokenizer from the Hugging
+# Face Hub when a model folder has no tokenizer.json (only vocabulary.*),
+# even in Offline Field Use. The bundle must refuse such a folder before the
+# library is constructed, on Field Check, preload, warm-up and transcription,
+# while Record Only keeps archiving. Temporary profile, empty HF cache, no
+# real weights.
+if OUTPUT=$(run_isolated_limited 120 --selftest-offline-tokenizer); then
+  echo "$OUTPUT"
+  pass "vocabulary-only model refused offline before WhisperModel"
+else
+  echo "$OUTPUT"
+  fail "a vocabulary-only model reached WhisperModel or the network"
+fi
+
+echo
 echo "== main window construction (offscreen) =="
 if OUTPUT=$(run_isolated --selftest-gui 2>&1); then
   pass "$(echo "$OUTPUT" | tail -n 1)"

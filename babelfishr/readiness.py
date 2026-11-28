@@ -597,6 +597,10 @@ def _check_transcription(config, report: ReadinessReport,
         report.add(Check("Local transcription smoke test", CheckStatus.SKIP, ""))
         return
 
+    # A folder without tokenizer.json is not present (inspect_model_directory):
+    # loading it would make faster-whisper fetch a tokenizer from the Hub.
+    from .providers.whisper_local import TOKENIZER_FILE, TOKENIZER_MISSING
+
     if not engine.model_present():
         from .providers.whisper_local import ModelState
 
@@ -605,6 +609,10 @@ def _check_transcription(config, report: ReadinessReport,
                   f"(missing: {', '.join(missing)})"
                   if state is ModelState.INCOMPLETE
                   else f"no model at {engine.model_directory()}")
+        if state is ModelState.INCOMPLETE and TOKENIZER_FILE in missing:
+            # Without it the library would fetch a tokenizer from the Hub,
+            # so it is never loaded (and not smoke-tested) here.
+            detail = f"{TOKENIZER_MISSING}: {detail}"
         report.add(Check(
             "Local ASR model present", CheckStatus.FAIL, detail,
             remedy=f"babelfishr prepare-field --asr-model {config.asr.model}",

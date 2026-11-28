@@ -178,14 +178,19 @@ def test_empty_directory_reads_as_missing_not_incomplete(tmp_path):
     assert inspect_model_directory(directory)[0] is ModelState.MISSING
 
 
-def test_tokenizer_may_be_either_asset(tmp_path):
-    """Older conversions ship vocabulary.* instead of tokenizer.json."""
+def test_vocabulary_alone_is_not_a_complete_model(tmp_path):
+    """Older conversions ship vocabulary.* without tokenizer.json. That used
+    to count as complete, but faster-whisper then fetches a tokenizer from
+    the Hub when the model loads - so it is incomplete (repairable)."""
     directory = model_directory_for(tmp_path, "small")
     directory.mkdir(parents=True)
     (directory / "model.bin").write_bytes(b"w")
     (directory / "config.json").write_text("{}")
     assert inspect_model_directory(directory)[0] is ModelState.INCOMPLETE
     (directory / "vocabulary.txt").write_text("a\nb\n")
+    assert inspect_model_directory(directory) == (ModelState.INCOMPLETE,
+                                                  ["tokenizer.json"])
+    (directory / "tokenizer.json").write_text("{}")
     assert inspect_model_directory(directory)[0] is ModelState.COMPLETE
 
 

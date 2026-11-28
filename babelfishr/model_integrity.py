@@ -127,10 +127,10 @@ def pin_for(model_name: str, pins: Optional[dict] = None) -> Pin:
     """The pinned identity of *model_name*, or :class:`UnpinnedModel`.
 
     A pin must name a full 40-hex commit and a sha256 for each file, and its
-    files must make a loadable model (weights, config and a tokenizer asset);
+    files must make a loadable model (weights, config and tokenizer.json);
     anything less cannot establish identity and is refused.
     """
-    from .providers.whisper_local import REQUIRED_ASSETS, TOKENIZER_ASSETS
+    from .providers.whisper_local import REQUIRED_ASSETS, TOKENIZER_FILE
 
     entry = (pins if pins is not None else _pins()).get(str(model_name))
     hint = ("this build has no pinned revision and checksums for the Whisper "
@@ -158,7 +158,7 @@ def pin_for(model_name: str, pins: Optional[dict] = None) -> Pin:
                                 int(size) if size is not None else None,
                                 meta.get("git_oid")))
     names = {f.name for f in files}
-    if not set(REQUIRED_ASSETS) <= names or not names & set(TOKENIZER_ASSETS):
+    if not set(REQUIRED_ASSETS) | {TOKENIZER_FILE} <= names:
         raise UnpinnedModel(f"{hint} - the pinned file list is not a complete model")
     # Smallest first and the weights last, as faster-whisper fetches them.
     files.sort(key=lambda f: (f.name == "model.bin", f.size or 0, f.name))
