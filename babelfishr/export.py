@@ -560,7 +560,61 @@ def to_json(transmissions: Sequence[Transmission],
     return json.dumps(payload, indent=indent, ensure_ascii=False)
 
 
+# Columns that hold measurements the app itself typed as numbers. Their
+# values stay numbers in the CSV (a negative or decimal value must sort and
+# sum in a spreadsheet); every other cell is text from the radio, the
+# operator or the app and is written as literal text.
+CSV_NUMERIC_COLUMNS = frozenset({
+    "duration", "frequency_mhz", "language_confidence",
+    "transcript_confidence", "capture_loss_seconds",
+})
+_CSV_NUMBER = re.compile(r"-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
+# What makes a spreadsheet read a cell as a formula (or DDE command): the
+# ASCII prefixes, their full-width forms, and a leading tab, carriage
+# return or other control character. Leading spaces are skipped too, since
+# some applications trim them before deciding.
+_CSV_FORMULA_PREFIX = frozenset("=+-@\uff1d\uff0b\uff0d\uff20")
+
+
+def csv_cell(column: str, value) -> object:
+    """One CSV cell as a spreadsheet must read it.
+
+    Typed measurements in CSV_NUMERIC_COLUMNS stay numbers. Any other text
+    that a spreadsheet could take for a formula - it starts, after optional
+    whitespace, with = + - @ (or their full-width forms), or starts with a
+    control character such as a tab or carriage return - gets a leading
+    apostrophe, so it is shown as text and never evaluated. Everything else
+    is written exactly. This is CSV only: JSON, Markdown and the database
+    keep the operator's text exactly.
+
+    Limit: the apostrophe is a widely honoured convention, not a standard.
+    Most spreadsheet applications display it as part of the cell when they
+    open a CSV (so "=1+1" reads "'=1+1"); none evaluates the cell.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(value)
+    if column in CSV_NUMERIC_COLUMNS:
+        if isinstance(value, (int, float)):
+            return value
+        if isinstance(value, str) and _CSV_NUMBER.fullmatch(value.strip()):
+            return value.strip()
+    text = value if isinstance(value, str) else str(value)
+    if not text:
+        return text
+    first = text[0]
+    stripped = text.lstrip(" \u00a0\u3000")
+    if (ord(first) < 32 or first == "\x7f"
+            or (stripped and stripped[0] in _CSV_FORMULA_PREFIX)):
+        return "'" + text
+    return text
+
+
 def to_csv(transmissions: Sequence[Transmission]) -> str:
+    """A spreadsheet-friendly table. Every cell goes through csv_cell():
+    app-typed measurements stay numbers, and text that a spreadsheet could
+    evaluate as a formula is written as literal text."""
     buffer = io.StringIO()
     writer = csv.DictWriter(buffer, fieldnames=CSV_COLUMNS, extrasaction="ignore")
     writer.writeheader()
@@ -588,7 +642,7 @@ def to_csv(transmissions: Sequence[Transmission]) -> str:
         if loss:
             row["capture_loss_seconds"] = f"{loss.seconds:.6f}".rstrip("0").rstrip(".")
             row["capture_loss_note"] = loss.note()
-        writer.writerow({k: row.get(k, "") for k in CSV_COLUMNS})
+        writer.writerow({k: csv_cell(k, row.get(k, "")) for k in CSV_COLUMNS})
     return buffer.getvalue()
 
 
@@ -826,7 +880,9 @@ def _bundle_readme(session: Session, count: int) -> str:
         "Contents\n"
         "  session.json      full metadata, transcripts and translations\n"
         "  transcript.md     human-readable log\n"
-        "  transmissions.csv spreadsheet-friendly table\n"
+        "  transmissions.csv spreadsheet-friendly table (text that a spreadsheet\n"
+        "                    could run as a formula starts with ' so it is\n"
+        "                    shown, never evaluated; session.json has it exact)\n"
         "  audio/            original recordings, named by transmission id\n\n"
         "Original transcripts and translations are stored in separate fields;\n"
         "the audio here is the unmodified capture.\n\n"
