@@ -36,7 +36,11 @@ audio = ["sounddevice>=0.4.6"]
 gui = ["PySide6>=6.5"]
 # certifi: a frozen bundle has no system trust store, so the CA data has
 # to be shipped with the application or every download fails.
-asr = ["faster-whisper>=1.0", "certifi>=2023.7.22"]
+# socksio: huggingface_hub's HTTP client (httpx2/httpcore2) honours the
+# system proxy settings, and with a SOCKS proxy configured (ALL_PROXY=
+# socks5h://...) it refuses to start without socksio - the model download
+# failed before sending a single byte.
+asr = ["faster-whisper>=1.0", "certifi>=2023.7.22", "socksio>=1.0,<2"]
 translate = ["argostranslate>=1.9", "certifi>=2023.7.22"]
 cloud = ["anthropic>=0.40"]
 # pyyaml lets the tests read the release workflow and check its
@@ -52,6 +56,7 @@ all = [
   "argostranslate>=1.9",
   "anthropic>=0.40",
   "certifi>=2023.7.22",
+  "socksio>=1.0,<2",
 ]
 
 [project.scripts]

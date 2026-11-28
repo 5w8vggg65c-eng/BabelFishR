@@ -373,6 +373,42 @@ def _selftest_resource_tracker() -> int:
     return 1
 
 
+def _selftest_socks_client() -> str:
+    """Build the production model-hub client with a SOCKS proxy configured,
+    as on a Mac whose network settings supply ALL_PROXY=socks5h://...
+    Nothing is sent: creating the client opens no connection. Without the
+    bundled socksio this raises ImportError ("Using SOCKS proxy, but the
+    'socksio' package is not installed") and the build fails here.
+    """
+    import socksio  # noqa: F401
+    from huggingface_hub.utils import _http as hf_http
+
+    keys = ("ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy",
+            "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy")
+    saved = {key: os.environ.get(key) for key in keys}
+    try:
+        for key in keys:
+            os.environ.pop(key, None)
+        os.environ["ALL_PROXY"] = "socks5h://127.0.0.1:9"
+        client = hf_http.default_client_factory()
+        try:
+            transport = client._transport_for_url(
+                client._merge_url("https://huggingface.co/"))
+            kind = type(getattr(transport, "_pool", transport)).__name__
+        finally:
+            client.close()
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    if "socks" not in kind.lower():
+        raise RuntimeError(f"a SOCKS proxy was configured but the hub client "
+                           f"uses {kind}")
+    return f"the model-hub client starts behind a SOCKS proxy ({kind})"
+
+
 def main(argv=None) -> int:
     """Launch the GUI, or hand off to the CLI when arguments are supplied.
 
@@ -399,8 +435,9 @@ def main(argv=None) -> int:
         zoneinfo.ZoneInfo.clear_cache()
         zoneinfo.ZoneInfo("America/Denver")
         zoneinfo.ZoneInfo("Asia/Kathmandu")
+        socks = _selftest_socks_client()
         print(f"babelfishr {babelfishr.__version__} imports cleanly; "
-              f"time zone regions resolve offline")
+              f"time zone regions resolve offline; {socks}")
         return 0
 
     if argv == ["--selftest-independence"]:

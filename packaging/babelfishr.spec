@@ -46,6 +46,23 @@ except Exception as exc:  # noqa: BLE001
         "the packaged app cannot complete any HTTPS download. "
         f"(pip install certifi)  [{exc}]")
 
+# SOCKS proxy support, explicitly. huggingface_hub's client (httpx2 over
+# httpcore2) reads the system proxy settings and, with ALL_PROXY=socks5h://
+# configured, refuses to start without socksio; httpcore2 imports it lazily,
+# so it is named here rather than left to import analysis. A Mac behind a
+# SOCKS proxy could not download any model from Preview 11.
+try:
+    import socksio  # noqa: F401
+
+    hidden += collect_submodules("socksio")
+    for package in ("httpcore2", "httpx2"):
+        hidden += [m for m in collect_submodules(package) if "socks" in m]
+except Exception as exc:  # noqa: BLE001
+    raise SystemExit(
+        "socksio is required to build a working bundle: behind a SOCKS proxy "
+        "the packaged app cannot reach the model hub without it. "
+        f"(pip install socksio)  [{exc}]")
+
 # The IANA time zone database, explicitly: zoneinfo reads it for the named
 # regions in Session Options (Denver, Kathmandu, ...). The frozen app must
 # not depend on the build machine's or the user's system copy.

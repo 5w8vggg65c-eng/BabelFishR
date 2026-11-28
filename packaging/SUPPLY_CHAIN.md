@@ -82,7 +82,8 @@ arm64 CPython 3.12 interpreter can install (cp312, abi3 or pure-Python;
 `arm64` or `universal2`; macOS <= 26.0). It keeps a hash only when it
 appears in both uv's output and PyPI's JSON API
 (`https://pypi.org/pypi/<name>/<version>/json`) for that exact file. It fails
-if a pin is left without a hash. The lock has 91 pins and 99 hashes.
+if a pin is left without a hash. The lock has 92 pins and 99 sha256 hashes (91 pins from
+the provenance below, plus socksio - see the next paragraph).
 
 **Provenance of the versions.** They are the exact versions the official Mac
 preview build resolved and tested. The source is GitHub Actions run
@@ -103,6 +104,16 @@ therefore read from the job log, through the GitHub API:
   Apart from pip itself, those 91 filenames are identical to the 91 files
   that check 1 below downloaded, so the hashes in the lock are the hashes of
   the exact files that run installed.
+
+**Addition after Preview 11: socksio 1.0.0.** On a Mac whose network settings
+supply a SOCKS proxy (ALL_PROXY=socks5h://...), the packaged CLI could not
+install any model: huggingface_hub's client (httpx2/httpcore2) refuses to start
+without socksio. `socksio>=1.0,<2` was added to the `asr` extra (and `all`),
+and the lock regenerated with `refresh_macos_lock.sh`. The only change to
+the lock was the new pin: every existing version and hash stayed the same.
+Its single hash is that of `socksio-1.0.0-py3-none-any.whl`, matching PyPI's
+JSON API, and a `--require-hashes` install of it succeeded. No Mac run has
+installed it yet; the next preview run is the first to do so.
 
 uv was not told to use these versions: an independent resolution today, for
 the same target, produced the same set. The input file
