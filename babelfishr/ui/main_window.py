@@ -3318,8 +3318,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self, "Export clip", str(self._export_directory() / f"{tx.id}.wav"),
             "WAV files (*.wav)")
         if path and not self._store_gone():
-            export_transmission_audio(tx, path)
-            self.status.showMessage(f"Exported {path}", 6000)
+            try:
+                # The save dialog already asked before replacing a file.
+                written = export_transmission_audio(tx, path, overwrite=True)
+            except OSError as exc:
+                QtWidgets.QMessageBox.warning(
+                    self, "Export",
+                    f"The clip could not be exported to {path}:\n{exc}\n\n"
+                    "Nothing was written there; the recording itself is safe.")
+                return
+            self.status.showMessage(f"Exported {written}", 6000)
 
     # -- data views ------------------------------------------------------
     # -- named Session tabs ----------------------------------------------
@@ -4493,8 +4501,18 @@ class MainWindow(QtWidgets.QMainWindow):
         conversation = self.app.store.get_conversation(conversation_id)
         label = _slug(conversation.name if conversation else session.id)
         target = pathlib.Path(directory) / f"babelfishr_{label}"
-        path = export_session(self.app.store, session.id, str(target),
-                              conversation_id=conversation_id)
+        try:
+            path = export_session(self.app.store, session.id, str(target),
+                                  conversation_id=conversation_id)
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Export",
+                f"The session bundle could not be exported to {directory}:\n"
+                f"{exc}\n\nNothing was written there and nothing already "
+                "there was changed.")
+            return
+        # A folder of that name already there is left alone; the bundle goes
+        # to a fresh "name (2)" beside it, and that is the path named here.
         self.status.showMessage(f"Exported session bundle to {path}", 10000)
 
     def _export_text(self, fmt: str) -> None:

@@ -8,12 +8,17 @@ readable after being copied to another machine.
 from __future__ import annotations
 
 import csv
+import dataclasses
+import errno
 import io
 import json
+import os
 import pathlib
+import re
 import shutil
+import tempfile
 import zipfile
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .models import Session, Transmission, iso, utcnow
 from .storage import Store
@@ -30,6 +35,182 @@ CSV_COLUMNS = [
     # A recogniser's guess for noise is not put in the transcript column.
     "transcript_status", "withheld_guess",
 ]
+
+
+class ExportCancelled(Exception):
+    """Raised when an export's ``cancelled`` hook asks it to stop.
+
+    Nothing is left behind: the operation's private staging is removed and
+    nothing appears at the requested name.
+    """
+
+
+#: Shown in place of an operator folder (a removable volume, a home folder)
+#: wherever one would otherwise travel inside a portable bundle.
+LOCAL_FOLDER = "[local folder]"
+
+_SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _safe_component(text: str, fallback: str) -> str:
+    """One harmless filename component: no separators, no leading dots,
+    nothing a filesystem treats specially."""
+    name = _SAFE_NAME.sub("_", str(text or "")).strip("._ ")
+    return name[:120] or fallback
+
+
+def _plan_audio(transmissions: Sequence[Transmission], include_audio: bool
+                ) -> List[Tuple[str, pathlib.Path, str]]:
+    """(tx id, source, bundle-relative path) for each recording to copy.
+
+    Bundle names are derived from the id but made safe and collision-free
+    (case-insensitively, for macOS and Windows volumes), so an odd id can
+    never escape ``audio/`` and two recordings never share a file.
+    """
+    if not include_audio:
+        return []
+    plan: List[Tuple[str, pathlib.Path, str]] = []
+    used: set = set()
+    seen_ids: set = set()
+    for tx in transmissions:
+        if not tx.audio_path or tx.id in seen_ids:
+            continue
+        source = pathlib.Path(tx.audio_path)
+        if not source.is_file():
+            continue
+        seen_ids.add(tx.id)
+        stem = _safe_component(tx.id, "clip")
+        suffix = ("." + _safe_component(source.suffix[1:], "audio")
+                  if source.suffix else "")
+        name, n = f"{stem}{suffix}", 1
+        while name.lower() in used:
+            n += 1
+            name = f"{stem}-{n}{suffix}"
+        used.add(name.lower())
+        plan.append((tx.id, source, f"audio/{name}"))
+    return plan
+
+
+def _operator_folders(store: Store, sessions: Iterable[Optional[Session]],
+                      conversation_id: Optional[str],
+                      transmissions: Sequence[Transmission]) -> List[str]:
+    """Absolute local folders that must not travel inside a bundle: the
+    Session's save paths, the recordings folder, where each recording sits,
+    and the operator's home folder. Longest first, so the most specific
+    folder is the one replaced."""
+    roots: set = set()
+
+    def add(value) -> None:
+        text = str(value or "").strip()
+        if not text:
+            return
+        path = pathlib.Path(text)
+        if not path.is_absolute():
+            return
+        text = str(path)
+        if len(text.rstrip("/\\")) >= 4:
+            roots.add(text.rstrip("/\\"))
+
+    for session in sessions:
+        if session is not None:
+            add(session.save_path)
+            if not conversation_id:
+                conversation_id = session.conversation_id
+    if conversation_id:
+        try:
+            conversation = store.get_conversation(conversation_id)
+        except Exception:  # noqa: BLE001 - redaction must not stop an export
+            conversation = None
+        if conversation is not None:
+            add(getattr(conversation, "save_path", ""))
+    add(getattr(store, "recordings_dir", ""))
+    for tx in transmissions:
+        for value in (tx.audio_path, tx.processed_audio_path):
+            if value:
+                add(pathlib.Path(value).parent)
+    try:
+        add(pathlib.Path.home())
+    except Exception:  # noqa: BLE001 - no home folder: nothing to hide
+        pass
+    return sorted(roots, key=len, reverse=True)
+
+
+def _redactor(roots: Sequence[str]):
+    if not roots:
+        return lambda text: text
+    pattern = re.compile(
+        "(?:" + "|".join(re.escape(r) for r in roots) + r")(?![A-Za-z0-9_.-])")
+    return lambda text: pattern.sub(LOCAL_FOLDER, text)
+
+
+def _redact_tree(value, redact):
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, list):
+        return [_redact_tree(v, redact) for v in value]
+    if isinstance(value, dict):
+        return {k: _redact_tree(v, redact) for k, v in value.items()}
+    return value
+
+
+def _unique_sibling(path: pathlib.Path, attempt: int,
+                    keep_suffix: bool) -> pathlib.Path:
+    """``name``, then ``name (2)``, ``name (3)``... keeping a file's suffix
+    (``clip (2).wav``); a folder's name is numbered whole."""
+    if attempt <= 1:
+        return path
+    if keep_suffix and path.suffix:
+        return path.with_name(f"{path.stem} ({attempt}){path.suffix}")
+    return path.with_name(f"{path.name} ({attempt})")
+
+
+def _publish(staged: pathlib.Path, final: pathlib.Path) -> pathlib.Path:
+    """Move *staged* to *final*, or to the first free ``final (n)``.
+
+    Never replaces anything: a file is published with a hard link (which
+    fails if the name is taken) where the volume supports it; a folder with
+    a rename after checking the name is free. Returns the name used.
+    """
+    for attempt in range(1, 10_000):
+        candidate = _unique_sibling(final, attempt, not staged.is_dir())
+        if os.path.lexists(candidate):
+            continue
+        if staged.is_dir():
+            try:
+                os.rename(staged, candidate)
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                if exc.errno in (errno.EEXIST, errno.ENOTEMPTY) \
+                        and os.path.lexists(candidate):
+                    continue
+                raise
+            return candidate
+        try:
+            os.link(staged, candidate)
+        except FileExistsError:
+            continue
+        except OSError:
+            # No hard links here (FAT/exFAT, some network shares): the
+            # name was free a moment ago; a plain rename is the fallback.
+            if os.path.lexists(candidate):
+                continue
+            os.rename(staged, candidate)
+            return candidate
+        try:
+            os.unlink(staged)
+        except OSError:
+            pass  # removed with the staging folder
+        return candidate
+    raise FileExistsError(f"no free name next to {final}")
+
+
+def _staging_dir(parent: pathlib.Path) -> pathlib.Path:
+    """A uniquely named, hidden folder owned by this export alone, next to
+    the final location (same volume, so publishing is a rename)."""
+    parent.mkdir(parents=True, exist_ok=True)
+    return pathlib.Path(tempfile.mkdtemp(prefix=".babelfishr-export-",
+                                         suffix=".partial", dir=parent))
 
 
 def to_json(transmissions: Sequence[Transmission],
@@ -149,80 +330,127 @@ def to_markdown(transmissions: Sequence[Transmission],
         if tx.notes:
             lines.append(f"**Notes:** {tx.notes}")
         if tx.audio_path:
-            lines.append(f"**Audio:** `{pathlib.Path(tx.audio_path).name}`")
+            # A bundle names its own relative file (audio/<id>.wav); a loose
+            # export names the recording without the folder it sits in.
+            audio = pathlib.PurePath(tx.audio_path)
+            shown = audio.name if audio.is_absolute() else audio.as_posix()
+            lines.append(f"**Audio:** `{shown}`")
         lines.append("")
     return "\n".join(lines)
 
 
 def export_session(store: Store, session_id: str, destination: str,
                    include_audio: bool = True, archive: bool = False,
-                   conversation_id: Optional[str] = None) -> str:
-    """Write a self-contained bundle. Returns the path written.
+                   conversation_id: Optional[str] = None,
+                   cancelled: Optional[Callable[[], bool]] = None) -> str:
+    """Write a self-contained bundle. Returns the path actually written.
 
     ``conversation_id`` exports a whole named Session - every monitoring run
     filed under it - rather than one run. That is what the operator means by
     "this Session": they started and stopped monitoring several times and
     expect one bundle, not the last fragment of it. Chronological either way,
     because an export is a record.
+
+    The bundle is built in a private staging folder next to *destination*
+    and published by renaming it into place, so a folder or ZIP appears
+    complete or not at all. Nothing that already exists is packaged,
+    changed or removed: when *destination* (or ``<destination>.zip``) is
+    taken, the bundle is published as ``<name> (2)``, ``<name> (3)``... and
+    that is the path returned. On any failure, or when ``cancelled()``
+    returns true (raising :class:`ExportCancelled`), the staging folder is
+    removed and nothing appears.
     """
     session = store.get_session(session_id)
     if session is None:
         raise KeyError(f"no such session: {session_id}")
+    sessions: List[Optional[Session]] = [session]
     if conversation_id:
         session_ids = store.session_ids_for_conversation(conversation_id)
         transmissions = []
         for other in session_ids:
             transmissions += store.list_transmissions(session_id=other,
                                                       limit=100_000)
+            if other != session_id:
+                sessions.append(store.get_session(other))
         transmissions.sort(key=lambda t: (t.started_at, t.id))
     else:
         transmissions = store.list_transmissions(session_id=session_id,
                                                  limit=100_000)
 
-    root = pathlib.Path(destination)
-    root.mkdir(parents=True, exist_ok=True)
-    audio_dir = root / "audio"
+    requested = pathlib.Path(destination)
+    if archive:
+        final = (requested if requested.suffix.lower() == ".zip"
+                 else requested.with_name(requested.name + ".zip"))
+    else:
+        final = requested
+    final = final.absolute()
 
-    copied: Dict[str, str] = {}
-    if include_audio:
-        audio_dir.mkdir(exist_ok=True)
-        for tx in transmissions:
-            if not tx.audio_path:
-                continue
-            source = pathlib.Path(tx.audio_path)
-            if not source.exists():
-                continue
-            target = audio_dir / f"{tx.id}{source.suffix}"
+    def check() -> None:
+        if cancelled is not None and cancelled():
+            raise ExportCancelled("export cancelled")
+
+    check()
+    plan = _plan_audio(transmissions, include_audio)
+    redact = _redactor(_operator_folders(store, sessions, conversation_id,
+                                         transmissions))
+    staging = _staging_dir(final.parent)
+    try:
+        root = staging / "bundle"
+        root.mkdir()
+        written: List[pathlib.Path] = []
+        copied: Dict[str, str] = {}
+        if include_audio:
+            (root / "audio").mkdir()
+        for tx_id, source, relative in plan:
+            check()
+            target = root / relative
             shutil.copy2(source, target)
-            copied[tx.id] = f"audio/{target.name}"
+            written.append(target)
+            copied[tx_id] = relative
+        check()
 
-    manifest = json.loads(to_json(transmissions, session))
-    manifest["format"] = "babelfishr.session-bundle.v1"
-    manifest["audio_files"] = copied
-    for entry in manifest["transmissions"]:
-        # Rewrite to bundle-relative paths so the export stays portable.
-        entry["audio_path"] = copied.get(entry["id"])
-        entry["processed_audio_path"] = None
+        # One mapping for every file: included audio has its bundle path,
+        # excluded or missing audio has none.
+        portable = [dataclasses.replace(tx, audio_path=copied.get(tx.id) or "",
+                                        processed_audio_path="")
+                    for tx in transmissions]
+        manifest = json.loads(to_json(transmissions, session))
+        manifest["format"] = "babelfishr.session-bundle.v1"
+        manifest["audio_files"] = copied
+        for entry in manifest["transmissions"]:
+            # Rewrite to bundle-relative paths so the export stays portable.
+            entry["audio_path"] = copied.get(entry["id"])
+            entry["processed_audio_path"] = None
+        if isinstance(manifest.get("session"), dict):
+            # Where this machine saved the run is not part of the record.
+            manifest["session"]["save_path"] = ""
+        manifest = _redact_tree(manifest, redact)
 
-    (root / "session.json").write_text(json.dumps(manifest, indent=2,
-                                                  ensure_ascii=False),
-                                       encoding="utf-8")
-    (root / "transcript.md").write_text(to_markdown(transmissions, session),
-                                        encoding="utf-8")
-    (root / "transmissions.csv").write_text(to_csv(transmissions), encoding="utf-8")
-    (root / "README.txt").write_text(_bundle_readme(session, len(transmissions)),
-                                     encoding="utf-8")
+        texts = {
+            "session.json": json.dumps(manifest, indent=2, ensure_ascii=False),
+            "transcript.md": redact(to_markdown(portable, session)),
+            "transmissions.csv": redact(to_csv(portable)),
+            "README.txt": redact(_bundle_readme(session, len(transmissions))),
+        }
+        for name, text in texts.items():
+            target = root / name
+            target.write_text(text, encoding="utf-8")
+            written.append(target)
+        check()
 
-    if not archive:
-        return str(root)
-
-    zip_path = root.with_suffix(".zip")
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for item in sorted(root.rglob("*")):
-            if item.is_file():
-                zf.write(item, item.relative_to(root))
-    shutil.rmtree(root)
-    return str(zip_path)
+        if archive:
+            staged = staging / final.name
+            with zipfile.ZipFile(staged, "w", zipfile.ZIP_DEFLATED) as zf:
+                for item in sorted(written):
+                    check()
+                    zf.write(item, item.relative_to(root).as_posix())
+        else:
+            staged = root
+        check()
+        published = _publish(staged, final)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return str(published)
 
 
 def _bundle_readme(session: Session, count: int) -> str:
@@ -244,8 +472,18 @@ def _bundle_readme(session: Session, count: int) -> str:
     )
 
 
-def export_transmission_audio(tx: Transmission, destination: str) -> str:
-    """Copy one clip's original audio out for sharing."""
+def export_transmission_audio(tx: Transmission, destination: str,
+                              overwrite: bool = False) -> str:
+    """Copy one clip's original audio out for sharing. Returns the path
+    actually written.
+
+    The copy is made beside the target under a private temporary name and
+    then moved into place, so a failed copy never leaves a partial file at
+    the target. An existing file is replaced only with ``overwrite=True``
+    (the operator confirmed that file in a save dialog); otherwise the clip
+    is written as ``name (2).wav`` and so on. A folder destination gets a
+    file named by the transmission id.
+    """
     if not tx.audio_path:
         raise ValueError(f"transmission {tx.id} has no audio on disk")
     source = pathlib.Path(tx.audio_path)
@@ -253,7 +491,26 @@ def export_transmission_audio(tx: Transmission, destination: str) -> str:
         raise FileNotFoundError(source)
     target = pathlib.Path(destination)
     if target.is_dir():
-        target = target / f"{tx.id}{source.suffix}"
+        suffix = ("." + _safe_component(source.suffix[1:], "audio")
+                  if source.suffix else "")
+        target = target / f"{_safe_component(tx.id, 'clip')}{suffix}"
+        overwrite = False
+    target = target.absolute()
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, target)
-    return str(target)
+    handle, temp_name = tempfile.mkstemp(prefix=".babelfishr-clip-",
+                                         suffix=".partial", dir=target.parent)
+    os.close(handle)
+    temp = pathlib.Path(temp_name)
+    try:
+        shutil.copy2(source, temp)
+        if overwrite:
+            os.replace(temp, target)
+            return str(target)
+        return str(_publish(temp, target))
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
