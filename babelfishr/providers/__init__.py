@@ -80,7 +80,7 @@ def _transcription_factories(config=None, mode=None
     paths = AppPaths.resolve(getattr(config, "app_home", None))
     mode = _mode_of(config, mode)
     return {
-        "faster-whisper": lambda: FasterWhisperEngine(
+        "faster-whisper": lambda: _account_engine_downloads(FasterWhisperEngine(
             model=getattr(asr, "model", "small"),
             device=getattr(asr, "device", "auto"),
             compute_type=getattr(asr, "compute_type", "default"),
@@ -90,9 +90,45 @@ def _transcription_factories(config=None, mode=None
             shared_language_encode=bool(getattr(asr, "shared_language_encode", True)),
             # Downloads only ever happen in preparation mode.
             local_files_only=not mode.allows_downloads,
-        ),
+        )),
         "mock": MockTranscriptionEngine,
     }
+
+
+def _account_engine_downloads(engine):
+    """Register an engine's own model download with the transfer owner.
+
+    In Online / Setup a Whisper engine with no prepared model fetches one
+    the first time it loads (warm-up, preload, the first message) through
+    its ``prepare()``. That is a model transfer like any other, so a switch
+    to a network-restricted mode must wait for it - or decline - rather than
+    show Offline while it runs. Wrapped here, at the call boundary, so the
+    download internals stay the provider's own. A cancel request from the
+    owner reaches the download as its ``cancelled`` check.
+    """
+    if getattr(engine, "local_files_only", True):
+        return engine              # never downloads: nothing to account for
+    import functools
+    import threading
+
+    from ..transfers import registry
+
+    prepare = engine.prepare
+
+    @functools.wraps(prepare)
+    def accounted_prepare(*args, **kwargs):
+        if kwargs.get("local_files_only") or (args and args[0]):
+            return prepare(*args, **kwargs)        # a local check, no network
+        stop = threading.Event()
+        caller_cancelled = kwargs.get("cancelled")
+        kwargs["cancelled"] = (lambda: stop.is_set() or bool(
+            caller_cancelled and caller_cancelled()))
+        description = f"the Whisper model {getattr(engine, 'model_size', '')}".rstrip()
+        with registry().begin("model", description, cancel=stop.set):
+            return prepare(*args, **kwargs)
+
+    engine.prepare = accounted_prepare
+    return engine
 
 
 def _translation_factories(config=None, mode=None
