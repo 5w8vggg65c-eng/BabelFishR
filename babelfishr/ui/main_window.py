@@ -4866,11 +4866,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         The native dialog's own overwrite prompt is turned off: what it
         asked about cannot be tied to a file afterwards. Instead the
-        existing file's identity (device, inode) is taken first, and then
-        BabelFishR asks once, by name, whether to replace it. The export
-        replaces only that very file; if it is gone or another file has
-        the name by then, nothing is replaced and the export is saved as
-        "name (2)" (see export._publish_staged).
+        existing file's version (device, inode, size, mtime, ctime) is
+        taken first, and then BabelFishR asks once, by name, whether to
+        replace it. The export replaces only that version, unchanged; if
+        the file is gone, replaced, edited or its version uncertain by then,
+        nothing is replaced and the export is saved as "name (2)" (see
+        export._publish_staged).
         """
         from ..export import confirmed_file
 
@@ -4892,9 +4893,10 @@ class MainWindow(QtWidgets.QMainWindow):
         answer = QtWidgets.QMessageBox.question(
             self, title,
             f"\u201c{pathlib.Path(path).name}\u201d already exists in "
-            f"{pathlib.Path(path).parent}.\n\nReplace it? If it changes "
-            "before the export finishes, it is kept and the export is "
-            "saved under a new numbered name.",
+            f"{pathlib.Path(path).parent}.\n\nReplace it?\n\nIf it is edited, "
+            "moved or replaced while the export is being prepared, it is "
+            "kept and the export is saved under a new numbered name instead. "
+            "A change in the very instant of saving cannot be detected.",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.No)
         return answer == QtWidgets.QMessageBox.Yes

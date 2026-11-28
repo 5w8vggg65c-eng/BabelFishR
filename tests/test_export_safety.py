@@ -29,6 +29,7 @@ from babelfishr import export
 from babelfishr.models import ProcessingState, Session, Transmission
 from export_wait import finish_export
 
+
 @pytest.fixture(autouse=True)
 def replace_answered_yes(monkeypatch):
     """BabelFishR's own "Replace it?" question (asked after the save dialog,

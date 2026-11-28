@@ -23,6 +23,7 @@ import re
 import shutil
 import stat
 import tempfile
+import time
 import zipfile
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -332,20 +333,75 @@ def portable_text(fmt: str, store: Store, transmissions: Sequence[Transmission],
     return redact(to_markdown(portable, described, runs=shown))
 
 
-FileIdentity = Tuple[int, int]
+# The version of an existing file the operator agreed to replace:
+# (device, inode, size, mtime_ns, ctime_ns, observed_at_ns).
+FileIdentity = Tuple[int, int, int, int, int, int]
+
+# Timestamps with no sub-millisecond part (FAT, exFAT, HFS+, some network
+# shares) cannot show a same-length edit made within the same timestamp
+# tick. On such a volume, a file changed this recently before it was
+# observed is treated as uncertain. High-resolution volumes (APFS, ext4,
+# ...) are compared exactly, with no waiting.
+COARSE_TIMESTAMP_NS = 1_000_000
+RECENT_CHANGE_WINDOW_NS = 2_000_000_000
+
+
+def _coarse(mtime_ns: int, ctime_ns: int) -> bool:
+    """True when the timestamps carry no sub-millisecond information (or
+    are missing), so a same-size edit could leave them unchanged."""
+    if mtime_ns <= 0 or ctime_ns <= 0:
+        return True
+    return mtime_ns % COARSE_TIMESTAMP_NS == 0 and ctime_ns % COARSE_TIMESTAMP_NS == 0
 
 
 def confirmed_file(path) -> Optional[FileIdentity]:
-    """The identity (device, inode) of the regular file at *path*, or None
-    if there is none. Taken on the GUI thread right after a save dialog: an
-    export replaces only that very file, which the operator confirmed."""
+    """The change-sensitive version of the regular file at *path*, or None
+    if there is none. Taken on the GUI thread just before BabelFishR asks
+    whether to replace it; the export replaces only that file, unchanged."""
     try:
         st = os.stat(path)
     except OSError:
         return None
     if not stat.S_ISREG(st.st_mode):
         return None
-    return (st.st_dev, st.st_ino)
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns,
+            time.time_ns())
+
+
+def _unchanged(target: pathlib.Path, version: Optional[FileIdentity]):
+    """The current stat of *target* if it is still exactly the observed,
+    confirmed version (same file, size, mtime and ctime, and not changed so
+    recently before it was observed that a same-tick edit could hide);
+    otherwise None."""
+    if version is None or len(version) != 6:
+        return None
+    dev, ino, size, mtime_ns, ctime_ns, observed_at = version
+    try:
+        st = os.stat(target)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns,
+            st.st_ctime_ns) != (dev, ino, size, mtime_ns, ctime_ns):
+        return None
+    if (_coarse(mtime_ns, ctime_ns)
+            and observed_at - max(mtime_ns, ctime_ns) < RECENT_CHANGE_WINDOW_NS):
+        # Coarse timestamps, changed just before it was observed: a further
+        # same-size edit in the same tick would be invisible. Uncertain.
+        return None
+    return st
+
+
+def _observed_now(target: pathlib.Path) -> Optional[FileIdentity]:
+    """The version of whatever file is at *target* right now, for an
+    explicit request to replace it (the CLI's --overwrite): replaced if it
+    is still unchanged at publication. No "changed just before it was
+    observed" doubt applies - nobody was shown a different version."""
+    version = confirmed_file(target)
+    if version is None:
+        return None
+    return version[:5] + (max(version[3], version[4]) + RECENT_CHANGE_WINDOW_NS,)
 
 
 def _create_exclusive(folder: pathlib.Path, prefix: str, mode: int):
@@ -362,11 +418,11 @@ def _create_exclusive(folder: pathlib.Path, prefix: str, mode: int):
 
 
 def _default_file_mode(folder: pathlib.Path) -> int:
-    """The mode a plain new file gets in *folder* (0o666 less the umask).
-
-    Found with an empty probe file, created and removed at once: the umask
-    cannot be read without changing it for every thread of the process."""
-    fd, probe = _create_exclusive(folder, ".babelfishr-mode-", 0o666)
+    """The mode a plain new file gets (0o666 less the umask), found with an
+    empty probe file in *folder* (the private staging folder), created and
+    removed at once: the umask cannot be read without changing it for
+    every thread of the process."""
+    fd, probe = _create_exclusive(folder, ".mode-", 0o666)
     try:
         return os.fstat(fd).st_mode & 0o777
     finally:
@@ -377,40 +433,51 @@ def _default_file_mode(folder: pathlib.Path) -> int:
             pass
 
 
+def _private_staging(parent: pathlib.Path) -> pathlib.Path:
+    """An owner-only (0700) folder beside the target, on the same volume,
+    holding a standalone export while it is written. Nobody else can reach
+    a file inside it, whatever that file's own mode, until it is moved out
+    by the atomic publication."""
+    parent.mkdir(parents=True, exist_ok=True)
+    return pathlib.Path(tempfile.mkdtemp(prefix=".babelfishr-export-",
+                                         suffix=".partial", dir=parent))
+
+
 def _publish_staged(temp: pathlib.Path, target: pathlib.Path,
                     replace: Optional[FileIdentity],
                     cancelled: Optional[Callable[[], bool]]) -> pathlib.Path:
-    """Publish a complete, flushed, owner-only staging file.
+    """Publish a complete, flushed file from the private staging folder.
 
-    *replace* is the identity of the file the operator confirmed replacing:
-    only while that very file is still at *target* is it replaced (keeping
-    its permissions). Otherwise - no file was confirmed, it was removed, or
-    something else now has the name - the name is never replaced: the file
-    is published under the first free ``name (n)``.
+    *replace* is the version of the file the operator confirmed replacing.
+    It is replaced (keeping its permissions) only while that file is still
+    at *target* unchanged - same device, inode, size, mtime and ctime (ns).
+    On a volume with coarse timestamps, a file changed within
+    RECENT_CHANGE_WINDOW_NS before it was observed is also treated as
+    uncertain. Otherwise - nothing was confirmed, or the file was removed,
+    replaced, edited in place, or its version is uncertain - nothing is
+    replaced: the file goes to the first free ``name (n)``.
 
-    The final mode is applied only now, and the cancel check is the last
-    step before publication: cancelled up to here, nothing is published and
-    the previous file keeps its bytes; past it, the export completes.
-    Limit: POSIX has no compare-and-replace, so a file swapped in at the
-    target between the identity check and the atomic replace (a window of
-    microseconds) would be replaced.
+    The final mode is applied inside the 0700 staging folder, then the
+    cancel check is the last step: cancelled up to there, nothing is
+    published and the previous file keeps its bytes; past it, the export
+    completes.
+
+    Residual limits, from the filesystem: a same-size edit that leaves
+    mtime and ctime identical (possible within one kernel timestamp tick,
+    a few ms, even on high-resolution volumes) cannot be detected; and
+    there is no compare-and-replace, so a change made to the target in the
+    instant between this final check and the atomic replace would still be
+    replaced.
     """
-    replacing = False
-    mode = None
-    if replace is not None:
-        try:
-            st = os.stat(target)
-        except FileNotFoundError:
-            st = None
-        if (st is not None and stat.S_ISREG(st.st_mode)
-                and (st.st_dev, st.st_ino) == tuple(replace)):
-            replacing, mode = True, st.st_mode & 0o7777
-    if mode is None:
-        mode = _default_file_mode(target.parent)
+    current = _unchanged(target, replace)
+    if current is not None:
+        mode = current.st_mode & 0o7777
+    else:
+        mode = _default_file_mode(temp.parent)
     os.chmod(temp, mode)
     if cancelled is not None and cancelled():
         raise ExportCancelled("export cancelled")
-    if replacing:
+    if current is not None:
         os.replace(temp, target)
         return target
     return _publish(temp, target)
@@ -422,40 +489,37 @@ def write_text_export(text: str, destination: str,
                       confirmed: Optional[FileIdentity] = None) -> str:
     """Write a standalone export atomically. Returns the path written.
 
-    The text goes to a private, owner-only (0600) temporary file in the
-    target folder and is flushed to disk; then the intended final mode is
-    applied and it is published. An existing file is replaced only when it
-    is the one the operator confirmed: *confirmed* (its identity, from
-    confirmed_file() at the save dialog), or with ``overwrite=True`` the
-    file present when this call starts (the CLI's --overwrite). Any other
-    occupied name - including one claimed after the dialog - is never
-    replaced: the export goes to ``name (2).md`` and so on.
+    The text is written, mode 0600, inside a private 0700 staging folder
+    beside the target and flushed to disk; the intended final mode is
+    applied there, and it is then published. An existing file is replaced
+    only when it is the unchanged file the operator confirmed: *confirmed*
+    (its version, from confirmed_file() before BabelFishR's own question),
+    or with ``overwrite=True`` the file present when this call starts (the
+    CLI's --overwrite). Any other occupied name - including one claimed or
+    edited after the dialog - is never replaced: the export goes to
+    ``name (2).md`` and so on.
 
     ``cancelled()`` is checked after the flush, immediately before
     publication: a cancel up to there raises ExportCancelled and leaves the
     previous file's bytes; after it the file is published and its path
-    returned. On any failure the previous file is untouched and no
-    temporary file is left; the error is raised.
+    returned. On every path the staging folder is removed and the error,
+    if any, is raised.
     """
     target = pathlib.Path(destination).absolute()
     if target.is_dir():
         raise IsADirectoryError(errno.EISDIR, "is a folder", str(target))
     if confirmed is None and overwrite:
-        confirmed = confirmed_file(target)
-    temp: Optional[pathlib.Path] = None
+        confirmed = _observed_now(target)
+    staging = _private_staging(target.parent)
     try:
-        fd, temp = _create_exclusive(target.parent, ".babelfishr-export-", 0o600)
+        fd, temp = _create_exclusive(staging, "export-", 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
         return str(_publish_staged(temp, target, confirmed, cancelled))
     finally:
-        if temp is not None:
-            try:
-                os.unlink(temp)
-            except OSError:
-                pass
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def _unique_sibling(path: pathlib.Path, attempt: int,
@@ -1006,16 +1070,17 @@ def export_transmission_audio(tx: Transmission, destination: str,
         target = target / f"{_safe_component(tx.id, 'clip')}{suffix}"
         overwrite = False
     target = target.absolute()
-    target.parent.mkdir(parents=True, exist_ok=True)
     if confirmed is None and overwrite:
-        confirmed = confirmed_file(target)
-    # Owner-only (0600, mkstemp) while the copy is written: copyfile, not
-    # copy2, which would give the partial file the recording's mode.
-    handle, temp_name = tempfile.mkstemp(prefix=".babelfishr-clip-",
-                                         suffix=".partial", dir=target.parent)
-    os.close(handle)
-    temp = pathlib.Path(temp_name)
+        confirmed = _observed_now(target)
+    # Written inside a private 0700 staging folder, the file itself 0600
+    # (mkstemp): copyfile, not copy2, which would give it the recording's
+    # mode. The final mode is applied at publication.
+    staging = _private_staging(target.parent)
     try:
+        handle, temp_name = tempfile.mkstemp(prefix="clip-", suffix=".partial",
+                                             dir=staging)
+        os.close(handle)
+        temp = pathlib.Path(temp_name)
         shutil.copyfile(source, temp)
         times = os.stat(source)
         os.utime(temp, ns=(times.st_atime_ns, times.st_mtime_ns))
@@ -1023,9 +1088,4 @@ def export_transmission_audio(tx: Transmission, destination: str,
             raise ExportCancelled("export cancelled")
         return str(_publish_staged(temp, target, confirmed, cancelled))
     finally:
-        try:
-            temp.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
+        shutil.rmtree(staging, ignore_errors=True)
