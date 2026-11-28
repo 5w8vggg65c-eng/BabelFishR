@@ -383,6 +383,15 @@ def cmd_field_check(args) -> int:
 
     config = Config.load(args.config)
     mode = OperatingMode(args.mode) if args.mode else OperatingMode.FIELD_OFFLINE
+    verify = getattr(args, "verify", None)
+    if verify:
+        # Local only: hashes the installed files against the pinned
+        # checksums - no network, allowed in every mode.
+        from .preparation import verify_asr_model
+
+        name = config.asr.model if verify is True else verify
+        _step, ok, detail = verify_asr_model(config, name, report=print)
+        print(f"Verify checksums: {'OK' if ok else 'FAILED'} - {detail}\n")
     report = field_check(config, run_smoke_tests=not args.no_smoke_tests, mode=mode)
     print(report.summary())
     if args.json:
@@ -882,6 +891,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip actually loading models and running fixtures")
     p.add_argument("--allow-record-only", action="store_true",
                    help="exit 0 when recording works even if processing does not")
+    p.add_argument("--verify", nargs="?", const=True, metavar="MODEL",
+                   help="first hash the installed Whisper model (default: the "
+                        "configured one) against its published checksums, "
+                        "locally, with no network")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_field_check)
 

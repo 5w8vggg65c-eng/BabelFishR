@@ -275,6 +275,29 @@ def install_model_job(config, model_name: str,
     return result
 
 
+def verify_model_job(config, model_name: str,
+                     report: Callable[[str], None] = lambda text: None,
+                     token: Optional[CancellationToken] = None,
+                     progress: Optional[Callable[[Any], None]] = None):
+    """Verify checksums of one installed Whisper model, off the GUI thread.
+
+    Deliberately NOT a registered transfer (no _transfer_job): it reads
+    local files only, so a network-restricted mode neither refuses it nor
+    waits for it."""
+    from ..preparation import verify_asr_model
+
+    token = token or CancellationToken()
+    token.raise_if_cancelled()
+    extra = {"progress": progress} if progress is not None else {}
+    try:
+        result = verify_asr_model(config, model_name, report=report,
+                                  cancelled=lambda: token.cancelled, **extra)
+    except DownloadCancelled as exc:
+        raise Cancelled() from exc
+    token.raise_if_cancelled()
+    return result
+
+
 def readiness_job(app, run_smoke_tests: bool = True,
                   report: Callable[[str], None] = lambda text: None,
                   microphone_permission: Optional[str] = None):

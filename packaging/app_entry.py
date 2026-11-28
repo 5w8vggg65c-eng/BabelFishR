@@ -458,6 +458,14 @@ def main(argv=None) -> int:
     if argv == ["--selftest-resource-tracker"]:
         return _selftest_resource_tracker()
 
+    if argv == ["--selftest-offline-tokenizer"]:
+        # A vocabulary-only Whisper model and an empty Hugging Face cache,
+        # offline: refused before WhisperModel (which would fetch a
+        # tokenizer from the Hub), with no network call. No real weights.
+        from babelfishr.offline_selfcheck import run as offline_tokenizer_check
+
+        return offline_tokenizer_check()
+
     if argv:
         from babelfishr.cli import main as cli_main
 

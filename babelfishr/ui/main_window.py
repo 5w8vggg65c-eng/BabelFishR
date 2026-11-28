@@ -526,7 +526,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left_layout.addWidget(self._rule())
 
         # -- left: LOCAL ENGINES ---------------------------------------------
-        from .local_engines import WhisperModelPicker
+        from .local_engines import ChecksumVerifier, WhisperModelPicker
 
         left_layout = self._disclosure_section(sidebar_layout, "LOCAL ENGINES", "engines")
         self.speech_engine_line = QtWidgets.QLabel("Speech: …")
@@ -557,6 +557,9 @@ class MainWindow(QtWidgets.QMainWindow):
         install_row = QtWidgets.QHBoxLayout()
         install_row.addStretch(1)
         install_row.addWidget(self.install_model_button)
+        # Verify checksums: local only, so offered in every mode.
+        self.checksum_verifier = ChecksumVerifier(self)
+        install_row.addWidget(self.checksum_verifier.button)
         left_layout.addLayout(install_row)
         # Progress of an install, in place: real bytes, its phases, Cancel.
         from .download_panel import DownloadProgressPanel
@@ -564,6 +567,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.install_panel = DownloadProgressPanel()
         self.install_panel.hide()
         left_layout.addWidget(self.install_panel)
+        left_layout.addWidget(self.checksum_verifier.panel)
         self.whisper_model_box.currentIndexChanged.connect(self._change_whisper_model)
         self._build_language_controls(left_layout)
         left_layout.addWidget(self.translation_engine_line)
@@ -1438,6 +1442,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return "Stop monitoring first: a model is not installed during a watch."
         if self._install_worker is not None:
             return "A speech model is being installed."
+        verifier = getattr(self, "checksum_verifier", None)
+        if verifier is not None and verifier.worker is not None:
+            return "Checksums are being verified."
         transfers = getattr(self.app, "transfers", None)
         if transfers is not None and transfers.restricted:
             return ("A network-restricted mode has been requested, so nothing "
@@ -1445,6 +1452,9 @@ class MainWindow(QtWidgets.QMainWindow):
         return ""
 
     def _refresh_install_model_button(self) -> None:
+        verifier = getattr(self, "checksum_verifier", None)
+        if verifier is not None:
+            verifier.refresh()
         button = getattr(self, "install_model_button", None)
         if button is None:
             return
@@ -1474,7 +1484,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 # Complete files are offered again only to be checked: a
                 # legacy install (no record) is hashed, a mismatch repaired.
                 checked, _why = integrity_state(directory, name)
-                if checked is Integrity.UNVERIFIED:
+                if checked in (Integrity.UNVERIFIED, Integrity.CHANGED):
                     verb = "Verify"
                 elif checked is Integrity.MISMATCH:
                     verb = "Repair"
@@ -1494,6 +1504,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         for name, label, _state in models:
             action = menu.addAction(label)
+            if label.startswith("Verify"):      # hashing only: local, no dialog
+                action.triggered.connect(
+                    lambda _c=False, n=name: self.checksum_verifier.start(n))
+                continue
             action.triggered.connect(lambda _c=False, n=name: self._install_model(n))
 
     def _install_model(self, name: str, confirm: bool = True) -> None:

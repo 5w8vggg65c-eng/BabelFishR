@@ -237,7 +237,7 @@ def test_offline_verification_of_an_existing_install_makes_no_request(
 
     # Offline, a mismatch cannot be repaired: it fails and is recorded.
     (target / "tokenizer.json").write_bytes(FILES_B["tokenizer.json"])
-    assert verified_state(target) == "unverified"     # changed since verified
+    assert verified_state(target) == "changed"     # not merely unverified
     with pytest.raises(whisper_local.IntegrityError):
         whisper_local.verify_model(MODEL, models_root(tmp_path))
     assert verified_state(target) == "mismatch"
