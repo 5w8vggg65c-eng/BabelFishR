@@ -621,25 +621,39 @@ def _check_transcription(config, report: ReadinessReport,
     # Integrity from the install record only (no hashing here): "verified"
     # only when the record matches the pin and the files as they are now.
     # A custom folder has no pinned identity, so it is never "verified".
-    from .model_integrity import Integrity, integrity_state
+    from .model_integrity import (CHANGED_WORDS, MISMATCH_WORDS, Integrity,
+                                  integrity_state)
 
     if getattr(config.asr, "model_path", None):
         integrity, integrity_detail = (Integrity.UNPINNED,
                                        "custom folder, checksums not verified")
     else:
         integrity, integrity_detail = integrity_state(directory, config.asr.model)
-    if integrity is Integrity.MISMATCH:
+    if integrity in (Integrity.MISMATCH, Integrity.CHANGED):
+        # Not usable as is: a model whose hash failed, or one that was
+        # verified and is no longer the bytes that were hashed. Both fail
+        # until hashed again locally (the engine also refuses them).
+        changed = integrity is Integrity.CHANGED
+        words = CHANGED_WORDS if changed else MISMATCH_WORDS
+        verify = "babelfishr field-check --verify (local, no network)"
+        remedy = (f"Verify checksums: {verify}, or Verify checksums in Local "
+                  f"engines." if changed else
+                  f"Repair it online: babelfishr prepare-field --asr-model "
+                  f"{config.asr.model}; or restore the original files and "
+                  f"verify checksums: {verify}.")
         report.add(Check(
             "Local ASR model present", CheckStatus.FAIL,
-            f"{config.asr.model} at {directory}: {integrity_detail}",
-            remedy=f"babelfishr prepare-field --asr-model {config.asr.model}",
+            f"{config.asr.model} at {directory} {words} ({integrity_detail})",
+            remedy=remedy,
             data={"path": str(directory), "bytes": size,
-                  "integrity": integrity.value}))
-        report.add(Check("Local ASR model loadable", CheckStatus.SKIP,
-                         "the model failed its checksums"))
-        report.add(Check("Local transcription smoke test", CheckStatus.SKIP,
-                         "the model failed its checksums"))
+                  "integrity": integrity.value,
+                  "integrity_detail": integrity_detail}))
+        why = ("the model changed since it was verified" if changed
+               else "the model failed its checksums")
+        report.add(Check("Local ASR model loadable", CheckStatus.SKIP, why))
+        report.add(Check("Local transcription smoke test", CheckStatus.SKIP, why))
         return
+    # A legacy install (no record) is used, and said to be unverified.
     wording = (integrity_detail if integrity is Integrity.VERIFIED
                else "checksums not verified")
     report.add(Check("Local ASR model present", CheckStatus.PASS,

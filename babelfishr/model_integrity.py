@@ -15,12 +15,31 @@ alone), and a repair could combine files of different repository revisions
   "verified" (:func:`integrity_state`, cheap: no hashing). A model installed
   before records existed is "unverified" until it is hashed; a model without
   a usable pin is "unpinned" and never verified.
+
+The cheap state distinguishes four situations, because they deserve
+different treatment:
+
+* ``unverified`` - no record (a legacy install from before records, or one
+  recorded against an older pin). Not known to be good, not known to be bad:
+  it is used, and said to be unverified. Hashing it would make every first
+  load after an upgrade read the whole model, and refusing it would strand
+  field kits prepared by an earlier version with no network to repair them.
+* ``verified`` - a record that matches the pin and every file as it is now.
+* ``changed`` - a record said verified, but a pinned file's size,
+  modification time or inode is no longer what was hashed, a pinned file is
+  missing, or an extra loadable asset appeared. These are no longer the bytes
+  that were checked: Field Check fails until they are hashed again
+  (:func:`verify_model` / "Verify checksums", local only), and the engine
+  re-hashes them before loading and refuses them if they fail.
+* ``mismatch`` - hashing found files that are not the published ones. Never
+  loaded until a local verification (after restoring) or a repair passes.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import enum
+import fnmatch
 import hashlib
 import json
 import os
@@ -55,7 +74,12 @@ class Integrity(str, enum.Enum):
     """A record matching the pin and the files currently on disk."""
 
     UNVERIFIED = "unverified"
-    """No record (a legacy install), or the files changed since it was made."""
+    """No record (a legacy install), or one made against another pin."""
+
+    CHANGED = "changed"
+    """Verified once, but the files are no longer the ones that were hashed
+    (size, modification time or inode differs, a file is missing, or an
+    extra loadable asset appeared). Not usable until hashed again."""
 
     MISMATCH = "mismatch"
     """Hashing found files that do not match the pin."""
@@ -158,6 +182,27 @@ def sha256_file(path, cancelled: Optional[Callable[[], None]] = None,
     return digest.hexdigest()
 
 
+#: The model assets a loader reads (whisper_local.ALLOW_PATTERNS, repeated
+#: here to avoid a circular import; a test keeps them equal).
+LOADABLE_PATTERNS = ("config.json", "preprocessor_config.json", "model.bin",
+                     "tokenizer.json", "vocabulary.*")
+
+
+def unexpected_files(directory, pin: Pin) -> List[str]:
+    """Loadable model assets in *directory* that the pin does not name (for
+    example a vocabulary.txt beside a pinned vocabulary.json): the loader
+    could read them, and they were never checked."""
+    try:
+        entries = list(pathlib.Path(directory).iterdir())
+    except OSError:
+        return []
+    names = set(pin.names)
+    return sorted(entry.name for entry in entries
+                  if entry.name not in names and entry.is_file()
+                  and any(fnmatch.fnmatchcase(entry.name, pattern)
+                          for pattern in LOADABLE_PATTERNS))
+
+
 def check_file(directory, pinned: PinnedFile,
                cancelled: Optional[Callable[[], None]] = None) -> str:
     """"ok", "missing" or "mismatch" for one pinned file, by sha256."""
@@ -199,7 +244,8 @@ def write_record(directory, pin: Pin, state: Integrity,
         path = directory / pinned.name
         if path.is_file():
             stat = path.stat()
-            entry.update(size=stat.st_size, mtime_ns=stat.st_mtime_ns)
+            entry.update(size=stat.st_size, mtime_ns=stat.st_mtime_ns,
+                         ino=stat.st_ino)
         files[pinned.name] = entry
     record = {"format": RECORD_FORMAT, "model": pin.model, "repo": pin.repo,
               "revision": pin.revision, "state": state.value,
@@ -215,8 +261,10 @@ def integrity_state(directory, model_name: str,
                     pins: Optional[dict] = None) -> Tuple[Integrity, str]:
     """``(Integrity, detail)`` without hashing anything (cheap enough for a
     readiness check or a menu): a record counts only when it names the
-    current pin and each file still has the size and modification time it
-    had when it was hashed."""
+    current pin and each file still has the size, modification time and
+    inode it had when it was hashed (records written before inodes were
+    recorded are compared on size and time). A verified record whose files
+    no longer match that is CHANGED, not merely unverified."""
     try:
         pin = pin_for(model_name, pins)
     except UnpinnedModel as exc:
@@ -233,22 +281,34 @@ def integrity_state(directory, model_name: str,
     if record.get("state") != Integrity.VERIFIED.value:
         return Integrity.UNVERIFIED, "checksums not verified yet"
     recorded = record.get("files") or {}
+    if any((recorded.get(pinned.name) or {}).get("sha256") != pinned.sha256
+           for pinned in pin.files):
+        return Integrity.UNVERIFIED, "verified against different checksums"
     for pinned in pin.files:
         entry = recorded.get(pinned.name) or {}
-        if entry.get("sha256") != pinned.sha256:
-            return Integrity.UNVERIFIED, "verified against different checksums"
         try:
             stat = (pathlib.Path(directory) / pinned.name).stat()
         except OSError:
-            return Integrity.UNVERIFIED, f"{pinned.name} is missing"
+            return (Integrity.CHANGED,
+                    f"{pinned.name} is missing since the model was verified")
         if (stat.st_size != entry.get("size")
-                or stat.st_mtime_ns != entry.get("mtime_ns")):
-            return Integrity.UNVERIFIED, f"{pinned.name} changed since it was verified"
+                or stat.st_mtime_ns != entry.get("mtime_ns")
+                or ("ino" in entry and stat.st_ino != entry.get("ino"))):
+            return Integrity.CHANGED, f"{pinned.name} changed since it was verified"
+    extra = unexpected_files(directory, pin)
+    if extra:
+        return (Integrity.CHANGED,
+                f"{', '.join(extra)} appeared since the model was verified")
     return Integrity.VERIFIED, f"checksums verified (revision {pin.revision[:12]})"
 
 
 def is_verified(directory, model_name: str) -> bool:
     return integrity_state(directory, model_name)[0] is Integrity.VERIFIED
+
+
+#: What Field Check and the engine say about a model that is not usable as is.
+CHANGED_WORDS = "changed since it was verified - verify checksums"
+MISMATCH_WORDS = "does not match its published checksums"
 
 
 def verify_directory(directory, pin: Pin, names: Optional[Iterable[str]] = None,

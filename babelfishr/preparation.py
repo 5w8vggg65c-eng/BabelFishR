@@ -351,6 +351,49 @@ def install_asr_model(config, model_name: str, *,
                         **_progress_arguments(progress, cancelled))
 
 
+def verify_asr_model(config, model_name: str, *,
+                     report: Optional[Reporter] = None,
+                     progress: Optional[ProgressCallback] = None,
+                     cancelled: Optional[CancelCheck] = None):
+    """Hash an installed Whisper model against its pinned checksums, locally.
+
+    The "Verify checksums" action, allowed in every mode (Offline Field Use
+    and Record Only included): it reads local files only - no network
+    request, no download guard, no free-space requirement, and it is not a
+    registered network transfer, so a restricted mode does not refuse it.
+    The install record is updated (verified, or mismatch with the failing
+    files) and nothing is deleted or fetched. Returns ``(step, ok, detail)``;
+    *progress* receives "verifying" snapshots (file k of n), *cancelled* is
+    polled between hashed chunks (DownloadCancelled).
+    """
+    from .model_integrity import Integrity, UnpinnedModel, integrity_state
+    from .providers.whisper_local import (IntegrityError, ModelState,
+                                          inspect_model_directory,
+                                          model_directory_for, verify_model)
+
+    say = report or (lambda text: None)
+    paths = config.paths()
+    directory = model_directory_for(paths.models, model_name)
+    state, missing = inspect_model_directory(directory)
+    if state is ModelState.MISSING:
+        return (ASR_STEP, False, f"no {model_name} model at {directory}")
+    say(f"Checking {model_name!r} against its published checksums (local "
+        f"files only, no network)...")
+    try:
+        verify_model(model_name, paths.models,
+                     **_progress_arguments(progress, cancelled))
+    except DownloadCancelled:
+        raise
+    except UnpinnedModel as exc:
+        return (ASR_STEP, False, f"cannot be verified: {exc}")
+    except (IntegrityError, OSError) as exc:
+        return (ASR_STEP, False, f"failed verification: {exc}")
+    integrity, detail = integrity_state(directory, model_name)
+    if integrity is not Integrity.VERIFIED:      # changed while hashing
+        return (ASR_STEP, False, f"not verified: {detail}")
+    return (ASR_STEP, True, f"{model_name} at {directory}: {detail}")
+
+
 def _write_manifest(paths: AppPaths, model_name: str,
                     directory: Optional[pathlib.Path], size_mb: float,
                     version: str) -> None:

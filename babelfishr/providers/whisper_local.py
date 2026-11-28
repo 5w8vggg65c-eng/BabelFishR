@@ -150,23 +150,14 @@ def prepare_model(model_name: str, models_root, local_files_only: bool = False,
         tracker.update(phase="verifying", file=name)
 
     if local_files_only:
-        if not target.is_dir():
-            raise IntegrityError(f"no model at {target}")
-        outcome = integrity.verify_directory(target, pin, cancelled=tracker.check_cancelled,
-                                             on_file=hashing)
-        problems = {name: state for name, state in outcome.items() if state != "ok"}
-        if problems:
-            if any(state == "mismatch" for state in problems.values()):
-                integrity.write_record(target, pin, integrity.Integrity.MISMATCH, problems)
-            raise IntegrityError(
-                f"the {model_name} model at {target} does not match its pinned "
-                f"checksums ({_describe(problems)}); repair it with a network connection")
-        integrity.write_record(target, pin, integrity.Integrity.VERIFIED)
-        tracker.update(phase="verifying", file="", bytes_done=0, bytes_total=0,
-                       files_done=len(names), files_total=len(names))
-        return target
+        return _verify_local(model_name, target, pin, tracker)
 
     target.mkdir(parents=True, exist_ok=True)
+    # Online, a loadable asset that is not part of the pinned revision is
+    # removed from our own model folder: the loader could read it.
+    for name in integrity.unexpected_files(target, pin):
+        log.warning("%s/%s is not part of the pinned revision; removing it", target, name)
+        _forget_local_file(target, name)
     present = [name for name in names if (target / name).exists()]
     outcome = integrity.verify_directory(target, pin, present,
                                          cancelled=tracker.check_cancelled,
@@ -235,14 +226,57 @@ def prepare_model(model_name: str, models_root, local_files_only: bool = False,
     return target
 
 
+def _verify_local(model_name: str, target: pathlib.Path, pin,
+                  tracker: ProgressTracker) -> pathlib.Path:
+    """Hash *target* against *pin* with local files only and record the
+    outcome (verified, or mismatch naming the failing files). Never deletes,
+    never fetches: the network code is not reached from here."""
+    from .. import model_integrity as integrity
+
+    names = pin.names
+    if not target.is_dir():
+        raise IntegrityError(f"no model at {target}")
+
+    def counting(name: str) -> None:
+        tracker.update(phase="verifying", file=name,
+                       files_done=names.index(name), files_total=len(names))
+
+    outcome = integrity.verify_directory(target, pin, cancelled=tracker.check_cancelled,
+                                         on_file=counting)
+    problems = {name: state for name, state in outcome.items() if state != "ok"}
+    # A loadable asset the pin does not name was never checked; the
+    # loader might read it. Offline it is reported, never deleted.
+    problems.update({name: "unexpected"
+                     for name in integrity.unexpected_files(target, pin)})
+    if problems:
+        # Recorded even when files are only missing: dropping the record
+        # instead would make a changed model look like a legacy one.
+        integrity.write_record(target, pin, integrity.Integrity.MISMATCH, problems)
+        raise IntegrityError(
+            f"the {model_name} model at {target} does not match its pinned "
+            f"checksums ({_describe(problems)}); repair it with a network connection")
+    integrity.write_record(target, pin, integrity.Integrity.VERIFIED)
+    tracker.update(phase="verifying", file="", bytes_done=0, bytes_total=0,
+                   files_done=len(names), files_total=len(names))
+    return target
+
+
 def verify_model(model_name: str, models_root,
                  progress: Optional[ProgressCallback] = None,
                  cancelled: Optional[CancelCheck] = None) -> pathlib.Path:
     """Hash an installed model against its pin with no network at all and
     record the outcome. Raises IntegrityError (or UnpinnedModel) unless every
     pinned file matches."""
-    return prepare_model(model_name, models_root, local_files_only=True,
-                         progress=progress, cancelled=cancelled)
+    from .. import model_integrity as integrity
+
+    pin = integrity.pin_for(model_name)          # fail closed
+    return _verify_local(model_name, model_directory_for(models_root, model_name),
+                         pin, ProgressTracker(progress, cancelled))
+
+
+class ModelIntegrityRefused(EngineUnavailable):
+    """The installed weights failed (or, changed, would not pass) their
+    pinned checksums, so the engine refuses to load them."""
 
 
 def _describe(problems) -> str:
@@ -489,6 +523,7 @@ class FasterWhisperEngine(TranscriptionEngine):
         # Hugging Face cache still being intact.
         directory = self.model_directory()
         if directory is not None and self.model_present():
+            self.check_integrity_before_load(directory)
             target = str(directory)
         elif self.local_files_only:
             raise EngineUnavailable(self.unavailable_reason())
@@ -510,6 +545,49 @@ class FasterWhisperEngine(TranscriptionEngine):
         log.info("loaded faster-whisper %s on %s (%s, local_files_only=%s)",
                  target, device, compute_type, self.local_files_only)
         return self._model
+
+    def check_integrity_before_load(self, directory) -> None:
+        """Known-bad weights never reach ASR. Called on the loading thread
+        (a processing worker, Field Check's or preparation's job - never the
+        GUI thread) before WhisperModel is constructed:
+
+        * mismatch (a record says hashing failed): refused, without hashing,
+          until a local verification or a repair passes;
+        * changed (verified once, the files are not the ones hashed): hashed
+          again here, locally. A pass records verified and loads; a failure
+          records mismatch and is refused. Never loaded unhashed;
+        * verified, unverified (legacy, no record) and unpinned (a custom
+          folder): loaded as before - readiness says which.
+
+        Raises :class:`ModelIntegrityRefused` (an EngineUnavailable), which
+        the pipeline reports as a failed transcription while the recording
+        itself is kept.
+        """
+        if self.model_path:
+            return                      # a custom folder has no pinned identity
+        from .. import model_integrity as integrity
+
+        state, detail = integrity.integrity_state(directory, self.model_size)
+        repair = (f"Repair it with a network connection (Install a speech model, or "
+                  f"'babelfishr prepare-field --asr-model {self.model_size}'), or "
+                  f"restore the original files and verify checksums "
+                  f"('babelfishr field-check --verify'). Recordings are still kept.")
+        if state is integrity.Integrity.MISMATCH:
+            raise ModelIntegrityRefused(
+                f"The Whisper model {self.model_size} at {directory} "
+                f"{integrity.MISMATCH_WORDS} ({detail}); it is not loaded. {repair}")
+        if state is not integrity.Integrity.CHANGED:
+            return
+        log.warning("Whisper model %s at %s %s (%s); hashing it before loading",
+                    self.model_size, directory, integrity.CHANGED_WORDS, detail)
+        try:
+            verify_model(self.model_size, self.models_root)
+        except IntegrityError as exc:
+            raise ModelIntegrityRefused(
+                f"The Whisper model {self.model_size} at {directory} changed since "
+                f"it was verified and {integrity.MISMATCH_WORDS}: {exc}. It is not "
+                f"loaded. {repair}") from exc
+        log.info("Whisper model %s re-verified locally before loading", self.model_size)
 
     def preload(self) -> None:
         """Load the model ahead of the first message (the processing worker
