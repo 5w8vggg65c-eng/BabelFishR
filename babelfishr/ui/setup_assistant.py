@@ -298,6 +298,13 @@ class SetupAssistant(theme.ConsoleDialog):
             self.log_view.verticalScrollBar().maximum())
 
     def _finished(self, payload) -> None:
+        if getattr(self, "_dismissed", False):
+            # The dialog was dismissed while this ran: nothing the operator
+            # can see asked for this result, so it changes no setting or mode.
+            self._worker = None
+            log.info("Setup result arrived after the dialog was dismissed; "
+                        "not applied")
+            return
         self.progress.setRange(0, 1)
         self.progress.setValue(1)
         self._worker = None
@@ -519,10 +526,32 @@ class SetupAssistant(theme.ConsoleDialog):
     def readiness(self):
         return self._readiness
 
+    # Escape (QDialog maps it to reject()) and the close box mean Cancel
+    # while a preparation runs: ask it to stop and stay open until it has
+    # settled. Hiding the dialog instead left the run going, and its late
+    # result persisted setup and switched the mode behind the operator.
+    def reject(self) -> None:
+        if self._worker is not None:
+            if self.cancel_button.isEnabled():
+                self._cancel()
+            return
+        super().reject()
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         if self._worker is not None:
-            self._worker.cancel()
+            if self.cancel_button.isEnabled():
+                self._cancel()
+            event.ignore()
+            return
         super().closeEvent(event)
+
+    def done(self, result: int) -> None:
+        # Dismissed by its owner while a run is still going (e.g. the
+        # console closing): stop it, and let no late result change anything.
+        if self._worker is not None:
+            self._dismissed = True
+            self._worker.cancel()
+        super().done(result)
 
 
 def _paragraph(text: str) -> QtWidgets.QLabel:
