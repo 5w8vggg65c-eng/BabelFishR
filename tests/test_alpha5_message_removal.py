@@ -155,7 +155,7 @@ def test_cancel_at_either_question_changes_nothing(qt_app, config, store, wav,
 
 
 def test_remove_from_thread_keeps_everything_and_is_restorable(
-        qt_app, config, store, wav, monkeypatch):
+        qt_app, config, store, wav, monkeypatch, tmp_path):
     app, window, txs = captured_window(qt_app, config, store, wav)
     target, other = txs[0], txs[1]
     target.transcript = "purple giraffe seventeen"
@@ -176,9 +176,12 @@ def test_remove_from_thread_keeps_everything_and_is_restorable(
     assert target.id not in {t.id for t in app.review_queue()}
     from babelfishr.export import export_session
 
-    export_session(store, target.session_id, str(config.paths().logs / "exp"),
-                   include_audio=False, conversation_id=app.conversation_id)
-    manifest = json.loads((config.paths().logs / "exp" / "session.json").read_text())
+    # Into this test's own folder (it wrote into the real Logs folder), and
+    # read back from the path the export reports: an occupied name is never
+    # replaced, the bundle goes to "exp (2)".
+    written = export_session(store, target.session_id, str(tmp_path / "exp"),
+                             include_audio=False, conversation_id=app.conversation_id)
+    manifest = json.loads((pathlib.Path(written) / "session.json").read_text())
     assert target.id not in {t["id"] for t in manifest["transmissions"]}
     assert other.id in {t["id"] for t in manifest["transmissions"]}
     assert "kept" in window.status.currentMessage()
