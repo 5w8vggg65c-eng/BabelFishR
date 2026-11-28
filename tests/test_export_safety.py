@@ -264,6 +264,9 @@ def test_a_failure_to_publish_leaves_nothing(store, tmp_path, monkeypatch, archi
     monkeypatch.setattr(export.os, "rename", denied)
     monkeypatch.setattr(export.os, "replace", denied)
     monkeypatch.setattr(export.os, "link", denied)
+    monkeypatch.setattr(export, "_rename_noreplace", denied)
+    monkeypatch.setattr(export.os, "mkdir", denied)
+    monkeypatch.setattr(export.os, "open", denied)
     with pytest.raises(PermissionError):
         export.export_session(store, "run1", str(out / "bundle"), archive=archive)
     assert list(out.iterdir()) == []

@@ -164,44 +164,146 @@ def _unique_sibling(path: pathlib.Path, attempt: int,
     return path.with_name(f"{path.name} ({attempt})")
 
 
+class _Unsupported(Exception):
+    """The volume or OS offers no atomic no-replace rename."""
+
+
+_UNSUPPORTED_ERRNOS = {getattr(errno, name) for name in (
+    "ENOSYS", "EINVAL", "ENOTSUP", "EOPNOTSUPP", "EPERM", "EXDEV", "ENOTTY")
+    if hasattr(errno, name)}
+
+
+def _libc():
+    import ctypes
+    import ctypes.util
+
+    name = ctypes.util.find_library("c")
+    return ctypes.CDLL(name, use_errno=True) if name else None
+
+
+def _rename_noreplace(src: pathlib.Path, dst: pathlib.Path) -> None:
+    """Atomically rename *src* to *dst*, failing if *dst* exists.
+
+    renamex_np(RENAME_EXCL) on macOS, renameat2(RENAME_NOREPLACE) on Linux.
+    Raises FileExistsError when the name is taken, _Unsupported when this
+    OS or volume (FAT/exFAT, some shares) cannot do it - never a replacing
+    rename.
+    """
+    import sys
+
+    try:
+        libc = _libc()
+    except OSError:
+        libc = None
+    if libc is None:
+        raise _Unsupported("no C library")
+    a, b = os.fsencode(str(src)), os.fsencode(str(dst))
+    if sys.platform == "darwin":
+        func = getattr(libc, "renamex_np", None)
+        call = (lambda: func(a, b, 0x00000004)) if func else None   # RENAME_EXCL
+    elif sys.platform.startswith("linux"):
+        func = getattr(libc, "renameat2", None)
+        at_fdcwd = -100
+        call = (lambda: func(at_fdcwd, a, at_fdcwd, b, 1)) if func else None  # NOREPLACE
+    else:
+        call = None
+    if call is None:
+        raise _Unsupported("no atomic no-replace rename on this OS")
+    import ctypes
+
+    if call() == 0:
+        return
+    err = ctypes.get_errno()
+    if err == errno.EEXIST or err == errno.ENOTEMPTY:
+        raise FileExistsError(err, os.strerror(err), str(dst))
+    if err in _UNSUPPORTED_ERRNOS:
+        raise _Unsupported(os.strerror(err))
+    raise OSError(err, os.strerror(err), str(src))
+
+
+def _claim_folder(staged: pathlib.Path, candidate: pathlib.Path) -> None:
+    """Fallback without an atomic no-replace rename: claim *candidate* with
+    an exclusive mkdir (it fails if anything is there, so no other export
+    and no operator folder can be taken over), then move the staged
+    entries into the folder this export now owns. On failure, every moved
+    entry goes back and the claimed folder is removed."""
+    os.mkdir(candidate)                       # FileExistsError if taken
+    moved: List[Tuple[pathlib.Path, pathlib.Path]] = []
+    try:
+        for entry in sorted(staged.iterdir()):
+            target = candidate / entry.name
+            os.rename(entry, target)          # into our own, new folder
+            moved.append((target, entry))
+    except BaseException:
+        for target, entry in reversed(moved):
+            try:
+                os.rename(target, entry)
+            except OSError:
+                pass
+        try:
+            os.rmdir(candidate)
+        except OSError:
+            pass
+        raise
+
+
+def _claim_file(staged: pathlib.Path, candidate: pathlib.Path) -> None:
+    """Fallback for a file: create *candidate* exclusively (O_EXCL), then
+    move the staged file over that placeholder, which only this export
+    created. On failure the placeholder is removed."""
+    fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    try:
+        os.replace(staged, candidate)
+    except BaseException:
+        try:
+            os.unlink(candidate)
+        except OSError:
+            pass
+        raise
+
+
 def _publish(staged: pathlib.Path, final: pathlib.Path) -> pathlib.Path:
     """Move *staged* to *final*, or to the first free ``final (n)``.
 
-    Never replaces anything: a file is published with a hard link (which
-    fails if the name is taken) where the volume supports it; a folder with
-    a rename after checking the name is free. Returns the name used.
+    Never replaces anything, even with other exports racing for the same
+    name, because every step that takes a name is exclusive: an atomic
+    no-replace rename where the OS and volume have one; otherwise a hard
+    link (files), or an exclusive mkdir / O_EXCL create of the name
+    followed by moving the content into what this export now owns. A plain
+    rename onto a name is never used (on POSIX it silently replaces an
+    empty folder or any file). Returns the name used.
     """
+    is_dir = staged.is_dir()
+    native = True
     for attempt in range(1, 10_000):
-        candidate = _unique_sibling(final, attempt, not staged.is_dir())
+        candidate = _unique_sibling(final, attempt, not is_dir)
         if os.path.lexists(candidate):
             continue
-        if staged.is_dir():
-            try:
-                os.rename(staged, candidate)
-            except FileExistsError:
-                continue
-            except OSError as exc:
-                if exc.errno in (errno.EEXIST, errno.ENOTEMPTY) \
-                        and os.path.lexists(candidate):
-                    continue
-                raise
-            return candidate
         try:
-            os.link(staged, candidate)
+            if native:
+                try:
+                    _rename_noreplace(staged, candidate)
+                    return candidate
+                except _Unsupported:
+                    native = False
+            if is_dir:
+                _claim_folder(staged, candidate)
+                return candidate
+            try:
+                os.link(staged, candidate)
+            except FileExistsError:
+                raise
+            except OSError:
+                _claim_file(staged, candidate)     # no hard links here
+                return candidate
+            try:
+                os.unlink(staged)
+            except OSError:
+                pass  # removed with the staging folder
+            return candidate
         except FileExistsError:
             continue
-        except OSError:
-            # No hard links here (FAT/exFAT, some network shares): the
-            # name was free a moment ago; a plain rename is the fallback.
-            if os.path.lexists(candidate):
-                continue
-            os.rename(staged, candidate)
-            return candidate
-        try:
-            os.unlink(staged)
-        except OSError:
-            pass  # removed with the staging folder
-        return candidate
     raise FileExistsError(f"no free name next to {final}")
 
 
