@@ -29,6 +29,19 @@ from babelfishr import export
 from babelfishr.models import ProcessingState, Session, Transmission
 from export_wait import finish_export
 
+@pytest.fixture(autouse=True)
+def replace_answered_yes(monkeypatch):
+    """BabelFishR's own "Replace it?" question (asked after the save dialog,
+    whose native overwrite prompt is off) is answered yes here; tests of
+    the question itself are in test_export_off_gui_thread.py."""
+    from babelfishr.ui.main_window import MainWindow
+
+    asked = []
+    monkeypatch.setattr(MainWindow, "_ask_replace",
+                        lambda self, title, path: asked.append(path) or True)
+    return asked
+
+
 T0 = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
 BUNDLE_FILES = {"session.json", "transcript.md", "transmissions.csv", "README.txt"}
 
@@ -307,7 +320,7 @@ def test_clip_export_never_silently_replaces_a_file(store, tmp_path, monkeypatch
     def full(*a, **k):
         raise OSError(errno.ENOSPC, "No space left on device")
 
-    monkeypatch.setattr(export.shutil, "copy2", full)
+    monkeypatch.setattr(export.shutil, "copyfile", full)
     with pytest.raises(OSError):
         export.export_transmission_audio(tx, str(named), overwrite=True)
     assert named.read_bytes() == b"older", "a failed copy damaged the file"

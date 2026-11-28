@@ -38,6 +38,19 @@ from babelfishr.testing import build_fixture
 
 from export_wait import finish_export
 
+@pytest.fixture(autouse=True)
+def replace_answered_yes(monkeypatch):
+    """BabelFishR's own "Replace it?" question (asked after the save dialog,
+    whose native overwrite prompt is off) is answered yes here; tests of
+    the question itself are in test_export_off_gui_thread.py."""
+    from babelfishr.ui.main_window import MainWindow
+
+    asked = []
+    monkeypatch.setattr(MainWindow, "_ask_replace",
+                        lambda self, title, path: asked.append(path) or True)
+    return asked
+
+
 SR = 48_000
 VOICE = {"kind": "voice", "duration": 1.5, "level_dbfs": -14}
 QUIET = {"gap": 4.0}
@@ -272,8 +285,10 @@ def test_a_failure_is_warned_on_the_gui_thread_and_the_old_file_kept(
     assert warned[-1][1] and "bad render" in warned[-1][0]
     assert chosen.read_text() == "older export"
 
-    # And a retry after the failures works.
+    # And a retry after the failures works. (undo() also drops the
+    # autouse "Replace it?" answer, so it is given again.)
     monkeypatch.undo()
+    replace_answered_yes.__wrapped__(monkeypatch)
     monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
                         staticmethod(lambda *a, **k: (str(chosen), "")))
     window._export_text("md")
@@ -377,8 +392,8 @@ def test_the_clip_copy_runs_off_the_gui_thread(window, store, qt_app, tmp_path,
     chosen = tmp_path / "clip.wav"
     monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
                         staticmethod(lambda *a, **k: (str(chosen), "")))
-    gate = Gate(export.shutil.copy2)
-    monkeypatch.setattr(export.shutil, "copy2", gate)
+    gate = Gate(export.shutil.copyfile)
+    monkeypatch.setattr(export.shutil, "copyfile", gate)
     shown = []
     monkeypatch.setattr(window.status, "showMessage", lambda text, *a: shown.append(
         (text, _on_gui_thread(qt_app))))
@@ -511,7 +526,7 @@ def test_a_clip_failure_warns_on_the_gui_thread_and_keeps_the_old_file(
         threads.append(threading.current_thread())
         raise OSError(errno.ENOSPC, "No space left on device")
 
-    monkeypatch.setattr(export.shutil, "copy2", full)
+    monkeypatch.setattr(export.shutil, "copyfile", full)
     window._on_export_clip(tx.id)
     finish_export(window)
     assert threads and threads[0] is not threading.main_thread()
@@ -525,8 +540,8 @@ def test_a_clip_failure_warns_on_the_gui_thread_and_keeps_the_old_file(
 def test_a_cancelled_clip_writes_nothing_and_a_retry_works(
         window, store, qt_app, tmp_path, monkeypatch):
     _, tx, chosen = _stopped_clip(window, store, qt_app, tmp_path, monkeypatch)
-    gate = Gate(export.shutil.copy2)
-    monkeypatch.setattr(export.shutil, "copy2", gate)
+    gate = Gate(export.shutil.copyfile)
+    monkeypatch.setattr(export.shutil, "copyfile", gate)
     window._on_export_clip(tx.id)
     assert gate.entered.wait(10.0)          # held mid-copy
     window._export_cancel_button.click()
@@ -555,11 +570,13 @@ def test_any_export_blocks_every_other_kind_while_it_runs(
                         staticmethod(lambda *a, **k: asked.append(a) or str(out)))
     monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName", staticmethod(
         lambda *a, **k: asked.append(a) or (str(chosen), "")))
-    gate = Gate(export.portable_text if first == "text" else export.shutil.copy2)
+    copier = "copyfile" if first == "clip" else "copy2"   # clip vs bundle audio
+    gate = Gate(export.portable_text if first == "text"
+                else getattr(export.shutil, copier))
     if first == "text":
         monkeypatch.setattr(export, "portable_text", gate)
     else:
-        monkeypatch.setattr(export.shutil, "copy2", gate)
+        monkeypatch.setattr(export.shutil, copier, gate)
     starts = {"clip": lambda: window._on_export_clip(tx.id),
               "bundle": window._export_session,
               "text": lambda: window._export_text("md")}
@@ -574,3 +591,171 @@ def test_any_export_blocks_every_other_kind_while_it_runs(
         gate.release.set()
     finish_export(window)
     assert window.export_button.isEnabled()
+
+
+def test_a_text_name_claimed_while_the_export_runs_survives(
+        window, store, qt_app, tmp_path, monkeypatch):
+    """The operator chose a new name; another file took it before the
+    export finished. That file is kept and the export reports its own."""
+    from PySide6 import QtWidgets
+
+    _monitor(window, store, qt_app)
+    chosen = tmp_path / "fresh.csv"
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(chosen), "")))
+    gate = Gate(export.portable_text)
+    monkeypatch.setattr(export, "portable_text", gate)
+    window._export_text("csv")
+    assert gate.entered.wait(10.0)
+    chosen.write_text("claimed meanwhile")
+    gate.release.set()
+    finish_export(window)
+    assert chosen.read_text() == "claimed meanwhile"
+    sibling = tmp_path / "fresh (2).csv"
+    assert sibling.is_file()
+    assert str(sibling) in window.status.currentMessage()
+
+
+def test_cancel_pressed_after_publication_reports_completion(
+        window, store, qt_app, tmp_path, monkeypatch):
+    from PySide6 import QtWidgets
+
+    _monitor(window, store, qt_app)
+    chosen = tmp_path / "out.md"
+    chosen.write_text("older")
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(chosen), "")))
+    real_replace = os.replace
+    pressed = threading.Event()
+
+    def replace_then_cancel(src, dst):
+        real_replace(src, dst)
+        window._export_job.token.cancel()      # Cancel lands just after
+        pressed.set()
+
+    monkeypatch.setattr(export.os, "replace", replace_then_cancel)
+    window._export_text("md")
+    finish_export(window)
+    assert pressed.is_set()
+    assert chosen.read_text() != "older"
+    assert f"Exported {chosen}" in window.status.currentMessage()
+
+
+# -- explicit consent bound to the file that was there ---------------------------
+def _real_question(monkeypatch, answer):
+    """Restore BabelFishR's own replace question and answer it; record the
+    native dialog's options and every question asked."""
+    from PySide6 import QtWidgets
+
+    from babelfishr.ui import main_window as mw
+
+    monkeypatch.setattr(mw.MainWindow, "_ask_replace", _REAL_ASK_REPLACE)
+    asked = []
+
+    def question(parent, title, text, *a, **k):
+        asked.append(text)
+        return answer
+    monkeypatch.setattr(QtWidgets.QMessageBox, "question", staticmethod(question))
+    return asked
+
+
+def _dialog(monkeypatch, chosen, seen_options):
+    from PySide6 import QtWidgets
+
+    def native(*a, **k):
+        seen_options.append(k.get("options"))
+        return (str(chosen), "")
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
+                        staticmethod(native))
+
+
+from babelfishr.ui.main_window import MainWindow as _MW  # noqa: E402
+_REAL_ASK_REPLACE = _MW._ask_replace
+
+
+@pytest.mark.parametrize("kind", ["text", "clip"])
+def test_consent_is_asked_by_the_app_for_the_file_it_observed(
+        window, store, qt_app, tmp_path, monkeypatch, kind):
+    from PySide6 import QtWidgets
+
+    _, tx, clip = _stopped_clip(window, store, qt_app, tmp_path, monkeypatch)
+    chosen = clip if kind == "clip" else tmp_path / "out.md"
+    chosen.write_bytes(b"older")
+    options = []
+    _dialog(monkeypatch, chosen, options)
+    asked = _real_question(monkeypatch, QtWidgets.QMessageBox.Yes)
+    start = (lambda: window._on_export_clip(tx.id)) if kind == "clip" else (
+        lambda: window._export_text("md"))
+    start()
+    finish_export(window)
+    # The native prompt was off; BabelFishR asked once, naming the file.
+    assert options == [QtWidgets.QFileDialog.Option.DontConfirmOverwrite]
+    assert len(asked) == 1 and chosen.name in asked[0]
+    assert chosen.read_bytes() != b"older"
+    assert [p.name for p in chosen.parent.iterdir() if p.name.startswith(".")] == []
+
+
+@pytest.mark.parametrize("kind", ["text", "clip"])
+def test_declining_writes_nothing(window, store, qt_app, tmp_path, monkeypatch,
+                                  kind):
+    from PySide6 import QtWidgets
+
+    _, tx, clip = _stopped_clip(window, store, qt_app, tmp_path, monkeypatch)
+    chosen = clip if kind == "clip" else tmp_path / "out.md"
+    chosen.write_bytes(b"older")
+    _dialog(monkeypatch, chosen, [])
+    _real_question(monkeypatch, QtWidgets.QMessageBox.No)
+    before = sorted(p.name for p in chosen.parent.iterdir())
+    (lambda: window._on_export_clip(tx.id))() if kind == "clip" else \
+        window._export_text("md")
+    assert window._export_job is None              # no export started
+    assert chosen.read_bytes() == b"older"
+    assert sorted(p.name for p in chosen.parent.iterdir()) == before
+
+
+@pytest.mark.parametrize("kind", ["text", "clip"])
+def test_consent_does_not_carry_over_to_a_file_swapped_in_later(
+        window, store, qt_app, tmp_path, monkeypatch, kind):
+    """The operator agreed to replace the file they saw; another file
+    took its place before the export published: that one is kept."""
+    from PySide6 import QtWidgets
+
+    _, tx, clip = _stopped_clip(window, store, qt_app, tmp_path, monkeypatch)
+    chosen = clip if kind == "clip" else tmp_path / "out.md"
+    chosen.write_bytes(b"agreed to replace")
+    _dialog(monkeypatch, chosen, [])
+    _real_question(monkeypatch, QtWidgets.QMessageBox.Yes)
+    if kind == "clip":
+        gate = Gate(export.shutil.copyfile)
+        monkeypatch.setattr(export.shutil, "copyfile", gate)
+        window._on_export_clip(tx.id)
+    else:
+        gate = Gate(export.portable_text)
+        monkeypatch.setattr(export, "portable_text", gate)
+        window._export_text("md")
+    assert gate.entered.wait(10.0)
+    swap = chosen.with_name("swap")
+    swap.write_bytes(b"someone else's")
+    os.replace(swap, chosen)
+    gate.release.set()
+    finish_export(window)
+    assert chosen.read_bytes() == b"someone else's"
+    sibling = chosen.with_name(f"{chosen.stem} (2){chosen.suffix}")
+    assert sibling.is_file()
+    assert str(sibling) in window.status.currentMessage()
+
+
+@pytest.mark.parametrize("kind", ["text", "clip"])
+def test_a_new_name_asks_nothing(window, store, qt_app, tmp_path, monkeypatch,
+                                 kind):
+    from PySide6 import QtWidgets
+
+    _, tx, clip = _stopped_clip(window, store, qt_app, tmp_path, monkeypatch)
+    chosen = (clip.with_name("new.wav") if kind == "clip"
+              else tmp_path / "new.md")
+    _dialog(monkeypatch, chosen, [])
+    asked = _real_question(monkeypatch, QtWidgets.QMessageBox.Yes)
+    (lambda: window._on_export_clip(tx.id))() if kind == "clip" else \
+        window._export_text("md")
+    finish_export(window)
+    assert asked == [] and chosen.is_file()

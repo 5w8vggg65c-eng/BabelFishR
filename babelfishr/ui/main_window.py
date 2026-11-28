@@ -3367,20 +3367,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 "The original recording is no longer on disk, so it cannot be "
                 "exported. The transcript and translation are kept.")
             return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Export clip", str(self._export_directory() / f"{tx.id}.wav"),
+        path, confirmed = self._choose_export_file(
+            "Export clip", str(self._export_directory() / f"{tx.id}.wav"),
             "WAV files (*.wav)")
         if not path or self._store_gone():
             return
 
         def job(stop):
             stop.raise_if_cancelled()
-            # The save dialog already asked before replacing a file. The
-            # copy runs off the GUI thread: a long recording on a slow drive
-            # must not freeze Stop Monitoring or the live indicators.
+            # The copy runs off the GUI thread: a long recording on a slow
+            # drive must not freeze Stop Monitoring or the live indicators.
             try:
                 return export_transmission_audio(
-                    tx, path, overwrite=True, cancelled=lambda: stop.cancelled)
+                    tx, path, cancelled=lambda: stop.cancelled,
+                    confirmed=confirmed)
             except ExportCancelled as exc:
                 raise Cancelled() from exc
 
@@ -4859,6 +4859,46 @@ class MainWindow(QtWidgets.QMainWindow):
             if owned and not handed_over:
                 snapshot.close()
 
+    def _choose_export_file(self, title: str, default: str, filters: str):
+        """Ask where to save one exported file. Returns (path, confirmed):
+        path None when the operator cancels; confirmed is the identity of
+        the existing file they agreed to replace, or None.
+
+        The native dialog's own overwrite prompt is turned off: what it
+        asked about cannot be tied to a file afterwards. Instead the
+        existing file's identity (device, inode) is taken first, and then
+        BabelFishR asks once, by name, whether to replace it. The export
+        replaces only that very file; if it is gone or another file has
+        the name by then, nothing is replaced and the export is saved as
+        "name (2)" (see export._publish_staged).
+        """
+        from ..export import confirmed_file
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, title, default, filters,
+            options=QtWidgets.QFileDialog.Option.DontConfirmOverwrite)
+        if not path:
+            return None, None
+        confirmed = confirmed_file(path)
+        if confirmed is None:
+            # Nothing there (or not a regular file): never replaced; a name
+            # taken in the meantime gets a new numbered name.
+            return path, None
+        if not self._ask_replace(title, path):
+            return None, None
+        return path, confirmed
+
+    def _ask_replace(self, title: str, path: str) -> bool:
+        answer = QtWidgets.QMessageBox.question(
+            self, title,
+            f"\u201c{pathlib.Path(path).name}\u201d already exists in "
+            f"{pathlib.Path(path).parent}.\n\nReplace it? If it changes "
+            "before the export finishes, it is kept and the export is "
+            "saved under a new numbered name.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        return answer == QtWidgets.QMessageBox.Yes
+
     def _export_text(self, fmt: str) -> None:
         """Export the selected named Session, in chronological order.
 
@@ -4878,8 +4918,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
             filters = {"md": "Markdown (*.md)", "json": "JSON (*.json)",
                        "csv": "CSV (*.csv)"}
-            path, _ = QtWidgets.QFileDialog.getSaveFileName(
-                self, "Export",
+            path, confirmed = self._choose_export_file(
+                "Export",
                 str(self._export_directory() / f"babelfishr_{session.id}.{fmt}"),
                 filters[fmt])
             if not path or self._store_gone():
@@ -4902,11 +4942,15 @@ class MainWindow(QtWidgets.QMainWindow):
                         fmt, snapshot, transmissions, session, sessions=runs,
                         conversation_id=conversation_id)
                     stop.raise_if_cancelled()
-                    # The dialog already confirmed replacing an existing
-                    # file: it is replaced atomically, only once the new
-                    # text is complete.
-                    return export_module.write_text_export(text, path,
-                                                           overwrite=True)
+                    # Cancel is honoured up to the moment of publication;
+                    # once published, the export reports what it wrote.
+                    try:
+                        return export_module.write_text_export(
+                            text, path, cancelled=lambda: stop.cancelled,
+                            confirmed=confirmed)
+                    except export_module.ExportCancelled as exc:
+                        from .workers import Cancelled
+                        raise Cancelled() from exc
                 finally:
                     if owned:
                         snapshot.close()

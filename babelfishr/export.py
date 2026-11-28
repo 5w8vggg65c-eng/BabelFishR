@@ -21,6 +21,7 @@ import os
 import pathlib
 import re
 import shutil
+import stat
 import tempfile
 import zipfile
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -331,48 +332,124 @@ def portable_text(fmt: str, store: Store, transmissions: Sequence[Transmission],
     return redact(to_markdown(portable, described, runs=shown))
 
 
+FileIdentity = Tuple[int, int]
+
+
+def confirmed_file(path) -> Optional[FileIdentity]:
+    """The identity (device, inode) of the regular file at *path*, or None
+    if there is none. Taken on the GUI thread right after a save dialog: an
+    export replaces only that very file, which the operator confirmed."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _create_exclusive(folder: pathlib.Path, prefix: str, mode: int):
+    """Create a new, uniquely named file in *folder* with *mode* (O_EXCL).
+    Returns (fd, path)."""
+    for _ in range(100):
+        candidate = folder / f"{prefix}{os.urandom(6).hex()}.partial"
+        try:
+            return os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                           mode), candidate
+        except FileExistsError:
+            continue
+    raise FileExistsError(f"no free temporary name in {folder}")
+
+
+def _default_file_mode(folder: pathlib.Path) -> int:
+    """The mode a plain new file gets in *folder* (0o666 less the umask).
+
+    Found with an empty probe file, created and removed at once: the umask
+    cannot be read without changing it for every thread of the process."""
+    fd, probe = _create_exclusive(folder, ".babelfishr-mode-", 0o666)
+    try:
+        return os.fstat(fd).st_mode & 0o777
+    finally:
+        os.close(fd)
+        try:
+            os.unlink(probe)
+        except OSError:
+            pass
+
+
+def _publish_staged(temp: pathlib.Path, target: pathlib.Path,
+                    replace: Optional[FileIdentity],
+                    cancelled: Optional[Callable[[], bool]]) -> pathlib.Path:
+    """Publish a complete, flushed, owner-only staging file.
+
+    *replace* is the identity of the file the operator confirmed replacing:
+    only while that very file is still at *target* is it replaced (keeping
+    its permissions). Otherwise - no file was confirmed, it was removed, or
+    something else now has the name - the name is never replaced: the file
+    is published under the first free ``name (n)``.
+
+    The final mode is applied only now, and the cancel check is the last
+    step before publication: cancelled up to here, nothing is published and
+    the previous file keeps its bytes; past it, the export completes.
+    Limit: POSIX has no compare-and-replace, so a file swapped in at the
+    target between the identity check and the atomic replace (a window of
+    microseconds) would be replaced.
+    """
+    replacing = False
+    mode = None
+    if replace is not None:
+        try:
+            st = os.stat(target)
+        except FileNotFoundError:
+            st = None
+        if (st is not None and stat.S_ISREG(st.st_mode)
+                and (st.st_dev, st.st_ino) == tuple(replace)):
+            replacing, mode = True, st.st_mode & 0o7777
+    if mode is None:
+        mode = _default_file_mode(target.parent)
+    os.chmod(temp, mode)
+    if cancelled is not None and cancelled():
+        raise ExportCancelled("export cancelled")
+    if replacing:
+        os.replace(temp, target)
+        return target
+    return _publish(temp, target)
+
+
 def write_text_export(text: str, destination: str,
-                      overwrite: bool = False) -> str:
+                      overwrite: bool = False,
+                      cancelled: Optional[Callable[[], bool]] = None,
+                      confirmed: Optional[FileIdentity] = None) -> str:
     """Write a standalone export atomically. Returns the path written.
 
-    The text goes to a private temporary file in the target folder, is
-    flushed to disk, and is then published: with ``overwrite=True`` (the
-    operator confirmed replacing that file) by an atomic replace, otherwise
-    never over an existing file - an occupied name gets ``name (2).md`` and
-    so on, as bundles do. On any failure the previous file is untouched and
-    no temporary file is left; the error is raised.
+    The text goes to a private, owner-only (0600) temporary file in the
+    target folder and is flushed to disk; then the intended final mode is
+    applied and it is published. An existing file is replaced only when it
+    is the one the operator confirmed: *confirmed* (its identity, from
+    confirmed_file() at the save dialog), or with ``overwrite=True`` the
+    file present when this call starts (the CLI's --overwrite). Any other
+    occupied name - including one claimed after the dialog - is never
+    replaced: the export goes to ``name (2).md`` and so on.
+
+    ``cancelled()`` is checked after the flush, immediately before
+    publication: a cancel up to there raises ExportCancelled and leaves the
+    previous file's bytes; after it the file is published and its path
+    returned. On any failure the previous file is untouched and no
+    temporary file is left; the error is raised.
     """
     target = pathlib.Path(destination).absolute()
     if target.is_dir():
         raise IsADirectoryError(errno.EISDIR, "is a folder", str(target))
+    if confirmed is None and overwrite:
+        confirmed = confirmed_file(target)
     temp: Optional[pathlib.Path] = None
     try:
-        for _ in range(100):
-            candidate = target.parent / (
-                f".babelfishr-export-{os.urandom(6).hex()}.partial")
-            try:
-                # 0o666 less the umask: the mode a plain write would give.
-                fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                             0o666)
-            except FileExistsError:
-                continue
-            temp = candidate
-            break
-        else:
-            raise FileExistsError(f"no free temporary name in {target.parent}")
+        fd, temp = _create_exclusive(target.parent, ".babelfishr-export-", 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        if overwrite:
-            try:
-                # Keep the confirmed file's permissions.
-                os.chmod(temp, os.stat(target).st_mode & 0o7777)
-            except OSError:
-                pass
-            os.replace(temp, target)
-            return str(target)
-        return str(_publish(temp, target))
+        return str(_publish_staged(temp, target, confirmed, cancelled))
     finally:
         if temp is not None:
             try:
@@ -588,8 +665,11 @@ def csv_cell(column: str, value) -> object:
     keep the operator's text exactly.
 
     Limit: the apostrophe is a widely honoured convention, not a standard.
-    Most spreadsheet applications display it as part of the cell when they
-    open a CSV (so "=1+1" reads "'=1+1"); none evaluates the cell.
+    It protects the file as BabelFishR wrote it: spreadsheet applications
+    open such a cell as text (many show the apostrophe, so "=1+1" reads
+    "'=1+1"). A spreadsheet that saves the file again may write the cell
+    without the apostrophe, and that saved copy can evaluate it when it is
+    reopened; JSON keeps the original text.
     """
     if value is None:
         return ""
@@ -880,9 +960,12 @@ def _bundle_readme(session: Session, count: int) -> str:
         "Contents\n"
         "  session.json      full metadata, transcripts and translations\n"
         "  transcript.md     human-readable log\n"
-        "  transmissions.csv spreadsheet-friendly table (text that a spreadsheet\n"
-        "                    could run as a formula starts with ' so it is\n"
-        "                    shown, never evaluated; session.json has it exact)\n"
+        "  transmissions.csv spreadsheet-friendly table. Text that a spreadsheet\n"
+        "                    could run as a formula starts with ' so that it\n"
+        "                    opens as text. That protects this file as written:\n"
+        "                    a spreadsheet that saves it again may drop the '\n"
+        "                    and the cell can then be evaluated when reopened.\n"
+        "                    session.json keeps every text exactly.\n"
         "  audio/            original recordings, named by transmission id\n\n"
         "Original transcripts and translations are stored in separate fields;\n"
         "the audio here is the unmodified capture.\n\n"
@@ -893,16 +976,20 @@ def _bundle_readme(session: Session, count: int) -> str:
 
 def export_transmission_audio(tx: Transmission, destination: str,
                               overwrite: bool = False,
-                              cancelled: Optional[Callable[[], bool]] = None
+                              cancelled: Optional[Callable[[], bool]] = None,
+                              confirmed: Optional[FileIdentity] = None
                               ) -> str:
     """Copy one clip's original audio out for sharing. Returns the path
     actually written.
 
     The copy is made beside the target under a private temporary name and
     then moved into place, so a failed copy never leaves a partial file at
-    the target. An existing file is replaced only with ``overwrite=True``
-    (the operator confirmed that file in a save dialog); otherwise the clip
-    is written as ``name (2).wav`` and so on. A folder destination gets a
+    the target. An existing file is replaced only when it is the one the
+    operator confirmed (*confirmed*, from confirmed_file() at the save
+    dialog; or with ``overwrite=True`` the file present when this call
+    starts); otherwise the clip is written as ``name (2).wav`` and so on.
+    The partial copy is owner-only; the final mode is applied at
+    publication (see write_text_export). A folder destination gets a
     file named by the transmission id. When ``cancelled()`` returns true
     before the copy is moved into place, :class:`ExportCancelled` is raised
     and nothing is written.
@@ -920,18 +1007,21 @@ def export_transmission_audio(tx: Transmission, destination: str,
         overwrite = False
     target = target.absolute()
     target.parent.mkdir(parents=True, exist_ok=True)
+    if confirmed is None and overwrite:
+        confirmed = confirmed_file(target)
+    # Owner-only (0600, mkstemp) while the copy is written: copyfile, not
+    # copy2, which would give the partial file the recording's mode.
     handle, temp_name = tempfile.mkstemp(prefix=".babelfishr-clip-",
                                          suffix=".partial", dir=target.parent)
     os.close(handle)
     temp = pathlib.Path(temp_name)
     try:
-        shutil.copy2(source, temp)
+        shutil.copyfile(source, temp)
+        times = os.stat(source)
+        os.utime(temp, ns=(times.st_atime_ns, times.st_mtime_ns))
         if cancelled is not None and cancelled():
             raise ExportCancelled("export cancelled")
-        if overwrite:
-            os.replace(temp, target)
-            return str(target)
-        return str(_publish(temp, target))
+        return str(_publish_staged(temp, target, confirmed, cancelled))
     finally:
         try:
             temp.unlink()

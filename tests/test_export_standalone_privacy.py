@@ -37,6 +37,19 @@ from babelfishr.models import (AnalysisArtifact, AnalysisAttempt, AnalysisOutcom
 
 from export_wait import finish_export
 
+@pytest.fixture(autouse=True)
+def replace_answered_yes(monkeypatch):
+    """BabelFishR's own "Replace it?" question (asked after the save dialog,
+    whose native overwrite prompt is off) is answered yes here; tests of
+    the question itself are in test_export_off_gui_thread.py."""
+    from babelfishr.ui.main_window import MainWindow
+
+    asked = []
+    monkeypatch.setattr(MainWindow, "_ask_replace",
+                        lambda self, title, path: asked.append(path) or True)
+    return asked
+
+
 T0 = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
 TRANSCRIPT = "Mayday relay, vessel Blue Heron, position five two north"
 TRANSLATION = "Mayday relais, Schiff Blue Heron, Position fünf zwei Nord"
