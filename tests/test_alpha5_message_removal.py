@@ -176,9 +176,12 @@ def test_remove_from_thread_keeps_everything_and_is_restorable(
     assert target.id not in {t.id for t in app.review_queue()}
     from babelfishr.export import export_session
 
-    export_session(store, target.session_id, str(config.paths().logs / "exp"),
-                   include_audio=False, conversation_id=app.conversation_id)
-    manifest = json.loads((config.paths().logs / "exp" / "session.json").read_text())
+    # A private folder, read back at the path actually written (an export
+    # never replaces an existing folder).
+    written = export_session(store, target.session_id,
+                             str(pathlib.Path(config.database).parent / "exp"),
+                             include_audio=False, conversation_id=app.conversation_id)
+    manifest = json.loads((pathlib.Path(written) / "session.json").read_text())
     assert target.id not in {t["id"] for t in manifest["transmissions"]}
     assert other.id in {t["id"] for t in manifest["transmissions"]}
     assert "kept" in window.status.currentMessage()
