@@ -23,7 +23,7 @@ import enum
 import json
 import logging
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 log = logging.getLogger(__name__)
 
@@ -492,6 +492,16 @@ class Session:
                          for g in self.capture_gaps), 6)
 
     @property
+    def driver_overflows(self) -> int:
+        """Input overflows the audio driver reported during this run: audio
+        lost before it reached BabelFishR, of unknown duration and position."""
+        return capture_loss_totals(self.capture_gaps).driver_overflows
+
+    @property
+    def capture_loss(self) -> "CaptureLossTotals":
+        return capture_loss_totals(self.capture_gaps)
+
+    @property
     def is_open(self) -> bool:
         return self.ended_at is None
 
@@ -508,6 +518,7 @@ class Session:
         d["duration"] = self.duration
         d["dropped_frames"] = self.dropped_frames
         d["dropped_seconds"] = self.dropped_seconds
+        d["driver_overflows"] = self.driver_overflows
         return d
 
     @classmethod
@@ -516,6 +527,7 @@ class Session:
         d.pop("duration", None)
         d.pop("dropped_frames", None)
         d.pop("dropped_seconds", None)
+        d.pop("driver_overflows", None)
         d["capture_gaps"] = list(d.get("capture_gaps") or [])
         d["started_at"] = parse_iso(d.get("started_at")) or utcnow()
         d["ended_at"] = parse_iso(d.get("ended_at"))
@@ -524,30 +536,53 @@ class Session:
         return cls(**{k: v for k, v in d.items() if k in known})
 
 
+#: CaptureGap.reason of audio discarded by BabelFishR's own capture buffer.
+GAP_BUFFER_OVERFLOW = "buffer-overflow"
+#: CaptureGap.reason of input overflows the audio driver reported (PortAudio
+#: ``input_overflow``): audio lost before it reached BabelFishR. How much,
+#: and exactly where, is not known - only how many times it was reported.
+GAP_DRIVER_OVERFLOW = "driver-overflow"
+
+
 @dataclasses.dataclass
 class CaptureGap:
     """A stretch of audio the input received but could not keep.
 
-    The live input's buffer overflowed (the capture thread fell behind) and
-    the oldest buffered audio was discarded to keep the device callback from
-    stalling. ``start_frame`` is the position in the run's stream, in frames
-    at ``sample_rate`` counted from the start of capture, where the missing
-    audio began; ``None`` when the frames were counted at the drop but could
-    not be placed (still unread when the run ended)."""
+    ``reason`` "buffer-overflow": the live input's buffer overflowed (the
+    capture thread fell behind) and the oldest buffered audio was discarded
+    to keep the device callback from stalling. ``start_frame`` is the
+    position in the run's stream, in frames at ``sample_rate`` counted from
+    the start of capture, where the missing audio began; ``None`` when the
+    frames were counted at the drop but could not be placed (still unread
+    when the run ended).
+
+    ``reason`` "driver-overflow": the audio driver reported ``overflows``
+    input overflows. Their duration is unknown, so ``frames`` and
+    :attr:`duration` are ``None`` (never a guess), and so is ``start_frame``.
+    """
 
     session_id: str = ""
-    frames: int = 0
+    frames: Optional[int] = 0
     sample_rate: int = 0
     start_frame: Optional[int] = None
     started_at: Optional[_dt.datetime] = None
     """Wall-clock time of the first missing frame (stream start + offset)."""
     blocks: int = 0
-    reason: str = "buffer-overflow"
+    reason: str = GAP_BUFFER_OVERFLOW
     recorded_at: _dt.datetime = dataclasses.field(default_factory=utcnow)
+    overflows: int = 0
+    """Driver-reported input overflows this record counts (driver-overflow)."""
 
     @property
-    def duration(self) -> float:
+    def duration(self) -> Optional[float]:
+        if self.frames is None:
+            return None
         return self.frames / float(self.sample_rate) if self.sample_rate else 0.0
+
+    @property
+    def located(self) -> bool:
+        """Is it known where in the stream the audio went missing?"""
+        return self.start_frame is not None and self.frames is not None
 
     @property
     def stream_offset(self) -> Optional[float]:
@@ -557,26 +592,97 @@ class CaptureGap:
         return self.start_frame / float(self.sample_rate)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"session_id": self.session_id, "frames": int(self.frames),
+        duration = self.duration
+        return {"session_id": self.session_id,
+                "frames": None if self.frames is None else int(self.frames),
                 "sample_rate": int(self.sample_rate),
-                "duration": round(self.duration, 6),
+                "duration": None if duration is None else round(duration, 6),
                 "start_frame": self.start_frame,
                 "stream_offset": (None if self.stream_offset is None
                                   else round(self.stream_offset, 6)),
                 "started_at": iso(self.started_at), "blocks": int(self.blocks),
-                "reason": self.reason, "recorded_at": iso(self.recorded_at)}
+                "reason": self.reason, "recorded_at": iso(self.recorded_at),
+                "overflows": int(self.overflows)}
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "CaptureGap":
         start = d.get("start_frame")
+        reason = d.get("reason") or GAP_BUFFER_OVERFLOW
+        frames = d.get("frames")
+        if reason == GAP_DRIVER_OVERFLOW:
+            # Stored as 0 only because the column is NOT NULL: unknown.
+            frames = None
+        elif frames is not None:
+            frames = int(frames)
         return cls(session_id=d.get("session_id") or "",
-                   frames=int(d.get("frames") or 0),
+                   frames=frames,
                    sample_rate=int(d.get("sample_rate") or 0),
                    start_frame=None if start is None else int(start),
                    started_at=parse_iso(d.get("started_at")),
                    blocks=int(d.get("blocks") or 0),
-                   reason=d.get("reason") or "buffer-overflow",
-                   recorded_at=parse_iso(d.get("recorded_at")) or utcnow())
+                   reason=reason,
+                   recorded_at=parse_iso(d.get("recorded_at")) or utcnow(),
+                   overflows=int(d.get("overflows") or 0))
+
+
+@dataclasses.dataclass(frozen=True)
+class CaptureLossTotals:
+    """What a run (or one message) lost during capture, summed."""
+
+    frames: int = 0
+    seconds: float = 0.0
+    gaps: int = 0
+    """Measured gaps (buffer overflows), located or not."""
+    driver_overflows: int = 0
+    """Driver-reported overflows: duration and position unknown."""
+
+    def __bool__(self) -> bool:
+        return bool(self.gaps or self.driver_overflows)
+
+    def note(self) -> str:
+        """One plain sentence, "" when nothing was lost. For the timeline,
+        the window's indicator and the human-readable exports alike."""
+        parts: List[str] = []
+        if self.gaps:
+            parts.append(f"Audio lost during capture: {self.seconds:.2f} s "
+                         f"({self.gaps} gap{'' if self.gaps == 1 else 's'})")
+        if self.driver_overflows:
+            n = self.driver_overflows
+            parts.append(f"{'the ' if parts else 'The '}input driver reported "
+                         f"{n} overflow{'' if n == 1 else 's'} "
+                         f"(audio lost, duration unknown)")
+        return "; ".join(parts) + ("." if parts else "")
+
+
+def capture_loss_totals(gaps: Iterable[Any]) -> CaptureLossTotals:
+    """Sum gap records (CaptureGap objects or their to_dict()). A legacy or
+    partial record without the newer keys counts as a measured gap."""
+    frames, seconds, count, overflows = 0, 0.0, 0, 0
+    for gap in gaps or ():
+        g = gap.to_dict() if isinstance(gap, CaptureGap) else dict(gap or {})
+        if (g.get("reason") or GAP_BUFFER_OVERFLOW) == GAP_DRIVER_OVERFLOW:
+            overflows += int(g.get("overflows") or 0) or 1
+            continue
+        count += 1
+        frames += int(g.get("frames") or 0)
+        duration = g.get("duration")
+        if duration is None and g.get("frames") and g.get("sample_rate"):
+            duration = int(g["frames"]) / float(g["sample_rate"])
+        seconds += float(duration or 0.0)
+    return CaptureLossTotals(frames=frames, seconds=round(seconds, 6),
+                             gaps=count, driver_overflows=overflows)
+
+
+def message_capture_loss(tx: Any) -> CaptureLossTotals:
+    """Loss attributed to one message: only gaps whose position is known and
+    fell while its audio was being received (signal_metadata capture_gaps,
+    written by the capture). Uncertain gaps belong to the run alone."""
+    meta = getattr(tx, "signal_metadata", None) or {}
+    entries = meta.get("capture_gaps") if isinstance(meta, dict) else None
+    located = [g for g in (entries or ()) if isinstance(g, dict)
+               and g.get("start_frame") is not None and g.get("frames")
+               and (g.get("reason") or GAP_BUFFER_OVERFLOW) != GAP_DRIVER_OVERFLOW]
+    return capture_loss_totals(located)
 
 
 def _enum_value(value: Any, default: Any) -> str:

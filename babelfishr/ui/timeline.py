@@ -11,7 +11,7 @@ from typing import Dict, List, Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..models import (ContentClass, ProcessingState, Provenance,
-                      Transmission)
+                      Transmission, message_capture_loss)
 from .playback import PAUSED, PLAYING, PlaybackController
 from .widgets import TagEditor
 
@@ -678,6 +678,17 @@ class TransmissionBubble(QtWidgets.QFrame):
         self.notes_label.hide()
         outer.addWidget(self.notes_label)
 
+        # Audio the input lost while this message was being received: said
+        # in words on the card (and to a screen reader), never left for the
+        # listener to discover as a jump in the recording.
+        self.capture_loss_label = QtWidgets.QLabel()
+        self.capture_loss_label.setObjectName("captureLossNote")
+        self.capture_loss_label.setWordWrap(True)
+        self.capture_loss_label.setTextFormat(QtCore.Qt.PlainText)
+        self.capture_loss_label.setAccessibleName("Audio lost during capture")
+        self.capture_loss_label.hide()
+        outer.addWidget(self.capture_loss_label)
+
         # No waveform here. This is a message thread: the transcript is what
         # the operator reads. An analyser belongs to a tool that analyses, not
         # to every line of a conversation.
@@ -887,6 +898,7 @@ class TransmissionBubble(QtWidgets.QFrame):
             self.notes_label.hide()
 
         self._rebuild_chips(tx)
+        self._render_capture_loss(tx)
 
         # Only what the operator must act on: a recording saved but not
         # processed because monitoring stopped. Routine states (queued,
@@ -938,6 +950,30 @@ class TransmissionBubble(QtWidgets.QFrame):
         if tx.hidden:
             self.status_label.setText("Removed from thread \u2014 data kept")
         self._render_playback()
+
+    def _render_capture_loss(self, tx: Transmission) -> None:
+        """Only loss known to fall inside this message's audio (see
+        message_capture_loss); the run's other loss is on the run note."""
+        note = message_capture_loss(tx).note()
+        self.capture_loss_label.setText(note)
+        self.capture_loss_label.setAccessibleDescription(note)
+        self.capture_loss_label.setToolTip(
+            "Part of this recording is missing: the audio input fell behind "
+            "and discarded audio while this message was being received. The "
+            "rest is kept, in order." if note else "")
+        self.capture_loss_label.setVisible(bool(note))
+        self._describe_row()
+
+    def _describe_row(self) -> None:
+        """The row's accessible description: whether it is selected, and
+        the capture-loss note when there is one."""
+        parts = ["Selected" if self.property("selected") else "",
+                 self.capture_loss_label.text()]
+        self.setAccessibleDescription(" ".join(p for p in parts if p))
+
+    @property
+    def capture_loss_note(self) -> str:
+        return self.capture_loss_label.text()
 
     def _render_words(self, tx: Transmission) -> None:
         # The transcript is the message. It is the primary content of the
@@ -1070,7 +1106,7 @@ class TransmissionBubble(QtWidgets.QFrame):
         if bool(self.property("selected")) == bool(selected):
             return
         self.setProperty("selected", bool(selected))
-        self.setAccessibleDescription("Selected" if selected else "")
+        self._describe_row()
         for widget in [self] + self.findChildren(QtWidgets.QWidget):
             widget.style().unpolish(widget)
             widget.style().polish(widget)
@@ -1325,6 +1361,55 @@ class TimelineView(QtWidgets.QScrollArea):
         self.empty_label.setAlignment(QtCore.Qt.AlignCenter)
         self.empty_label.setObjectName("emptyState")
         self._layout.insertWidget(0, self.empty_label)
+
+        # Per-run capture-loss notes: pinned above the scrolling thread (in
+        # the viewport margin, outside the bubbles' layout, so the reading
+        # anchor and the bubbles' order are untouched), shown only while a
+        # run in view lost audio.
+        self.run_notes = QtWidgets.QLabel(self)
+        self.run_notes.setObjectName("runCaptureLoss")
+        self.run_notes.setWordWrap(True)
+        self.run_notes.setTextFormat(QtCore.Qt.PlainText)
+        self.run_notes.setAccessibleName("Monitoring runs with audio lost during capture")
+        self.run_notes.setContentsMargins(10, 4, 10, 4)
+        self.run_notes.hide()
+        self._run_note_lines: List[str] = []
+
+    def set_run_notes(self, lines: List[str]) -> None:
+        """One line per monitoring run in view that lost audio during
+        capture (empty: none did - the note goes away)."""
+        lines = [line for line in lines if line]
+        self._run_note_lines = lines
+        text = "\n".join(lines)
+        self.run_notes.setText(text)
+        self.run_notes.setAccessibleDescription(text)
+        self.run_notes.setToolTip(
+            "Audio these runs' input lost during capture. Loss whose position "
+            "is known is also noted on the message it fell in." if lines else "")
+        self.run_notes.setVisible(bool(lines))
+        self._place_run_notes()
+
+    @property
+    def run_note_lines(self) -> List[str]:
+        return list(self._run_note_lines)
+
+    def _place_run_notes(self) -> None:
+        if not self._run_note_lines:
+            self.setViewportMargins(0, 0, 0, 0)
+            return
+        frame = self.frameWidth()
+        width = max(1, self.width() - 2 * frame)
+        height = self.run_notes.heightForWidth(width)
+        if height <= 0:
+            height = self.run_notes.sizeHint().height()
+        self.setViewportMargins(0, height, 0, 0)
+        self.run_notes.setGeometry(frame, frame, width, height)
+        self.run_notes.raise_()
+
+    def resizeEvent(self, event):                  # noqa: N802
+        super().resizeEvent(event)
+        if self._run_note_lines:
+            self._place_run_notes()
 
     def clear(self, keep_playback: bool = False) -> None:
         # Leaving a thread stops its audio: nothing keeps playing with its

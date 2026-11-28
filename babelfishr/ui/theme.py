@@ -264,6 +264,8 @@ QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
     background: transparent;
 }}
 #statusBand #stateBadge {{ border-radius: 10px; padding: 2px 10px; }}
+#statusBand #captureLossBadge {{ border-radius: 10px; padding: 2px 10px;
+    background-color: #8A4B00; }}
 {badge_rules}
 #modeButton {{ border: 1px solid transparent; padding: 2px 6px; }}
 #modeButton:hover, #modeButton:focus {{ border: 1px solid {t['on_band']}; }}

@@ -20,7 +20,8 @@ import tempfile
 import zipfile
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from .models import Session, Transmission, iso, utcnow
+from .models import (Session, Transmission, capture_loss_totals, iso,
+                     message_capture_loss, utcnow)
 from .storage import Store
 
 CSV_COLUMNS = [
@@ -34,6 +35,10 @@ CSV_COLUMNS = [
     "needs_review", "translation_status",
     # A recogniser's guess for noise is not put in the transcript column.
     "transcript_status", "withheld_guess",
+    # Audio lost during capture while this message was being received
+    # (only gaps whose position is known; the run's others are in the
+    # Markdown header and the JSON session record).
+    "capture_loss_seconds", "capture_loss_note",
 ]
 
 
@@ -356,13 +361,44 @@ def to_csv(transmissions: Sequence[Transmission]) -> str:
                                         else "audio unintelligible: engine guess withheld")
             if not tx.translation_correction:
                 row["translation"] = ""
+        loss = message_capture_loss(tx)
+        if loss:
+            row["capture_loss_seconds"] = f"{loss.seconds:.6f}".rstrip("0").rstrip(".")
+            row["capture_loss_note"] = loss.note()
         writer.writerow({k: row.get(k, "") for k in CSV_COLUMNS})
     return buffer.getvalue()
 
 
+def _capture_loss_lines(session: Optional[Session],
+                        runs: Optional[Sequence[Optional[Session]]]) -> List[str]:
+    """The header's capture-loss line(s): totals over the exported runs, and
+    one line per run when more than one run lost audio. Nothing when none
+    did (a record with no loss reads as before)."""
+    chosen = [r for r in (runs if runs is not None else [session]) if r is not None]
+    seen, unique = set(), []
+    for run in chosen:
+        if run.id not in seen:
+            seen.add(run.id)
+            unique.append(run)
+    losing = [r for r in unique if r.capture_loss]
+    if not losing:
+        return []
+    total = capture_loss_totals(g for r in losing for g in r.capture_gaps)
+    lines = [f"- **Capture loss:** {total.note()}"]
+    if len(unique) > 1:
+        for run in sorted(losing, key=lambda r: r.started_at):
+            lines.append(f"  - Monitoring run started {iso(run.started_at)}: "
+                         f"{run.capture_loss.note()}")
+    return lines
+
+
 def to_markdown(transmissions: Sequence[Transmission],
-                session: Optional[Session] = None) -> str:
-    """A log a human can read - the format most operators actually want."""
+                session: Optional[Session] = None,
+                runs: Optional[Sequence[Optional[Session]]] = None) -> str:
+    """A log a human can read - the format most operators actually want.
+
+    ``runs``: every monitoring run the transmissions come from (a named
+    Session's export), for the capture-loss totals; default ``session``."""
     lines: List[str] = []
     if session is not None:
         lines += [
@@ -375,6 +411,7 @@ def to_markdown(transmissions: Sequence[Transmission],
             f"- **Target language:** {session.target_language}",
             f"- **Transcription:** {session.transcription_engine or 'none'}",
             f"- **Translation:** {session.translation_engine or 'none'}",
+            *_capture_loss_lines(session, runs),
             "",
             "> Frequency and channel are operator-supplied metadata, not measured "
             "by BabelFishR.",
@@ -427,6 +464,9 @@ def to_markdown(transmissions: Sequence[Transmission],
                             f"automatic detection guessed "
                             f"'{unresolved.get('guessed_language') or '?'}' and no "
                             f"language pack is installed for it."))
+        loss = message_capture_loss(tx)
+        if loss:
+            lines.append(f"**Capture loss:** {loss.note()}")
         if tx.needs_review:
             lines.append("**Review:** needs review")
         if tx.notes:
@@ -530,7 +570,7 @@ def export_session(store: Store, session_id: str, destination: str,
 
         texts = {
             "session.json": json.dumps(manifest, indent=2, ensure_ascii=False),
-            "transcript.md": redact(to_markdown(portable, session)),
+            "transcript.md": redact(to_markdown(portable, session, runs=sessions)),
             "transmissions.csv": redact(to_csv(portable)),
             "README.txt": redact(_bundle_readme(session, len(transmissions))),
         }
