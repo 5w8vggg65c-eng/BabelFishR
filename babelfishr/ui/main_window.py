@@ -4652,8 +4652,6 @@ class MainWindow(QtWidgets.QMainWindow):
             transmissions += self.app.store.list_transmissions(
                 session_id=other, limit=100_000)
         transmissions.sort(key=lambda t: (t.started_at, t.id))
-        renderers = {"md": export_module.to_markdown, "json": export_module.to_json,
-                     "csv": export_module.to_csv}
         filters = {"md": "Markdown (*.md)", "json": "JSON (*.json)",
                    "csv": "CSV (*.csv)"}
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -4661,15 +4659,22 @@ class MainWindow(QtWidgets.QMainWindow):
             filters[fmt])
         if not path or self._store_gone():
             return
-        renderer = renderers[fmt]
-        if fmt == "md":
-            # Every run of the Session, for the capture-loss totals.
-            runs = self.app.store.sessions_for_conversation(conversation_id)
-            text = renderer(transmissions, session, runs=runs)
-        else:
-            text = (renderer(transmissions, session) if fmt != "csv"
-                    else renderer(transmissions))
-        pathlib.Path(path).write_text(text, encoding="utf-8")
+        # The same portable projection as a bundle: no save folder,
+        # recording folders, home folder or path diagnostics.
+        runs = [self.app.store.get_session(i) for i in session_ids]
+        try:
+            text = export_module.portable_text(
+                fmt, self.app.store, transmissions, session, sessions=runs,
+                conversation_id=conversation_id)
+            # The dialog already confirmed replacing an existing file: it is
+            # replaced atomically, only once the new text is complete.
+            path = export_module.write_text_export(text, path, overwrite=True)
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Export",
+                f"The export could not be written to {path}:\n{exc}\n\n"
+                "Any file already there was not changed.")
+            return
         self.status.showMessage(f"Exported {path}", 8000)
 
     # -- shutdown --------------------------------------------------------
