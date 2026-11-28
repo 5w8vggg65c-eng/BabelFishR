@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from PySide6 import QtCore, QtWidgets
 
+from ..model_integrity import Integrity, integrity_state
 from ..providers.whisper_local import MODEL_SIZES, ModelState, inspect_model_directory
 
 
@@ -31,6 +32,16 @@ class WhisperModelPicker(QtWidgets.QComboBox):
                 try:
                     state, _ = inspect_model_directory(directory)
                     status, detail = labels[state], str(directory)
+                    if state is ModelState.COMPLETE:
+                        # From the install record only (cheap, no hashing).
+                        checked, why = integrity_state(directory, name)
+                        if (name == current and self.app.config.asr.model_path):
+                            checked, why = Integrity.UNPINNED, "custom folder"
+                        status += (", verified" if checked is Integrity.VERIFIED
+                                   else ", checksum mismatch"
+                                   if checked is Integrity.MISMATCH
+                                   else ", unverified")
+                        detail += f"\n{why}"
                 except OSError as exc:
                     state, status, detail = None, "Unavailable", str(exc)
                 label = name.replace("-", " ").capitalize()

@@ -30,13 +30,26 @@ httpx2 = pytest.importorskip("httpx2")
 huggingface_hub = pytest.importorskip("huggingface_hub")
 
 REPO = "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
+#: Revision A: the commit the test pin names.
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
+#: Revision B: a newer, equally legitimate commit with the same file names
+#: and lengths but different content. "main" points here.
+COMMIT_B = "fedcba9876543210fedcba9876543210fedcba98"
 FILES = {
     "config.json": b'{"alignment_heads": []}'.ljust(1024, b" "),
     "tokenizer.json": bytes(range(256)) * 16,              # 4,096
     "model.bin": (b"\x00\x01binary-weights" * 20_000)[:257_040],
 }
 TOTAL = sum(len(v) for v in FILES.values())               # 262,160
+_ROTATE = bytes((i + 1) % 256 for i in range(256))
+
+
+def other_revision(files):
+    """Same names, same lengths, different bytes."""
+    return {name: data.translate(_ROTATE) for name, data in files.items()}
+
+
+FILES_B = other_revision(FILES)
 
 
 def blob_id(content: bytes) -> str:
@@ -45,19 +58,35 @@ def blob_id(content: bytes) -> str:
 
 class InMemoryHub:
     """Enough of the Hub's HTTP API for model_info, snapshot_download and
-    hf_hub_download, with real lengths, commit and Git blob ETags."""
+    hf_hub_download, with real lengths, commits, Git blob ETags and Range
+    requests, serving two revisions (``main`` is the newer one, B).
+    *tamper* replaces what is served for a file (any revision)."""
 
-    def __init__(self, fail_model_info=False, chunk=8192, files=None):
-        self.files = files or FILES
+    def __init__(self, fail_model_info=False, chunk=8192, files=None, tamper=None):
+        files = files or FILES
+        self.revisions = {COMMIT: files, COMMIT_B: other_revision(files)}
+        self.main = COMMIT_B
         self.fail_model_info = fail_model_info
         self.chunk = chunk
+        self.tamper = dict(tamper or {})
         self.requests = []
+        self.revisions_asked = []           # the revision of every rev-scoped request
+        self.ranges = []
         self.served = {}
 
-    def info(self):
-        return {"id": REPO, "modelId": REPO, "sha": COMMIT, "private": False,
+    @property
+    def files(self):
+        return self.revisions[COMMIT]
+
+    def _commit(self, revision):
+        self.revisions_asked.append(revision)
+        return self.main if revision == "main" else revision
+
+    def info(self, commit):
+        files = self.revisions[commit]
+        return {"id": REPO, "modelId": REPO, "sha": commit, "private": False,
                 "siblings": [{"rfilename": name, "size": len(data), "blobId": blob_id(data)}
-                             for name, data in self.files.items()]}
+                             for name, data in files.items()]}
 
     def __call__(self, request):
         path, method = request.url.path, request.method
@@ -65,35 +94,55 @@ class InMemoryHub:
         self.requests.append((method, path, query))
         api = f"/api/models/{REPO}"
         if path == api:
+            self.revisions_asked.append("main")      # no revision named = main
+            return httpx2.Response(200, json=self.info(self.main))
+        if path.startswith(f"{api}/revision/"):
+            commit = self._commit(path[len(f"{api}/revision/"):])
+            if commit not in self.revisions:
+                return httpx2.Response(404)
             if self.fail_model_info and "blobs=true" in query:
                 return httpx2.Response(503, json={"error": "Service Unavailable"})
-            return httpx2.Response(200, json=self.info())
-        if path.startswith(f"{api}/revision/"):
-            return httpx2.Response(200, json=self.info())
+            return httpx2.Response(200, json=self.info(commit))
         if path.startswith(f"{api}/tree/"):
+            commit = self._commit(path[len(f"{api}/tree/"):].split("/", 1)[0])
             return httpx2.Response(200, json=[
                 {"type": "file", "path": name, "size": len(data), "oid": blob_id(data)}
-                for name, data in self.files.items()])
+                for name, data in self.revisions.get(commit, {}).items()])
         prefix = f"/{REPO}/resolve/"
         if path.startswith(prefix):
-            name = path[len(prefix):].split("/", 1)[1]
-            data = self.files.get(name)
+            revision, name = path[len(prefix):].split("/", 1)
+            commit = self._commit(revision)
+            data = self.revisions.get(commit, {}).get(name)
             if data is None:
                 return httpx2.Response(404)
-            headers = {"X-Repo-Commit": COMMIT, "ETag": f'"{blob_id(data)}"',
-                       "Content-Length": str(len(data)), "Content-Type": "application/octet-stream"}
+            data = self.tamper.get(name, data)
+            headers = {"X-Repo-Commit": commit, "ETag": f'"{blob_id(data)}"',
+                       "Content-Length": str(len(data)),
+                       "Content-Type": "application/octet-stream",
+                       "Accept-Ranges": "bytes"}
             if method == "HEAD":
                 return httpx2.Response(200, headers=headers)
-            self.served[name] = self.served.get(name, 0) + len(data)
-            chunks = [data[i:i + self.chunk] for i in range(0, len(data), self.chunk)]
-            return httpx2.Response(200, headers=headers, content=iter(chunks))
+            status, start = 200, 0
+            wanted = request.headers.get("Range", "")
+            if wanted.startswith("bytes="):
+                start = int(wanted[len("bytes="):].split("-", 1)[0] or 0)
+                self.ranges.append((name, start))
+                status = 206
+                headers["Content-Range"] = f"bytes {start}-{len(data) - 1}/{len(data)}"
+                headers["Content-Length"] = str(len(data) - start)
+            body = data[start:]
+            self.served[name] = self.served.get(name, 0) + len(body)
+            chunks = [body[i:i + self.chunk] for i in range(0, len(body), self.chunk)]
+            return httpx2.Response(status, headers=headers, content=iter(chunks))
         return httpx2.Response(404)
 
 
 @pytest.fixture
 def hub(monkeypatch, tmp_path):
-    """Install an in-memory Hub as huggingface_hub's HTTP client."""
+    """Install an in-memory Hub as huggingface_hub's HTTP client, and pin
+    the model to its revision A."""
     from huggingface_hub.utils import _http
+    from pinning import pin
 
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf-home"))
     monkeypatch.setenv("HF_HUB_DISABLE_TELEMETRY", "1")
@@ -103,6 +152,7 @@ def hub(monkeypatch, tmp_path):
 
     def install(**options):
         made["hub"] = InMemoryHub(**options)
+        pin(monkeypatch, "large-v3-turbo", made["hub"].files, repo=REPO, revision=COMMIT)
         huggingface_hub.set_client_factory(
             lambda: httpx2.Client(transport=httpx2.MockTransport(made["hub"])))
         return made["hub"]
@@ -118,6 +168,12 @@ def download(tmp_path, cancelled=None):
     target = whisper_local.prepare_model("large-v3-turbo", tmp_path / "models",
                                          progress=seen.append, cancelled=cancelled)
     return pathlib.Path(target), seen
+
+
+def verified_state(target, model="large-v3-turbo"):
+    from babelfishr.model_integrity import integrity_state
+
+    return integrity_state(target, model)[0].value
 
 
 def assert_files(target):
@@ -138,14 +194,18 @@ def test_a_verified_total_downloads_all_three_files_exactly(hub, tmp_path):
     final = seen[-1]
     assert final.bytes_done == TOTAL and final.fraction == 1.0
     assert final.files_total == 3
+    assert set(server.revisions_asked) == {COMMIT}
+    assert verified_state(target) == "verified"
 
 
 def test_without_a_verified_total_the_fallback_completes(hub, tmp_path):
     server = hub(fail_model_info=True)
     target, seen = download(tmp_path)                    # used to raise AttributeError
     assert_files(target)
-    assert any(path.endswith("/revision/main") for _, path, _ in server.requests), \
+    assert any(path.endswith(f"/revision/{COMMIT}") for _, path, _ in server.requests), \
         "the snapshot_download fallback was not exercised"
+    assert set(server.revisions_asked) == {COMMIT}, "the fallback asked for another revision"
+    assert verified_state(target) == "verified"
     downloading = [p for p in seen if p.phase == "downloading"]
     assert downloading and all(p.bytes_total is None and p.fraction is None
                                for p in downloading)

@@ -1448,15 +1448,26 @@ class MainWindow(QtWidgets.QMainWindow):
         from ..preparation import MODEL_SIZES_MB
         from ..providers.whisper_local import MODEL_SIZES, ModelState, inspect_model_directory
 
+        from ..model_integrity import Integrity, integrity_state
+
         found = []
         for name in MODEL_SIZES:
+            directory = self.app.whisper_model_directory(name)
             try:
-                state, _ = inspect_model_directory(self.app.whisper_model_directory(name))
+                state, _ = inspect_model_directory(directory)
             except OSError:
                 state = None
-            if state is ModelState.COMPLETE:
-                continue
             verb = "Repair" if state is ModelState.INCOMPLETE else "Install"
+            if state is ModelState.COMPLETE:
+                # Complete files are offered again only to be checked: a
+                # legacy install (no record) is hashed, a mismatch repaired.
+                checked, _why = integrity_state(directory, name)
+                if checked is Integrity.UNVERIFIED:
+                    verb = "Verify"
+                elif checked is Integrity.MISMATCH:
+                    verb = "Repair"
+                else:
+                    continue
             size = MODEL_SIZES_MB.get(name, 0)
             title = name.replace("-", " ").capitalize()
             found.append((name, f"{verb} {title} (about {size} MB)", state))

@@ -53,6 +53,11 @@ def fake_preparation(monkeypatch):
 
     calls = {"downloads": [], "fail": None, "warm": []}
 
+    from babelfishr import model_integrity
+    from pinning import pin_synthetic
+
+    pin_synthetic(monkeypatch)
+
     def prepare_model(name, models_root, **_progress):
         from babelfishr.providers.whisper_local import model_directory_for
 
@@ -61,6 +66,9 @@ def fake_preparation(monkeypatch):
             raise RuntimeError(calls["fail"])
         directory = model_directory_for(models_root, name)
         complete_files(directory)
+        # As the real prepare_model does after its checksums pass.
+        model_integrity.write_record(directory, model_integrity.pin_for(name),
+                                     model_integrity.Integrity.VERIFIED)
         return directory
 
     class Result:
@@ -244,15 +252,22 @@ def test_the_local_folder_is_named_turbo_whatever_the_source(monkeypatch, tmp_pa
 
     asked = []
 
+    from pinning import REVISION, pin
+
+    pin(monkeypatch, TURBO, {name: b"abcd" for name in
+                             ("config.json", "model.bin", "tokenizer.json")})
+
     class Api:
-        def model_info(self, repo_id, files_metadata=False):
+        def model_info(self, repo_id, revision=None, files_metadata=False):
+            assert revision == REVISION, "not the pinned revision"
             asked.append(("info", repo_id))
             return types.SimpleNamespace(siblings=[
                 types.SimpleNamespace(rfilename=name, size=4, lfs=None)
                 for name in ("config.json", "model.bin", "tokenizer.json",
                              "README.md")])
 
-    def hf_hub_download(repo_id, filename, local_dir, tqdm_class=None, **_):
+    def hf_hub_download(repo_id, filename, local_dir, tqdm_class=None, revision=None, **_):
+        assert revision == REVISION, "not the pinned revision"
         asked.append((repo_id, filename, local_dir))
         (whisper_local.pathlib.Path(local_dir) / filename).write_bytes(b"abcd")
         return str(whisper_local.pathlib.Path(local_dir) / filename)
@@ -264,7 +279,8 @@ def test_the_local_folder_is_named_turbo_whatever_the_source(monkeypatch, tmp_pa
                         types.SimpleNamespace(utils=utils, WhisperModel=object))
     monkeypatch.setitem(sys.modules, "faster_whisper.utils", utils)
     resolved = whisper_local.prepare_model(TURBO, tmp_path / "models")
-    repo = "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
+    # The repository the Hub serves (the old mobiuslabsgmbh id redirects).
+    repo = "dropbox-dash/faster-whisper-large-v3-turbo"
     folder = str(tmp_path / "models" / TURBO)
     assert asked[0] == ("info", repo)
     # The same files faster-whisper fetches (README.md is not one), weights last.

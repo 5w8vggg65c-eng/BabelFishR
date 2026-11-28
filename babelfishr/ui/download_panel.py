@@ -141,7 +141,10 @@ class DownloadProgressPanel(QtWidgets.QFrame):
                          f"of {files_total}")
         elif phase == "verifying":
             self.bar.setRange(0, 0)
-            text = self.PHASES["verifying"]
+            # With a file: that file is being hashed against its pinned
+            # checksum; without: the offline load and smoke test.
+            text = ("Checking the files against their published checksums…"
+                    if getattr(progress, "file", "") else self.PHASES["verifying"])
         elif phase == "done":
             self.bar.setRange(0, 1000)
             self.bar.setValue(1000)
