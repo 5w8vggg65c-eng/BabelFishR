@@ -35,11 +35,12 @@ from babelfishr import export
 from babelfishr.models import (AnalysisArtifact, AnalysisAttempt, AnalysisOutcome,
                                ErrorInfo, ProcessingState, Session, Transmission)
 
+from export_wait import finish_export
+
 T0 = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
 TRANSCRIPT = "Mayday relay, vessel Blue Heron, position five two north"
 TRANSLATION = "Mayday relais, Schiff Blue Heron, Position fünf zwei Nord"
 NOTE_WORDS = "Coast guard acknowledged; folder of evidence is"
-
 
 @pytest.fixture
 def operator(tmp_path, monkeypatch):
@@ -417,6 +418,7 @@ def test_window_export_is_projected_and_replaces_the_confirmed_file(
     monkeypatch.setattr(window.status, "showMessage",
                         lambda text, *a: shown.append(text))
     window._export_text(fmt)
+    finish_export(window)
     assert shown[-1] == f"Exported {chosen}"
     check_standalone(fmt, chosen.read_text(encoding="utf-8"), operator)
     assert sorted(p.name for p in out.iterdir()) == [chosen.name]
@@ -442,6 +444,7 @@ def test_window_export_failure_warns_and_keeps_the_old_file(
 
     monkeypatch.setattr(export.os, "fsync", full)
     window._export_text(fmt)
+    finish_export(window)
     assert warned and "could not be written" in warned[0]
     assert "No space left on device" in warned[0]
     assert chosen.read_text() == "older export"

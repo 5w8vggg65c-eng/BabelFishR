@@ -27,10 +27,10 @@ import pytest
 
 from babelfishr import export
 from babelfishr.models import ProcessingState, Session, Transmission
+from export_wait import finish_export
 
 T0 = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.timezone.utc)
 BUNDLE_FILES = {"session.json", "transcript.md", "transmissions.csv", "README.txt"}
-
 
 def snapshot(root: pathlib.Path) -> dict:
     """Every path under *root* with its bytes (None for folders)."""
@@ -383,6 +383,7 @@ def test_window_reexport_after_a_removal_is_a_fresh_exact_bundle(
                         lambda text, *a: shown.append(text))
 
     window._export_session()
+    finish_export(window)
     (first,) = [p for p in out.iterdir()]
     assert shown[-1] == f"Exported session bundle to {first}"
     first_before = snapshot(first)
@@ -390,6 +391,7 @@ def test_window_reexport_after_a_removal_is_a_fresh_exact_bundle(
 
     store.hide_transmission("tx_b")
     window._export_session()
+    finish_export(window)
     second = out / f"{first.name} (2)"
     assert shown[-1] == f"Exported session bundle to {second}"
     assert snapshot(first) == first_before, "the earlier bundle was changed"
@@ -417,6 +419,7 @@ def test_window_export_failure_warns_and_leaves_nothing(window, store, tmp_path,
 
     monkeypatch.setattr(export.shutil, "copy2", full)
     window._export_session()
+    finish_export(window)
     assert warned and "could not be exported" in warned[0]
     assert list(out.iterdir()) == []
 
@@ -436,6 +439,7 @@ def test_window_clip_export_replaces_only_a_confirmed_file(window, store, tmp_pa
     monkeypatch.setattr(window.status, "showMessage",
                         lambda text, *a: shown.append(text))
     window._on_export_clip(tx.id)
+    finish_export(window)
     assert chosen.read_bytes() == pathlib.Path(tx.audio_path).read_bytes()
     assert shown[-1] == f"Exported {chosen}"
     assert staging_left(tmp_path) == []

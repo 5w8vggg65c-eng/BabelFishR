@@ -301,6 +301,46 @@ class Store:
         self.fts_enabled = True
         self._migrate()
 
+    @classmethod
+    def open_snapshot(cls, path: str,
+                      recordings_dir: Optional[str] = None) -> "Store":
+        """A second, read-only connection to an existing database, frozen
+        at the moment it is opened.
+
+        For a long read off the GUI thread (an export): it never shares the
+        application's connection, so it neither waits behind nor interleaves
+        with the capture's writes, and every read through it sees the same
+        consistent state - one read transaction (SQLite WAL snapshot), taken
+        here, until :meth:`close`. Nothing is migrated or created and writes
+        are refused (``query_only``). The connection may be handed to one
+        other thread, used there, and closed there.
+        """
+        if str(path) == ":memory:":
+            raise ValueError("an in-memory database has no second connection")
+        self = cls.__new__(cls)
+        self.path = str(path)
+        self.recordings_dir = pathlib.Path(
+            recordings_dir or (pathlib.Path(self.path).parent / "recordings"))
+        self._lock = threading.RLock()
+        self._writes = 0
+        uri = pathlib.Path(self.path).absolute().as_uri() + "?mode=rw"
+        self._conn = sqlite3.connect(uri, uri=True, check_same_thread=False,
+                                     isolation_level=None)
+        try:
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA query_only = ON")
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            self._conn.execute("BEGIN")
+            # The snapshot is taken at the first read, so read now.
+            self._conn.execute("SELECT count(*) FROM sessions").fetchone()
+            self.fts_enabled = bool(self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'transmissions_fts'"
+            ).fetchone())
+        except Exception:
+            self._conn.close()
+            raise
+        return self
+
     # ---- lifecycle -----------------------------------------------------
     def close(self) -> None:
         with self._lock:

@@ -234,6 +234,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._readiness = None
         self._theming = False
         self._readiness_worker = None
+        # The export running off the GUI thread, if any (see _start_export).
+        self._export_job = None
+        self._export_actions: tuple = ()
         # One entry per thing that can be wrong, so clearing one cannot hide
         # another that is still true. See _warn.
         self._warnings: Dict[str, str] = {}
@@ -2038,6 +2041,8 @@ class MainWindow(QtWidgets.QMainWindow):
         export_csv = QtGui.QAction("Export data (CSV)...", self)
         export_csv.triggered.connect(lambda: self._export_text("csv"))
         file_menu.addAction(export_csv)
+        self._export_actions = (export_session, export_md, export_json,
+                                export_csv)
 
         # The View and Tools actions are kept as attributes: they are the
         # commands the operator reaches through the visible menu, and a test
@@ -3345,8 +3350,11 @@ class MainWindow(QtWidgets.QMainWindow):
             + "\n\nThe recording itself is safe.")
 
     def _on_export_clip(self, tx_id: str) -> None:
-        from ..export import export_transmission_audio
+        from ..export import ExportCancelled, export_transmission_audio
+        from .workers import Cancelled
 
+        if self._export_already_running():
+            return
         tx = self.app.store.get_transmission(tx_id)
         if tx is None or not tx.audio_path:
             QtWidgets.QMessageBox.warning(self, "Export", "No audio for this clip.")
@@ -3362,17 +3370,31 @@ class MainWindow(QtWidgets.QMainWindow):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Export clip", str(self._export_directory() / f"{tx.id}.wav"),
             "WAV files (*.wav)")
-        if path and not self._store_gone():
+        if not path or self._store_gone():
+            return
+
+        def job(stop):
+            stop.raise_if_cancelled()
+            # The save dialog already asked before replacing a file. The
+            # copy runs off the GUI thread: a long recording on a slow drive
+            # must not freeze Stop Monitoring or the live indicators.
             try:
-                # The save dialog already asked before replacing a file.
-                written = export_transmission_audio(tx, path, overwrite=True)
-            except OSError as exc:
-                QtWidgets.QMessageBox.warning(
-                    self, "Export",
-                    f"The clip could not be exported to {path}:\n{exc}\n\n"
-                    "Nothing was written there; the recording itself is safe.")
-                return
-            self.status.showMessage(f"Exported {written}", 6000)
+                return export_transmission_audio(
+                    tx, path, overwrite=True, cancelled=lambda: stop.cancelled)
+            except ExportCancelled as exc:
+                raise Cancelled() from exc
+
+        def failed(text: str) -> None:
+            QtWidgets.QMessageBox.warning(
+                self, "Export",
+                f"The clip could not be exported to {path}:\n{text}\n\n"
+                "Nothing was written there; the recording itself is safe.")
+
+        self._start_export(
+            "Exporting the clip", job,
+            done=lambda written: self.status.showMessage(
+                f"Exported {written}", 6000),
+            error=failed)
 
     # -- data views ------------------------------------------------------
     # -- named Session tabs ----------------------------------------------
@@ -4586,6 +4608,198 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_source_language()
 
     # -- exports ---------------------------------------------------------
+    # Every export reads, renders and writes off the GUI thread: a large
+    # named Session takes a while, and meanwhile Stop Monitoring and the
+    # live capture-loss indicator must keep working. What is exported is
+    # fixed when the operator chooses Export (a read-only snapshot of the
+    # store), the destination is asked for here, on the GUI thread, and the
+    # result is reported here too; only the work in between runs elsewhere.
+
+    #: How long closing the window waits for a cancelled export to stop
+    #: before quitting anyway (the export then ends on its own connection,
+    #: and either publishes complete or removes its staging).
+    EXPORT_CLOSE_WAIT_S = 15.0
+
+    def _export_already_running(self) -> bool:
+        """One export at a time: a second request is refused, politely."""
+        if self._export_job is None:
+            return False
+        self.status.showMessage(
+            f"{self._export_job.describe} is still running - wait for it to "
+            "finish or cancel it first.", 8000)
+        return True
+
+    def _export_snapshot(self):
+        """(store, owned): the database as it stands now, frozen, on a
+        read-only connection of its own that the export worker uses and
+        closes - never the application's shared connection. *owned* is
+        False only for an in-memory store, which has no second connection.
+        """
+        store = self.app.store
+        opener = getattr(type(store), "open_snapshot", None)
+        if opener is None or str(getattr(store, "path", ":memory:")) == ":memory:":
+            return store, False
+        return opener(store.path, recordings_dir=str(store.recordings_dir)), True
+
+    def _export_selection(self, snapshot, conversation_id: str):
+        """The runs filed under the selected named Session and the one that
+        describes it (the live run, else the first stored), read from the
+        snapshot so the export agrees with itself."""
+        session_ids = snapshot.session_ids_for_conversation(conversation_id)
+        live = self.app.session
+        session = snapshot.get_session(live.id) if live is not None else None
+        if session is None and live is not None and snapshot is self.app.store:
+            session = live
+        if session is None:
+            session = next((s for s in (snapshot.get_session(i)
+                                        for i in session_ids) if s), None)
+        return session_ids, session
+
+    def _begin_export_snapshot(self, conversation_id: str):
+        """(snapshot, owned, session_ids, session), or None after telling
+        the operator why there is nothing to export."""
+        try:
+            snapshot, owned = self._export_snapshot()
+        except (OSError, sqlite3.Error) as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Export", f"The Session could not be read for export:\n"
+                f"{exc}\n\nNothing was written.")
+            return None
+        try:
+            session_ids, session = self._export_selection(snapshot,
+                                                          conversation_id)
+        except BaseException:
+            if owned:
+                snapshot.close()
+            raise
+        if session is None:
+            if owned:
+                snapshot.close()
+            QtWidgets.QMessageBox.information(
+                self, "Export",
+                "This Session has no monitoring runs to export yet.")
+            return None
+        return snapshot, owned, session_ids, session
+
+    def _start_export(self, describe: str, job, done, error) -> None:
+        """Run ``job(stop)`` on the thread pool; ``done(result)`` or
+        ``error(text)`` then runs here, on the GUI thread.
+
+        *stop* is this export's own CancellationToken, set by the Cancel
+        button or by closing the window; *job* honours it at safe points
+        and raises Cancelled. A job that had already published when Cancel
+        was pressed still reports what it wrote - it is never called
+        cancelled after the fact.
+        """
+        import types
+
+        from .workers import Cancelled, CancellationToken, run_in_background
+
+        token = CancellationToken()
+        job_state = types.SimpleNamespace(describe=describe, token=token,
+                                          deadline=None, worker=None)
+
+        def run(stop):
+            try:
+                return ("done", job(stop))
+            except OSError as exc:
+                return ("error", str(exc))
+            except Cancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001 - reported, not raised
+                if stop.cancelled:
+                    raise Cancelled() from exc
+                raise
+
+        def current() -> bool:
+            # A job abandoned by a close that stopped waiting reports to
+            # nobody: the window may be on its way out.
+            if self._export_job is not job_state:
+                return False
+            self._end_export()
+            return True
+
+        def finished(outcome) -> None:
+            if current():
+                kind, value = outcome
+                (done if kind == "done" else error)(value)
+
+        def failed(text: str) -> None:
+            if current():
+                error(text)
+
+        def cancelled() -> None:
+            if current():
+                self.status.showMessage(
+                    f"{describe} was cancelled - nothing was written and "
+                    "nothing already there was changed.", 8000)
+
+        self._export_job = job_state
+        self._show_export_running(True)
+        job_state.banner = f"{describe}... The window stays usable meanwhile."
+        self.status.showMessage(job_state.banner, 0)
+        job_state.worker = run_in_background(
+            run, stop=token, on_finished=finished, on_failed=failed,
+            on_cancelled=cancelled)
+
+    def _end_export(self) -> None:
+        job, self._export_job = self._export_job, None
+        self._show_export_running(False)
+        # Only this export's own progress line; a message shown meanwhile
+        # (an audio warning, Stop's "Finishing") is left alone.
+        if job is not None and self.status.currentMessage() in (
+                job.banner, getattr(job, "cancelling", None)):
+            self.status.clearMessage()
+
+    def _cancel_export(self) -> None:
+        job = self._export_job
+        if job is not None and not job.token.cancelled:
+            job.token.cancel()
+            job.cancelling = (f"Cancelling - {job.describe.lower()} stops at "
+                              "the next safe point.")
+            self.status.showMessage(job.cancelling, 0)
+
+    def _show_export_running(self, running: bool) -> None:
+        """The Cancel button, and the export commands while one runs."""
+        button = getattr(self, "_export_cancel_button", None)
+        if button is None:
+            if not running:
+                return
+            button = QtWidgets.QPushButton("Cancel export")
+            button.setObjectName("exportCancelButton")
+            button.setToolTip("Stop the export; nothing is left behind and "
+                              "nothing already there is changed")
+            button.clicked.connect(self._cancel_export)
+            self.status.addPermanentWidget(button)
+            self._export_cancel_button = button
+        button.setVisible(running)
+        button.setEnabled(running)
+        if self._store_off_limits:
+            return          # quitting: the routes stay shut
+        for action in self._export_actions:
+            action.setEnabled(not running)
+        self.export_button.setEnabled(not running)
+
+    def _export_settled(self) -> bool:
+        """For closing: True once no export is running. A running one is
+        cancelled and given EXPORT_CLOSE_WAIT_S to stop; after that the
+        close goes ahead and the export, on its own connection, is left to
+        end by itself without reporting to this window."""
+        import time
+
+        job = self._export_job
+        if job is None:
+            return True
+        if job.deadline is None:
+            job.token.cancel()
+            job.deadline = time.monotonic() + self.EXPORT_CLOSE_WAIT_S
+        if time.monotonic() < job.deadline:
+            return False
+        log.warning("closing while %s had not stopped; leaving it to finish",
+                    job.describe.lower())
+        self._export_job = None
+        return True
+
     def _export_session(self) -> None:
         """Export the whole named Session, not the last monitoring run.
 
@@ -4594,39 +4808,56 @@ class MainWindow(QtWidgets.QMainWindow):
         by "this Session". After a stop and a restart it would have exported
         the tail of the thread and nothing else.
         """
+        if self._export_already_running() or self._store_gone():
+            return
         conversation_id = self.app.conversation_id
-        session_ids = self.app.store.session_ids_for_conversation(conversation_id)
-        session = self.app.session
-        if session is None:
-            session = next((s for s in (self.app.store.get_session(i)
-                                        for i in session_ids) if s), None)
-        if session is None:
-            QtWidgets.QMessageBox.information(
-                self, "Export",
-                "This Session has no monitoring runs to export yet.")
+        begun = self._begin_export_snapshot(conversation_id)
+        if begun is None:
             return
-        directory = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Choose a folder for the session bundle")
-        if not directory or self._store_gone():
-            return
-        from ..export import export_session
-
-        conversation = self.app.store.get_conversation(conversation_id)
-        label = _slug(conversation.name if conversation else session.id)
-        target = pathlib.Path(directory) / f"babelfishr_{label}"
+        snapshot, owned, _session_ids, session = begun
+        handed_over = False
         try:
-            path = export_session(self.app.store, session.id, str(target),
-                                  conversation_id=conversation_id)
-        except OSError as exc:
-            QtWidgets.QMessageBox.warning(
-                self, "Export",
-                f"The session bundle could not be exported to {directory}:\n"
-                f"{exc}\n\nNothing was written there and nothing already "
-                "there was changed.")
-            return
-        # A folder of that name already there is left alone; the bundle goes
-        # to a fresh "name (2)" beside it, and that is the path named here.
-        self.status.showMessage(f"Exported session bundle to {path}", 10000)
+            directory = QtWidgets.QFileDialog.getExistingDirectory(
+                self, "Choose a folder for the session bundle")
+            if not directory or self._store_gone():
+                return
+            from ..export import ExportCancelled, export_session
+            from .workers import Cancelled
+
+            conversation = snapshot.get_conversation(conversation_id)
+            label = _slug(conversation.name if conversation else session.id)
+            target = pathlib.Path(directory) / f"babelfishr_{label}"
+            session_id = session.id
+
+            def job(stop):
+                try:
+                    return export_session(snapshot, session_id, str(target),
+                                          conversation_id=conversation_id,
+                                          cancelled=lambda: stop.cancelled)
+                except ExportCancelled as exc:
+                    raise Cancelled() from exc
+                finally:
+                    if owned:
+                        snapshot.close()
+
+            def failed(text: str) -> None:
+                QtWidgets.QMessageBox.warning(
+                    self, "Export",
+                    f"The session bundle could not be exported to {directory}:\n"
+                    f"{text}\n\nNothing was written there and nothing already "
+                    "there was changed.")
+
+            # A folder of that name already there is left alone; the bundle
+            # goes to a fresh "name (2)" beside it, and that is the path named.
+            self._start_export(
+                "Exporting the session bundle", job,
+                done=lambda path: self.status.showMessage(
+                    f"Exported session bundle to {path}", 10000),
+                error=failed)
+            handed_over = True
+        finally:
+            if owned and not handed_over:
+                snapshot.close()
 
     def _export_text(self, fmt: str) -> None:
         """Export the selected named Session, in chronological order.
@@ -4634,48 +4865,67 @@ class MainWindow(QtWidgets.QMainWindow):
         A transcript is a record of what was received and when, so it reads
         oldest-first regardless of how the thread is displayed.
         """
+        if self._export_already_running() or self._store_gone():
+            return
         conversation_id = self.app.conversation_id
-        session_ids = self.app.store.session_ids_for_conversation(conversation_id)
-        session = self.app.session
-        if session is None:
-            session = next((s for s in (self.app.store.get_session(i)
-                                        for i in session_ids) if s), None)
-        if session is None:
-            QtWidgets.QMessageBox.information(
-                self, "Export",
-                "This Session has no monitoring runs to export yet.")
+        begun = self._begin_export_snapshot(conversation_id)
+        if begun is None:
             return
-        from .. import export as export_module
-
-        transmissions = []
-        for other in session_ids:
-            transmissions += self.app.store.list_transmissions(
-                session_id=other, limit=100_000)
-        transmissions.sort(key=lambda t: (t.started_at, t.id))
-        filters = {"md": "Markdown (*.md)", "json": "JSON (*.json)",
-                   "csv": "CSV (*.csv)"}
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Export", str(self._export_directory() / f"babelfishr_{session.id}.{fmt}"),
-            filters[fmt])
-        if not path or self._store_gone():
-            return
-        # The same portable projection as a bundle: no save folder,
-        # recording folders, home folder or path diagnostics.
-        runs = [self.app.store.get_session(i) for i in session_ids]
+        snapshot, owned, session_ids, session = begun
+        handed_over = False
         try:
-            text = export_module.portable_text(
-                fmt, self.app.store, transmissions, session, sessions=runs,
-                conversation_id=conversation_id)
-            # The dialog already confirmed replacing an existing file: it is
-            # replaced atomically, only once the new text is complete.
-            path = export_module.write_text_export(text, path, overwrite=True)
-        except OSError as exc:
-            QtWidgets.QMessageBox.warning(
+            from .. import export as export_module
+
+            filters = {"md": "Markdown (*.md)", "json": "JSON (*.json)",
+                       "csv": "CSV (*.csv)"}
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(
                 self, "Export",
-                f"The export could not be written to {path}:\n{exc}\n\n"
-                "Any file already there was not changed.")
-            return
-        self.status.showMessage(f"Exported {path}", 8000)
+                str(self._export_directory() / f"babelfishr_{session.id}.{fmt}"),
+                filters[fmt])
+            if not path or self._store_gone():
+                return
+
+            def job(stop):
+                try:
+                    transmissions = []
+                    for other in session_ids:
+                        stop.raise_if_cancelled()
+                        transmissions += snapshot.list_transmissions(
+                            session_id=other, limit=100_000)
+                    transmissions.sort(key=lambda t: (t.started_at, t.id))
+                    runs = [snapshot.get_session(i) for i in session_ids]
+                    stop.raise_if_cancelled()
+                    # The same portable projection as a bundle: no save
+                    # folder, recording folders, home folder or path
+                    # diagnostics.
+                    text = export_module.portable_text(
+                        fmt, snapshot, transmissions, session, sessions=runs,
+                        conversation_id=conversation_id)
+                    stop.raise_if_cancelled()
+                    # The dialog already confirmed replacing an existing
+                    # file: it is replaced atomically, only once the new
+                    # text is complete.
+                    return export_module.write_text_export(text, path,
+                                                           overwrite=True)
+                finally:
+                    if owned:
+                        snapshot.close()
+
+            def failed(text: str) -> None:
+                QtWidgets.QMessageBox.warning(
+                    self, "Export",
+                    f"The export could not be written to {path}:\n{text}\n\n"
+                    "Any file already there was not changed.")
+
+            self._start_export(
+                f"Exporting {fmt.upper()}", job,
+                done=lambda written: self.status.showMessage(
+                    f"Exported {written}", 8000),
+                error=failed)
+            handed_over = True
+        finally:
+            if owned and not handed_over:
+                snapshot.close()
 
     # -- shutdown --------------------------------------------------------
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
@@ -4714,6 +4964,8 @@ class MainWindow(QtWidgets.QMainWindow):
             text = "Quitting - closing the engines and the database."
         else:
             parts = []
+            if self._export_job is not None:
+                parts.append(f"{self._export_job.describe.lower()} stops")
             outstanding = self.app.outstanding_work()
             if outstanding:
                 parts.append(f"{outstanding} transmission(s) finish processing")
@@ -4738,6 +4990,8 @@ class MainWindow(QtWidgets.QMainWindow):
         is told what failed. The application closes each resource once, and
         only at the very end, so a retry cannot close something still in use.
         """
+        if not self._export_settled():
+            return False        # cancelled; retried until it has stopped
         try:
             done = self.app.close(wait=False, start_cleanup=False)
         except Exception as exc:  # noqa: BLE001 - report, keep, retry

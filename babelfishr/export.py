@@ -892,7 +892,9 @@ def _bundle_readme(session: Session, count: int) -> str:
 
 
 def export_transmission_audio(tx: Transmission, destination: str,
-                              overwrite: bool = False) -> str:
+                              overwrite: bool = False,
+                              cancelled: Optional[Callable[[], bool]] = None
+                              ) -> str:
     """Copy one clip's original audio out for sharing. Returns the path
     actually written.
 
@@ -901,7 +903,9 @@ def export_transmission_audio(tx: Transmission, destination: str,
     the target. An existing file is replaced only with ``overwrite=True``
     (the operator confirmed that file in a save dialog); otherwise the clip
     is written as ``name (2).wav`` and so on. A folder destination gets a
-    file named by the transmission id.
+    file named by the transmission id. When ``cancelled()`` returns true
+    before the copy is moved into place, :class:`ExportCancelled` is raised
+    and nothing is written.
     """
     if not tx.audio_path:
         raise ValueError(f"transmission {tx.id} has no audio on disk")
@@ -922,6 +926,8 @@ def export_transmission_audio(tx: Transmission, destination: str,
     temp = pathlib.Path(temp_name)
     try:
         shutil.copy2(source, temp)
+        if cancelled is not None and cancelled():
+            raise ExportCancelled("export cancelled")
         if overwrite:
             os.replace(temp, target)
             return str(target)
